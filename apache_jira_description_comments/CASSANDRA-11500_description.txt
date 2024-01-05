@@ -1,0 +1,33 @@
+When a Materialized View uses a non-PK base table column in its PK, if an update changes that column value, we add the new view entry and remove the old one. When doing that removal, the current code uses the same timestamp than for the liveness info of the new entry, which is the max timestamp for any columns participating to the view PK. This is not correct for the deletion as the old view entry could have other columns with higher timestamp which won't be deleted as can easily shown by the failing of the following test:
+{noformat}
+CREATE TABLE t (k int PRIMARY KEY, a int, b int);
+CREATE MATERIALIZED VIEW mv AS SELECT * FROM t WHERE k IS NOT NULL AND a IS NOT NULL PRIMARY KEY (k, a);
+
+INSERT INTO t(k, a, b) VALUES (1, 1, 1) USING TIMESTAMP 0;
+UPDATE t USING TIMESTAMP 4 SET b = 2 WHERE k = 1;
+UPDATE t USING TIMESTAMP 2 SET a = 2 WHERE k = 1;
+
+SELECT * FROM mv WHERE k = 1; // This currently return 2 entries, the old (invalid) and the new one
+{noformat}
+
+So the correct timestamp to use for the deletion is the biggest timestamp in the old view entry (which we know since we read the pre-existing base row), and that is what CASSANDRA-11475 does (the test above thus doesn't fail on that branch).
+
+Unfortunately, even then we can still have problems if further updates requires us to overide the old entry. Consider the following case:
+{noformat}
+CREATE TABLE t (k int PRIMARY KEY, a int, b int);
+CREATE MATERIALIZED VIEW mv AS SELECT * FROM t WHERE k IS NOT NULL AND a IS NOT NULL PRIMARY KEY (k, a);
+
+INSERT INTO t(k, a, b) VALUES (1, 1, 1) USING TIMESTAMP 0;
+UPDATE t USING TIMESTAMP 10 SET b = 2 WHERE k = 1;
+UPDATE t USING TIMESTAMP 2 SET a = 2 WHERE k = 1; // This will delete the entry for a=1 with timestamp 10
+UPDATE t USING TIMESTAMP 3 SET a = 1 WHERE k = 1; // This needs to re-insert an entry for a=1 but shouldn't be deleted by the prior deletion
+UPDATE t USING TIMESTAMP 4 SET a = 2 WHERE k = 1; // ... and we can play this game more than once
+UPDATE t USING TIMESTAMP 5 SET a = 1 WHERE k = 1;
+...
+{noformat}
+
+In a way, this is saying that the "shadowable" deletion mechanism is not general enough: we need to be able to re-insert an entry when a prior one had been deleted before, but we can't rely on timestamps being strictly bigger on the re-insert. In that sense, this can be though as a similar problem than CASSANDRA-10965, though the solution there of a single flag is not enough since we can have to replace more than once.
+
+I think the proper solution would be to ship enough information to always be able to decide when a view deletion is shadowed. Which means that both liveness info (for updates) and shadowable deletion would need to ship the timestamp of any base table column that is part the view PK (so {{a}} in the example below).  It's doable (and not that hard really), but it does require a change to the sstable and intra-node protocol, which makes this a bit painful right now.
+
+But I'll also note that as CASSANDRA-1096 shows, the timestamp is not even enough since on equal timestamp the value can be the deciding factor. So in theory we'd have to ship the value of those columns (in the case of a deletion at least since we have it in the view PK for updates). That said, on that last problem, my preference would be that we start prioritizing CASSANDRA-6123 seriously so we don't have to care about conflicting timestamp anymore, which would make this problem go away.

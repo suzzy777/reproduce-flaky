@@ -1,0 +1,87 @@
+It's hard to review the patch to this bug without better understanding the failure. Can you paste what the failure looked like? It seems like the test is expecting a minimum availability of 2000ms, not a maximum. My instinct says doing this over the cluster would take even longer, but a >= test would still pass. 
+
+I think what's happening in this failure is that we are advancing the query status to a ready state prematurely, signaling to clients that rows fetched are available before they truly are. 
+
+Right now, the tests hard codes a value of 2000 for ROWS_AVAIL_LOWER_BOUND_MS. Perhaps there's some way to make this configurable according to the test context (local vs. remote.) If that's the agreed approach, I could open a JIRA to do so. In any event, I think the current test should still be skipped immediately -- it's just a question whether to skip for remote cluster testing in general, or until the test can be fixed up to work in the case of a remote cluster.
+
+[~alex.behm] can add more context here.
+
+{noformat}
+query_test/test_rows_availability.py:84: in test_rows_availability
+    assert rows_avail_ms >= self.ROWS_AVAIL_LOWER_BOUND_MS,\
+E   AssertionError: The 'Rows available' timeline event was marked prematurely 1980ms after the previous timeline event.
+E     Expected the event to be marked no earlier than 2000ms after the previous event.
+E     Query: select * from functional.alltypestiny where month = 1 and bool_col = sleep(1000)
+E   assert 1980 >= 2000
+E    +  where 2000 = <test_rows_availability.TestRowsAvailability object at 0x7f757669ca90>.ROWS_AVAIL_LOWER_BOUND_MS
+{noformat}
+
+
+Submitted for review:
+https://gerrit.cloudera.org/#/c/6144/
+
+Looking more closely at the test and the failure, it does seem like something is off. We should not advance the query state to FINISHED before rows are available. The test is carefully crafted to sleep for 2s before any rows can become available.
+
+
+[~dknupp], [~mikesbrown], I poked around the code and I think this test has been broken for quite a while. Obviously, that does not speak well for the effectiveness of this test :). Let me explain.
+
+* The test measures the time between the "Rows available" timeline event and the previous timeline event.
+* The test asserts that that time is at least above a 2s threshold. The queries are carefully crafted in a way that rows cannot be returned before 2s.
+* The previous timeline event is set in Coordinator::StartFInstances():
+{code}
+void Coordinator::StartFInstances() {
+  ...
+  int num_instances = 0;
+  for (const FragmentExecParams& fragment_params: schedule_.fragment_exec_params()) {
+    num_instances += fragment_params.instance_exec_params.size();
+    for (const FInstanceExecParams& instance_params:
+        fragment_params.instance_exec_params) {
+      InstanceState* exec_state = obj_pool()->Add(
+          new InstanceState(instance_params, obj_pool()));
+      int instance_state_idx = GetInstanceIdx(instance_params.instance_id);
+      fragment_instance_states_[instance_state_idx] = exec_state;
+
+      DebugOptions* instance_debug_options =
+          debug_options.IsApplicable(instance_state_idx) ? &debug_options : NULL;
+      exec_env_->fragment_exec_thread_pool()->Offer(
+          std::bind(&Coordinator::ExecRemoteFInstance,
+            this, std::cref(instance_params), instance_debug_options)); <--- fragments are sent out and Opened() here.
+    }
+  }
+  exec_complete_barrier_->Wait();
+  VLOG_QUERY << "started " << num_fragment_instances << " fragment instances for query "
+      << query_id_;
+  query_events_->MarkEvent(
+      Substitute("All $0 fragment instances started", num_instances)); <--- This timeline event comes right before "Rows available"
+}
+{code}
+
+The problem is that the remote fragment may start executing immediately, so the time difference between "Rows available" and "All fragment instances started" could be less than the time it takes for rows to be produced by the remote fragment.
+The "All fragment instances started" timeline event was added relatively recently. So the existing test did make sense at some point in the past - but it is definitely broken now.
+
+Conclusion: I recommend disabling the test for now. It should not be too hard to fix the test, though.
+
+
+
+
+
+IMPALA-4987: Fix flaky test test_row_availability.py
+
+This patch keeps test_row_availbility from randomly failing. In this test
+the time interval between the 'Rows available' timeline event and the
+previous event in the runtime profile is measured in order to make sure
+that the rows become available after a specific amount of time. This
+measurement is not correct since the previous event is that the
+coordinator finished sending the query fragments to the backends, which
+means the execution on some backends might have already started. This
+patch tracks another event "Ready to start" as the beginning of the time
+interval instead. The coordinator begins to send the query fragments to
+the backends after this event so the time check should always pass.
+
+
+[~dknupp], can you check whether the remote cluster test is fixed now?
+
+I'm working on those test suites today (and for the rest of this week.) I'll try to add it back in.
+
+Thanks [~tianyiwang] for fixing this.
+

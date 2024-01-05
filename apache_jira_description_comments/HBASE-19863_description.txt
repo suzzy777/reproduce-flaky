@@ -1,0 +1,81 @@
+Under some circumstances scan with SingleColumnValueFilter may fail with an exception
+{noformat} 
+java.lang.IllegalStateException: isDelete failed: deleteBuffer=C3, qualifier=C2, timestamp=1516433595543, comparison result: 1 
+at org.apache.hadoop.hbase.regionserver.ScanDeleteTracker.isDeleted(ScanDeleteTracker.java:149)
+	at org.apache.hadoop.hbase.regionserver.ScanQueryMatcher.match(ScanQueryMatcher.java:386)
+	at org.apache.hadoop.hbase.regionserver.StoreScanner.next(StoreScanner.java:545)
+	at org.apache.hadoop.hbase.regionserver.KeyValueHeap.next(KeyValueHeap.java:147)
+	at org.apache.hadoop.hbase.regionserver.HRegion$RegionScannerImpl.populateResult(HRegion.java:5876)
+	at org.apache.hadoop.hbase.regionserver.HRegion$RegionScannerImpl.nextInternal(HRegion.java:6027)
+	at org.apache.hadoop.hbase.regionserver.HRegion$RegionScannerImpl.nextRaw(HRegion.java:5814)
+	at org.apache.hadoop.hbase.regionserver.RSRpcServices.scan(RSRpcServices.java:2552)
+	at org.apache.hadoop.hbase.protobuf.generated.ClientProtos$ClientService$2.callBlockingMethod(ClientProtos.java:32385)
+	at org.apache.hadoop.hbase.ipc.RpcServer.call(RpcServer.java:2150)
+	at org.apache.hadoop.hbase.ipc.CallRunner.run(CallRunner.java:112)
+	at org.apache.hadoop.hbase.ipc.RpcExecutor$Handler.run(RpcExecutor.java:187)
+	at org.apache.hadoop.hbase.ipc.RpcExecutor$Handler.run(RpcExecutor.java:167)
+{noformat}
+Conditions:
+table T with a single column family 0 that uses ROWCOL bloom filter (important)  and column qualifiers C1,C2,C3,C4,C5. 
+When we fill the table for every row we put deleted cell for C3.
+The table has a single region with two HStore:
+A: start row: 0, stop row: 99 
+B: start row: 10 stop row: 99
+B has newer versions of rows 10-99. Store files have several blocks each (important). 
+Store A is the result of major compaction,  so it doesn't have any deleted cells (important).
+So, we are running a scan like:
+{noformat}
+scan 'T', { COLUMNS => ['0:C3','0:C5'], FILTER => "SingleColumnValueFilter ('0','C5',=,'binary:whatever')"}
+{noformat}  
+How the scan performs:
+First, we iterate A for rows 0 and 1 without any problems. 
+Next, we start to iterate A for row 10, so read the first cell and set hfs scanner to A :
+10:0/C1/0/Put/x but found that we have a newer version of the cell in B : 10:0/C1/1/Put/x, 
+so we make B as our current store scanner. Since we are looking for particular columns 
+C3 and C5, we perform the optimization StoreScanner.seekOrSkipToNextColumn which 
+would run reseek for all store scanners.
+For store A the following magic would happen in requestSeek:
+  1. bloom filter check passesGeneralBloomFilter would set haveToSeek to false because row 10 doesn't have C3 qualifier in store A.  
+  2. Since we don't have to seek we just create a fake row 10:0/C3/OLDEST_TIMESTAMP/Maximum, an optimization that is quite important for us and it commented with :
+{noformat}
+     // Multi-column Bloom filter optimization.
+    // Create a fake key/value, so that this scanner only bubbles up to the top
+    // of the KeyValueHeap in StoreScanner after we scanned this row/column in
+    // all other store files. The query matcher will then just skip this fake
+    // key/value and the store scanner will progress to the next column. This
+    // is obviously not a "real real" seek, but unlike the fake KV earlier in
+    // this method, we want this to be propagated to ScanQueryMatcher.
+{noformat}
+    
+For store B we would set it to fake 10:0/C3/createFirstOnRowColTS()/Maximum to skip C3 entirely. 
+After that we start searching for qualifier C5 using seekOrSkipToNextColumn which run first trySkipToNextColumn:
+{noformat}
+  protected boolean trySkipToNextColumn(Cell cell) throws IOException {
+    Cell nextCell = null;
+    do {
+      Cell nextIndexedKey = getNextIndexedKey();
+      if (nextIndexedKey != null && nextIndexedKey != KeyValueScanner.NO_NEXT_INDEXED_KEY
+          && matcher.compareKeyForNextColumn(nextIndexedKey, cell) >= 0) {
+        this.heap.next();
+        ++kvsScanned;
+      } else {
+        return false;
+      }
+    } while ((nextCell = this.heap.peek()) != null && CellUtil.matchingRowColumn(cell, nextCell));
+    return true;
+  }
+{noformat}
+If store has several blocks than nextIndexedKey would be not null and compareKeyForNextColumn wouldn't be negative, 
+so we try to search forward until we index or end of the row. But in this.heap.next(), the scanner for A bubbles up (as the comment promise) and we try to get next value from it. 
+And here is the problem: 
+If StoreFileScanner has current set to fake 10:0/C3/OLDEST_TIMESTAMP/Maximum, the underlying hfs still has 10:0/C1/O/Put, so the next call for next() 
+would set current value to 10:0/C2/0/x, which we pass to ScanQueryMatcher and it fails with the early mentioned exception because  DeleteTracker pointed to the latest delete we saw and that would be (10:0:/C3/1/Delete)
+
+So the problem happens because:
+1. in trySkipToNextColumn we don't expect any of 'bubble' ups and plan to iterate to the next column/next row/next block. 
+2. Optimization with fake rows is done to avoid unnecessary seeks.
+3. KeyValueHeap.next() knows nothing about fake rows so at one moment it may use scanner that has inconsistent state (cur value is far behind of hfs.keyValue, so seek is required before next())  
+
+We don't have any UT yet due to the complexity of the real use case, but it would be nice to discuss the way how to fix it. Personally, the easiest and safest way is to make KeyValueHeap be aware of bloom filter optimization and handle fake rows. So, in next() when we set new current scanner we may check whether it has cur set to a fake value and enforce seek if so. The check itself is supposed to be quick (timestamp & max comparison). 
+Any thoughts/suggestions [~stack], [~anoop.hbase], [~aertoria]
+

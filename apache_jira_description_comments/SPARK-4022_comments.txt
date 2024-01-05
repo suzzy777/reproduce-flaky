@@ -1,0 +1,118 @@
+Yeah, looks like it is only in examples at least, so I don't know if Colt ever got technically distributed (? I forget whether it goes out with transitive deps). But best to change it. I can try it, since I know Commons Math well, unless someone's already on it.
+
+[~srowen] We use its random number generators and the stat.Probability package in core and mllib. It would be great if you can work on this JIRA. There are couple places we need to change:
+
+1) sampling
+2) chi-sq tests
+3) random forests
+4) some unit tests
+
+We also need to shade the commons-math3 jar because hadoop depends on it. Fortunately, commons-math3 doesn't have any run-time deps.
+
+Ah right there is Jet too, not just Colt.
+
+The LGPL license actually only pertains to a few parts of Colt, in hep.aida.*, which aren't used by Spark.
+Another solution is just to make sure these classes never become part of the distribution. Colt and Jet themselves don't appear to be LGPL, in the main.
+
+Of course, if there was a desire to just stop using Colt+Jet anyway, I'm cool with that too.
+
+Colt is really old. Even the download link (http://acs.lbl.gov/software/colt/colt-download) is broken. It is good if we switch to an alternative that is active and has no license issues.
+
+I have begun work on this. You can see the base change here:
+
+https://github.com/srowen/spark/commits/SPARK-4022
+https://github.com/srowen/spark/commit/8246dbd39be7ff162392c59c28dee74a1419e236
+
+There are 4 potential problems, each of which might need some assistance as to how to proceed.
+
+*HypothesisTestSuite failure*
+
+CC [~dorx]
+
+{code}
+HypothesisTestSuite:
+  ...
+- chi squared pearson RDD[LabeledPoint] *** FAILED ***
+  org.apache.commons.math3.exception.NotStrictlyPositiveException: shape (0)
+  at org.apache.commons.math3.distribution.GammaDistribution.<init>(GammaDistribution.java:168)
+  ...
+  at org.apache.spark.mllib.stat.test.ChiSqTest$.chiSquaredMatrix(ChiSqTest.scala:241)
+  at org.apache.spark.mllib.stat.test.ChiSqTest$$anonfun$chiSquaredFeatures$4.apply(ChiSqTest.scala:134)
+  at org.apache.spark.mllib.stat.test.ChiSqTest$$anonfun$chiSquaredFeatures$4.apply(ChiSqTest.scala:125)
+  at scala.collection.TraversableLike$$anonfun$map$1.apply(TraversableLike.scala:244)
+{code}
+
+The commons-math3 implementation complains that a chi squared distribution is created with 0 degrees of freedom. It looks like that for col 645 in this test, there is just one feature, 0, and two labels. The contingency table should be at least 2x2 but it's 1x2 only, and that's not valid AFAICT. I spent some time staring at this and don't quite know what to make of fixing it.
+
+*KMeansClusterSuite failure*
+
+CC [~mengxr]
+
+{code}
+KMeansClusterSuite:
+- task size should be small in both training and prediction *** FAILED ***
+  org.apache.spark.SparkException: Job aborted due to stage failure: Task 0 in stage 1.0 failed 4 times, most recent failure: Lost task 0.3 in stage 1.0 (TID 8, localhost): java.io.InvalidClassException: org.apache.spark.util.random.PoissonSampler; local class incompatible: stream classdesc serialVersionUID = -795011761847245121, local class serialVersionUID = 4249244967777318419
+{code}
+
+I understand what it's saying. PoissonSampler did indeed change and its serialized form changed, but, I don't see how two incompatible versions are turning up as a result of one clean build.
+
+*RandomForestSuite failure*
+
+CC [~josephkb]
+
+{code}
+RandomForestSuite:
+...
+- alternating categorical and continuous features with multiclass labels to test indexing *** FAILED ***
+  java.lang.AssertionError: assertion failed: validateClassifier calculated accuracy 0.75 but required 1.0.
+  at scala.Predef$.assert(Predef.scala:179)
+  at org.apache.spark.mllib.tree.RandomForestSuite$.validateClassifier(RandomForestSuite.scala:227)
+{code}
+
+My guess on this one is that something is sampled differently as a result of this change, and happens to make the decision forest come out differently on this toy data set, and it happens to get 3/4 instead of 4/4 right now. This may be ignorable, meaning, the test was actually a little too strict and optimistic.
+
+*Less efficient seeded sampling for series of Poisson variables*
+
+CC [~dorx]
+
+Colt had a way to seed the RNG, then generate a one-off sample from a Poisson distribution with mean m. commons-math3 lets you seed an instance of a Poisson distribution with mean m, but then not change that mean. To simulate, it's necessary to recreate a Poisson distribution with each successive mean with a deterministic series of seeds.
+
+See here: https://github.com/srowen/spark/commit/8246dbd39be7ff162392c59c28dee74a1419e236#diff-0544248063499d8688c21f49be0918c8R285
+
+This isn't a problem per se but could be slower. I am not sure if this code can be changed to not require constant reinitialization of the distribution.
+
+Hi Sean, Thanks for picking this up!  W.r.t. the RandomForestSuite failure, I agree that the test is likely flaky since it relies on choosing random subsets of the features.  That test actually does not really need to call validateClassifier; the test was to check for a bug in training which caused an exception previously.  It should be fine to change (in that test in RandomForestSuite.scala):
+from {code}RandomForestSuite.validateClassifier(model, arr, 1.0){code}
+to {code}RandomForestSuite.validateClassifier(model, arr, 0.0){code}
+
+
+Hi [~srowen],
+
+ChiSqTest:
+
+This is an independence test. Since a constant distribution is independent of any distribution by definition, I think we should return pValue = 1.0 and statistic = 0.0 in that case.
+
+KMeansClusterSuite:
+
+It passed on my local machine. This test requires the assembly jar. Did you rebuild? Btw, breeze also depends on commons-math3. Even we plan to shade the jar, we should try to use the same version.
+
+Poisson sampler:
+
+The workaround won't generate good Poisson sequence because we change seed too frequently. We need two different mean values in stratified sampling. Refactoring the code is independent of this JIRA. So I would recommend the following:
+
+1) maintain a map of mean -> PoissonDistribution in RandomDataGenerator
+2) if the request mean is in the map, use the RNG there, otherwise, insert a new RNG into the map (and check the size of the map)
+
+
+[~mengxr] [~josephkb] Great, most of this is resolved now. 
+
+{{KMeansSuite}} still fails for me, yes, after a clean build. I wonder if the problem is that the commons-math3 code is in a different package in the assembly? Before thinking too hard about it, let me open a PR to see what Jenkins makes of it.
+
+I also implemented the different approach to Poisson sampler seeding. It would be good to cap the size of the cache, although, I wonder if that could lead to problems. If a sampler is removed and recreated, it will start generating the same sequence again from the same seed. If it is not seeded, it will be nondeterministic. It looks like {{RandomDataGenerator}} instances are short-lived and applied to a fixed set of mean values, which suggests this won't blow up readily. I admit I just glanced at the usages though.
+
+User 'srowen' has created a pull request for this issue:
+https://github.com/apache/spark/pull/2928
+
+Issue resolved by pull request 2928
+[https://github.com/apache/spark/pull/2928]
+

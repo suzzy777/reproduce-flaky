@@ -1,0 +1,87 @@
+I thought this was a problem with python 3.11 in CASSANDRA-18188, but I believe the actual cause is that the 'py' dependency isn't being found by the pytest-timeout package.  Which means these are just tests that timed out through pytest.mark.timeout, which then triggered the error produced.
+
+This is strange, though.  If I run the docker image and go into the venv, the 'py' package is already there:
+
+{noformat}
+$ docker run -it apache/cassandra-testing-ubuntu2004-java11 /bin/bash
+cassandra@c2ce4e76c5ee:~$ . ./env3.8/bin/activate
+(env3.8) cassandra@c2ce4e76c5ee:~$ pip install py
+Requirement already satisfied: py in ./env3.8/lib/python3.8/site-packages (1.11.0)
+WARNING: You are using pip version 22.0.4; however, version 22.3.1 is available.
+You should consider upgrading via the '/home/cassandra/env3.8/bin/python -m pip install --upgrade pip' command.
+(env3.8) cassandra@c2ce4e76c5ee:~$
+{noformat}
+
+We can still add defense in depth however by declaring it explicitly, which I've done [here|https://github.com/driftx/cassandra-dtest/tree/CASSANDRA-18198].  I've started a Jenkins run, but the chances of hitting a timeout in one of the affected tests aren't great: [!https://ci-cassandra.apache.org/job/Cassandra-devbranch/2226/badge/icon!|https://ci-cassandra.apache.org/blue/organizations/jenkins/Cassandra-devbranch/detail/Cassandra-devbranch/2226/pipeline]
+ 
+
+
+I thought perhaps the image had some version of 'py' that indeed lacked the 'io' submodule, but it's not only there, py.io.get_terminal_width() can be called and returns the correct width.
+
+What I was missing here is that the virtualenvs in the /env3.x locations are for cqlsh, and dtest creates its own venv from inside the docker image.  If I follow what that does, I end up in a venv like this:
+
+{noformat}
+(venv) cassandra@0b4fc44433d6:~$ python -c 'import py; print(py.io.get_terminal_width());'
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+AttributeError: module 'py' has no attribute 'io'
+(venv) cassandra@0b4fc44433d6:~$ pip install py
+Collecting py
+  Using cached py-1.11.0-py2.py3-none-any.whl (98 kB)
+Installing collected packages: py
+Successfully installed py-1.11.0
+WARNING: You are using pip version 22.0.4; however, version 22.3.1 is available.
+You should consider upgrading via the '/home/cassandra/venv/bin/python -m pip install --upgrade pip' command.
+(venv) cassandra@0b4fc44433d6:~$ 
+{noformat}
+
+this is because the virtualenv is created with the system python3.8 from /usr/bin/python3.8, which is missing the py module:
+
+{noformat}
+cassandra@9186bcbeb831:~$ /usr/bin/python3.8
+Python 3.8.10 (default, Mar 15 2022, 12:22:08) 
+[GCC 9.4.0] on linux
+Type "help", "copyright", "credits" or "license" for more information.
+>>> import py
+Traceback (most recent call last):
+  File "<stdin>", line 1, in <module>
+ModuleNotFoundError: No module named 'py'
+>>> 
+{noformat}
+
+The simplest solution is probably to declare it as a dependency in the dtests, as I did above [here|https://github.com/driftx/cassandra-dtest/tree/CASSANDRA-18198].
+
+It won't get baked into the test images until they are built and deployed next time. But this will fix it each test runtime.
++1
+
+bq. It won't get baked into the test images until they are built and deployed
+
+That is indeed why I suggested we go this route.  Thanks for the review, committed!
+
+Butler: https://butler.cassandra.apache.org/#/ci/upstream/workflow/Cassandra-4.0/failure/bootstrap_test/TestBootstrap/test_simultaneous_bootstrap
+
+Can you point me to the error that is in the title?
+
+I don't see anything related to this ticket, please open a new one.
+
+h1. Regression
+
+dtest-offheap.bootstrap_test.TestBootstrap.test_simultaneous_bootstrap (from Cassandra dtests)
+Failing for the past 1 build (Since [#1451|https://ci-cassandra.apache.org/job/Cassandra-trunk/1451/] )
+[Took 5 min 9 sec.|https://ci-cassandra.apache.org/job/Cassandra-trunk/1451/testReport/dtest-offheap.bootstrap_test/TestBootstrap/test_simultaneous_bootstrap/history]
+ 
+!https://ci-cassandra.apache.org/static/f3f9be2d/images/32x32/health-80plus.png! Failed 3 times in the last 30 runs. Flakiness: 17%, Stability: 90%
+h3. Error Message
+
+cassandra.OperationTimedOut: errors=\{'127.0.0.2:9042': 'Client request timeout. See Session.execute[_async](timeout)'}, last_host=127.0.0.2:9042
+h3. Stacktrace
+
+self = <bootstrap_test.TestBootstrap object at 0x7f42b8ff1340> @since('2.1.1') def test_simultaneous_bootstrap(self): """ Attempt to bootstrap two nodes at once, to assert the second bootstrapped node fails, and does not interfere. Start a one node cluster and run a stress write workload. Start up a second node, and wait for the first node to detect it has joined the cluster. While the second node is bootstrapping, start a third node. This should fail. @jira_ticket CASSANDRA-7069 @jira_ticket CASSANDRA-9484 """ bootstrap_error = "Other bootstrapping/leaving/moving nodes detected," \ " cannot bootstrap while cassandra.consistent.rangemovement is true" cluster = self.cluster cluster.set_environment_variable('CASSANDRA_TOKEN_PREGENERATION_DISABLED', 'True') cluster.populate(1) cluster.start() node1, = cluster.nodelist() node1.stress(['write', 'n=500K', 'no-warmup', '-schema', 'replication(factor=1)', '-rate', 'threads=10']) node2 = new_node(cluster) node2.start() for _ in range(30): # wait until node2 shows up ntout = node1.nodetool('status').stdout if re.search(r'UJ\s+' + node2.ip_addr, ntout): break time.sleep(0.1) node3 = new_node(cluster, remote_debug_port='2003') try: node3.start(wait_other_notice=False, verbose=False) except NodeError: pass # node doesn't start as expected time.sleep(.5) node2.watch_log_for("Starting listening for CQL clients") node3.watch_log_for(bootstrap_error) session = self.patient_exclusive_cql_connection(node2) # Repeat the select count(*) query, to help catch # bugs like 9484, where count(*) fails at higher # data loads. for _ in range(5): > assert_one(session, "SELECT count(*) from keyspace1.standard1", [500000], cl=ConsistencyLevel.ONE) bootstrap_test.py:885: _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ tools/assertions.py:130: in assert_one res = session.execute(simple_query) ../venv/src/cassandra-driver/cassandra/cluster.py:2618: in execute return self.execute_async(query, parameters, trace, custom_payload, timeout, execution_profile, paging_state, host, execute_as).result() _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ self = <ResponseFuture: query='<SimpleStatement query="SELECT count(*) from keyspace1.standard1", consistency=ONE>' request_i...9042': 'Client request timeout. See Session.execute[_async](timeout)'}, last_host=127.0.0.2:9042 coordinator_host=None> def result(self): """ Return the final result or raise an Exception if errors were encountered. If the final result or error has not been set yet, this method will block until it is set, or the timeout set for the request expires. Timeout is specified in the Session request execution functions. If the timeout is exceeded, an :exc:`cassandra.OperationTimedOut` will be raised. This is a client-side timeout. For more information about server-side coordinator timeouts, see :class:`.policies.RetryPolicy`. Example usage:: >>> future = session.execute_async("SELECT * FROM mycf") >>> # do other stuff... >>> try: ... rows = future.result() ... for row in rows: ... ... # process results ... except Exception: ... log.exception("Operation failed:") """ self._event.wait() if self._final_result is not _NOT_SET: return ResultSet(self, self._final_result) else: > raise self._final_exception E cassandra.OperationTimedOut: errors=\{'127.0.0.2:9042': 'Client request timeout. See Session.execute[_async](timeout)'}, last_host=127.0.0.2:9042 ../venv/src/cassandra-driver/cassandra/cluster.py:4894: OperationTimedOut
+
+That is a garden variety timeout, not related to the python error.
+
+Hi [~brandon.williams] [~mck] 
+I have also met some timeout exceptions last week, such as 
+https://ci-cassandra.apache.org/job/Cassandra-4.0/545/testReport/dtest-novnode.repair_tests.incremental_repair_test/TestIncRepair/test_multiple_full_repairs_lcs/ , same dtest case but different c* version.
+and some timeout exceptions have repeated more than once. So should I open new ticket for this? 
+

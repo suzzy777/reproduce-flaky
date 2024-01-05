@@ -1,0 +1,312 @@
+[~stack] [~Apache9] Any ideas about how to fix this?
+
+I‘m not quite familiar with the AMv2 yet...
+
+When split a region, the parent region was marked as State.SPLIT. And the daughter regions were marked as State.SPLITTING_NEW. But for merge regions, only the new child region was marked State.MERGED. And don't change the parent regions state.
+{code:java}
+  public void markRegionAsSplit(final RegionInfo parent, final ServerName serverName,
+      final RegionInfo daughterA, final RegionInfo daughterB)
+  throws IOException {
+    // Update hbase:meta. Parent will be marked offline and split up in hbase:meta.
+    // The parent stays in regionStates until cleared when removed by CatalogJanitor.
+    // Update its state in regionStates to it shows as offline and split when read
+    // later figuring what regions are in a table and what are not: see
+    // regionStates#getRegionsOfTable
+    final RegionStateNode node = regionStates.getOrCreateRegionStateNode(parent);
+    node.setState(State.SPLIT);
+    final RegionStateNode nodeA = regionStates.getOrCreateRegionStateNode(daughterA);
+    nodeA.setState(State.SPLITTING_NEW);
+    final RegionStateNode nodeB = regionStates.getOrCreateRegionStateNode(daughterB);
+    nodeB.setState(State.SPLITTING_NEW);
+
+    regionStateStore.splitRegion(parent, daughterA, daughterB, serverName);
+    if (shouldAssignFavoredNodes(parent)) {
+      List<ServerName> onlineServers = this.master.getServerManager().getOnlineServersList();
+      ((FavoredNodesPromoter)getBalancer()).
+          generateFavoredNodesForDaughter(onlineServers, parent, daughterA, daughterB);
+    }
+  }
+
+  /**
+   * When called here, the merge has happened. The two merged regions have been
+   * unassigned and the above markRegionClosed has been called on each so they have been
+   * disassociated from a hosting Server. The merged region will be open after this call. The
+   * merged regions are removed from hbase:meta below> Later they are deleted from the filesystem
+   * by the catalog janitor running against hbase:meta. It notices when the merged region no
+   * longer holds references to the old regions.
+   */
+  public void markRegionAsMerged(final RegionInfo child, final ServerName serverName,
+      final RegionInfo mother, final RegionInfo father) throws IOException {
+    final RegionStateNode node = regionStates.getOrCreateRegionStateNode(child);
+    node.setState(State.MERGED);
+    regionStates.deleteRegion(mother);
+    regionStates.deleteRegion(father);
+    regionStateStore.mergeRegions(child, mother, father, serverName);
+    if (shouldAssignFavoredNodes(child)) {
+      ((FavoredNodesPromoter)getBalancer()).
+        generateFavoredNodesForMergedRegion(child, mother, father);
+    }
+  }
+{code}
+
+The impl seems not same with the javadoc......
+{code:java}
+  public enum State {
+    OFFLINE,        // region is in an offline state
+    OPENING,        // server has begun to open but not yet done
+    OPEN,           // server opened region and updated meta
+    CLOSING,        // server has begun to close but not yet done
+    CLOSED,         // server closed region and updated meta
+    SPLITTING,      // server started split of a region
+    SPLIT,          // server completed split of a region
+    FAILED_OPEN,    // failed to open, and won't retry any more
+    FAILED_CLOSE,   // failed to close, and won't retry any more
+    MERGING,        // server started merge a region
+    MERGED,         // server completed merge a region
+    SPLITTING_NEW,  // new region to be created when RS splits a parent
+                    // region but hasn't be created yet, or master doesn't
+                    // know it's already created
+    MERGING_NEW;    // new region to be created when RS merges two
+                    // daughter regions but hasn't be created yet, or
+                    // master doesn't know it's already created
+{code}
+
+Thank you for the research [~zghaobac]; let me have a go at it boss. Nice work sir.
+
+For the regions belong to disabled table or splitted region, we skip to assign it in AssignProcedure.startTransition method. Maybe we can use the same pattern for merged region. Thanks [~stack] for pick up this. :-)
+{code:java}
+    // Don't assign if table is in disabling of disabled state.
+    TableStateManager tsm = env.getMasterServices().getTableStateManager();
+    TableName tn = regionNode.getRegionInfo().getTable();
+    if (tsm.isTableState(tn, TableState.State.DISABLING, TableState.State.DISABLED)) {
+      LOG.info("Table " + tn + " state=" + tsm.getTableState(tn) + ", skipping " + this);
+      return false;
+    }
+    // If the region is SPLIT, we can't assign it. But state might be CLOSED, rather than
+    // SPLIT which is what a region gets set to when Unassigned as part of SPLIT. FIX.
+    if (regionNode.isInState(State.SPLIT) ||
+        (regionNode.getRegionInfo().isOffline() && regionNode.getRegionInfo().isSplit())) {
+      LOG.info("SPLIT, cannot be assigned; " + this + "; " + regionNode +
+        "; hri=" + regionNode.getRegionInfo());
+      return false;
+    }
+{code}
+
+
+Thank you [~zghaobac] Let me look tomorrow. I came across another instance today where on restart, if CLOSED, we presume an outstanding assign though the table is disabled.... This seems similar. Let me study it. Thanks for the research.
+
+It looks like the test can go on longer than our ten minute timeout. Here is complaint from last two failures in nightlies.
+
+-------------------------------------------------------------------------------
+Test set: org.apache.hadoop.hbase.client.TestAsyncRegionAdminApi
+-------------------------------------------------------------------------------
+Tests run: 25, Failures: 0, Errors: 2, Skipped: 2, Time elapsed: 572.508 s <<< FAILURE! - in org.apache.hadoop.hbase.client.TestAsyncRegionAdminApi
+org.apache.hadoop.hbase.client.TestAsyncRegionAdminApi  Time elapsed: 14.642 s  <<< ERROR!
+org.junit.runners.model.TestTimedOutException: test timed out after 600 seconds
+  at org.apache.hadoop.hbase.client.TestAsyncRegionAdminApi.testMergeRegions(TestAsyncRegionAdminApi.java:363)
+
+org.apache.hadoop.hbase.client.TestAsyncRegionAdminApi  Time elapsed: 14.642 s  <<< ERROR!
+java.lang.Exception: Appears to be stuck in thread Socket Reader #1 for port 35917
+
+
+
+-------------------------------------------------------------------------------
+Test set: org.apache.hadoop.hbase.client.TestAsyncRegionAdminApi
+-------------------------------------------------------------------------------
+Tests run: 24, Failures: 0, Errors: 2, Skipped: 2, Time elapsed: 574.354 s <<< FAILURE! - in org.apache.hadoop.hbase.client.TestAsyncRegionAdminApi
+org.apache.hadoop.hbase.client.TestAsyncRegionAdminApi  Time elapsed: 7.735 s  <<< ERROR!
+org.junit.runners.model.TestTimedOutException: test timed out after 600 seconds
+  at org.apache.hadoop.hbase.client.TestAsyncRegionAdminApi.testSplitSwitch(TestAsyncRegionAdminApi.java:285)
+
+org.apache.hadoop.hbase.client.TestAsyncRegionAdminApi  Time elapsed: 7.772 s  <<< ERROR!
+java.lang.Exception: Appears to be stuck in thread Socket Reader #1 for port 43069
+
+
+
+
+
+See how there are 20 odd tests run. See how last one was running for 14 seconds yet we timed out after 600 seconds. Here are start times for the latest run:
+
+{code}
+  1 2018-02-13 02:58:52,380 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncRegionAdminApi#testCompactRegionServer[0] Thread=302, OpenFileDescriptor=1612, MaxFileDescriptor=1048576, SystemLoadAverage=1886, ProcessCount=20, AvailableMemoryMB=9729
+  2 2018-02-13 02:59:21,149 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncRegionAdminApi#testGetOnlineRegions[0] Thread=324, OpenFileDescriptor=1625, MaxFileDescriptor=1048576, SystemLoadAverage=1887, ProcessCount=17, AvailableMemoryMB=9766
+  3 2018-02-13 02:59:32,669 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncRegionAdminApi#testCompactMob[0] Thread=367, OpenFileDescriptor=1616, MaxFileDescriptor=1048576, SystemLoadAverage=1814, ProcessCount=17, AvailableMemoryMB=8805
+  4 2018-02-13 02:59:50,492 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncRegionAdminApi#testSplitTable[0] Thread=373, OpenFileDescriptor=1630, MaxFileDescriptor=1048576, SystemLoadAverage=1763, ProcessCount=17, AvailableMemoryMB=8683
+  5 2018-02-13 03:01:18,069 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncRegionAdminApi#testAssignRegionAndUnassignRegion[0] Thread=380, OpenFileDescriptor=1581, MaxFileDescriptor=1048576, SystemLoadAverage=1761, ProcessCount=17, AvailableMemoryMB=9252
+  6 2018-02-13 03:01:28,706 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncRegionAdminApi#testCompact[0] Thread=386, OpenFileDescriptor=1586, MaxFileDescriptor=1048576, SystemLoadAverage=1804, ProcessCount=17, AvailableMemoryMB=10421
+  7 2018-02-13 03:02:36,046 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncRegionAdminApi#testGetRegionByStateOfTable[0] Thread=360, OpenFileDescriptor=1573, MaxFileDescriptor=1048576, SystemLoadAverage=1778, ProcessCount=17, AvailableMemoryMB=10053
+  8 2018-02-13 03:02:51,851 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncRegionAdminApi#testFlushTableAndRegion[0] Thread=387, OpenFileDescriptor=1581, MaxFileDescriptor=1048576, SystemLoadAverage=1773, ProcessCount=20, AvailableMemoryMB=9379
+  9 2018-02-13 03:03:09,421 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncRegionAdminApi#testSplitSwitch[0] Thread=405, OpenFileDescriptor=1590, MaxFileDescriptor=1048576, SystemLoadAverage=1809, ProcessCount=17, AvailableMemoryMB=8787
+ 10 2018-02-13 03:03:33,784 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncRegionAdminApi#testMergeRegions[0] Thread=413, OpenFileDescriptor=1595, MaxFileDescriptor=1048576, SystemLoadAverage=1795, ProcessCount=17, AvailableMemoryMB=9152
+ 11 2018-02-13 03:04:01,365 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncRegionAdminApi#testGetRegionLocation[0] Thread=414, OpenFileDescriptor=1579, MaxFileDescriptor=1048576, SystemLoadAverage=1941, ProcessCount=17, AvailableMemoryMB=9509
+ 12 2018-02-13 03:04:16,832 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncRegionAdminApi#testMoveRegion[0] Thread=516, OpenFileDescriptor=1584, MaxFileDescriptor=1048576, SystemLoadAverage=1914, ProcessCount=17, AvailableMemoryMB=9343
+ 13 2018-02-13 03:04:31,078 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncRegionAdminApi#testCompactRegionServer[1] Thread=533, OpenFileDescriptor=1587, MaxFileDescriptor=1048576, SystemLoadAverage=1859, ProcessCount=18, AvailableMemoryMB=9435
+ 14 2018-02-13 03:04:53,780 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncRegionAdminApi#testGetOnlineRegions[1] Thread=516, OpenFileDescriptor=1615, MaxFileDescriptor=1048576, SystemLoadAverage=1963, ProcessCount=17, AvailableMemoryMB=8486
+ 15 2018-02-13 03:05:02,060 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncRegionAdminApi#testCompactMob[1] Thread=530, OpenFileDescriptor=1611, MaxFileDescriptor=1048576, SystemLoadAverage=1904, ProcessCount=17, AvailableMemoryMB=7932
+ 16 2018-02-13 03:05:15,861 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncRegionAdminApi#testSplitTable[1] Thread=440, OpenFileDescriptor=1627, MaxFileDescriptor=1048576, SystemLoadAverage=2889, ProcessCount=17, AvailableMemoryMB=8820
+ 17 2018-02-13 03:06:28,128 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncRegionAdminApi#testAssignRegionAndUnassignRegion[1] Thread=415, OpenFileDescriptor=1573, MaxFileDescriptor=1048576, SystemLoadAverage=2198, ProcessCount=17, AvailableMemoryMB=8435
+ 18 2018-02-13 03:06:38,684 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncRegionAdminApi#testCompact[1] Thread=415, OpenFileDescriptor=1584, MaxFileDescriptor=1048576, SystemLoadAverage=2224, ProcessCount=17, AvailableMemoryMB=9374
+ 19 2018-02-13 03:07:49,370 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncRegionAdminApi#testGetRegionByStateOfTable[1] Thread=387, OpenFileDescriptor=1578, MaxFileDescriptor=1048576, SystemLoadAverage=2212, ProcessCount=17, AvailableMemoryMB=9501
+ 20 2018-02-13 03:08:04,891 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncRegionAdminApi#testFlushTableAndRegion[1] Thread=407, OpenFileDescriptor=1578, MaxFileDescriptor=1048576, SystemLoadAverage=2373, ProcessCount=17, AvailableMemoryMB=7516
+ 21 2018-02-13 03:08:18,921 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncRegionAdminApi#testSplitSwitch[1] Thread=429, OpenFileDescriptor=1590, MaxFileDescriptor=1048576, SystemLoadAverage=2329, ProcessCount=17, AvailableMemoryMB=8346
+{code}
+
+
+Nothing taking particularly long...but in aggregate we can see it add up to close to ten minutes.
+
+Failures of this test are always in the last two test runs... testMergeRegions or the one before testSplitSwitch.
+
+Of the note the thread dump on timeout seems to be working... Looks like this:
+
+
+{code}
+2018-02-13 03:08:26,355 INFO  [PEWorker-9] assignment.RegionStateStore(201): pid=349 updating hbase:meta row=testSplitSwitch,,1518491298922.12b2541384b1b1dfd77b118e09a9633c., regionState=CLOSED
+2018-02-13 03:08:26,355 DEBUG [RS_CLOSE_REGION-regionserver/49484dcb1f1c:0-1] handler.CloseRegionHandler(125): Closed testSplitSwitch,,1518491298922.12b2541384b1b1dfd77b118e09a9633c.
+====> TEST TIMED OUT. PRINTING THREAD DUMP. <====
+
+Timestamp: 2018-02-13 03:08:26,635
+
+"IPC Server handler 3 on 43069" daemon prio=5 tid=53 timed_waiting
+java.lang.Thread.State: TIMED_WAITING
+        at sun.misc.Unsafe.park(Native Method)
+        at java.util.concurrent.locks.LockSupport.parkNanos(LockSupport.java:215)
+        at java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject.awaitNanos(AbstractQueuedSynchronizer.java:2078)
+        at java.util.concurrent.LinkedBlockingQueue.poll(LinkedBlockingQueue.java:467)
+        at org.apache.hadoop.ipc.CallQueueManager.take(CallQueueManager.java:136)
+        at org.apache.hadoop.ipc.Server$Handler.run(Server.java:2185)
+"RS-EventLoopGroup-4-24" daemon prio=10 tid=824 runnable
+...
+{code}
+
+Let me break up this test.
+
+.001 just breaks up the test into two pieces. Other reason test takes a while is that it is parameterized.
+
+Let me push this to see how it does overnight.
+
+Pushed to master and branch-2. Leaving open for now to see if this fixes it.
+
+-------------------------------------------------------------------------------
+Test set: org.apache.hadoop.hbase.client.TestAsyncTableAdminApi
+-------------------------------------------------------------------------------
+Tests run: 34, Failures: 0, Errors: 2, Skipped: 0, Time elapsed: 572.494 s <<< FAILURE! - in org.apache.hadoop.hbase.client.TestAsyncTableAdminApi
+org.apache.hadoop.hbase.client.TestAsyncTableAdminApi  Time elapsed: 19.573 s  <<< ERROR!
+org.junit.runners.model.TestTimedOutException: test timed out after 600 seconds
+  at org.apache.hadoop.hbase.client.TestAsyncTableAdminApi.testListTables(TestAsyncTableAdminApi.java:122)
+
+org.apache.hadoop.hbase.client.TestAsyncTableAdminApi  Time elapsed: 19.604 s  <<< ERROR!
+java.lang.Exception: Appears to be stuck in thread DataXceiver for client DFSClient_NONMAPREDUCE_-1429371430_23 at /127.0.0.1:60612 [Receiving block BP-217569409-172.17.0.2-1518490564363:blk_1073741829_1005]
+
+.. has the same pattern. Parameterized. No particular test taking a while:
+{code}
+2018-02-13 02:56:30,183 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testCreateTableWithEmptyRowInTheSplitKeys[0] Thread=302, OpenFileDescriptor=1610, MaxFileDescriptor=1048576, SystemLoadAverage=1755, ProcessCount=17, AvailableMemoryMB=10328
+2018-02-13 02:56:30,294 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testDeleteTable[0] Thread=304, OpenFileDescriptor=1612, MaxFileDescriptor=1048576, SystemLoadAverage=1755, ProcessCount=17, AvailableMemoryMB=10317
+2018-02-13 02:56:41,992 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testDisableAndEnableTables[0] Thread=322, OpenFileDescriptor=1613, MaxFileDescriptor=1048576, SystemLoadAverage=1763, ProcessCount=17, AvailableMemoryMB=9131
+2018-02-13 02:57:21,465 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testCreateTable[0] Thread=349, OpenFileDescriptor=1596, MaxFileDescriptor=1048576, SystemLoadAverage=1841, ProcessCount=17, AvailableMemoryMB=9816
+2018-02-13 02:57:35,108 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testModifyColumnFamily[0] Thread=345, OpenFileDescriptor=1571, MaxFileDescriptor=1048576, SystemLoadAverage=1801, ProcessCount=17, AvailableMemoryMB=10954
+2018-02-13 02:57:50,562 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testDisableCatalogTable[0] Thread=343, OpenFileDescriptor=1585, MaxFileDescriptor=1048576, SystemLoadAverage=1867, ProcessCount=17, AvailableMemoryMB=11009
+2018-02-13 02:58:03,013 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testCreateTableWithRegions[0] Thread=341, OpenFileDescriptor=1574, MaxFileDescriptor=1048576, SystemLoadAverage=1876, ProcessCount=17, AvailableMemoryMB=9139
+2018-02-13 02:58:41,708 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testIsTableEnabledAndDisabled[0] Thread=454, OpenFileDescriptor=1569, MaxFileDescriptor=1048576, SystemLoadAverage=1901, ProcessCount=20, AvailableMemoryMB=9379
+2018-02-13 02:58:51,803 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testListTables[0] Thread=459, OpenFileDescriptor=1578, MaxFileDescriptor=1048576, SystemLoadAverage=1886, ProcessCount=17, AvailableMemoryMB=9836
+2018-02-13 02:59:28,658 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testTruncateTablePreservingSplits[0] Thread=370, OpenFileDescriptor=1570, MaxFileDescriptor=1048576, SystemLoadAverage=1823, ProcessCount=17, AvailableMemoryMB=8980
+2018-02-13 02:59:52,804 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testCompactionTimestamps[0] Thread=385, OpenFileDescriptor=1575, MaxFileDescriptor=1048576, SystemLoadAverage=1805, ProcessCount=17, AvailableMemoryMB=8672
+2018-02-13 03:00:11,715 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testTableAvailableWithRandomSplitKeys[0] Thread=385, OpenFileDescriptor=1593, MaxFileDescriptor=1048576, SystemLoadAverage=1863, ProcessCount=17, AvailableMemoryMB=8835
+2018-02-13 03:00:24,545 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testAddSameColumnFamilyTwice[0] Thread=388, OpenFileDescriptor=1584, MaxFileDescriptor=1048576, SystemLoadAverage=2003, ProcessCount=17, AvailableMemoryMB=7541
+2018-02-13 03:00:35,379 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testDeleteColumnFamily[0] Thread=385, OpenFileDescriptor=1583, MaxFileDescriptor=1048576, SystemLoadAverage=1838, ProcessCount=20, AvailableMemoryMB=9449
+2018-02-13 03:00:47,174 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testCreateTableNumberOfRegions[0] Thread=375, OpenFileDescriptor=1583, MaxFileDescriptor=1048576, SystemLoadAverage=1869, ProcessCount=17, AvailableMemoryMB=8005
+2018-02-13 03:01:35,396 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testModifyNonExistingColumnFamily[0] Thread=474, OpenFileDescriptor=1610, MaxFileDescriptor=1048576, SystemLoadAverage=1780, ProcessCount=17, AvailableMemoryMB=11665
+2018-02-13 03:01:45,858 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testDisableAndEnableTable[0] Thread=473, OpenFileDescriptor=1609, MaxFileDescriptor=1048576, SystemLoadAverage=1686, ProcessCount=17, AvailableMemoryMB=9984
+2018-02-13 03:02:01,911 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testEnableTableRetainAssignment[0] Thread=473, OpenFileDescriptor=1608, MaxFileDescriptor=1048576, SystemLoadAverage=1744, ProcessCount=17, AvailableMemoryMB=9619
+2018-02-13 03:02:24,360 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testAddColumnFamily[0] Thread=508, OpenFileDescriptor=1608, MaxFileDescriptor=1048576, SystemLoadAverage=1723, ProcessCount=17, AvailableMemoryMB=9967
+2018-02-13 03:02:41,339 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testDeleteSameColumnFamilyTwice[0] Thread=466, OpenFileDescriptor=1605, MaxFileDescriptor=1048576, SystemLoadAverage=1755, ProcessCount=20, AvailableMemoryMB=9127
+2018-02-13 03:02:57,573 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testTruncateTable[0] Thread=462, OpenFileDescriptor=1599, MaxFileDescriptor=1048576, SystemLoadAverage=1873, ProcessCount=17, AvailableMemoryMB=9838
+2018-02-13 03:03:18,690 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testGetTableDescriptor[0] Thread=392, OpenFileDescriptor=1594, MaxFileDescriptor=1048576, SystemLoadAverage=1851, ProcessCount=17, AvailableMemoryMB=8470
+2018-02-13 03:03:30,418 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testTableExist[0] Thread=392, OpenFileDescriptor=1590, MaxFileDescriptor=1048576, SystemLoadAverage=1829, ProcessCount=17, AvailableMemoryMB=8128
+2018-02-13 03:03:41,935 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testCreateTableWithOnlyEmptyStartRow[0] Thread=407, OpenFileDescriptor=1595, MaxFileDescriptor=1048576, SystemLoadAverage=1986, ProcessCount=17, AvailableMemoryMB=8175
+2018-02-13 03:03:41,970 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testCreateTableWithEmptyRowInTheSplitKeys[1] Thread=407, OpenFileDescriptor=1595, MaxFileDescriptor=1048576, SystemLoadAverage=1986, ProcessCount=17, AvailableMemoryMB=8175
+2018-02-13 03:03:42,008 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testDeleteTable[1] Thread=407, OpenFileDescriptor=1595, MaxFileDescriptor=1048576, SystemLoadAverage=1986, ProcessCount=17, AvailableMemoryMB=8173
+2018-02-13 03:03:55,676 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testDisableAndEnableTables[1] Thread=406, OpenFileDescriptor=1600, MaxFileDescriptor=1048576, SystemLoadAverage=1943, ProcessCount=17, AvailableMemoryMB=9118
+2018-02-13 03:04:27,855 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testCreateTable[1] Thread=404, OpenFileDescriptor=1597, MaxFileDescriptor=1048576, SystemLoadAverage=1951, ProcessCount=17, AvailableMemoryMB=9735
+2018-02-13 03:04:36,314 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testModifyColumnFamily[1] Thread=404, OpenFileDescriptor=1596, MaxFileDescriptor=1048576, SystemLoadAverage=1805, ProcessCount=17, AvailableMemoryMB=8979
+2018-02-13 03:04:48,274 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testDisableCatalogTable[1] Thread=402, OpenFileDescriptor=1600, MaxFileDescriptor=1048576, SystemLoadAverage=1907, ProcessCount=17, AvailableMemoryMB=9479
+2018-02-13 03:04:57,542 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testCreateTableWithRegions[1] Thread=407, OpenFileDescriptor=1598, MaxFileDescriptor=1048576, SystemLoadAverage=1973, ProcessCount=21, AvailableMemoryMB=8213
+2018-02-13 03:05:32,167 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testIsTableEnabledAndDisabled[1] Thread=491, OpenFileDescriptor=1590, MaxFileDescriptor=1048576, SystemLoadAverage=2722, ProcessCount=17, AvailableMemoryMB=10923
+2018-02-13 03:05:43,040 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testListTables[1] Thread=488, OpenFileDescriptor=1590, MaxFileDescriptor=1048576, SystemLoadAverage=2605, ProcessCount=17, AvailableMemoryMB=9014
+{code}
+
+Let me push an addendum that breaks up this one too.
+
+Pushed an addendum that gives TestAsyncTableAdminApi the same treatment, breaking it in two.
+
+FAILURE: Integrated in Jenkins build HBase-Trunk_matrix #4577 (See [https://builds.apache.org/job/HBase-Trunk_matrix/4577/])
+HBASE-19965 Fix flaky TestAsyncRegionAdminApi (stack: rev cf57ea15f1044d69fcfc8edee3c6f710ed78a7e0)
+* (add) hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestAsyncRegionAdminApi2.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestAsyncRegionAdminApi.java
+HBASE-19965 Fix flaky TestAsyncRegionAdminApi; ADDENDUM do same to (stack: rev b4622ffad7011b3d29bce6376edb896de6df9f6e)
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestAsyncTableAdminApi.java
+* (add) hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestAsyncTableAdminApi2.java
+
+
+This fell off the flakies list. The change in TestAsyncTableAdminApi is not enough... https://builds.apache.org/job/HBase%20Nightly/job/branch-2/314/testReport/junit/org.apache.hadoop.hbase.client/TestAsyncTableAdminApi/org_apache_hadoop_hbase_client_TestAsyncTableAdminApi/ Let me move some more over to TestAsyncTableAdminApi2 or make a TestAsyncTableAdminApi3.
+
+Here is for the test that timed out, build 314:
+
+-------------------------------------------------------------------------------
+Test set: org.apache.hadoop.hbase.client.TestAsyncTableAdminApi
+-------------------------------------------------------------------------------
+Tests run: 30, Failures: 0, Errors: 2, Skipped: 0, Time elapsed: 574.271 s <<< FAILURE! - in org.apache.hadoop.hbase.client.TestAsyncTableAdminApi
+org.apache.hadoop.hbase.client.TestAsyncTableAdminApi  Time elapsed: 8.443 s  <<< ERROR!
+org.junit.runners.model.TestTimedOutException: test timed out after 600 seconds
+
+org.apache.hadoop.hbase.client.TestAsyncTableAdminApi  Time elapsed: 8.473 s  <<< ERROR!
+java.lang.Exception: Appears to be stuck in thread DataXceiver for client DFSClient_NONMAPREDUCE_1381247601_23 at /127.0.0.1:40966 [Receiving block BP-1735548202-172.17.0.2-1518565636532:blk_1073741829_1005]
+
+Parameterized there are about 29 tests. None takes a particularly long time:
+
+{code}
+ 1 2018-02-13 23:47:40,557 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testCreateTableWithEmptyRowInTheSplitKeys[0] Thread=302, OpenFileDescriptor=1612, MaxFileDescriptor=1048576, SystemLoadAverage=2007, ProcessCount=17, AvailableMemoryM    B=21888
+  2 2018-02-13 23:47:40,659 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testDeleteTable[0] Thread=305, OpenFileDescriptor=1614, MaxFileDescriptor=1048576, SystemLoadAverage=1982, ProcessCount=17, AvailableMemoryMB=21890
+  3 2018-02-13 23:47:51,503 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testDisableAndEnableTables[0] Thread=320, OpenFileDescriptor=1616, MaxFileDescriptor=1048576, SystemLoadAverage=1827, ProcessCount=17, AvailableMemoryMB=21940
+  4 2018-02-13 23:48:32,308 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testCreateTable[0] Thread=344, OpenFileDescriptor=1589, MaxFileDescriptor=1048576, SystemLoadAverage=1798, ProcessCount=17, AvailableMemoryMB=22132
+  5 2018-02-13 23:48:41,898 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testCreateTableWithRegions[0] Thread=344, OpenFileDescriptor=1586, MaxFileDescriptor=1048576, SystemLoadAverage=1867, ProcessCount=17, AvailableMemoryMB=21816
+  6 2018-02-13 23:49:23,348 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testIsTableEnabledAndDisabled[0] Thread=435, OpenFileDescriptor=1571, MaxFileDescriptor=1048576, SystemLoadAverage=1732, ProcessCount=17, AvailableMemoryMB=21124
+  7 2018-02-13 23:49:36,012 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testListTables[0] Thread=441, OpenFileDescriptor=1577, MaxFileDescriptor=1048576, SystemLoadAverage=1809, ProcessCount=17, AvailableMemoryMB=20713
+  8 2018-02-13 23:50:08,285 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testTruncateTablePreservingSplits[0] Thread=375, OpenFileDescriptor=1567, MaxFileDescriptor=1048576, SystemLoadAverage=1902, ProcessCount=17, AvailableMemoryMB=20604
+  9 2018-02-13 23:50:26,969 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testCreateTableNumberOfRegions[0] Thread=373, OpenFileDescriptor=1590, MaxFileDescriptor=1048576, SystemLoadAverage=1889, ProcessCount=17, AvailableMemoryMB=20979
+ 10 2018-02-13 23:51:18,514 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testDisableAndEnableTable[0] Thread=439, OpenFileDescriptor=1569, MaxFileDescriptor=1048576, SystemLoadAverage=1876, ProcessCount=17, AvailableMemoryMB=20712
+ 11 2018-02-13 23:51:40,787 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testEnableTableRetainAssignment[0] Thread=430, OpenFileDescriptor=1575, MaxFileDescriptor=1048576, SystemLoadAverage=1754, ProcessCount=17, AvailableMemoryMB=20766
+ 12 2018-02-13 23:51:59,198 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testTruncateTable[0] Thread=473, OpenFileDescriptor=1578, MaxFileDescriptor=1048576, SystemLoadAverage=1826, ProcessCount=17, AvailableMemoryMB=21183
+ 13 2018-02-13 23:52:17,821 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testGetTableDescriptor[0] Thread=446, OpenFileDescriptor=1576, MaxFileDescriptor=1048576, SystemLoadAverage=1827, ProcessCount=17, AvailableMemoryMB=21732
+ 14 2018-02-13 23:52:27,280 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testTableExist[0] Thread=446, OpenFileDescriptor=1576, MaxFileDescriptor=1048576, SystemLoadAverage=1855, ProcessCount=17, AvailableMemoryMB=21342
+ 15 2018-02-13 23:52:38,715 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testCreateTableWithOnlyEmptyStartRow[0] Thread=459, OpenFileDescriptor=1581, MaxFileDescriptor=1048576, SystemLoadAverage=1814, ProcessCount=17, AvailableMemoryMB=205    98
+ 16 2018-02-13 23:52:38,764 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testCreateTableWithEmptyRowInTheSplitKeys[1] Thread=459, OpenFileDescriptor=1581, MaxFileDescriptor=1048576, SystemLoadAverage=1814, ProcessCount=17, AvailableMemoryM    B=20595
+ 17 2018-02-13 23:52:38,813 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testDeleteTable[1] Thread=459, OpenFileDescriptor=1581, MaxFileDescriptor=1048576, SystemLoadAverage=1814, ProcessCount=17, AvailableMemoryMB=20594
+ 18 2018-02-13 23:52:50,184 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testDisableAndEnableTables[1] Thread=396, OpenFileDescriptor=1580, MaxFileDescriptor=1048576, SystemLoadAverage=1760, ProcessCount=19, AvailableMemoryMB=20454
+ 19 2018-02-13 23:53:25,670 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testCreateTable[1] Thread=370, OpenFileDescriptor=1574, MaxFileDescriptor=1048576, SystemLoadAverage=1660, ProcessCount=17, AvailableMemoryMB=20662
+ 20 2018-02-13 23:53:37,265 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testCreateTableWithRegions[1] Thread=366, OpenFileDescriptor=1576, MaxFileDescriptor=1048576, SystemLoadAverage=1664, ProcessCount=17, AvailableMemoryMB=22533
+ 21 2018-02-13 23:54:10,781 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testIsTableEnabledAndDisabled[1] Thread=456, OpenFileDescriptor=1573, MaxFileDescriptor=1048576, SystemLoadAverage=1792, ProcessCount=17, AvailableMemoryMB=19696
+ 22 2018-02-13 23:54:22,740 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testListTables[1] Thread=455, OpenFileDescriptor=1577, MaxFileDescriptor=1048576, SystemLoadAverage=1648, ProcessCount=17, AvailableMemoryMB=19641
+ 23 2018-02-13 23:54:56,100 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testTruncateTablePreservingSplits[1] Thread=387, OpenFileDescriptor=1567, MaxFileDescriptor=1048576, SystemLoadAverage=1639, ProcessCount=17, AvailableMemoryMB=20829
+ 24 2018-02-13 23:55:15,611 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testCreateTableNumberOfRegions[1] Thread=383, OpenFileDescriptor=1596, MaxFileDescriptor=1048576, SystemLoadAverage=1636, ProcessCount=20, AvailableMemoryMB=20761
+ 25 2018-02-13 23:55:54,008 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testDisableAndEnableTable[1] Thread=475, OpenFileDescriptor=1569, MaxFileDescriptor=1048576, SystemLoadAverage=1807, ProcessCount=18, AvailableMemoryMB=22096
+ 26 2018-02-13 23:56:12,884 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testEnableTableRetainAssignment[1] Thread=454, OpenFileDescriptor=1573, MaxFileDescriptor=1048576, SystemLoadAverage=1775, ProcessCount=17, AvailableMemoryMB=20974
+ 27 2018-02-13 23:56:35,923 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testTruncateTable[1] Thread=485, OpenFileDescriptor=1575, MaxFileDescriptor=1048576, SystemLoadAverage=1652, ProcessCount=17, AvailableMemoryMB=20504
+ 28 2018-02-13 23:56:52,508 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testGetTableDescriptor[1] Thread=462, OpenFileDescriptor=1586, MaxFileDescriptor=1048576, SystemLoadAverage=1705, ProcessCount=17, AvailableMemoryMB=20830
+ 29 2018-02-13 23:57:06,321 INFO  [Time-limited test] hbase.ResourceChecker(148): before: client.TestAsyncTableAdminApi#testTableExist[1] Thread=456, OpenFileDescriptor=1569, MaxFileDescriptor=1048576, SystemLoadAverage=1984, ProcessCount=17, AvailableMemoryMB=20508
+~
+{code}
+
+Could work on startup times. Would help. Let me split out a third class.
+
+Pushed second addendum that breaks a TestAsyncTableAdminAPI3 out of TestAsyncTableAdminAPI.
+
+FAILURE: Integrated in Jenkins build HBase-Trunk_matrix #4582 (See [https://builds.apache.org/job/HBase-Trunk_matrix/4582/])
+HBASE-19965 Fix flaky TestAsyncRegionAdminApi; ADDENDUM do same to (stack: rev 6e35f5eab9799e5d1450f97dec9335800dd39c03)
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestAsyncTableAdminApi.java
+* (add) hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestAsyncTableAdminApi3.java
+
+
+This fell off the flakies list, both TestAsyncRegion* and TestAsyncTable*.
+
+Two addendums.
+

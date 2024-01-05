@@ -1,0 +1,142 @@
+This is a subtle bug that the FileSystem object is first created in Path#getFileSystem(), and then unintentionally closed by InitLibhdfs() in the c++ code. So the following usages on the FileSystem object will raise this IOException of "Filesystem closed".
+
+It all happens in FileMetadataLoader#load():
+{code:java}
+public void load() throws CatalogException, IOException {
+  Preconditions.checkState(loadStats_ == null, "already loaded");
+  loadStats_ = new LoadStats(partDir_);
+  FileSystem fs = partDir_.getFileSystem(CONF);  // Create FileSystem object here since it's the first get
+  ...
+  boolean listWithLocations = FileSystemUtil.supportsStorageIds(fs) &&
+      (oldFdsByRelPath_.isEmpty() || forceRefreshLocations);  // Trigger static code of FileSystemUtil here{code}
+In FE tests that not extend FrontendTestBase, BackendConfig.INSTANCE is not initialized. So the static code of FileSystemUtil will init it:
+[https://github.com/apache/impala/blob/645df57af8db40bff19407b7006b469bc3298737/fe/src/main/java/org/apache/impala/common/FileSystemUtil.java#L869-L873]
+
+This finally inits FeSupport here:
+[https://github.com/apache/impala/blob/b6d6e86f1ec3fc45dccdbdc0933a235668dae2c4/fe/src/main/java/org/apache/impala/service/FeSupport.java#L494]
+The stacktrace:
+{noformat}
+22/11/11 16:28:36 INFO service.FeSupport: Loading libfesupport.so
+java.lang.Throwable
+        at org.apache.impala.service.FeSupport.loadLibrary(FeSupport.java:490)
+        at org.apache.impala.service.FeSupport.LookupSymbol(FeSupport.java:213)
+        at org.apache.impala.service.FeSupport.LookupSymbol(FeSupport.java:222)
+        at org.apache.impala.catalog.Function.lookupSymbol(Function.java:475)
+        at org.apache.impala.catalog.ScalarFunction.createBuiltin(ScalarFunction.java:185)
+        at org.apache.impala.catalog.ScalarFunction.createBuiltinOperator(ScalarFunction.java:173)
+        at org.apache.impala.catalog.ScalarFunction.createBuiltinOperator(ScalarFunction.java:168)
+        at org.apache.impala.analysis.ArithmeticExpr.initBuiltins(ArithmeticExpr.java:105)
+        at org.apache.impala.catalog.BuiltinsDb.initBuiltins(BuiltinsDb.java:105)
+        at org.apache.impala.catalog.BuiltinsDb.<init>(BuiltinsDb.java:94)
+        at org.apache.impala.catalog.BuiltinsDb.getInstance(BuiltinsDb.java:79)
+        at org.apache.impala.analysis.SqlScanner.init(SqlScanner.java:752)
+        at org.apache.impala.analysis.SqlScanner.<clinit>(SqlScanner.java:768)
+        at org.apache.impala.service.BackendConfig.create(BackendConfig.java:60)
+        at org.apache.impala.service.BackendConfig.create(BackendConfig.java:53)
+        at org.apache.impala.common.FileSystemUtil.<clinit>(FileSystemUtil.java:870)
+        at org.apache.impala.catalog.FileMetadataLoader.load(FileMetadataLoader.java:176)
+        at org.apache.impala.catalog.FileMetadataLoaderTest.testLoadMissingDirectory(FileMetadataLoaderTest.java:195)
+        at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+        at sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:62)
+        at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+        at java.lang.reflect.Method.invoke(Method.java:498)
+        at org.junit.runners.model.FrameworkMethod$1.runReflectiveCall(FrameworkMethod.java:50)
+        at org.junit.internal.runners.model.ReflectiveCallable.run(ReflectiveCallable.java:12)
+        at org.junit.runners.model.FrameworkMethod.invokeExplosively(FrameworkMethod.java:47)
+        at org.junit.internal.runners.statements.InvokeMethod.evaluate(InvokeMethod.java:17)
+        at org.junit.runners.ParentRunner.runLeaf(ParentRunner.java:325)
+        at org.junit.runners.BlockJUnit4ClassRunner.runChild(BlockJUnit4ClassRunner.java:78)
+        at org.junit.runners.BlockJUnit4ClassRunner.runChild(BlockJUnit4ClassRunner.java:57)
+        at org.junit.runners.ParentRunner$3.run(ParentRunner.java:290)
+        at org.junit.runners.ParentRunner$1.schedule(ParentRunner.java:71)
+        at org.junit.runners.ParentRunner.runChildren(ParentRunner.java:288)
+        at org.junit.runners.ParentRunner.access$000(ParentRunner.java:58)
+        at org.junit.runners.ParentRunner$2.evaluate(ParentRunner.java:268)
+        at org.junit.runners.ParentRunner.run(ParentRunner.java:363)
+        at org.apache.maven.surefire.junit4.JUnit4Provider.execute(JUnit4Provider.java:365)
+        at org.apache.maven.surefire.junit4.JUnit4Provider.executeWithRerun(JUnit4Provider.java:272)
+        at org.apache.maven.surefire.junit4.JUnit4Provider.executeTestSet(JUnit4Provider.java:236)
+        at org.apache.maven.surefire.junit4.JUnit4Provider.invoke(JUnit4Provider.java:159)
+        at org.apache.maven.surefire.booter.ForkedBooter.invokeProviderInSameClassLoader(ForkedBooter.java:386)
+        at org.apache.maven.surefire.booter.ForkedBooter.runSuitesInProcess(ForkedBooter.java:323)
+        at org.apache.maven.surefire.booter.ForkedBooter.main(ForkedBooter.java:143){noformat}
+It then goes into JniUtil::InitLibhdfs():
+{noformat}
+Java_org_apache_impala_service_FeSupport_NativeFeInit()
+-> InitCommonRuntime()
+   -> JniUtil::InitLibhdfs(){noformat}
+It closes the FileSystem object:
+{code:cpp}
+void JniUtil::InitLibhdfs() {
+  // make random libhdfs calls to make sure that the context class loader isn't
+  // null; see xxx for an explanation
+  hdfsFS fs = hdfsConnect("default", 0);
+  hdfsDisconnect(fs);
+}
+{code}
+Note that hdfsDisconnect() is the cpp equivalent for FileSystem#close():
+{code:c}
+int hdfsDisconnect(hdfsFS fs)
+{
+    // JAVA EQUIVALENT:
+    //  fs.close()
+{code}
+[https://github.com/apache/hadoop/blob/5bb11cecea136acccac2563b37021b554e517012/hadoop-hdfs-project/hadoop-hdfs-native-client/src/main/native/libhdfs/hdfs.c#L869-L872]
+
+Uploaded a patch that add logs to reveal the cause: [^IMPALA-11720-add-logs.patch]
+
+and the logs generated by the following command
+{code:java}
+(pushd fe && mvn test -Dtest=FileMetadataLoaderTest#testLoadMissingDirectory -Dsurefire.rerunFailingTestsCount=2){code}
+stdout log file: [^org.apache.impala.catalog.FileMetadataLoaderTest-output.txt]
+FeSupport log file: [^FeSupport.quanlong-OptiPlex-BJ.quanlong.log.INFO.20221111-162836.26125]
+
+Note that the second run succeeded since a FileSystem object is created again and BackendConfig.INSTANCE is already initialized so no code will close the FileSystem object unintentionally.
+
+Uploaded a fix for review: [https://gerrit.cloudera.org/c/19233/]
+
+CC [~MikaelSmith] , [~gaborkaszab] 
+
+Commit 86fdbfcc995a22a5836c6625fd5c86080fa7764a in impala's branch refs/heads/master from stiga-huang
+[ https://gitbox.apache.org/repos/asf?p=impala.git;h=86fdbfcc9 ]
+
+IMPALA-11720: Deflake FileMetadataLoaderTest due to FileSystem closed
+
+IMPALA-11699 recently reverted the changes in FileMetadataLoaderTest
+that it no longer extends to FrontendTestBase. This causes tests in
+FileMetadataLoaderTest to become flaky if run individually.
+
+This is a subtle bug in FileMetadataLoader#load(), where we first call
+FileSystem#getFileSystem() to get a FileSystem object, and then call
+methods of FileSystemUtil which will trigger class loading of it and
+running its static code.
+
+FileSystem#getFileSystem() will create a FileSystem object in the first
+get and cache it for follow-up usage. Without extending
+FrontendTestBase, BackendConfig.INSTANCE is not initialized when the
+test is run. So the static code in FileSystemUtil lazily initializes
+BackendConfig.INSTANCE, which initializes FeSupport and finally calls
+JniUtil::InitLibhdfs(). In this method, a FileSystem object is get and
+closed. This is exactly the FileSystem object created in
+FileMetadataLoader#load(). So the following usage on it causes an
+IOException of "Filesystem closed".
+
+The purpose of JniUtil::InitLibhdfs() is to make a simple call on
+libhdfs to make it initialize the JVM. This is crucial when launching
+from C++ codes for impalad and catalogd to init the embedded JVM. So we
+should keep it unchanged.
+
+The fix for this bug is to maintain the state of BackendConfig.INSTANCE
+in the static code of FileSystemUtil (i.e., keep un-initialized or
+initialized), which avoids the subtle side effects.
+
+Tests:
+ - Verified tests in FileMetadataLoaderTest individually
+
+Change-Id: Ib6f96950210c9a0124fe03696ef334cb00b057ab
+Reviewed-on: http://gerrit.cloudera.org:8080/19233
+Tested-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+Reviewed-by: Michael Smith <michael.smith@cloudera.com>
+Reviewed-by: Qifan Chen <qfchen@hotmail.com>
+
+

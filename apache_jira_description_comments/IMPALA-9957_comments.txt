@@ -1,0 +1,133 @@
+The crash in DEBUG build reveals the error. [https://github.com/apache/impala/blob/f602c3f80f5f61ccaebdf1493ff7c89230b77410/be/src/exec/grouping-aggregator-partition.cc#L125]
+{code:java}
+100 Status GroupingAggregator::Partition::SerializeStreamForSpilling() {
+101   DCHECK(!parent->is_streaming_preagg_);
+102   if (parent->needs_serialize_) {
+...
+115 
+116     // Serialize and copy the spilled partition's stream into the new stream.
+117     Status status;
+118     BufferedTupleStream* new_stream = parent->serialize_stream_.get();
+119     HashTable::Iterator it = hash_tbl->Begin(parent->ht_ctx_.get());
+120     while (!it.AtEnd()) {
+121       Tuple* tuple = it.GetTuple();
+122       it.Next();
+123       AggFnEvaluator::Serialize(agg_fn_evals, tuple);
+124       if (UNLIKELY(!new_stream->AddRow(reinterpret_cast<TupleRow*>(&tuple), &status))) {
+125         DCHECK(!status.ok()) << "Stream was unpinned - AddRow() only fails on error";    <<---- Failed here
+126         // Even if we can't add to new_stream, finish up processing this agg stream to
+127         // make clean up easier (someone has to finalize this stream and we don't want to
+128         // remember where we are).
+129         parent->CleanupHashTbl(agg_fn_evals, it);
+130         hash_tbl->Close();
+131         hash_tbl.reset();
+132         aggregated_row_stream->Close(nullptr, RowBatch::FlushMode::NO_FLUSH_RESOURCES);
+133         return status;
+134       }
+135     }
+{code}
+new_stream->AddRow returns false with an OK status. So we close the hash_tbl in this method and return to the caller at 
+https://github.com/apache/impala/blob/f602c3f80f5f61ccaebdf1493ff7c89230b77410/be/src/exec/grouping-aggregator-partition.cc#L180
+{code}
+163 Status GroupingAggregator::Partition::Spill(bool more_aggregate_rows) {
+...
+169   RETURN_IF_ERROR(SerializeStreamForSpilling());
+170 
+171   // Free the in-memory result data.
+172   AggFnEvaluator::Close(agg_fn_evals, parent->state_);
+173   agg_fn_evals.clear();
+174 
+175   if (agg_fn_perm_pool.get() != nullptr) {
+176     agg_fn_perm_pool->FreeAll();
+177     agg_fn_perm_pool.reset();
+178   }
+179 
+180   hash_tbl->Close();    <<---- RELEASE build crash in this
+181   hash_tbl.reset();
+182 
+{code}
+At line180, we close the hash_tbl again, which causes the crash in RELEASE build.
+
+It's leagal for new_stream->AddRow (i.e. BufferedTupleStream::AddRow) to return false with an OK status. As the comment says, 
+{quote}  /// b) The append fails because the unused reservation was not sufficient to add
+  ///   a new page to the stream large enough to fit 'row' and the stream could not
+  ///   increase the reservation to get enough unused reservation. Returns false and
+  ///   sets 'status' to OK. The append can be retried after freeing up memory or
+  ///   unpinning the stream.
+{quote}
+We should dealing with this case in GroupingAggregator::Partition::SerializeStreamForSpilling().
+
+After digging deeper with some pointers from [~tarmstrong@cloudera.com], I think I understand the bug. 
+
+When GroupingAggregator(final phase) runs out of its unused reservation, it will choose a partition to spill. If the aggregator needs serialize, we need to add tuples to the serialize_stream_. However, we only reserve default_buffer_size space for the serialize_stream_. It can't init a large page without increasing the reservation. This breaks our assumption that GroupingAggregator can work in its min reservation which is (2 * max_buffer_size + 16 * default_buffer_size) in this case.
+
+For example, in this case default_buffer_size = 2MB, max_buffer_size = 4MB. GroupingAggregator's minReservation = 40MB (needs_serialize=true). 
+In AggregationNode::Open() when adding rows, GroupingAggregator's minReservation could be ran out by:
+
+* hash_table (2MB)
+* Partition 0 (4MB): pinned with a large page
+* Partition 1 (4MB): pinned with a large page
+* Partition 2 - 15: each reserves 2MB for write pages
+* serialize_stream_: reserves 2MB for write pages
+
+When adding a large row to partition 2, it needs to allocate a 4MB page. If GroupingAggregator can't increase its reservation. It will choose a partition to spill. However, partiton 0 and 1 both have large pages. We need to allocate a large page in serialize_stream_ too but there are no more unused reservation.
+
+I think we should set write_page_reservation of the serialize_stream to max_buffer_size instead of default_buffer_size. So there are always enough spaces for the serialize_stream to allocate a large page when we start to spill. Do you think this solution make sense? [~tarmstrong@cloudera.com]
+
+[~stigahuang] yeah I agree with your analysis here.
+
+Commit e0a6e942b28909baa0f56e21e3d33adfb5eb19b7 in impala's branch refs/heads/master from stiga-huang
+[ https://gitbox.apache.org/repos/asf?p=impala.git;h=e0a6e94 ]
+
+IMPALA-9955,IMPALA-9957: Fix not enough reservation for large pages in GroupingAggregator
+
+The minimum requirement for a spillable operator is ((min_buffers -2) *
+default_buffer_size) + 2 * max_row_size. In the min reservation, we only
+reserve space for two large pages, one for reading, the other for
+writing. However, to make the non-streaming GroupingAggregator work
+correctly, we have to manage these extra reservations carefully. So it
+won't run out of the min reservation when it actually needs to spill a
+large page, or when it actually needs to read a large page.
+
+To be specific, for how to manage the large write page reservation,
+depending on whether needs_serialize is true or false:
+- If the aggregator needs to serialize the intermediate results when
+  spilling a partition, we have to save a large page worth of
+  reservation for the serialize stream, in case it needs to write large
+  rows. This space can be restored when all the partitions are spilled
+  so the serialize stream is not needed until we build/repartition a
+  spilled partition and thus have pinned partitions again. If the large
+  write page reservation is used, we save it back whenever possible
+  after we spill or close a partition.
+- If the aggregator doesn't need the serialize stream at all, we can
+  restore the large write page reservation whenever we fail to add a
+  large row, before spilling any partitions. Reclaim it whenever
+  possible after we spill or close a partition.
+A special case is when we are processing a large row and it's the last
+row in building/repartitioning a spilled partition, the large write page
+reservation can be restored for it no matter whether we need the
+serialize stream. Because partitions will be read out after this so no
+needs for spilling.
+
+For the large read page reservation, it's transferred to the spilled
+BufferedTupleStream that we are reading in building/repartitioning a
+spilled partition. The stream will restore some of it when reading a
+large page, and reclaim it when the output row batch is reset. Note that
+the stream is read in attach_on_read mode, the large page will be
+attached to the row batch's buffers and only get freed when the row
+batch is reset.
+
+Tests:
+- Add tests in test_spilling_large_rows (test_spilling.py) with
+  different row sizes to reproduce the issue.
+- One test in test_spilling_no_debug_action becomes flaky after this
+  patch. Revise the query to make the udf allocate larger strings so it
+  can consistently pass.
+- Run CORE tests.
+
+Change-Id: I3d9c3a2e7f0da60071b920dec979729e86459775
+Reviewed-on: http://gerrit.cloudera.org:8080/16240
+Tested-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+Reviewed-by: Tim Armstrong <tarmstrong@cloudera.com>
+
+

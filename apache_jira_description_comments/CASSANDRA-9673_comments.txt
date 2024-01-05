@@ -1,0 +1,352 @@
+Marking as 3.X because it's not blocking 3.0, but it would be nice to have it in before the RC happens.
+
+[~iamaleksey] can you elaborate a bit more on how to achieve this:
+
+bq. To avoid merely shifting the temp buffer to the receiving side(s) we should change the structure of the batchlog table to use a list or a map of individual mutations.
+
+On the receiver, is there a way to do this without deserializing each mutation only to serialize it again into a blob (byte buffer) or alternatively something like {{list<mutation_type>}} where {{mutation_type}} is
+
+{code}
+ksname : string
+key : blob
+updates : map<uuid, blob>
+{code}
+
+Isn't this worse than just leaving all mutations serialized in a unique byte buffer copied directly from the incoming message and inserted in the batchlog table as the data blob?  
+
+We could use the {{BufferPool}} to minimize GC, except we just need to find a way to give the buffers back to the pool eventually.
+
+Yes, I thought I mentioned it offline (and it should really all be in the ticket, either way, so my bad). The mutations will now be stored in a map {{<something, blob>}}.
+
+The missing, and, again, unexplained part is that we don't decode the message from {{ByteBuffer}} s into {{Mutation}} s on the receiving side. There is no point in doing so, given that only replay needs the {{Mutation}} objects.
+
+Thanks Aleksey, as discussed offline, we'll got with a list of {{blob}}, one per mutation, no need to decode any mutation.
+
+[~iamaleksey] do we also need a BATCH_RESPONSE verb or should we just keep on using REQUEST_RESPONSE? I've added BATCH_RESPONSE but it is functionally identical to REQUEST_RESPONSE. The same goes for the handler, WriteResponseHandler, which I have not duplicated instead. Another question is whether we need to introduce a new stage or is it OK to keep on using Stage.MUTATION?
+
+I started writing dtest to check that we can still support older nodes, e.g. 2.2, but things are quite broken at the moment, for example in ReadCommand serializer:
+
+{code}
+if (version < MessagingService.VERSION_30)
+    throw new UnsupportedOperationException();
+{code}
+
+cc [~slebresne] - do we already have a ticket or plan for fixing compatibility with older nodes?
+
+
+bq. do we also need a BATCH_RESPONSE verb or should we just keep on using REQUEST_RESPONSE? I've added BATCH_RESPONSE but it is functionally identical to REQUEST_RESPONSE.
+
+No, we reuse {{REQUEST_RESPONSE}} for almost everything. You do create a new response message class, but reuse the same verb. Look at the branch for CASSANDRA-6230 to see how {{HintResponse}} is being handled.
+
+bq. Another question is whether we need to introduce a new stage or is it OK to keep on using Stage.MUTATION?
+
+We don't *need* to, but it might already have been done by CASSANDRA-6477.
+
+bq. do we already have a ticket or plan for fixing compatibility with older nodes?
+
+CASSANDRA-9704
+
+bq. We don't need to, but it might already have been done by CASSANDRA-6477.
+
+Actually, scratch that. On the receiving side, we most definitely shouldn't - should be reusing the {{MUTATION}} stage.
+
+[~iamaleksey], the code is ready for a first round of review. The only things still shared with write mutations are {{DatabaseDescriptor.getWriteRpcTimeout()}} and {{WriteTimeoutException}}. Let me know if you want to change these two as well, however I assume you don't want to change the WRITE_TIMEOUT error code in the native protocol.
+
+As for testing, in addition to the unit tests, I wrote two new dtests to check that we can still inter-operate with 2.2 nodes. However until CASSANDRA-9704 is delivered we cannot run these tests. I feel like we should have more tests in this area, for example I couldn't find any test checking that we actually replay a batch in case of failure, but as usual I don't know how to write these tests without a way to inject failures or to mock objects.
+
+Pending CI:
+http://cassci.datastax.com/view/Dev/view/stef1927/job/stef1927-9673-testall/lastCompletedBuild/testReport/
+http://cassci.datastax.com/view/Dev/view/stef1927/job/stef1927-9673-dtest/lastCompletedBuild/testReport/
+
+While logically this looks like a clear win for batchlog usage w/gc pressure, could we get a couple of .jfr attached to the ticket to illustrate the difference made by the patch?
+
+I've attached an archive containing .jfr files for trunk and the patched branch. I generated the files using the following dtest:
+
+{code}
+    def logged_batch_stress_test(self):
+        """
+        @jira_ticket CASSANDRA-9673, a stress test to record any improvements in GC usage
+        """
+        cluster = self.cluster
+
+        cluster.populate(3)
+        cluster.start(wait_other_notice=True, jvm_args=["-XX:+UnlockCommercialFeatures", "-XX:+FlightRecorder"])
+        nodes = cluster.nodelist()
+
+        self._start_jfr_recording(nodes)
+
+        nodes[0].stress(['user', 'profile=/home/stefania/git/cstar/9673.yaml', 'ops(insert=1,)', 'n=50000', '-rate', 'threads=8'])
+
+        self._dump_jfr_recording(nodes)
+
+    def _start_jfr_recording(self, nodes):
+        """
+        Start jfr recording provided the cluster was started with jvm_args=["-XX:+UnlockCommercialFeatures", "-XX:+FlightRecorder"]
+        """
+        for node in nodes:
+            p = subprocess.Popen(['jcmd', str(node.pid), 'JFR.start'],
+                                 stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE)
+            stdout, stderr = p.communicate()
+            debug(stdout)
+            debug(stderr)
+
+    def _dump_jfr_recording(self, nodes):
+        """
+        Save jfr recording to file
+        """
+        for node in nodes:
+            p = subprocess.Popen(['jcmd', str(node.pid), 'JFR.dump', 'recording=1', 'filename=recording_{}.jfr'.format(node.address())],
+                                 stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE)
+            stdout, stderr = p.communicate()
+            debug(stdout)
+            debug(stderr)
+{code}
+
+9673.yaml is included in the archive attached or available [here|https://dl.dropboxusercontent.com/u/15683245/9673.yaml]. I couldn't figure out any other way to use logged batches in cassandra-stress other than with a user schema, that is the only reason for the user schema.
+
+I've also run a cperf test with the same stress test:
+
+http://cstar.datastax.com/tests/id/20a0d848-2b84-11e5-be06-42010af0688f
+
+I don't notice any differences in the cperf test and I am not at all familiar with analyzing .jfr files (first time I use FlightRecorder ever). If anything it seems to me the patched branch uses less memory but has more GCs but perhaps I should have used a bigger sample. I also only looked at the coordinator .jfrs (the first node).
+
+[~JoshuaMcKenzie], any suggestions or comments?
+
+You may want to try (much) larger batches to show that there is a difference (assuming this user profile does what you think it's doing in the first place).
+
+The user profile is correct, I verified with a temporary debug line that SP.syncWriteToBatchlog() is executing.
+
+With progressively bigger tests it gets clearer however that the GC times improve with the patched version. I've attached the results with *n=500000*, file 004, along with the JMC screenshots of the GC times of the first node. We can see a dramatic improvement. The second node also improves somewhat, whilst there is no change on the third node.
+
+Thanks for putting these results together [~stefania_alborghetti] - we as a project need to be more disciplined about producing results like these and it really helps clarify both the improvement and the use-case that will benefit from the change.
+
+Looking good!
+
+This is waiting for a review so I put it as patch available.
+
+It's not been forgotten - will finish the review shortly, sorry for a delay.
+
+[~Stefania] Now that CASSANDRA-7237 has been resolved, can you reapply the patch on top of latest cassandra-3.0? This will be more difficult than a regular rebase.
+
+CASSANDRA-6477 intervened with MS verbs for batchlog, and CASSANDRA-7237 added the new table. In addition to compatibility measures in your existing patch, we now also need to intercept mutations for the old batchlog table and properly convert them to mutations for the new table, with the new structure.
+
+Oh, and one minor thing - I think it's okay now to start reusing the deprecated old verbs for new purposes. {{STREAM_INITIATE}} and {{STREAM_INITIATE_DONE}} can be taken over for bathlog purposes.
+
+[~iamaleksey] I still need to do mixed version testing and check the CI results but the rebase on 3.0 and the changes you requested are available for review if you want to speed things up. Else I'll post another update when the tests are complete.
+
+I've left you a question in SS with a TODO, I am no sure why in {{mutateMV}} we insert a batch mutation containing all mutations, for every single mutation, it seems wrong to me.
+
+For replaying legacy mutations, I've opted for a conversion done before replaying, which is not very efficient, but keeps the code clean. I figured mixed version clusters are transient but if it concerns you I can enhance it.
+
+The tests should be good now, but I've launched one more build just in case. The results will be here:
+
+http://cassci.datastax.com/job/stef1927-9673-dtest/
+http://cassci.datastax.com/job/stef1927-9673-testall/
+
+This is ready for review, pay attention to [this line|https://github.com/stef1927/cassandra/blob/b65cdb515ac3144116aaae7836d6ae1befd197b6/src/java/org/apache/cassandra/service/StorageProxy.java#L680] that I moved out of the for loop in {{mutateMV}}. It made no sense to have it inside the loop, and it was causing some MV utests to time-out on Jenkins.
+
+Rebased against most recent trunk and made some minor changes, here: https://github.com/iamaleksey/cassandra/tree/9673-3.0. Didn't go very far. Removed {{BATCHLOG_MUTATION}} Stage that Carl and I think is no longer needed (but we'll bring it back if that's a mistake), and did some renames and minor cleanup of unused methods.
+
+Good work. There is only one real issue so far, with that fixed, we could commit as is, but I have a bunch of nits that'd be nice to address: we are not properly handling old-format batchlog mutations sent live from 2.1/2.2 nodes, during live upgrades.
+
+You need to modify {{MutationVerbHandler}} and add special treatment to mutations for the old batchlog table.
+
+Nits:
+1. I would prefer {{BatchStoreMessage}} and {{BatchRemoveMessage}} to be dumb and only be concerned about serialization/deserialization. This means no {{getMutation()}} in either. For {{BatchRemoveMessage}}, the actual logic should be in {{BatchRemoveVerbHandler}}.
+2. I would like to separate {{Batch}} and {{BatchStoreMessage}} and put actual saving to batchlog logic into a new {{Batch}} class - to be used both for local (MV) writes and proper BL remote writes.
+3. If moved to {{Batch}} (and if not, too), I would prefer the mutation collections in them to only be set in the constructor.
+4. Somehow we are calling {{LegacyBatchMigrator.convertBatchEntries()}} on every replay, reverting Branimir's changes, instead of explicitly only doing it once, upon first replay. I'm presuming that this is done as a workaround for the live upgrade issue. I would prefer that we moved the migration to {{CassandraDaemon.setup()}}, where legacy schema and hints migration already get called.
+
+{{remove(UUID batchId)}} should probably be a method in {{BatchlogManager}} itself.
+
+This is done, I'm just waiting for the CI results:
+
+http://cassci.datastax.com/view/Dev/view/stef1927/job/stef1927-9673-3.0-dtest/
+http://cassci.datastax.com/view/Dev/view/stef1927/job/stef1927-9673-3.0-testall/
+
+You are correct, the previous strategy was to handle legacy mutations by invoking {{LegacyBatchMigrator.convertBatchEntries}} every time before replaying: 
+
+_For replaying legacy mutations, I've opted for a conversion done before replaying, which is not very efficient, but keeps the code clean. I figured mixed version clusters are transient but if it concerns you I can enhance it._
+
+I changed it so that legacy mutations are converted on-the-fly before being applied.
+
+I created a new class, {{Batch}}, and moved the {{BatchStoreMessage}} logic there, so the messages are only concerned with serialization. The static remove method, I actually prefer to have it in {{Batch}} rather than {{BatchLogManager}} but you can move it if you prefer it in {{BatchlogManager}}. The remaining nits should also be addressed.
+
+Here are the CI results (build #5 still pending).
+
+Failing utests:
+
+Build #4
+* {{org.apache.cassandra.db.RecoveryManagerTest.testRecoverPITUnordered}} - timed out also on 3.0 (build #105)
+
+Build #3:
+* {{org.apache.cassandra.io.sstable.IndexSummaryManagerTest.testRedistributeSummaries-compression}} - timed out due to a compaction, seems unrelated
+
+* {{org.apache.cassandra.cql3.MaterializedViewLongTest.testConflictResolution}} - this does worry me, sometimes it passes and sometimes it fails, it seems to always pass on 3.0. However it doesn't go through {{SP.mutateMV()}} so I don't see how we could have broken it, perhaps because we've removed  the dedicated stage? Sample failure [here|http://cassci.datastax.com/job/stef1927-9673-3.0-testall/3/testReport/org.apache.cassandra.cql3/MaterializedViewLongTest/testConflictResolution/].
+
+The failing dtests seem inline with 3.0. Note that I have a fix for the two failing tests in batch_test.py [here|https://github.com/riptano/cassandra-dtest/pull/496/commits].
+
+I also added a function ({{nanoSince()}}) to distinguish legacy mutations with clashing timestamps but it's very slow - do you think we need this?
+
+{code}
+    UUID newId = id;
+    if (id.version() != 1 || timestamp != UUIDGen.unixTimestamp(id))
+        newId = UUIDGen.getTimeUUID(timestamp, nanoSince(id, timestamp));
+{code}
+
+As far as I understand only 1.2 mutations would have non-time UUIDs, {{id.version() != 1}}, however strictly speaking time uuids would not necessarily match {{written_at}}, which is the current time in micros divided 1000, whereas the uuid would have been created a little earlier, so if we crossed the millisecond boundary we would have {{timestamp != UUIDGen.unixTimestamp(id)}}. The code I am talking about is in {{LegacyBatchMigrator.apply}} and it is called when applying legacy mutations. WDYT?
+
+bq. However it doesn't go through SP.mutateMV() so I don't see how we could have broken it, perhaps because we've removed the dedicated stage? 
+
+You removed the dedicated stage? Yes that would cause these timeouts. If you have 32 mutation slots and you are doing 32 MV updates at once that leaves no MUTATION slots for batchlog updates (these happen inside executing mutation)
+
+To quote Carl, "I'm not sure if the BL needed to be separated since the MV were moved off; it probably isn't a problem now that we don't do remote replica batchlog".
+
+I'll rebase on top of the latest 3.0 and see if this is still an issue, but let me second that I'm extremely not fond of a new stage just for BL writes.
+
+Actually, this happens directly without submitting to another stage.  So let me look at the patch and see if anything changed there.
+
+Pushed a bit more to [my branch|https://github.com/iamaleksey/cassandra/commits/9673-3.0] on top of your changes.
+
+1. Makes it so that only {{BatchlogManager}} itself is aware of {{system.batches}} table and does any writes to it (we already had {{BatchlogManager::deleteBatch}} method, in fact)
+2. Changes the codes so that we don't allocate a redundant {{ArrayList}} in {{Batch}}, and so that we never mutate those collections (encoded/decoded) in place
+3. Removes (now) redundant extra schedule call at {{BatchlogManager}} startup
+4. Makes it so that if we are dealing with an encoded (remote) batch, then the mutations are always in the current messaging version format. Having the version separate felt brittle.
+5. Switches to vints for batch and hint encoding
+
+One of the goals for me was overall consistency with hints code, since the two are very related. After some coding, however, I realized that {{BatchStoreMessage}} was indeed redundant. It carries no extra information other than the {{Batch}} itself (unlike {{HintMessage}} that also carries the host id). Symmetry with {{BatchRemoveMessage}} was nice, but the latter was also completely redundant - it merely wraps the UUID and adds nothing. So I ditched both classes, and suggest that we just marshal Batch/UUID instances, raw.
+
+I'm not done with the review yet, and don't have an answer to your uuid question atm. Just wanted to push the latest.
+
+As for migration, my preference would be to make it happen at the borders only. So I'd ask you again to move this live upgrade batchlog mutation conversion to {{MutationVerbHandler}}, and away from {{Keyspace::apply}}. The latter is just too deep.
+
+A standalone test for {{LegacyBatchMigrator::converBatchEntries}} would be nice.
+
+I would also prefer to move the whole package to o.a.c.batchlog instead of o.a.c.db.batch. o.a.c.db is overpopulated, and, frankly, meaningless. I've been depopulating it slowly - with schema and hints being separate top-level packages already.
+
+P.S. Shouldn't be part of this ticket, but I only now noticed how poor our metrics for batchlog are. As in, we've got no metrics whatsoever. Will open a separate ticket to track how many batches were written, accepted, removed, replayed.
+
+Thanks for all your work, it's in much better shape now.
+
+bq. As for migration, my preference would be to make it happen at the borders only. So I'd ask you again to move this live upgrade batchlog mutation conversion to MutationVerbHandler, and away from Keyspace::apply. The latter is just too deep.
+
+Done. I was trying to limit the impact so I pushed it down until I found the loop on the partition updates. I've added a check on the message version though, so we should be OK.
+
+bq. A standalone test for LegacyBatchMigrator::converBatchEntries would be nice.
+
+{{BatchLogManager.testReplay}} tests this (now that we moved the conversion to {{MutationVerbHandler}})
+
+bq. I would also prefer to move the whole package to o.a.c.batchlog instead of o.a.c.db.batch. o.a.c.db is overpopulated, and, frankly, meaningless. I've been depopulating it slowly - with schema and hints being separate top-level packages already.
+
+Done.
+
+--
+
+Hinted handoff dtests were broken so I reverted vints in {{HintsMessage}}. I think the hint size encoding must match what's stored on disk? If I am correct then I believe {{HintsBuffer.ENTRY_OVERHEAD_SIZE}} also must change, since it wasn't totally trivial to fix this I reverted {{HintsMessage}}. I did not revert {{Hint}} however, up to you if you want to fix everything here or move to another ticket.
+
+Regarding {{MaterializedViewLongTest}}, I ran it in a loop for 10 times and it failed once out of 10 times on both unpatched 3.0 and patched 3.0. There is one obvious problem in that the test is still looking at _system.batchlog_ rather than _system.batches_, I fixed that. I also think we need to wait for the ordinary mutations to be applied in the test as well, so that means the ordinary MUTATION stage. Finally shouldn't the mutations with only a local endpoint in SP.mutateMV be applied in MATERIALIZED_VIEW_MUTATION stage? See tentative fix [here|https://github.com/stef1927/cassandra/commit/7d772ebc731524a3cdf08225451e8022bc98b7be]. With the fix applied the test ran 20 times successfully but this doesn't necessarily mean it is OK now. Also, the change in SP may not be needed, provided we wait for the MUTATION stage as well in the test (I did not test without the changes to SP).
+
+bq. shouldn't the mutations with only a local endpoint in SP.mutateMV be applied in MATERIALIZED_VIEW_MUTATION stage?
+
+No because it just slows things down.   We are already in a mutation stage, so its faster to just apply the memtable in the current thread vs sending off to another.
+
+I've opened CASSANDRA-10197 to address the flaky test.
+
+Understood. And how are exceptions handled? Say, the first mutation is applied and the second throws, they don't seem to be added to the batchlog either?
+
+Then the whole base mutation is aborted. 
+
+Can they ever timeout out when building? 
+
+{{MaterializedViewBuilder.buildKey}} catches a WTE thrown by {{SP.mutateMV()}} and has a warning that says _Encountered write timeout when building materialized view, the entries were stored in the batchlog and will be replayed at another time_. That doesn't look true unless there is another batchlog stored elsewhere that I missed.
+
+Also, when building it doesn't look like we are in a mutation stage but in the compaction executor.
+
+Anyway, I think I understand a bit better now, thanks for your answers.
+
+bq. If I am correct then I believe HintsBuffer.ENTRY_OVERHEAD_SIZE also must change, since it wasn't totally trivial to fix this I reverted HintsMessage.
+
+I think the problem is that I forgot to update serialization logic in {{EncodedHintMessage}}. Re-running the dtests with it corrected, will let you know how it goes.
+
+bq. I think the problem is that I forgot to update serialization logic in EncodedHintMessage.  Re-running the dtests with it corrected, will let you know how it goes.
+
+I missed the obvious place to check yesterday, thanks for fixing this. Your CI results look OK.
+
+I reverted the unrelated changes to {{SP.mutateMV()}} and made a tiny change to {{HintsMessage}}. CI is pending. 
+
+I got rid of {{BatchResponse}} and siwtched to just {{WriteReponse}}, which I made use a singleton instance of {{WriteResponse}}. We can't/shouldn't cache the message itself for batch responses, though (unlike with hints, where we can), because that has consequences for tracing (metadata in headers is per-message).
+
+A few more things:
+- {{BatchCallback::onFailure}} shouldn't just signal - it masks failure
+- {{LegacyBatchlogMigrator}} should log at {{INFO}}, conditional on legacy batchlog table being empty
+- {{LegacyBatchlogMigrator}} should try and calculate page size from sstable stats (like {{LegacyHintsMigrator}})
+
+Nit: {{StorageProxy.BatchlogEndpoints}} constructor is using {{forEach}} for no apparent reason. Just use a for-loop there. Plus, {{this}} references there are redundant and thus against our code style.
+
+I feel like I'm starting to lose focus here. I think we are in a good state and ready to commit once those are addressed - you've done a good job. So let's just do that, and I'll create follow-up JIRAs if necessary.
+
+As for your timestamp question. We don't care about the original {{written_at}} not matching the timestamp from the timeuuid, at all. Let's just stick to always using {{UUIDGen.unixTimestamp(id)}} in case of v1, unconditionally.
+
+Also, there is a bug in {{LBM::apply}}: we are calling {{Batch::createLocal}} using the current {{timestampMicros}}, whereas we should be using the original create time. Otherwise we risk to resurrect expired batches here, because of overly fresh {{creationTime}}.
+
+bq. LegacyBatchlogMigrator should log at INFO, conditional on legacy batchlog table being empty
+
+Do you mean only during migration or all the time? Also, when would we check that the table is empty: before migrating, after migrating or every time?
+
+bq. LegacyBatchlogMigrator should try and calculate page size from sstable stats (like LegacyHintsMigrator)
+
+I've applied the logic already available in {{BatchlogManager}}, which is not the same as {{LegacyHintsMigrator}}. Let me know if the latter is preferable.
+
+bq. Also, there is a bug in LBM::apply: we are calling Batch::createLocal using the current timestampMicros, whereas we should be using the original create time. Otherwise we risk to resurrect expired batches here, because of overly fresh creationTime.
+
+Is it sufficient to multiply the timestamp by 1000 or do we need to dig it out from the partition update? Not sure how to do this via {{QueryProcessor.executeInternalWithPaging}}.
+
+Remaining points are done.
+
+I meant checking for table emptiness at the beginning of startup migration, and logging once if not empty. Logging on each conversion is obviously an overkill.
+
+Also, the logic in conversion for != 1 uuids seems a bit weird. It will never be the case that we'll get a mutation on upgrade with a random uuid. Made it just use the counter unconditionally at all times.
+
+There was a bug in {{SP::syncWriteToBatchlog}} that is as old as is batchlog itself. We are using CL.ONE unconditionally, even when we have two endpoints. And both legacy/modern writes should be sharing the same callback, so I switched back to using {{WriteResponseHandler}} for both.
+
+Rebased against most recent cassandra-3.0 and force-pushed. I think I broke some replay tests. Could you have a look and fix, if necessary? And, if you are overall +1, I'll commit.
+
+Thank you.
+
+bq. I meant checking for table emptiness at the beginning of startup migration, and logging once if not empty. 
+
+Right, makes more sense now.
+
+bq. Also, the logic in conversion for != 1 uuids seems a bit weird. It will never be the case that we'll get a mutation
+
+The replay unit tests were still checking for 1.2 mutations.
+
+bq. There was a bug in SP::syncWriteToBatchlog that is as old as is batchlog itself. We are using CL.ONE unconditionally, even when we have two endpoints. And both legacy/modern writes should be sharing the same callback, so I switched back to using WriteResponseHandler for both.
+
+Thanks for fixing this.
+
+bq.  I think I broke some replay tests. 
+
+I removed the 1.2 mutations from the replay tests. They are fine now.
+
+Rebased again and force pushed, if the latest CI is good then I'm +1 as well:
+
+http://cassci.datastax.com/view/Dev/view/stef1927/job/stef1927-9673-3.0-dtest/
+http://cassci.datastax.com/view/Dev/view/stef1927/job/stef1927-9673-3.0-testall/
+
+Thanks!
+
+dtests failing exactly the same 8 tests that the vanilla cassandra-3.0 branch, utests have 2 UDF access control failures and the relatively common recoverymanager timeout.
+
+Committed as [53a177a9150586e56408f25c959f75110a2997e7|https://github.com/apache/cassandra/commit/53a177a9150586e56408f25c959f75110a2997e7] to cassandra-3.0 and merged with trunk.
+
+Thank you for your work and your patience.
+
+Thank you Aleksey for all the work you've put in. 
+
+The dtest pull request is here:
+
+https://github.com/riptano/cassandra-dtest/pull/496/files.
+

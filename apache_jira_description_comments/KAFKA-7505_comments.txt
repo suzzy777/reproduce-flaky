@@ -1,0 +1,178 @@
+cc [~rsivaram] in case she has thoughts.
+
+The stack trace shows that the client didn't see SSL handshake notification from the broker when the broker failed handshake and then closed the connection.
+
+The sequence with older versions where this succeeds:
+# Client writes SSL handshake data
+# Broker process handshake data from client, fails handshake
+# Broker flushes handshake failure notification, waiting if necessary for flush to complete
+# Client reads data from broker, processes SSL handshake notification
+# Client processes failure as an authentication exception
+
+We see the same sequence with Java 11 most of the time, but sometimes it fails because client is attempting to write more data to the broker (which is possible with the TLS protocol). The sequence is:
+# Client writes some SSL handshake data
+# Broker process handshake data from client, fails handshake
+# Broker flushes failure notification, waiting if necessary for flush to complete
+# Client attempts to write more data, fails with an I/O exception since broker has closed the connection
+# Client processes failure as an I/O exception
+
+We guarantee that we never process an ordinary I/O exception as an authentication exception, but we don't actually guarantee the reverse. The tests however are strict because we want to try and handle all known authentication failure scenarios. I will see if we can fix this scenario in our implementation.
+
+
+rajinisivaram opened a new pull request #5800: KAFKA-7505: Process incoming bytes on write error to report SSL failures
+URL: https://github.com/apache/kafka/pull/5800
+ 
+ 
+   
+   ### Committer Checklist (excluded from commit message)
+   - [ ] Verify design and implementation 
+   - [ ] Verify test coverage and CI build status
+   - [ ] Verify documentation (including upgrade notes)
+   
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on GitHub and use the
+URL above to go to the specific comment.
+ 
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+rajinisivaram closed pull request #5800: KAFKA-7505: Process incoming bytes on write error to report SSL failures
+URL: https://github.com/apache/kafka/pull/5800
+ 
+ 
+   
+
+This is a PR merged from a forked repository.
+As GitHub hides the original diff on merge, it is displayed below for
+the sake of provenance:
+
+As this is a foreign pull request (from a fork), the diff is supplied
+below (as it won't show otherwise due to GitHub magic):
+
+diff --git a/clients/src/main/java/org/apache/kafka/common/network/SslTransportLayer.java b/clients/src/main/java/org/apache/kafka/common/network/SslTransportLayer.java
+index a5ff06d9ada..a6696f79f66 100644
+--- a/clients/src/main/java/org/apache/kafka/common/network/SslTransportLayer.java
++++ b/clients/src/main/java/org/apache/kafka/common/network/SslTransportLayer.java
+@@ -254,11 +254,12 @@ public void handshake() throws IOException {
+             throw closingException();
+ 
+         int read = 0;
++        boolean readable = key.isReadable();
+         try {
+             // Read any available bytes before attempting any writes to ensure that handshake failures
+             // reported by the peer are processed even if writes fail (since peer closes connection
+             // if handshake fails)
+-            if (key.isReadable())
++            if (readable)
+                 read = readFromSocketChannel();
+ 
+             doHandshake();
+@@ -267,15 +268,16 @@ public void handshake() throws IOException {
+         } catch (IOException e) {
+             maybeThrowSslAuthenticationException();
+ 
+-            // this exception could be due to a write. If there is data available to unwrap,
+-            // process the data so that any SSL handshake exceptions are reported
+-            if (handshakeStatus == HandshakeStatus.NEED_UNWRAP && netReadBuffer.position() > 0) {
+-                try {
+-                    handshakeUnwrap(false);
+-                } catch (SSLException e1) {
+-                    maybeProcessHandshakeFailure(e1, false, e);
+-                }
++            // This exception could be due to a write. If there is data available to unwrap in the buffer, or data available
++            // in the socket channel to read and unwrap, process the data so that any SSL handshake exceptions are reported.
++            try {
++                do {
++                    handshakeUnwrap(false, true);
++                } while (readable && readFromSocketChannel() > 0);
++            } catch (SSLException e1) {
++                maybeProcessHandshakeFailure(e1, false, e);
+             }
++
+             // If we get here, this is not a handshake failure, throw the original IOException
+             throw e;
+         }
+@@ -334,7 +336,7 @@ private void doHandshake() throws IOException {
+                 log.trace("SSLHandshake NEED_UNWRAP channelId {}, appReadBuffer pos {}, netReadBuffer pos {}, netWriteBuffer pos {}",
+                           channelId, appReadBuffer.position(), netReadBuffer.position(), netWriteBuffer.position());
+                 do {
+-                    handshakeResult = handshakeUnwrap(read);
++                    handshakeResult = handshakeUnwrap(read, false);
+                     if (handshakeResult.getStatus() == Status.BUFFER_OVERFLOW) {
+                         int currentAppBufferSize = applicationBufferSize();
+                         appReadBuffer = Utils.ensureCapacity(appReadBuffer, currentAppBufferSize);
+@@ -456,12 +458,13 @@ private SSLEngineResult handshakeWrap(boolean doWrite) throws IOException {
+     }
+ 
+     /**
+-    * Perform handshake unwrap
+-    * @param doRead boolean
+-    * @return SSLEngineResult
+-    * @throws IOException
+-    */
+-    private SSLEngineResult handshakeUnwrap(boolean doRead) throws IOException {
++     * Perform handshake unwrap
++     * @param doRead boolean If true, read more from the socket channel
++     * @param ignoreHandshakeStatus If true, continue to unwrap if data available regardless of handshake status
++     * @return SSLEngineResult
++     * @throws IOException
++     */
++    private SSLEngineResult handshakeUnwrap(boolean doRead, boolean ignoreHandshakeStatus) throws IOException {
+         log.trace("SSLHandshake handshakeUnwrap {}", channelId);
+         SSLEngineResult result;
+         int read = 0;
+@@ -470,6 +473,7 @@ private SSLEngineResult handshakeUnwrap(boolean doRead) throws IOException {
+         boolean cont;
+         do {
+             //prepare the buffer with the incoming data
++            int position = netReadBuffer.position();
+             netReadBuffer.flip();
+             result = sslEngine.unwrap(netReadBuffer, appReadBuffer);
+             netReadBuffer.compact();
+@@ -478,8 +482,9 @@ private SSLEngineResult handshakeUnwrap(boolean doRead) throws IOException {
+                 result.getHandshakeStatus() == HandshakeStatus.NEED_TASK) {
+                 handshakeStatus = runDelegatedTasks();
+             }
+-            cont = result.getStatus() == SSLEngineResult.Status.OK &&
+-                handshakeStatus == HandshakeStatus.NEED_UNWRAP;
++            cont = (result.getStatus() == SSLEngineResult.Status.OK &&
++                    handshakeStatus == HandshakeStatus.NEED_UNWRAP) ||
++                    (ignoreHandshakeStatus && netReadBuffer.position() != position);
+             log.trace("SSLHandshake handshakeUnwrap: handshakeStatus {} status {}", handshakeStatus, result.getStatus());
+         } while (netReadBuffer.position() != 0 && cont);
+ 
+@@ -828,8 +833,17 @@ private void handshakeFailure(SSLException sslException, boolean flush) throws I
+ 
+         state = State.HANDSHAKE_FAILED;
+         handshakeException = new SslAuthenticationException("SSL handshake failed", sslException);
+-        if (!flush || flush(netWriteBuffer))
++
++        // Attempt to flush any outgoing bytes. If flush doesn't complete, delay exception handling until outgoing bytes
++        // are flushed. If write fails because remote end has closed the channel, log the I/O exception and  continue to
++        // handle the handshake failure as an authentication exception.
++        try {
++            if (!flush || flush(netWriteBuffer))
++                throw handshakeException;
++        } catch (IOException e) {
++            log.debug("Failed to flush all bytes before closing channel", e);
+             throw handshakeException;
++        }
+     }
+ 
+     // SSL handshake failures are typically thrown as SSLHandshakeException, SSLProtocolException,
+
+
+ 
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on GitHub and use the
+URL above to go to the specific comment.
+ 
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+

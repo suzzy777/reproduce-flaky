@@ -1,0 +1,214 @@
+MJ - sending this your way, since I think you've thought about releasing resources on cancellation before wrt admission control.
+
+I think we need to push this out. I've spent a fair amount of time with it, and unfortunately things have become more difficult since we've merged BufferedBlockMgrs to be singletons (per-query), as this really complicates the cancellation path on the coordinator node as other non-coordinator fragments on the same coordinator node may have various threads (e.g. build-side threads) using it concurrently as the coordinator attempts to shut it down. It's certainly not unfixable, but after trying some fixes that got quite complicated, it just looks too risky right now.
+
+Won't make 2.5 but still high on our list.
+
+[~tarmstrong], just FYI as you rework related code.
+
+I think "IMPALA-4678: move query MemTracker into QueryState" may help with the BufferedBlockMgr issue, since the BufferedBlockMgr reference is now released in RuntimeState::ReleaseResources(), which is called from PlanFragmentExecutor::Close(), which is called when the fragment thread stops executing (i.e. during the unwinding after cancellation).
+
+"IMPALA-2905: Handle coordinator fragment lifecycle like all others" removed the special-casing of the coordinator fragment, so this should also happen on the coordinator fragment.
+
+[~mjacobs] does that solve part of the issue? It seems like part (2) with the admission controller may still be relevant.
+
+[~tarmstrong] yes I'd imagine 1 would be solved but 2 would be a problem still until we change the code, which I'd think would be feasible now.
+
+I think there are really two parts to this that could be tackled as separate steps:
+* Separating the lifetime of memory resources and the control structures within the Impala daemon that is coordinating the query. I.e. making sure all query execution memory, scratch files, etc, etc is released by calling QueryState::ReleaseResources() once the final row is returned or the coordinator fragment is closed. This is really an single-node problem.
+* Releasing admission control resources once the query's fragments have finished execution. This is a distributed problem since in the common case we would want to only release the resources once all fragments are finished executing. This would happen once the coordinator fragment's local resources have been released and the remote fragments have all finished (or, if there is some communication failure, after a fixed timeout).
+
+Studying Joe's patch, the crux of the second part seems to be deciding what the precondition for releasing admission control resources is. It is likely related to the postconditions of CancelInternal() or WaitForBackendCompletion() but it's unclear whether those are sufficient as-is.
+
+* WaitForBackendCompletion(): returns when all backends have completed *or* the query status is non-OK (which means either the query failed or CancelInternal() was called).
+* CancelInternal(): returns when either each backend has completed or the cancellation message was delivered to the backend or sending the cancellation message failed.
+
+Currently the query can be closed after either of those two functions has returned, so the postcondition of WaitForBackendCompletion() is currently the precondition of releasing admission control resources. This means there is a race between the cancelled backends releasing resources (or those backends failing to send a status report and then going away) and the next query being admitted.  Automatically releasing admission control resources will change the time of the race a bit but probably not that much. This seems like it will likely work fine most of the time, but could lead to overadmission if fragments are slow to clean themselves up.
+
+I don't think we can necessarily provide stronger post-conditions in all cases, since it is always possible that cancellation messages will not be able to be delivered to a backend. However, the postconditions could be stronger in some cases:
+* If the query was cancelled without an error (either because it hit a limit or was cancelled by the client), we don't wait until the backends actually confirm completion, but we could. 
+* If the query was cancelled with an error, we could similarly wait until the backends confirm completion (although we should carefully think about the case when there are RPC errors, because status reports are likely to go missing).
+
+IMPALA-2990 prevents us just waiting for all the backends to be complete, since it can end up waiting indefinitely. We could instead have a timed wait and give up after a certain amount of time. However, it's unclear whether it's worth adding an ad-hoc solution that will become irrelevant with IMPALA-2990. 
+
+I think the two options are:
+* Release admission control resources immediately after cancellation, accepting that the existing race with fragment cancellation is still possible and slightly more likely.
+* Wait for either all backends to report completion or a timeout to expire. The race is still possible if a backend is slow to cancel and we may be slower to release admission control resources than before.
+In either case we should revisit after IMPALA-2990 is fixed.
+
+Regarding the two options, is there an experiment we can do to decide how important the race window is?  Also, in either case, let's at least make the "failure mode" obvious. i.e. when one does hit the window and can't get resources because of it, let's clearly define what happens in those cases.
+
+We could probably run a stress test against a single coordinator with admission control on to see if it overadmitted queries.
+
+Thinking about it some more, I feel like the race is unlikely to have an impact on a healthy cluster - the newly admitted query would also have to deliver and start the fragments on the backend faster than the slow-to-cancel fragment could clean itself up for resources to actually get oversubscribed.
+
+On an unhealthy cluster where RPCs are failing the races seem more likely, since the cancellation may not get delivered. However, it may be better to optimistically admit queries instead of conservatively holding up all queries, given that in that scenarios queries already have a chance of failing due to RPC errors. The failure mode (overadmitted queries hitting resource limits) is likely easier to debug than having admission control grind to a halt waiting for timeouts.
+
+I discovered that what I'd previously described for releasing admission control resources was incomplete. The coordinator needs to release the "admitted" resources, but then for memory-based admission control, the "reserved" memory needs to be released on the backends. I think this helps with the cancellation problems described above since the reserved memory won't go down until the query is actually cancelled. 
+
+The problem is that currently the per-backend "reserved" memory is determined by summing the limits of the query MemTrackers in a backend, so until the query MemTracker is torn down, the memory is considered reserved.
+
+Joe's patch solved this by deregistering the query MemTrackers earlier, however I don't think it's possible to correctly solve the problem that way since the client request state can still track memory against the query's MemTracker even after the query has been cancelled for the result cache. I think instead we need to change when the memory is considered reserved - if the query has finished executing but the memory tracker is still registered, we should not count the entire query memory limit as reserved, only the current consumption.
+
+[~tarmstrong] [~dhecht] In the long term, does it make sense to have different modes of releasing reserved resources via admission control?
+
+i.e. Have an eager mode, which allows for the race between where we release the admitted resources and where they're actually freed by the backends, which allows for intermittent oversubscription. (this is what we would do by default)
+And an aggressive mode, which means WaitForBackendCompletion() does not return until all backends are cancelled/closed AND their resources are freed. (this would require IMPALA-2990 to be fixed)
+
+My view is we should avoid that since it would complicate testing. It would be hard to make sure both modes are working as expected and complicate reasoning about things for both us and Impala users.
+
+I think we should reevaluate the behaviour once it's clear what IMPALA-2990 looks like. In a healthy cluster with no RPC errors it would be nice if we tore down the query in a more orderly manner - i.e. the coordinator doesn't consider the query finished until all fragments report completion.
+
+
+IMPALA-1575: Part 1: eagerly release query exec resources
+
+Release of backend resources for query execution on the coordinator
+daemon should occur eagerly as soon as query execution is finished
+or cancelled. Before this patch some resources managed by QueryState,
+like scratch files, were only released when the query was closed
+and all of the query's control structures were torn down.
+
+These resources are referred to as "ExecResources" in various places to
+distinguish them from resources associated with the client request (like
+the result cache) that are still required after the query finishes
+executing.
+
+This first change does not solve the admission control problem for two
+reasons:
+* We don't release the "admitted" memory on the coordinator until
+  the query is unregistered.
+* Admission control still considers the memory reserved until the
+  query memtracker is unregistered, which happens only when the
+  QueryState is destroyed: see MemTracker::GetPoolMemReserved().
+
+The flow is mostly similar to initial_reservation_refcnt_, except the
+coordinator also holds onto a reference count, which is released
+when either the final row is returned or cancellation is initiated.
+After the coordinator releases its refcount, the resources can be
+freed as soon as local fragments also release their refcounts.
+
+Also clean up Coordinator slightly by preventing runtime_state() from
+leaking out to ClientRequestState - instead it's possible to log
+the query MemTracker by following parent links in the MemTracker.
+
+This patch is partially based on Joe McDonnell's IMPALA-1575 patch.
+
+Testing:
+Ran core tests.
+
+Change-Id: I41ff374b0403f10a145f7fee9b3145953ee32341
+Reviewed-on: http://gerrit.cloudera.org:8080/8303
+Reviewed-by: Tim Armstrong <tarmstrong@cloudera.com>
+Tested-by: Impala Public Jenkins
+
+
+IMPALA-1575: part 2: yield admission control resources
+
+This change releases admission control resources more eagerly,
+once the query has finished actively executing. Some resources
+(tracked and untracked) are still consumed by the client request
+as long as it remains open, e.g. memory for control structures
+and the result cache. However, these resources are relatively
+small and should not block admission of new queries.
+
+The same as in part 1, query execution is considered to be finished
+under any of the following conditions:
+1. The query encounters an error and fails
+2. The query is cancelled due to the idle query timeout
+3. The query reaches eos (or the DML completes)
+4. The client cancels the query without closing the query
+
+Admission control resources are released in two ways:
+1. by calling AdmissionController::ReleaseQuery() on the coordinator
+   promptly after query execution finishes, instead of waiting for
+   UnregisterQuery(). This means that the query and its memory is
+   no longer considered "admitted".
+2. by changing the behaviour of MemTracker::GetPoolMemReserved() so
+   that it is aware of when a query has finished executing and does not
+   consider its entire memory limit to be "reserved".
+
+The preconditions for releasing an admitted query are subtle because the
+queries are being admitted to a distributed system, not just the
+coordinator.  The comment for ReleaseAdmissionControlResources()
+documents the preconditions and rationale. Note that the preconditions
+are not weaker than the preconditions of calling UnregisterQuery()
+before this patch.
+
+Testing:
+TestAdmissionController is extended to end queries in four ways:
+cancellation by client, idle timeout, the last row being fetched,
+and the client closing the query. The test uses a mix of all four.
+After the query ends, all clients wait for the test to complete
+before closing the query or closing the connection. This ensures
+that the admission control decisions are based entirely on the
+query end behavior. This test works for both query admission control
+and mem_limit admission control and can detect both kinds of admission
+control resources ("admitted" and "reserved") not being released
+promptly.
+
+This is based on an earlier patch by Joe McDonnell.
+
+Change-Id: I80279eb2bda740d7f61420f52db3bfa42a6a51ac
+Reviewed-on: http://gerrit.cloudera.org:8080/8323
+Reviewed-by: Tim Armstrong <tarmstrong@cloudera.com>
+Tested-by: Impala Public Jenkins
+
+Reverting because of IMPALA-6171
+
+IMPALA-1575: part 2: yield admission control resources
+
+This change releases admission control resources more eagerly,
+once the query has finished actively executing. Some resources
+(tracked and untracked) are still consumed by the client request
+as long as it remains open, e.g. memory for control structures
+and the result cache. However, these resources are relatively
+small and should not block admission of new queries.
+
+The same as in part 1, query execution is considered to be finished
+under any of the following conditions:
+1. The query encounters an error and fails
+2. The query is cancelled due to the idle query timeout
+3. The query reaches eos (or the DML completes)
+4. The client cancels the query without closing the query
+
+Admission control resources are released in two ways:
+1. by calling AdmissionController::ReleaseQuery() on the coordinator
+   promptly after query execution finishes, instead of waiting for
+   UnregisterQuery(). This means that the query and its memory is
+   no longer considered "admitted".
+2. by changing the behaviour of MemTracker::GetPoolMemReserved() so
+   that it is aware of when a query has finished executing and does not
+   consider its entire memory limit to be "reserved".
+
+The preconditions for releasing an admitted query are subtle because the
+queries are being admitted to a distributed system, not just the
+coordinator.  The comment for ReleaseAdmissionControlResources()
+documents the preconditions and rationale. Note that the preconditions
+are not weaker than the preconditions of calling UnregisterQuery()
+before this patch.
+
+Testing:
+TestAdmissionController is extended to end queries in four ways:
+cancellation by client, idle timeout, the last row being fetched,
+and the client closing the query. The test uses a mix of all four.
+After the query ends, all clients wait for the test to complete
+before closing the query or closing the connection. This ensures
+that the admission control decisions are based entirely on the
+query end behavior. This test works for both query admission control
+and mem_limit admission control and can detect both kinds of admission
+control resources ("admitted" and "reserved") not being released
+promptly.
+
+I ran into a problem similar to IMPALA-3772 with the admission control
+tests becoming flaky due to query timeouts on release builds, which I
+solved in a similar way by increasing the frequency of statestore
+updates.
+
+This is based on an earlier patch by Joe McDonnell.
+
+Change-Id: Ib1fae8dc1c4b0eca7bfa8fadae4a56ef2b37947a
+Reviewed-on: http://gerrit.cloudera.org:8080/8581
+Reviewed-by: Tim Armstrong <tarmstrong@cloudera.com>
+Tested-by: Impala Public Jenkins
+
+

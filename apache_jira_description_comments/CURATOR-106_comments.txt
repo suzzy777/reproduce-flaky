@@ -1,0 +1,239 @@
+When the ZK goes down you do not get the Exception, and the function is not recursively called. Guaranteed delete() has a callback function that handles the errors, so I guess this is not an issue. What do you think Jordan?
+
+    void addFailedDelete(String path)
+    {
+        if ( client.isStarted() )
+        {
+            log.debug("Path being added to guaranteed delete set: " + path);
+            try
+            {
+                client.delete().guaranteed().inBackground().forPath(path);
+            }
+            catch ( Exception e )
+            {
+                addFailedDelete(path);
+            }
+        }
+    }
+
+[~evaristojosec@yahoo.es]: I have certainly run into this issue (and will be adding a test case here if I get a nice chunk of time to do so). There is the chance that I did not use Curator properly, so I'll investigate that possibility, but it is something that can happen.
+
+I have had a look at this as well, and I don't think that it can recurse because the client.delete().guaranteed().inBackground().forPath(path) call shouldn't ever throw an exception because it's running in the background.
+
+Perhaps instead of recursing in the case of an exception (which could only happen due to some sort of bug), it should just log an error?
+
+I'm experiencing this bug, at least with older  versions of ZooKeeper. I hit it when using InterProcessMutex#release(), which does a _foreground_ guaranteed delete. It seems that, with guaranteed, a _foreground_ delete turns into a background guaranteed delete (which might also lead to a race condition, but I still have to test that case). At some point, the recursion is triggered and stack overflow is thrown.
+
+I will send a pull request to make FailedDeleteManager#addFailedDelete use a while loop instead of recursion and solve the stack overflow. But there are probably more critical problems to solve here (e.g. race conditions).
+
+
+This is still an issue in 2.12.0, and looking at the code also seems to be a problem in 3.x. It occurs consistently for me in a test where I've disabled retries and are trying to release an InterProcessMutex while there is no connection to Zookeeper (probably a contrived example, but I suspect the same thing would happen with any guaranteed delete). It looks to me like the problem is that CuratorFrameworkImpl.processBackgroundOperation actually does the operation in the foreground on the first attempt https://github.com/apache/curator/blob/master/curator-framework/src/main/java/org/apache/curator/framework/imps/CuratorFrameworkImpl.java#L505. Maybe this can be fixed by making processBackgroundOperation enqueue the operation instead of trying to perform it, and then let the background operations loop pick up the operation instead?
+
+{code}
+at org.apache.curator.framework.imps.DeleteBuilderImpl$4.retriesExhausted(DeleteBuilderImpl.java:217)
+at org.apache.curator.framework.imps.CuratorFrameworkImpl.checkBackgroundRetry(CuratorFrameworkImpl.java:716)
+at org.apache.curator.framework.imps.CuratorFrameworkImpl.performBackgroundOperation(CuratorFrameworkImpl.java:857)
+at org.apache.curator.framework.imps.CuratorFrameworkImpl.processBackgroundOperation(CuratorFrameworkImpl.java:507)
+at org.apache.curator.framework.imps.DeleteBuilderImpl.forPath(DeleteBuilderImpl.java:221)
+at org.apache.curator.framework.imps.DeleteBuilderImpl.forPath(DeleteBuilderImpl.java:35)
+at org.apache.curator.framework.imps.FailedDeleteManager.addFailedDelete(FailedDeleteManager.java:55)
+at org.apache.curator.framework.imps.DeleteBuilderImpl$4.retriesExhausted(DeleteBuilderImpl.java:217)
+at org.apache.curator.framework.imps.CuratorFrameworkImpl.checkBackgroundRetry(CuratorFrameworkImpl.java:716)
+at org.apache.curator.framework.imps.CuratorFrameworkImpl.performBackgroundOperation(CuratorFrameworkImpl.java:857)
+at org.apache.curator.framework.imps.CuratorFrameworkImpl.processBackgroundOperation(CuratorFrameworkImpl.java:507)
+at org.apache.curator.framework.imps.DeleteBuilderImpl.forPath(DeleteBuilderImpl.java:221)
+at org.apache.curator.framework.imps.DeleteBuilderImpl.forPath(DeleteBuilderImpl.java:35)
+at org.apache.curator.framework.imps.FailedDeleteManager.addFailedDelete(FailedDeleteManager.java:55)
+etc.
+{code}
+
+GitHub user srdo opened a pull request:
+
+    https://github.com/apache/curator/pull/215
+
+     CURATOR-106: Ensure background operations happen in the background thread to avoid stack overflows when retrying guaranteed operations
+
+    See https://issues.apache.org/jira/browse/CURATOR-106?focusedCommentId=15979112&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-15979112
+    
+    Also a few tests in TestNamespaceFacade were not passing because they were using blank connect strings. I'd be happy to open a separate issue for that change if necessary, or remove it if I misunderstood the tests.
+
+You can merge this pull request into a Git repository by running:
+
+    $ git pull https://github.com/srdo/curator CURATOR-106
+
+Alternatively you can review and apply these changes as the patch at:
+
+    https://github.com/apache/curator/pull/215.patch
+
+To close this pull request, make a commit to your master/trunk branch
+with (at least) the following in the commit message:
+
+    This closes #215
+    
+----
+commit 2422c2be094835e84161919b3fee5e4c872d4397
+Author: Stig Rohde Døssing <sdo@it-minds.dk>
+Date:   2017-04-21T20:03:27Z
+
+    CURATOR-106: Ensure background operations happen in the background thread to avoid stack overflows when retrying guaranteed operations
+
+commit e7bf733d91460117d19958221b4902f4b99efb2e
+Author: Stig Rohde Døssing <sdo@it-minds.dk>
+Date:   2017-04-21T20:03:58Z
+
+    CURATOR-106: Fix flaky unit test
+
+----
+
+
+Github user Randgalt commented on the issue:
+
+    https://github.com/apache/curator/pull/215
+  
+    This will break most clients. It's vital that, under normal circumstances, background callbacks execute from ZooKeeper's thread. ZooKeeper uses the same thread for watchers and background callbacks. This change will break that. 
+
+
+Github user srdo commented on the issue:
+
+    https://github.com/apache/curator/pull/215
+  
+    Hi @Randgalt. Just to make sure, you're talking about calls to BackgroundCallback.processResult, right?
+    
+    I don't follow how this change causes those to be invoked from a different thread than usual. The changed code is only hit if processBackgroundOperation is called with a null event (isInitialExecution is true). As far as I can tell, the invocations that happen from the Zookeeper callbacks always seem to pass a non-null event, and so don't hit the changed code. 
+    
+    I took a look at the call sites for BackgroundCallback.processResult, and the only way I can see that this change has changed the calling thread is if CuratorFrameworkImpl.processBackgroundOperation is called with a null parameter, and CuratorFrameworkImpl.performBackgroundOperation then hits a ConnectionLossException, through checkBackgroundRetry -> sendToBackgroundCallback -> BackgroundCallback.processResult. https://github.com/apache/curator/blob/master/curator-framework/src/main/java/org/apache/curator/framework/imps/CuratorFrameworkImpl.java#L857. The other invocations of sendToBackgroundCallback (the only call site for BackgroundCallback.processResult except for the wrapper in Backgrounding) only happen through a call to processBackgroundOperation with a non-null event.
+    
+    I did a quick spot check using the BackgroundCallback in CuratorFrameworkBackground.testBasic. Printing the thread executing BackgroundCallback.processResult before the change:
+    The executing thread Thread[main-EventThread,5,main]
+    
+    after the change:
+    The executing thread Thread[main-EventThread,5,main]
+
+
+Github user Randgalt commented on the issue:
+
+    https://github.com/apache/curator/pull/215
+  
+    OK - I didn't look at the change deeply. I'll look more when I have a chance
+
+
+Github user srdo commented on the issue:
+
+    https://github.com/apache/curator/pull/215
+  
+    Thanks :)
+
+
+Github user Randgalt commented on the issue:
+
+    https://github.com/apache/curator/pull/215
+  
+    @srdo I've looked at this again more deeply and I stand by my original comment. This code:
+    
+    ```java
+            boolean isInitialExecution = (event == null);
+            if (isInitialExecution) {
+                queueOperation(operationAndData);
+                return;
+            }
+    ```
+    
+    Breaks a vital contract. `queueOperation` will add the operation to `backgroundOperations` which are handled by CuratorFrameworkImpl's `executorService`. So, we cannot accept this PR. I'm going to close it unless you can think of a way of solving the original problem differently. I'll look at CURATOR-106 when I can to see if I can understand the issue.
+
+
+Github user asfgit closed the pull request at:
+
+    https://github.com/apache/curator/pull/215
+
+
+Github user srdo commented on the issue:
+
+    https://github.com/apache/curator/pull/215
+  
+    @Randgalt Could you elaborate on why this is wrong? If I understand you, the issue is that background callbacks must happen in the Zookeeper thread, not CuratorFrameworkImpl's ExecutorService thread? I still don't see how this is changed by the code you posted. In order for there to be a change in behavior, a Zookeeper thread must call `CuratorFrameworkImpl.processBackgroundOperation` with a null event. If the event is not null, the behavior is unchanged.
+    
+    I'm having a hard time finding any instances of `CuratorFrameworkImpl.processBackgroundOperation` being called with a null event from a Zookeeper callback. The calls I can find all have a non-null event when called from inside a Zookeeper callback.
+    
+    It looks to me like all the calls to `processBackgroundOperation` with a null event are coming from `forPath` or equivalent (e.g. `forOperations`). Aren't those running in the user's thread, and not one of Zookeeper's threads?
+    
+    Do you have an example where the thread executing the background callback has changed, or any calls to `processBackgroundOperation` with a null event from Zookeeper callback code?
+
+
+Github user Randgalt commented on the issue:
+
+    https://github.com/apache/curator/pull/215
+  
+    Look at CreateBuilderImpl#pathInBackground()
+    
+    ```java
+    client.processBackgroundOperation(operationAndData, null);
+    ```
+    
+    All the DSL builders call `processBackgroundOperation()` with null the first time. Now, you ask, how can a ZooKeeper thread call this? Here's how:
+    
+    ```java
+    class MyWatcher implements Watcher {
+        public void process(WatchedEvent event) {
+            curatorClient.create().inBackground().forPath(p);
+        }
+    }
+    ```
+    
+    It can also happen from a background operation callback.
+
+
+Github user srdo commented on the issue:
+
+    https://github.com/apache/curator/pull/215
+  
+    Okay, I think I misunderstood your concern. I thought you were worried about something like this
+    ```
+    curatorClient.create().inBackground((client, event) -> {
+      //I thought your concern was that this code sometimes wouldn't run in the EventThread
+    }).forPath(p)
+    ```
+    
+    Isn't your example code already broken? 
+    
+    ```
+    class MyWatcher implements Watcher {
+        public void process(WatchedEvent event) {
+            curatorClient.create().inBackground().forPath(p);
+            //I'm assuming your concern is that code here may assume that the path is now created?
+        }
+    }
+    ```
+    
+    If the surrounding code is depending on the create call running in the foreground (in the EventThread), why is it using `inBackground`?  It'll be flaky any time there's a connection issue or a retry (in which case the create operation was already being put on the background thread by `performBackgroundOperation`). 
+    
+    Otherwise if the code isn't depending on the create call running in the foreground, is there still an issue with the change?
+
+
+Github user Randgalt commented on the issue:
+
+    https://github.com/apache/curator/pull/215
+  
+    The watcher code is counting on starting the ZooKeeper operation from the same thread as the Watcher. You're right the connection issues can get in the way of this. But, to me, this is all moot. This is how Curator works today and it would be very disruptive to change it now. We can't change deep behavior like this without it affecting users of the library. 
+
+
+Github user srdo commented on the issue:
+
+    https://github.com/apache/curator/pull/215
+  
+    Too bad. Thanks for explaining though. Would you be more in favor of this patch if I added a new `processBackgroundOperation` instead of modifying the existing one? The stack overflow error mentioned in CURATOR-106 is happening because the FailedDeleteManager is assuming that the backgrounded delete actually happens in the background. When it doesn't, the stack may overflow because FailedDeleteManager triggers a delete, which may fail, which causes a call to FailedDeleteManager etc. It likely doesn't happen when retries are enabled, because only the first try happens in the foreground.
+
+
+Github user Randgalt commented on the issue:
+
+    https://github.com/apache/curator/pull/215
+  
+    Yeah - if we can address the specific problem without changing expected existing behavior that would be great.
+
+
+Github user srdo commented on the issue:
+
+    https://github.com/apache/curator/pull/215
+  
+    @Randgalt I'm probably just going to leave this alone. The stack trace I posted on the JIRA issue was from an application running 2.12.0. I've been unable to provoke the stack overflow on 3.x. It still looks like it's possible for the FailedDeleteManager to recurse a bunch through the same path as in the stack trace, but since I can't provoke the error I'm not sure the bug still exists. Since I can't test a potential fix I'd rather not change the code, at least not unless someone encounters the error on 3.x.
+
+

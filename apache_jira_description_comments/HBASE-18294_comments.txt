@@ -1,0 +1,2226 @@
+While benchmarking, we noticed the number of flushes in stores with basic compaction is similar to the number of flushes in stores with no compaction. We expected the number of flushes with basic compaction to be smaller as the index is smaller and therefore the heap size is smaller and the memstore can absorb more data before it is required to flush to disk.
+
+This is a very small change, I will make a patch later today.
+However, it might have significant affect on performance, and therefore should be at least considered also for 2.0.0. 
+
+
+This is the per region flush decision. Yes that is based ONLY on DATA size.  Heap ovehead is not considered. This is changed with intention.  The heap overhead is playing a role when the global memstore size based flushes are happening.  We have some upper bound for this global size.   When one say flush region when 128 MB size is reached, the user simple expectation will be 128 MB of data (key + value).  But what we were seeing in the past is actual data size might be some times even half of this size.  Many a times we have seen Qs in mail list why so.  
+The compacting memstore and its flattening and merge (index alone) helps to reduce the global heap ovehead. The data merge mode (useful when duplicated cells use case) will help to reduce the # region flushes.
+
+
+Pls see HBASE-16747
+
+Currently the total memstore size in a region also measures only the data size and not overall heap size:
+{code}
+long size = this.memstoreDataSize.addAndGet(memstoreSize.getDataSize());
+{code}
+I think this is wrong.
+When the data is flushed to disk
+(1) metadata changes
+(2) data is compacted
+(3) data is compressed
+All these can cause the file to be smaller than 128MB so the user cannot expect to get files of certain sizes.
+The purpose of a flush is to release memory when the memory exceeds the threshold. It does not guarantee creating files of minimal sizes.
+If indeed there are cases where the data only takes half of the memory or even less and the rest is used for index and metadata, and we only check if data exceeds 128MB than we may use double the size of the memory. 
+As a result
+(*) the system can exceed the blocking threshold (where updates are blocked) more frequently than we would like, and 
+(*) we can even get out-of-memory-exceptoion in certain scenarios.
+
+I think a better practice would be to respect the thresholds while considering the total heap size -- both in region level when triggering a flush, and in store level when selecting stores to be flushed. 
+
+But the old way old heap size based decision was making the file even smaller. Even if there is no compression or encoding...   For the off heap based memstores also the data size alone based region flush is better. As said, the above jira changed this.  I think the cur way is fine and more inline with user expectation.
+
+In RegionServerAccounting we are trying to do all the flush calculation. Check 'isAboveHighWaterMark()'. There we still consider the heapSize for the global heap pressure related flushes.
+What is that you are observing now? Are you seeing some different behaviour now? Offheap memstores need this change so that we are able to decide the region flush based on data size alone as the whole data is offheap.
+
+
+Considering heap size for triggering global heap pressure reduction is fine, however, we expect the system to get to this point rarely.
+As you mention in your document disregarding heap size can cause blocking, excessive GC and even OOME.
+Following HBASE-16747 there are 3 cases where considering data size and not heap size
+(1) when choosing biggest region to flush following global heap pressure
+(2) when choosing large stores to flush within the region
+(3) when deciding to trigger  region level flush (exceeding the 128MB threshold).
+
+Lets consider the on-heap scenario first:
+For (1)+(2) it is already decided that there is a flush and now we are looking to choose biggest memory consumers (biggest region/largest store). Therefore we should compare heap size. Otherwise, we may choose a smaller region/store simply because its data is bigger but it may actually take less heap space.  
+For (3) the configurable threshold gives the admin a way to compute how many regions the RS can handle with a given memory. That was documented in blogs etc. Now with the change we actually have no way to predict what is the maximum memory size of a region. This may come as a surprise to some admins.
+
+bq. For the off heap based memstores also the data size alone based region flush is better.
+bq. Offheap memstores need this change so that we are able to decide the region flush based on data size alone as the whole data is offheap.
+Then lets make a different policy for off-heap cases. Enforcing the same policy for on/off-heap doesn't seem to be optimal for both.
+
+I suggest to make different policies for on-heap data (to consider heap size in all the cases above), and off-heap that considers heap/data size any way you think is best for off-heap. 
+
+When the data size of the memstore is high (choosing one to flush), the heap occupancy of it also will be on higher side no?  Am speaking abt the common case.  We have basic flattening as the default now and CompactingMemstore is the default.  So we can expect all the memstores to be in this way not like some are flattened and some are never. (Am speaking wrt defaults configs as we have now).  
+One can tune the region flush size as per the new changes.  May be the default itself we can change now.
+But considering data size only for the per region flush decision is more inline with a normal user thinking.  128MB size I have configured and the data is flushed at that data size reach.  What is the heap overhead (we have some with DefaultMemstore and some thing else when compacting memstore basic mode in place etc. Tomorrow if a new algorithm comes it may even reduce) is not a user headache.   Still we have to consider that as we can not make our RS to OOME or have GC bad impacts.  That any way at global level we are doing.
+
+In normal cases also flushes due to global pressure might be happening.   Say we have 100 regions per RS and then as per default settings, the ideal heap size need for global memstores is
+100 * 128 MB = 12.5 GB 
+12.5 * 4 = 50 GB.
+We allow the memstores size to grow 4 times 128 MB before blocking.
+So configuring this big size might not be the usual case.  Agree that we will kick start the flush of region once the size is 128 MB.  But if the write pressure is high the size can grow beyond 2x .
+
+
+
+
+
+The per-cell metadata overhead with basic compaction is about 60B. This means that with small values metadata can easily double the heap occupancy of the memstore.
+bq.   When the data size of the memstore is high (choosing one to flush), the heap occupancy of it also will be on higher side no?
+Not necessarily. It depends on the size of the values. one memstore can have 50MB data and 100MB total heap size while another memstore has 70MB  data and only 80MB total heap size.
+bq.  considering data size only for the per region flush decision is more inline with a normal user thinking. 
+Not necessarily.  Here are 2 blogs which consider 128MB to be the total memstore occupancy:
+https://www.quora.com/HBase-Region-Server-guidelines-give-a-size-range-of-about-1TB-whereas-data-nodes-are-configured-20-times-bigger-Why by [~larsgeorge]
+_"we can address 4GB of heap for writes, allowing us up to have 32 regions that are written to while flushing at 128MB"_
+http://hadoop-hbase.blogspot.co.uk/2013/01/hbase-region-server-memory-sizing.html by [~lhofhansl]
+_"... you'd need ~338 regions. @128MB that's about 43GB"_
+Users who came to understand HBase through this kind of blogs expect a region (memstore) not to exceed the 128MB threshold.
+
+With the current implementation all places including regular and blocking thresholds at the region level and both selection policies at the RS-region and region-store level consider data size and not heap size.
+
+We should change the 128 MB flush size default value then?
+When to be flushed, flushing the one with max data size in it make sense no?
+Any way after the compacting memstore, we are reducing the heap overhead in btw by in memory flushes.
+
+bq. We should change the 128 MB flush size default value then?
+This is an orthogonal discussion. I don't have a strong opinion on whether it should be higher or lower. Plus the user has the ability to control this parameter. The discussion here is what this parameter is limiting data size or heap size.
+bq. When to be flushed, flushing the one with max data size in it make sense no?
+For me flushing the one with max heap space makes more sense.
+bq. Any way after the compacting memstore, we are reducing the heap overhead in btw by in memory flushes.
+For compacting memstore the per-cell metadata overhead is about 60B, which can be 50% of the heap size for 60B cells and 10% of the heap for 600B cells. So there are cases where the metadata is not negligible.
+
+Hi Everybody!
+
+As we can see there is a correlation between data size and heap size. 
+If a memstore has NONE policy, we have about 100 bytes per cell.
+If a memstore has BASIC policy with CellArrayMap, we have about 60 bytes per cell for immutable and still 100 bytes per cell for mutable active segment.
+If a memstore has BASIC policy with CellChunkMap, we have about 20 bytes per cell for immutable and still 100 bytes per cell for mutable active segment.
+
+If you assume all memstores are homogeneous (either this or that) and more than that if you assume the cells size is more or less the same for all memstores. 
+Then the heap size is just a function of number of cells, plus constant; and heap size can be a function of a data size. In this case, it doesn't matter so much whether you decide to flush based on data size or heap size. 
+But even in this case, this is a big change for community, where their calculations are based on 128MB and this is now wrong.
+
+However, the memstores are not homogeneous. Otherwise, why to bother and to allow all this flexibility? For sure, at least cell size can differ drastically.
+More than that, if heap size doesn't matter now, then why to bother and count bits trying to make CellChunkMap overhead as small as possible?
+
+As at least the CellArrayMap and CellChunkMap based memstores can be intermixed, I believe it is more wise to keep an decide about flushing to disk according to the heap size. Heap size includes data size, therefore it is not that we disregard the data size. As I said, they are correlated. If you see that this is extremely important for the off-heap, then let's decide according to data size for the off-heap cases.
+
+Last thing I wrote in the developer thread:
+bq. Here is a suggestion: We can track both heap and off-heap sizes and have 2 thresholds one for limiting heap size and one for limiting off-heap size. And in all decision making junctions we check whether one of the thresholds is exceeded and if it is we trigger a flush. We can choose which entity to flush based on the cause. For example, if we decided to flush since the heap size exceeds the heap threshold than we flush the region/store with greatest heap size. and likewise for off-heap flush. I can prepare a patch.
+
+I plan to start working on this. The main changes in the code would be 
+(1) change MemStoreSize and MemStoreSizing to a tuple of 3 - data size, heap size, and off-heap size. So for example, if we have in a store key-values of size 100MB allocated off-heap and 20MB of metadata allocated on-heap the counters will be <100,20,100>, if both key-values and metadata is allocated on-heap the counters would be <100,120,0>.
+(2) have each segment manage a MemStoreSizing object instead of separate counters. Incrementing/decrementing the correct counters would be by advise from the segment's MSLAB.
+(3) whenever increasing the counters check both on-heap and off-heap threshold; trigger a flush if exceeded one of them.
+(4) upon flush request collect counters from all stores (and stores' segments) to decide which store to flush 
+
+Let me know if you have any concerns or foresee any problems with this solution.
+
+
+How would the off-heap threshold be determined ?
+
+Is it related to the value given by -XX:MaxDirectMemorySize parameter ?
+
+bq.to a tuple of 3 - data size, heap size, and off-heap size
+Not sure why 3 items to be tracked.  data size and heap size is enough IMO.  Data size can be on heap or off heap based on the MSLAB in use.  The main thing will be that at Region level have to track not just the data size but the heap size also.  We do this at segment level any way.  
+
+bq. How would the off-heap threshold be determined ?
+This is a good question.
+As far as I seen a threshold is already defined at the RS level. 
+I would need to install some threshold also at the region level. I am open to suggestions.
+This is the reason for having 3 items instead of 2. I would like to be able to compare two counters against two threshold, where the counters represent the size in byte of key-values plus any metadata allocated on-heap and off-heap respectively. 
+
+Attaching an initial patch just so you can start reviewing the code.
+Still need to add the off-heap threshold at the region level.
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 12s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:blue}0{color} | {color:blue} findbugs {color} | {color:blue}  0m  0s{color} | {color:blue} Findbugs executables are not available. {color} |
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green}  0m  0s{color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 6 new or modified test files. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 14s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  5m 41s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  2m 22s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  2m 49s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  7m 58s{color} | {color:green} branch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 48s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 16s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  5m 30s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  2m 26s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  2m 26s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red}  1m 13s{color} | {color:red} hbase-server: The patch generated 50 new + 452 unchanged - 50 fixed = 502 total (was 502) {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  5m 10s{color} | {color:green} patch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green} 65m 36s{color} | {color:green} Patch does not cause any errors with Hadoop 2.6.1 2.6.2 2.6.3 2.6.4 2.6.5 2.7.1 2.7.2 2.7.3 2.7.4 or 3.0.0-alpha4. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  2m  3s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  3m 10s{color} | {color:green} hbase-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  3m 30s{color} | {color:green} hbase-client in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}150m 25s{color} | {color:green} hbase-server in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 28m 46s{color} | {color:green} hbase-mapreduce in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  1m 50s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}285m 24s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hbase:eee3b01 |
+| JIRA Issue | HBASE-18294 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12897297/HBASE-18294.01.patch |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  shadedjars  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux 55f198c7a40a 3.13.0-133-generic #182-Ubuntu SMP Tue Sep 19 15:49:21 UTC 2017 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build@2/component/dev-support/hbase-personality.sh |
+| git revision | master / 1ba7cc2164 |
+| maven | version: Apache Maven 3.5.2 (138edd61fd100ec658bfa2d307c43b76940a5d7d; 2017-10-18T07:58:13Z) |
+| Default Java | 1.8.0_151 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HBASE-Build/9761/artifact/patchprocess/diff-checkstyle-hbase-server.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/9761/testReport/ |
+| modules | C: hbase-common hbase-client hbase-server hbase-mapreduce U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/9761/console |
+| Powered by | Apache Yetus 0.6.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+bq. Not sure why 3 items to be tracked. data size and heap size is enough IMO. Data size can be on heap or off heap based on the MSLAB in use. The main thing will be that at Region level have to track not just the data size but the heap size also. We do this at segment level any way. 
+
+Please pay attention that after CCM is introduced also part of the heap size can be off-heap
+
+Attaching a new patch with region level counters and thresholds.
+Per-region flush is based on heap/off-heap size and not based on data size.
+Still missing the way to set the off-heap threshold so currently it is equal to the on-heap threshold. Will change this once I figure out what is the best way.
+I tend towards adding a configuration property.
+I also think similar changes are required at the RS level. 
+Meanwhile current patch is in RB.
+Thanks for the comments so far, please keep reviewing.
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m  0s{color} | {color:blue} Docker mode activated. {color} |
+| {color:red}-1{color} | {color:red} patch {color} | {color:red}  0m  8s{color} | {color:red} HBASE-18294 does not apply to master. Rebase required? Wrong Branch? See https://yetus.apache.org/documentation/0.6.0/precommit-patchnames for help. {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| JIRA Issue | HBASE-18294 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12897706/HBASE-18294.02.patch |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/9820/console |
+| Powered by | Apache Yetus 0.6.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m  0s{color} | {color:blue} Docker mode activated. {color} |
+| {color:red}-1{color} | {color:red} patch {color} | {color:red}  0m  5s{color} | {color:red} HBASE-18294 does not apply to master. Rebase required? Wrong Branch? See https://yetus.apache.org/documentation/0.6.0/precommit-patchnames for help. {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| JIRA Issue | HBASE-18294 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12897727/HBASE-18294.03.patch |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/9822/console |
+| Powered by | Apache Yetus 0.6.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Third rebase... hope this time it works !!
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 15s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:blue}0{color} | {color:blue} findbugs {color} | {color:blue}  0m  0s{color} | {color:blue} Findbugs executables are not available. {color} |
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green}  0m  0s{color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  1s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 16 new or modified test files. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 23s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  8m  0s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  3m 28s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  4m 10s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green} 11m 12s{color} | {color:green} branch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  2m  7s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 21s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  7m 37s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  3m 33s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  3m 33s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red}  1m 51s{color} | {color:red} hbase-server: The patch generated 3 new + 853 unchanged - 59 fixed = 856 total (was 912) {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  6m 19s{color} | {color:green} patch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green} 60m 28s{color} | {color:green} Patch does not cause any errors with Hadoop 2.6.1 2.6.2 2.6.3 2.6.4 2.6.5 2.7.1 2.7.2 2.7.3 2.7.4 or 3.0.0-alpha4. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 41s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  2m 11s{color} | {color:green} hbase-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  3m 17s{color} | {color:green} hbase-client in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}109m 38s{color} | {color:red} hbase-server in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 15m  7s{color} | {color:green} hbase-mapreduce in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  1m  6s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}235m 17s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hbase:eee3b01 |
+| JIRA Issue | HBASE-18294 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12897952/HBASE-18294.04.patch |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  shadedjars  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux 4e5200739627 3.13.0-129-generic #178-Ubuntu SMP Fri Aug 11 12:48:20 UTC 2017 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build/component/dev-support/hbase-personality.sh |
+| git revision | master / d8fb10c832 |
+| maven | version: Apache Maven 3.5.2 (138edd61fd100ec658bfa2d307c43b76940a5d7d; 2017-10-18T07:58:13Z) |
+| Default Java | 1.8.0_151 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HBASE-Build/9859/artifact/patchprocess/diff-checkstyle-hbase-server.txt |
+| unit | https://builds.apache.org/job/PreCommit-HBASE-Build/9859/artifact/patchprocess/patch-unit-hbase-server.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/9859/testReport/ |
+| modules | C: hbase-common hbase-client hbase-server hbase-mapreduce U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/9859/console |
+| Powered by | Apache Yetus 0.6.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+A new patch is available, also on RB.
+Added a new region level off-heap flush size configuration property.
+Updated code for RS-level flushes.
+ 
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m  0s{color} | {color:blue} Docker mode activated. {color} |
+| {color:red}-1{color} | {color:red} patch {color} | {color:red}  0m  4s{color} | {color:red} HBASE-18294 does not apply to master. Rebase required? Wrong Branch? See https://yetus.apache.org/documentation/0.6.0/precommit-patchnames for help. {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| JIRA Issue | HBASE-18294 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12898380/HBASE-18294.05.patch |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/9913/console |
+| Powered by | Apache Yetus 0.6.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  2m 14s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:blue}0{color} | {color:blue} findbugs {color} | {color:blue}  0m  0s{color} | {color:blue} Findbugs executables are not available. {color} |
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green}  0m  0s{color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 16 new or modified test files. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 24s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  4m 34s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 37s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  2m 24s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  7m 18s{color} | {color:green} branch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 15s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 13s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  4m 32s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 37s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  1m 37s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 26s{color} | {color:green} The patch hbase-common passed checkstyle {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 28s{color} | {color:green} The patch hbase-client passed checkstyle {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 14s{color} | {color:green} hbase-server: The patch generated 0 new + 854 unchanged - 59 fixed = 854 total (was 913) {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 16s{color} | {color:green} The patch hbase-mapreduce passed checkstyle {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  4m 51s{color} | {color:green} patch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green} 51m  3s{color} | {color:green} Patch does not cause any errors with Hadoop 2.6.1 2.6.2 2.6.3 2.6.4 2.6.5 2.7.1 2.7.2 2.7.3 2.7.4 or 3.0.0-alpha4. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 15s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  1m 51s{color} | {color:green} hbase-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  2m 34s{color} | {color:green} hbase-client in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 96m  8s{color} | {color:red} hbase-server in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 13m 58s{color} | {color:green} hbase-mapreduce in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  1m  7s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}194m 44s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hbase:eee3b01 |
+| JIRA Issue | HBASE-18294 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12898431/HBASE-18294.06.patch |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  shadedjars  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux 3f4f9a9dc178 3.13.0-129-generic #178-Ubuntu SMP Fri Aug 11 12:48:20 UTC 2017 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build/component/dev-support/hbase-personality.sh |
+| git revision | master / 9b7b83d862 |
+| maven | version: Apache Maven 3.5.2 (138edd61fd100ec658bfa2d307c43b76940a5d7d; 2017-10-18T07:58:13Z) |
+| Default Java | 1.8.0_151 |
+| unit | https://builds.apache.org/job/PreCommit-HBASE-Build/9923/artifact/patchprocess/patch-unit-hbase-server.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/9923/testReport/ |
+| modules | C: hbase-common hbase-client hbase-server hbase-mapreduce U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/9923/console |
+| Powered by | Apache Yetus 0.6.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+[~anoopsamjohn] I hope you don't mind I'm adding your comment on the new off-heap flush size configuration property here since it would be easier to have this important discussion in the Jira rather in RB:
+bq. Do we really need to add this extra flush size? It will be very difficult for the users to set all. They used to set the flush size. Being a normal user, I set some flush size means am expecting the flush will happen after the data reached this size.  We have implemented this as heapSize oriented in the past as every thing was in heap. Also we can not make the heap size of all memstores to grow beyond a limt. We have the global heap upper barrier and stuff like that.
+bq. The change for 2.0 is to change the per region flush decision to be data size based not heap size based. I agree that is a change in the way we were working. So the flushes will be delayed than the prev tuned ways.
+bq. Also I agree to one of ur args (In mail chain I guess) that when we select regions to flush because of global heap pressure, we should select the one with max heap size. Right now that is not happening.
+bq. So this directs to the need to track the data size and heap size both at region level. Agree.
+bq. We can still have the flush decision at region level based on the data size only?  When the global heap size is at barrier, we will select region based on the heap size. When the data size barrier breaches(In off heap case), we will select regions based data size. 
+bq. I dont think we have to do all these of adding one more off heap flush size etc. Pls lets keep simple.
+
+With the new property the user is not obligated to set flush size or heap flush size -- both of them are optional and will take the default value if not set by the application.
+Other than that, why is it so unreasonable to have 2 thresholds, after all we have 2 parameters to set the heap size used by the application: (1) JVM heap: -Xmx, (2) off-heap -XX:MaxDirectMemorySize.
+Consider a case in the future when off-heap is fully supported the admin decides to allocate 100GB off-heap and only 1.6GB on-heap and assume the machine has about 800 regions. We would like to allow the admin to set different thresholds on the occupancy of each region on- and off-heap, say 2MB and 128MB, respectively.
+
+It is true that we have global heap size as an upper limit but this is just as a safe guard.
+Reaching global pressure too frequently means the RS is not "healthy". Do we agree on this??
+We have region level threshold to trigger the vast majority of flushes. And from what I have noticed in the benchmarks I did this is not always the case.
+
+I plan to do an additional write-only experiment to count number of times we reach global pressure. The goal of the current patch is to reduce this number.
+Let me get back when I have the numbers.
+
+[~eshcar]
+So one basic question. So this change you are seeing after working with CCM and with its index offheap? And that is why you feel that when we have CCM index offheap and since we don take the offheap index data in to account we tend to do more flushes?
+So we need a counter which accounts for offheap size as a whole (including data and the index size just for CCM offheap case)? Am I missing something here?
+
+Sorry I missed to add one more thing which I wanted to.  Saw some where the ask on how to handle the meta size used by CCM for meta data when the MSLAB is off heap.  That is any way off heap only and not data. I would say we can just consider this as data part only.  To effectively reach our data, we need this. It would be just ok.  What am saying is just for CCM, we no need to add more complexity.
+bq.Reaching global pressure too frequently means the RS is not "healthy". Do we agree on this??
+Ya reaching global barrier is not that good. Because this will make writes to be blocked for flushes.  But this situation depends on many factors. It may not mean RS is not healthy.  The more #regions in this RS, this chance is more. The more client pressure then also more chances. 
+Say we have x as the global heap upper barrier and there are n regions. I consider 128 MB as flush size and 4 as blocking multiplier. Then if x>=128 * 4 * n, we would never see the barrier breach. But this is not so advisable thing any way. Just saying.  Even the HDFS slowness can make the flushes to take longer and so barrier breaches.  So I dont think we can say barrier breaching is always too bad and RS is unhealthy then.
+BTW am not getting how we can avoid/reduce that situation using these changes.
+The arg u made abt the selection of region when there is a global size breach make sense fully.  And I feel we should correct it.  So tracking the heapSize at the Region level is needed. (Remember we track it at each Segment level and can always sum all segments heapSize to know this. We do this in some flow cases).   When there is a flush region selection because of global heap barrier breach, we should select region(s) which releases max heap size. 
+For per region flush decision (128MB) IMHO we can continue to check against data size.  Or may be if the BC is a concern still, we can have check like
+if ( dataSize >= 128 || heapSize >= 128 ) flush()
+
+We were discussing internally on this.
+bq.I plan to do an additional write-only experiment to count number of times we reach global pressure. The goal of the current patch is to reduce this number.
+So the addition of offheap related new configs are also for that? As Anoop says yes we need to find if the selection of region was really happening on a region that had reached max heap space. May be since only data size is considered this region is not the actual region whose heap size (along with data) has reached the threshold.
+Coming to the CCM case am not sure if we need to track the data and meta data as offheap meta data size seperately.
+CCM indexing is a special feature and for that we need not expose a config at the HTD level. I saw that in the latest patch and not in the first patch in RB. 
+{code}
+    // Copy over all regions. Regions are sorted by size with biggest first.
+    for (HRegion region : this.onlineRegions.values()) {
+      sortedRegions.put(region.getMemStoreSize(), region);
+    }
+{code}
+So this is where you see the problem because only data size is been fetched here and not the heap size.
+
+I am back with some numbers.
+First, I noticed that master suffer major performance degradation w.r.t. branch-2. This is out of the scope of this Jira and I plan to discuss this issue separately.
+Considering only the delta presented in the current patch here is what I observe for write-only workload with default parameters (Basic memstore compaction)
+
+||code||Throughput||#flushes||#global heap pressure log lines||
+|master|58-59Kops|~1250|~700|
+|master+patch|70-71Kops|~2000|0|
+
+And we see similar trends when running with no memstore compaction. We see that looking at the heap size instead of data size causes more disk flushes, since each store trigger flushes more frequently. However, the throughput increases significantly as we *never* reach global heap pressure. IMO this demonstrates that frequent pressure due to global heap size is not healthy, at least from performance perspective.
+
+These experiments show the benefit of the patch for on-heap stores. I think it is best to enforce symmetric behavior for on-heap and off-heap stores. And this should start with the naming convention. So let's not have data size vs. on-heap size but rather on-heap vs off-heap size. 
+The reason I think we should have two (optional) threshold is that the space allocated on- and off-heap and their usage can vary. Or let me phrase it as a question: is there a reason not to let the admin the liberty to set these threshold differently?? if they are not set by the admin they get the default value (which is currently 128MB).
+
+bq.First, I noticed that master suffer major performance degradation w.r.t. branch-2
+Can you file a JIRA for this if you have not already done.
+bq. We see that looking at the heap size instead of data size causes more disk flushes, since each store trigger flushes more frequently. However, the throughput increases significantly as we never reach global heap pressure. 
+So when you say considering only the delta of the current patch - you are just trying to see per region flush as data + heap and so the global pressure reduces. Because we do more region level flushes. 
+From code one thing I noticed is that in the current master branch - when we decide there is a lower mark breach for the memstore we decide based on both data and heap size. (for onheap memstores). But the region that we select is only by region data size. and I think that is why we are suggesting a change there. 
+So probably for onheap cases we should check (data + heap > 128MB)  while selecting the best region and take it for flush.
+I think this is why the argument of increasing the existing default values comes. Because our decision metric has changed.
+
+
+Ya all that observation make sense. On heap tests u did. The better throughput may be because of less GC pauses too. We are clearing each of the region much earlier.  We can achieve that same impact by reducing the current def 128MB flush size also. Just saying. The GC pause issue as well as the blocking updates issue (because of global barrier breach) can be addressed.  As said, its ok even to continue the old way of check (heap size also check against 128MB) for on heap. If that is a concern.
+
+bq.I think this is why the argument of increasing the existing default values comes. Because our decision metric has changed.
+Did not see Ram comment when I was writing. I mean reducing the existing def values. Correct Ram?  Ya with that alone the issues what is  noticed in tests can be solved, We noticed this as discussed in past.  Just did not conclude then whether to reduce the def.
+Said that am still ok for on heap, continue with old way. 
+
+bq.I mean reducing the existing def values
+Yes as the case may be. 
+
+Ram and Anoop, the reason we see so much heap global pressure is that the regions themselves are not conservative enough to make flush decisions early on. *Changing default values is not a way to fix this inherent problem*:
+(1) Reducing the threshold may solve the problem for some setting but will not solve it for other settings. For example, in the same experiment if we have the threshold set to 64MB but with twice as much regions we will see the same affect.
+(2) There are claims pro reducing memstore size like for reducing GC, but there are also claims pro increasing the size to reduce number of flushes, reduce number of compactions and reduce write amplification.
+(3) In addition, even if we change the default values the system should have optimal performance with the values set by the admin which can be any number.
+
+The core changes in this patch focus on the mechanism and decision making for region level flushes, namely evaluate total heap size instead of data size only. 
+The changes at the region server accounting level are mainly cosmetic changes, to make on-heap and off-heap symmetric (why should we ignore the CCM index when it is allocated off-heap, even if it is small, if we can count it the same way we count the CAM index for on-heap?).
+And I think the changes are not that dramatic about 20 lines of code in {{RegionServerAccounting}}, they do not complicate things much.
+
+Can we in-parallel to the discussion here continue with concrete comments on the code in RB so we can converge towards commit. 
+Thanks
+
+Ya as I said in above comments, we can continue to have decision for flush based on data size OR heap Size.   FOr on heap cases (which is the one what we have till now) there will be no differences at all.  Ya I agree to the concern that people will see diff wrt blocked writes and so overall throughput.  
+For off heap there is no need to do so many separate accounting and configs.  Because there also any way we will have heap size based checks. Data size based check is what mainly govern the flushes there. Because the whole work moves the heap overhead because of the data size to off heap area. I dont know why this is not acceptable.
+bq.There are claims pro reducing memstore size like for reducing GC, but there are also claims pro increasing the size to reduce number of flushes, reduce number of compactions and reduce write amplification.
+Ya that is what. You can not say faster flush is better always. It all depends on the global heap size available for the all regions.
+
+My strong concern is against adding public APIs to set off heap flush size on heap flush size. We were having only flush size been configured by user. As every thing in on heap, we ended up deciding based on heap size.  That same can not be equated to exposing heap flush size (flushSize ) and off heap flush size now.
+
+I think I understand where our different view stem from.
+Currently a region server as a whole is classified either as on-heap or off-heap, which means the cluster is classified either as on-heap or off-heap. When this is the case it seems two thresholds are redundant.
+My view is that off-heap can be a table-level property. which means some regions in a single RS can be classified as on-heap while others are classified as off-heap. In this case, two thresholds, two counters, are necessary.
+
+bq. For off heap there is no need to do so many separate accounting and configs. Data size based check is what mainly govern the flushes there
+
+I can run the same experiments with off-heap setting. If we see similar improvements with off-heap setting will this convince you with the need to compare to off-heap+on-heap sizes instead of data size?
+
+
+bq.My view is that off-heap can be a table-level property. which means some regions in a single RS can be classified as on-heap while others are classified as off-heap.
+No we can NOT do this.  And I dont know why this a need for this?  The off heap is at MSLAB pool. So it can be either on heap or off heap in an RS.  
+
+Chiming in ...
+
+This question seems to be irrelevant to whether MSLAB use is a per-table or global flag. Agreed that we should avoid adding new configurations whenever possible. 
+
+Let's try to remain factual in the decisions we make. The goal is to get the best possible performance from a machine with given RAM resources, on-heap or not. [~eshcar], could you please publish some numbers that validate the solution's value? [~anoop.hbase], mind sharing any data that proves the opposite? 
+
+Thanks!
+
+
+I attached a new patch, much thinner.
+MemStoreSizing only has two entries, and no threshold is added.
+The main change is that in store level and region level we check heap size and not data size to make flush decisions.
+I think this is something we can all agree on.
+Patch is in RB, please review.
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 11s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:blue}0{color} | {color:blue} findbugs {color} | {color:blue}  0m  0s{color} | {color:blue} Findbugs executables are not available. {color} |
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green}  0m  0s{color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 13 new or modified test files. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  4m 54s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 40s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 12s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  5m 51s{color} | {color:green} branch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 27s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  4m 37s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 40s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 40s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red}  1m 12s{color} | {color:red} hbase-server: The patch generated 2 new + 673 unchanged - 57 fixed = 675 total (was 730) {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  4m 34s{color} | {color:green} patch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green} 19m  0s{color} | {color:green} Patch does not cause any errors with Hadoop 2.6.5 2.7.4 or 3.0.0. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 27s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 97m 17s{color} | {color:red} hbase-server in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 18s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}135m 50s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hbase.regionserver.TestPerColumnFamilyFlush |
+|   | hadoop.hbase.regionserver.TestHRegionWithInMemoryFlush |
+|   | hadoop.hbase.regionserver.TestHRegion |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hbase:eee3b01 |
+| JIRA Issue | HBASE-18294 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12903181/HBASE-18294.07.patch |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  shadedjars  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux 604d085d7ec5 3.13.0-129-generic #178-Ubuntu SMP Fri Aug 11 12:48:20 UTC 2017 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build/component/dev-support/hbase-personality.sh |
+| git revision | master / 9a07e07e55 |
+| maven | version: Apache Maven 3.5.2 (138edd61fd100ec658bfa2d307c43b76940a5d7d; 2017-10-18T07:58:13Z) |
+| Default Java | 1.8.0_151 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HBASE-Build/10609/artifact/patchprocess/diff-checkstyle-hbase-server.txt |
+| unit | https://builds.apache.org/job/PreCommit-HBASE-Build/10609/artifact/patchprocess/patch-unit-hbase-server.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/10609/testReport/ |
+| modules | C: hbase-server U: hbase-server |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/10609/console |
+| Powered by | Apache Yetus 0.6.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+[~eshcar] trying to understand here. So the 128MB limit will not be used anymore, and we might flush MemStore as big as what the memory can hold?
+
+Hey [~jmspaggi],
+We are definitely going to use the 128MB limit, only that we will compare it to the total heap size occupancy of the store/region and not just to the size of the data.
+For example, consider a store in which the data of each cell is 100B. We have noticed in our experiments that the (average) heap size of each such cell is *150B*.
+Which means -- if we have 1M records in memory the data size is only 100MB, while the heap size is 150MB.
+If we compare the data size against the threshold we do not flush yet, while if we compare the heap size this store was flushed to disk when it exceeded 128MB.
+
+bq.If we compare the data size against the threshold we do not flush yet, while if we compare the heap size this store was flushed to disk when it exceeded 128MB.
+Probably you should go with || case - check both data + heap or only data. Because for offheap memstore heap won't reach this value. I think that is what others were suggesting too.
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  2m 19s{color} | {color:blue} Docker mode activated. {color} |
+| {color:red}-1{color} | {color:red} patch {color} | {color:red}  0m  3s{color} | {color:red} HBASE-18294 does not apply to master. Rebase required? Wrong Branch? See https://yetus.apache.org/documentation/0.6.0/precommit-patchnames for help. {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hbase:eee3b01 |
+| JIRA Issue | HBASE-18294 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12903565/HBASE-18294.08.patch |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/10675/console |
+| Powered by | Apache Yetus 0.6.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 10s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:blue}0{color} | {color:blue} findbugs {color} | {color:blue}  0m  1s{color} | {color:blue} Findbugs executables are not available. {color} |
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green}  0m  0s{color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 13 new or modified test files. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  5m 32s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 54s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 26s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  6m 41s{color} | {color:green} branch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 29s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  4m 34s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 41s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 41s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 12s{color} | {color:green} hbase-server: The patch generated 0 new + 673 unchanged - 57 fixed = 673 total (was 730) {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  4m 33s{color} | {color:green} patch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green} 19m  1s{color} | {color:green} Patch does not cause any errors with Hadoop 2.6.5 2.7.4 or 3.0.0. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 27s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 98m 13s{color} | {color:red} hbase-server in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 18s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}138m 28s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hbase.regionserver.TestPerColumnFamilyFlush |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hbase:eee3b01 |
+| JIRA Issue | HBASE-18294 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12903572/HBASE-18294.09.patch |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  shadedjars  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux c74f428cab6b 3.13.0-129-generic #178-Ubuntu SMP Fri Aug 11 12:48:20 UTC 2017 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build/component/dev-support/hbase-personality.sh |
+| git revision | master / c24cf2d55e |
+| maven | version: Apache Maven 3.5.2 (138edd61fd100ec658bfa2d307c43b76940a5d7d; 2017-10-18T07:58:13Z) |
+| Default Java | 1.8.0_151 |
+| unit | https://builds.apache.org/job/PreCommit-HBASE-Build/10684/artifact/patchprocess/patch-unit-hbase-server.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/10684/testReport/ |
+| modules | C: hbase-server U: hbase-server |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/10684/console |
+| Powered by | Apache Yetus 0.6.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Sorry [~ram_krish] I missed you comment.
+
+bq. Probably you should go with || case - check both data + heap or only data. Because for offheap memstore heap won't reach this value.
+
+Note that with the new patch heap size is always larger than data size because it includes both data and metadata regardless of where it is allocated heap or off heap.
+
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  1m 54s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:blue}0{color} | {color:blue} findbugs {color} | {color:blue}  0m  0s{color} | {color:blue} Findbugs executables are not available. {color} |
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green}  0m  0s{color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 13 new or modified test files. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  4m 53s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 47s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 17s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  6m  1s{color} | {color:green} branch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 30s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  4m 56s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 48s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 48s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red}  1m 14s{color} | {color:red} hbase-server: The patch generated 2 new + 673 unchanged - 57 fixed = 675 total (was 730) {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  4m 42s{color} | {color:green} patch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green} 20m 11s{color} | {color:green} Patch does not cause any errors with Hadoop 2.6.5 2.7.4 or 3.0.0. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 29s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 95m 37s{color} | {color:red} hbase-server in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 18s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}137m 53s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hbase:eee3b01 |
+| JIRA Issue | HBASE-18294 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12903627/HBASE-18294.10.patch |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  shadedjars  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux 6e37de2531bf 3.13.0-133-generic #182-Ubuntu SMP Tue Sep 19 15:49:21 UTC 2017 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build/component/dev-support/hbase-personality.sh |
+| git revision | master / 38472e1c07 |
+| maven | version: Apache Maven 3.5.2 (138edd61fd100ec658bfa2d307c43b76940a5d7d; 2017-10-18T07:58:13Z) |
+| Default Java | 1.8.0_151 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HBASE-Build/10697/artifact/patchprocess/diff-checkstyle-hbase-server.txt |
+| unit | https://builds.apache.org/job/PreCommit-HBASE-Build/10697/artifact/patchprocess/patch-unit-hbase-server.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/10697/testReport/ |
+| modules | C: hbase-server U: hbase-server |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/10697/console |
+| Powered by | Apache Yetus 0.6.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m  9s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:blue}0{color} | {color:blue} findbugs {color} | {color:blue}  0m  0s{color} | {color:blue} Findbugs executables are not available. {color} |
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green}  0m  0s{color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 13 new or modified test files. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  4m 56s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 46s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 16s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  6m  1s{color} | {color:green} branch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 30s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  4m 56s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 46s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 46s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 12s{color} | {color:green} hbase-server: The patch generated 0 new + 673 unchanged - 57 fixed = 673 total (was 730) {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  4m 39s{color} | {color:green} patch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green} 20m  3s{color} | {color:green} Patch does not cause any errors with Hadoop 2.6.5 2.7.4 or 3.0.0. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 32s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}114m  2s{color} | {color:red} hbase-server in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 17s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}154m 30s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hbase.regionserver.TestHRegionWithInMemoryFlush |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hbase:eee3b01 |
+| JIRA Issue | HBASE-18294 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12903666/HBASE-18294.11.patch |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  shadedjars  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux 5ef29dd95894 3.13.0-133-generic #182-Ubuntu SMP Tue Sep 19 15:49:21 UTC 2017 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build/component/dev-support/hbase-personality.sh |
+| git revision | master / 38472e1c07 |
+| maven | version: Apache Maven 3.5.2 (138edd61fd100ec658bfa2d307c43b76940a5d7d; 2017-10-18T07:58:13Z) |
+| Default Java | 1.8.0_151 |
+| unit | https://builds.apache.org/job/PreCommit-HBASE-Build/10705/artifact/patchprocess/patch-unit-hbase-server.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/10705/testReport/ |
+| modules | C: hbase-server U: hbase-server |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/10705/console |
+| Powered by | Apache Yetus 0.6.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+bq.Note that with the new patch heap size is always larger than data size because it includes both data and metadata regardless of where it is allocated heap or off heap.
+At Region level only?  What abt the global level (in RSAccounting)?  If there also same, it means for off heap we will reach the upper barrier so soon. For off heap the Xmx will be much lower and so the upper barrier.  I feel the other way is better. Account data size and heap size how we have now.  
+
+I did not change the global level - see current patch in RB
+
+Test passes locally, trying to re-submit
+
+| (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m  9s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:blue}0{color} | {color:blue} findbugs {color} | {color:blue}  0m  1s{color} | {color:blue} Findbugs executables are not available. {color} |
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green}  0m  0s{color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 13 new or modified test files. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  4m 31s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 41s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 12s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  5m 49s{color} | {color:green} branch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 27s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  4m 33s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 41s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 41s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 11s{color} | {color:green} hbase-server: The patch generated 0 new + 673 unchanged - 57 fixed = 673 total (was 730) {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  4m 40s{color} | {color:green} patch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green} 19m 13s{color} | {color:green} Patch does not cause any errors with Hadoop 2.6.5 2.7.4 or 3.0.0. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 26s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 92m 29s{color} | {color:green} hbase-server in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 18s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}130m 45s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hbase:eee3b01 |
+| JIRA Issue | HBASE-18294 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12903698/HBASE-18294.11.patch |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  shadedjars  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux 941ed6b4e31e 3.13.0-129-generic #178-Ubuntu SMP Fri Aug 11 12:48:20 UTC 2017 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build/component/dev-support/hbase-personality.sh |
+| git revision | master / 1556939236 |
+| maven | version: Apache Maven 3.5.2 (138edd61fd100ec658bfa2d307c43b76940a5d7d; 2017-10-18T07:58:13Z) |
+| Default Java | 1.8.0_151 |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/10717/testReport/ |
+| modules | C: hbase-server U: hbase-server |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/10717/console |
+| Powered by | Apache Yetus 0.6.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+QA passed
+I would like to commit this in the next few days.
+Please let me know if there are issues that were not addressed.
+
+| (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  1m 54s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:blue}0{color} | {color:blue} findbugs {color} | {color:blue}  0m  0s{color} | {color:blue} Findbugs executables are not available. {color} |
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green}  0m  0s{color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 13 new or modified test files. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  5m  0s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 46s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 15s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  5m 59s{color} | {color:green} branch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 27s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  4m 40s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 42s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 42s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 12s{color} | {color:green} hbase-server: The patch generated 0 new + 673 unchanged - 57 fixed = 673 total (was 730) {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  4m 36s{color} | {color:green} patch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green} 19m  3s{color} | {color:green} Patch does not cause any errors with Hadoop 2.6.5 2.7.4 or 3.0.0. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 27s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 96m 16s{color} | {color:green} hbase-server in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 17s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}137m  0s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hbase:eee3b01 |
+| JIRA Issue | HBASE-18294 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12903725/HBASE-18294.12.patch |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  shadedjars  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux 211a612c65ac 3.13.0-133-generic #182-Ubuntu SMP Tue Sep 19 15:49:21 UTC 2017 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build/component/dev-support/hbase-personality.sh |
+| git revision | master / 80c7e4ea79 |
+| maven | version: Apache Maven 3.5.2 (138edd61fd100ec658bfa2d307c43b76940a5d7d; 2017-10-18T07:58:13Z) |
+| Default Java | 1.8.0_151 |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/10721/testReport/ |
+| modules | C: hbase-server U: hbase-server |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/10721/console |
+| Powered by | Apache Yetus 0.6.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+bq. "The main change is that in store level and region level we check heap size and not data size to make flush decisions."
+
+This issue supercedes HBASE-16747, right? It restores heap-occupancy size rather than data-size as basis making flush decisions?
+
+Needs a nice release note. I read through the whole issue but am not clear on what this patch actually lands in end. On review of rb I got a little confused on when data-size and when heap-size ... 
+
+Question: if off-heap, flush trigger is data+overhead hitting flush threshold?
+
+Patch looks good to me (A few notes up on rb).
+
+[~ram_krish] and [~anoop.hbase], you fellows good w/ it?  (boys seems to be off these last few days...).
+
+
+I tried running this patch to see if it would help w/ HBASE-19639 but doesn't seem to make a diff.... 
+
+Thanks all for the reviews, attached a new patch with the final changes.
+
+You got it all correct  [~stack]:
+- At the region level we make flush decisions based on heap-occupancy instead of data size; same care for on- and off-heap cases. 
+- At the RS level all stays as before with special care for heap and off heap cases.
+
+I looked at HBASE-19639 seems like updates are at a rate that the flush cannot handle so eventually you exceed the blocking threshold.
+Can you add some more information from the logs, how many flushes succeed before the test is stuck? what's preventing the flush from completing?
+
+Am not before a system so did not go through your patch fully. So the change is for regoin level go back to the old way of data + heap. Global level there is no change. I am not stopping the commit of this patch after reading some latest comments in HBASE-16747. If others are fine pls go ahead with this commit.
+
+bq.we make flush decisions based on heap-occupancy instead of data size; same care for on- and off-heap cases
+This is what still am not getting/convinced.  I had gone through the patch quickly.  We get the cells data and heap size in MemstoreSize after it is been added to Segment.  There u can see that the sizes are been calculated using cell's length and its heap size.
+{code}
+long heapSize = heapSizeChange(cellToAdd, succ);
+    incSize(cellSize, heapSize);
+    if (memstoreSizing != null) {
+      memstoreSizing.incMemStoreSize(cellSize, heapSize);
+    }
+...
+protected long heapSizeChange(Cell cell, boolean succ) {
+    if (succ) {
+      return ClassSize
+          .align(indexEntrySize() + PrivateCellUtil.estimatedHeapSizeOf(cell));
+    }
+    return 0;
+  }
+...
+public static long estimatedHeapSizeOf(final Cell cell) {
+    if (cell instanceof HeapSize) {
+      return ((HeapSize) cell).heapSize();
+    }
+    // TODO: Add sizing of references that hold the row, family, etc., arrays.
+    return estimatedSerializedSizeOf(cell);
+  }
+{code}
+
+When off heap, we have ByteBufferKV cell objects.  And its heapSize is been implemented as 
+{code}
+public long heapSize() {
+    if (this.buf.hasArray()) {
+      return ClassSize.align(FIXED_OVERHEAD + length);
+    }
+    return ClassSize.align(FIXED_OVERHEAD);
+  }
+{code}
+This is correct also.  When off heap, the data size comes with the off heap occupancy and the heap size is having the overhead value only.  The cell key and value size (which are in DBB) is NOT added to heap size. This is correct also.   So now if the decision at the Region level is only based on heap size, this will be an issue in off heap case.    Global accounting ya seems fine. No changes.  Pls correct me where am getting thing wrong.
+
+Yes. That is my concern too. If we make heap only for region level then offheap will have to be changed too. I think that is what was discussed over in HBASE-16747. I thought this patch ensures offheap and onheap works same way now at region level.
+
+My previous solution had three different counters in MemStoreSize: (1) one for data size (2) one for on-heap size (3) one for off-heap size. 
+The main reason I rolled back this change is the understanding that in the near future HBase is going to support only clusters that are either entirely on-heap or entirely off-heap and so there is no need to measure on- and off-heap occupancy separately in any level (cluster, RS, region or memstore).
+This means that when we say heap: heap size, heap occupancy, heap space, etc. we mean all bytes allocated on the heap including JVM and OS heap.
+If an implementation of the {{Cell}} class the method {{heapSize()}} does not return the number of bytes allocated to store data that is related to this cell (key, value, metadata, etc.) then I would say the implementation does not satisfy the specification of the method and needs to be changed.
+
+Is there any reason the method was implemented this way??
+
+How about the following change adding {{KeyValueUtil.length(this)}} to the computation in the implementation of {{ByteBufferKV}}
+I think it will fix the problem. Do you see any reason it shouldn't work?
+{code}
+  public long heapSize() {
+    if (this.buf.hasArray()) {
+      return ClassSize.align(FIXED_OVERHEAD + length);
+    }
+    return ClassSize.align(FIXED_OVERHEAD) + KeyValueUtil.length(this);
+  }
+{code}
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 10s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:blue}0{color} | {color:blue} findbugs {color} | {color:blue}  0m  0s{color} | {color:blue} Findbugs executables are not available. {color} |
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green}  0m  0s{color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 13 new or modified test files. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  4m 33s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 42s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 13s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  5m 45s{color} | {color:green} branch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 28s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  4m 50s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 43s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 43s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 14s{color} | {color:green} hbase-server: The patch generated 0 new + 673 unchanged - 57 fixed = 673 total (was 730) {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  4m 49s{color} | {color:green} patch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green} 19m 30s{color} | {color:green} Patch does not cause any errors with Hadoop 2.6.5 2.7.4 or 3.0.0. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 26s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}101m 19s{color} | {color:red} hbase-server in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 18s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}140m 14s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hbase.client.TestClientPushback |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hbase:eee3b01 |
+| JIRA Issue | HBASE-18294 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12903791/HBASE-18294.13.patch |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  shadedjars  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux 6b1e8958d85b 3.13.0-133-generic #182-Ubuntu SMP Tue Sep 19 15:49:21 UTC 2017 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build@2/component/dev-support/hbase-personality.sh |
+| git revision | master / 41c2dd04da |
+| maven | version: Apache Maven 3.5.2 (138edd61fd100ec658bfa2d307c43b76940a5d7d; 2017-10-18T07:58:13Z) |
+| Default Java | 1.8.0_151 |
+| unit | https://builds.apache.org/job/PreCommit-HBASE-Build/10741/artifact/patchprocess/patch-unit-hbase-server.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/10741/testReport/ |
+| modules | C: hbase-server U: hbase-server |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/10741/console |
+| Powered by | Apache Yetus 0.6.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+[~eshcar] Yeah, working on trying to figure whey ITBLL can't go big. This patch may actually have improved things after all... I can go a bit bigger. Trying more.
+
+Also, I'm in favor of on and offheap working same way for now with accounting being data+overhead until we have more experience running offheap (Waiting on by-off by [~anoop.hbase] and/or [~ram_krish] on suggested change -- looks good to me but the boys know this area better).
+
+I can not some how agree to ur reasoning here. Heapsize is considering what is there in Java heap.  All the places it is this way. That is why we consider even the overhead of Java objects.  I dont know what is this much blocking us from having a dataSize > flushSize ||  heapSize >flushSize   check.  I said my concern here and leaving remaining things all to you. 
+
+For now data+overhead  check for both also some what acceptable arg.   But change the meaning of heapSize itself, I dont know at least I can not digest that. 
+Off heap memstore is any way a new impl and not ON by default.  We do the same way (which is not that right IMHO) here too will make us tied again right?  IMHO region flush size means when the data size is this much do a flush.  We calc based on Java as we have all Java heap related limitations and bounds.  Any way I dont want to be a blocker here.  So I would move aside now..:-)
+
+bq. dataSize > flushSize || heapSize >flushSize
+
+You are trying to accommodate the offheap case with the above [~anoop.hbase] ?  If offheap, we ignore the onheap overhead and only flush when the offheap dataisze is > flushSize?  What about the case where overhead is more than data size where key is larger than value?
+
+Yes Stack.  That is why we have || check.  We have a limit on both. We wont allow any of the size to grow above the limit.
+bq.What about the case where overhead is more than data size where key is larger than value?
+In off heap memstore, even the key is in off heap. The key , value and tag parts.  WHat is there in on heap (java heap) is the POJO overhead and CSLM overhead.  Ya even that can be larger than the key+value+tags.  But will that be that normal?  May be rare IMO. U can correct me.   Any way we have the || check..   We can do like what u proposed above that even for the off heap also we can consider the dataSize+ overhead.  But then that way have to continue for ever.  Now the on heap case we can not change because that is a drastic behave change.  At first (when impl other jira) we all were thinking that change will make /align things to intended way..  But later feedbacks are not that.  So we will have to continue with that for ever/  For off heap also, if we do now, we have to continue for ever IMO.  Ya if u strongly feel that is to be the case (we say it loudly that 128 MB region flush size means 128 MB size of cells data + all their overhead),  I will stand by that.
+
+bq. But change the meaning of heapSize itself....
+
+Yeah, this is an issue. We are saying that in the offheap case, heapsize means onheap overhead + offheap datasize. Yeah, this is a mangling of the original understanding. Needs qualification at least.
+
+bq. IMHO region flush size means when the data size is this much do a flush. 
+
+That'd be best but then there is the overhead. Perhaps we could make it so overhead is tracked in background and then flush threshold serves as memory-usage barrier and as desired file-size indicator but we've not done the work. Ignoring overhead at the region scope will make us to run into the global barrier especially if key is non-negligible in size (the global barrier does track overhead); going to the global barrier is a perf killer.
+
+bq. Any way I dont want to be a blocker here. So I would move aside now
+
+You ain't a blocker. We need your expertise in here sir. What you think of the [~eshcar] change? Is that the right way to do accounting of the offheap size? Thanks.
+
+bq. Is that the right way to do accounting of the offheap size? 
+No..  Because as per that patch, the off heap case will check only the on heap overhead now.  There is no consideration of the data size.  For that changing the heapSize() meaning , I dont know whether that is correct way. That is a quick fix but !!  The other fix might involve some bigger change (At Region, Segment levels).. We have to track dataSize and heapOverhead instead of dataSize and heapSize.
+Now heapSize means for on heap case this is overhead + dataSize.
+
+bq. ... we say it loudly that 128 MB region flush size means 128 MB size of cells data + all their overhead...
+
+We can do this, yes.
+
+bq. There is no consideration of the data size.
+
+Ok.
+
+My 2 cents - after reviewing the code to the best of my ability. 
+
+IMO the confusion stems from the unfortunate name - heapSize - the code historically uses for the overall allocated memory. Such that it is not clear whether we mean the Java heap or the OS heap. Might be good to replace globally - maybe in a different jira. 
+
+Regarding the per-store flush trigger ... Still not sure what is the reasoning behind non-uniform handling of on-(Java) heap and off-(Java) heap allocations. Could someone please re-iterate why just monitor the overall allocated memory (data + overhead), no matter where, and flush when the threshold is crossed? Obviously there are all kinds of concerns, but the only experiment on the table is the one by [~eshcar], which demonstrates that regions flush too early, at least with on-heap data, due to conservative accounting. 
+
+We intend to benchmark the off-heap write path thoroughly, in particular to evaluate the benefits of the CCM index (HBase-16421). If something unexpected comes up there, we'll all re-convene and re-discuss. Until then, may I suggest to keep the things simple and run the accounting context-free, along the lines with [~eshcar]'s patch. 
+
+Sounds good [~ebortnik] but [~eshcar]'s patch needs to include offheap datasize as [~anoop.hbase] says. Yeah, agree that in new world, heapsize confuses.
+
+bq.but Eshcar Hillel's patch needs to include offheap datasize as Anoop Sam John says.
+And for that the solution said was to change heapSize impl of the ByteBufferKV.  May be not that apt IMO.  Ya heapSize() is intended to track the on heap sizes.. Yes we were all on heap till now.  All these naming confuses us now.  For simplicity we can even keep like for off heap cases we consider data size only.  That is what the per region flush decision is based on an || condition.  The change is supposed to be same.   We dont have off heap usage as default.  Any one trying that would thoroughly tune things and test.  We can correct it always , that the off heap also follow same way of data size + overhead.   At least I believe that all agree to the point that the flush size would best mean the sum of data size when to flush.  In theory at least.  Practical wise we could not follow this as we were always under the limits of java heap.   
+
+Again am not seeing the code. Seeing these discussions, I think the intent of [~eshcar] I get it. Initially to avoid this confusion of offheap and onheap tracking she tried to add a new param at the HTD level so that at global level alone we ensure this new param is honored. But that was asking too much from user. Hence she simplified it with the old way. Left global region server level pressure unchanged and only track the region level with heap + data size. It does not help offheap cases for sure because we clearly distinguished what is heapSize and that heapSize was purely based on what java is going to occupy for that given cell.
+One question  - since tracking data size is much better in region level, why don't we change the global size to work with heap+dataSize || dataSize > 128 MB?
+This will solve the blocking updates issue and at the same time works for offheap cases also right? I t hink this what Anoop also asked in one of yesterday's comment. Again am not a blocker just saying. 
+
+bq.why don't we change the global size to work with heap+dataSize || dataSize > 128 MB?
+No Ram.. we can not do..  Because global level when the check passed, this is forced flushes with blocking updates.  We dont want that to happen.   So this change will make things even worse that the blocking will happen much before and much often.
+bq.I t hink this what Anoop also asked in one of yesterday's comment. 
+No I was saying the OR check at Region level flushes. Global level no changes. That this patch also doing correctly (global level tracking)
+
+Added a link to a doc. Hard to follow what is going on in here.
+
+Got it. So probably we should add || case only for region level then. Global level I could how ever remember there was an issue in selecting a region (the biggest region I believe to be selected for flush?). That was also a reason right for the perf drop because it was not doing it right? Ok won;t have access to net for next 24 hrs. Let me check later. thanks and sorry for confusion. 
+
+
+Thanks [~stack] for the document, I think its a good summary of the issue.
+
+I think it is important to have symmetric behavior for on-heap and off-heap clusters. Even if users do special tuning for off-heap clusters it is not reasonable to expect them understand that on-heap flushes when total occupancy exceeds 128MB and off-heap flushes when key-values are exceeding 128MB. 
+I would like to avoid checking heapsize >128MB OR datasize > 128MB since this is exactly defining unsymmetrical behavior for on-heap and off-heap clusters.
+
+I understand also that [~anoop.hbase] and [~ram_krish] are objecting to change the implementation of {{heapSize()}} so it accounts also for off-heap size, either because they feel it is confusing or because they think it will cause some real problems in the off-heap implementation
+
+So here is a suggestion: 
+(1) I will change the name of the counter in {{MemStoreSize}} from {{heapSize}} to something like {{totalAllocationSize}} or {{totalOccupancy}}  
+(2) I will add methods {{estimatedTotalOccupancyOf(final Cell cell)}} and {{totalOccupancy()}} to compute total occupancy of data+metadata no matter were they are allocated java-heap or off-heap (the way I suggested above) and will use them to update the counters in {{MemStoreSize}}
+(3) only changing region level flush decision, not changing RS global accounting and decisions
+
+If this is acceptable, I can make a new patch in a day or two.
+
+So when the Cell is added to Segment, the MemStoreSize  will have the dataSize and the totalOccupancy  (this is dataSize + overhead).   This MemstoreSize will be used at Region level o update the local counters there and then passed to global level RSAccounting also..  So there also same way it is updated.   Now at global level we have 2 checks.  We have on heap upper barrier (def 40% of Xmx) and off heap barrier which is specified by user. The check is any of the barrier breach..    The code for checking is
+{code}
+public FlushType isAboveHighWaterMark() {
+    // for onheap memstore we check if the global memstore size and the
+    // global heap overhead is greater than the global memstore limit
+    if (memType == MemoryType.HEAP) {
+      if (getGlobalMemStoreHeapSize() >= globalMemStoreLimit) {
+        return FlushType.ABOVE_ONHEAP_HIGHER_MARK;
+      }
+    } else {
+      // If the configured memstore is offheap, check for two things
+      // 1) If the global memstore data size is greater than the configured
+      // 'hbase.regionserver.offheap.global.memstore.size'
+      // 2) If the global memstore heap size is greater than the configured onheap
+      // global memstore limit 'hbase.regionserver.global.memstore.size'.
+      // We do this to avoid OOME incase of scenarios where the heap is occupied with
+      // lot of onheap references to the cells in memstore
+      if (getGlobalMemStoreDataSize() >= globalMemStoreLimit) {
+        // Indicates that global memstore size is above the configured
+        // 'hbase.regionserver.offheap.global.memstore.size'
+        return FlushType.ABOVE_OFFHEAP_HIGHER_MARK;
+      } else if (getGlobalMemStoreHeapSize() >= this.globalOnHeapMemstoreLimit) {
+        // Indicates that the offheap memstore's heap overhead is greater than the
+        // configured 'hbase.regionserver.global.memstore.size'.
+        return FlushType.ABOVE_ONHEAP_HIGHER_MARK;
+      }
+    }
+    return FlushType.NORMAL;
+  }
+{code}
+Now for off heap the Xmx will be way lower.  Now as per this change suggested, the heapSize will include the dataSize and overhead. So it will make the on heap barrier breach too easy and too often.  Or else we will have to do a minus and track overhead here.  (overhead = heapSize - dataSize).    But again the issue is even when the off heap is in use, some times the some cells can be in on heap..  Those are bigger cells which can not be cloned to MSLAB or upserted cells or so on..  Knowing that at RSAccounting layer is not possible.. Or else the MemstoreSize has to track all diff..    On all these my simple Q is this
+Any way the off heap is not a default used memstore now. If one uses that it will be after proper test and tune.  The delayed flush in case of off heap can be avoided by reducing the flush Size (say 100 MB instead of 128 MB)..   Agree the tuning is bit tedious. But for existing users, no case that off heap will get in use.  We can even make changes for off heap flushes after 2.0 also..   So my doubt always was why not keep things simple.   
+if u are ready for more involved change, we can correct it.. I can help...  If NOT that the case, lets keep things most simple.. This is my call on this.  
+
+
+Thank you [~anoop.hbase] for explaining. I think I understand now what is going on, however, I must say things are not at all simple :)
+In different places we give different semantic to the same name. For example, data size means in some places key-value size and in some places means off-heap size; heap size sometimes means heap size and sometimes means metadata size.
+This is very hard to follow and maintain.
+
+My understanding is that for off heap clusters part is allocated on-heap and part is allocated off-heap and there is no way around it.
+
+As this is the state of the things, I strongly feel that we should go back to the patch that introduced three counter in MemStoreSize data size, heap size, and off-heap size.
+At the region level we'll have MemStoreSize accounting (with 3 counters), and have flush decisions based on comparing to (existing) on-heap and (new) off-heap thresholds;
+while at the RS level we'll have only off-heap accounting and on-heap accounting to be compared against the two existing thresholds.
+
+This may seem like a lot to change, however,
+(1) the patch is practically ready (might need some small modifications and adjustments due to recent code reviews)
+(2) at the end of the day each counter has its own semantic that is highly correlated with its name and is consistent across levels.
+
+I think #2 is super important to avoid future bugs and facilitate maintenance of the code for further adjustments.
+
+Do you see any reasons to object to the change beside your view that it is more complicated than the current trunk code?
+
+
+Agree with [~eshcar]. This design introduces the abstraction that nicely separates between allocation accounting and flush triggering. The two should be separate - this way things become simple again. 
+
+Good that all started getting each other and trying to come to same point. :-)   At that time (1st patch) the discussion or disagreement was mainly on a new HCD setter for offheap flush size. 
+So we may have to track on heap Data size, off heap data size and heap overhead.  At region level it is ok to do flush decision for both on heap and off heap based on single condition.  ie  onHeapDataSize + offHeapDataSize + overhead >=128 MB.    This is ok.
+At global level bit change needed as we have the heapOverhead now not the complete java heap occupancy.
+
+Pls note, every where heapSize means the Java heap size.  This might be POJO overhead alone or overhead + cell size based on where the cell data sits.
+What u say?  Bigger changes but if u can make am fully agree to that.  Will help with reviews once patch is in :-)
+
+OK let me prepare the patch.
+
+Hallelujah! Thanks, all, for the fruitful discussion. 
+
+
+Sent from Yahoo Mail for iPhone
+
+
+On Thursday, December 28, 2017, 8:24 PM, Eshcar Hillel (JIRA) <jira@apache.org> wrote:
+
+
+    [ https://issues.apache.org/jira/browse/HBASE-18294?page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel&focusedCommentId=16305641#comment-16305641 ] 
+
+Eshcar Hillel commented on HBASE-18294:
+---------------------------------------
+
+OK let me prepare the patch.
+
+
+
+
+--
+This message was sent by Atlassian JIRA
+(v6.4.14#64029)
+
+
+
+
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m  0s{color} | {color:blue} Docker mode activated. {color} |
+| {color:red}-1{color} | {color:red} patch {color} | {color:red}  0m  4s{color} | {color:red} HBASE-18294 does not apply to master. Rebase required? Wrong Branch? See https://yetus.apache.org/documentation/0.6.0/precommit-patchnames for help. {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| JIRA Issue | HBASE-18294 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12897297/HBASE-18294.01.patch |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/11144/console |
+| Powered by | Apache Yetus 0.6.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+We are back to a ``fat'' patch, so here is a summary of major changes w.r.t. master:
+- MemStoreSize and MemStoreSizing now manage three counters (1) data size (2) heap size (3) off heap size,
+- FlushLargeStorePolicy::shouldFlush(), HRegion::checkResources(), HRegion::isFlushSize() and HRegion::requestFlushIfNeeded() check both heap size and off heap size against their (heap and off-heap) bounds,
+- RegionServerAccounting manages 3 counters (off-heap size is added), RegionServerAccounting::isAboveHighWaterMark(), RegionServerAccounting::isAboveLowWaterMark(), and RegionServerAccounting::getFlushPressure() compare on-heap and off-heap sizes to their bounds,
+- ByteBufferKeyValue::heapSize() always considers key-value length.
+
+Patch is also in RB.
+
+You can remove the .01 patch and rename .15 patch as .01 patch so that QA runs tests over the new patch
+
+Thanks Ted.
+
+I will try it if QA doesn't succeed this time as well.
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  2m 29s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:blue}0{color} | {color:blue} findbugs {color} | {color:blue}  0m  0s{color} | {color:blue} Findbugs executables are not available. {color} |
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green}  0m  0s{color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 16 new or modified test files. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 22s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  4m 14s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 29s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 56s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  5m 56s{color} | {color:green} branch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 10s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 12s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  4m 12s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 27s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  1m 27s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red}  0m 59s{color} | {color:red} hbase-server: The patch generated 1 new + 831 unchanged - 61 fixed = 832 total (was 892) {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  4m  5s{color} | {color:green} patch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green} 18m 20s{color} | {color:green} Patch does not cause any errors with Hadoop 2.6.5 2.7.4 or 3.0.0. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 16s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  2m 22s{color} | {color:green} hbase-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  2m 53s{color} | {color:green} hbase-client in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}112m 55s{color} | {color:red} hbase-server in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 11m 33s{color} | {color:green} hbase-mapreduce in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  1m 32s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}174m 53s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hbase.regionserver.TestMajorCompaction |
+|   | hadoop.hbase.regionserver.TestWalAndCompactingMemStoreFlush |
+|   | hadoop.hbase.regionserver.wal.TestLogRolling |
+|   | hadoop.hbase.regionserver.TestAtomicOperation |
+|   | hadoop.hbase.regionserver.TestCompactionWithCoprocessor |
+|   | hadoop.hbase.regionserver.wal.TestAsyncLogRolling |
+|   | hadoop.hbase.regionserver.TestPerColumnFamilyFlush |
+|   | hadoop.hbase.client.TestClientPushback |
+|   | hadoop.hbase.regionserver.TestCompaction |
+|   | hadoop.hbase.TestIOFencing |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hbase:eee3b01 |
+| JIRA Issue | HBASE-18294 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12907066/HBASE-18294.01.patch |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  shadedjars  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux bfb02f3a4b09 4.4.0-43-generic #63-Ubuntu SMP Wed Oct 12 13:48:03 UTC 2016 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build@2/component/dev-support/hbase-personality.sh |
+| git revision | master / f3c563fc00 |
+| maven | version: Apache Maven 3.5.2 (138edd61fd100ec658bfa2d307c43b76940a5d7d; 2017-10-18T07:58:13Z) |
+| Default Java | 1.8.0_151 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HBASE-Build/11150/artifact/patchprocess/diff-checkstyle-hbase-server.txt |
+| unit | https://builds.apache.org/job/PreCommit-HBASE-Build/11150/artifact/patchprocess/patch-unit-hbase-server.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/11150/testReport/ |
+| modules | C: hbase-common hbase-client hbase-server hbase-mapreduce U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/11150/console |
+| Powered by | Apache Yetus 0.6.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m  0s{color} | {color:blue} Docker mode activated. {color} |
+| {color:red}-1{color} | {color:red} patch {color} | {color:red}  0m  5s{color} | {color:red} HBASE-18294 does not apply to master. Rebase required? Wrong Branch? See https://yetus.apache.org/documentation/0.6.0/precommit-patchnames for help. {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| JIRA Issue | HBASE-18294 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12907066/HBASE-18294.01.patch |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/11168/console |
+| Powered by | Apache Yetus 0.6.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 10s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:blue}0{color} | {color:blue} findbugs {color} | {color:blue}  0m  0s{color} | {color:blue} Findbugs executables are not available. {color} |
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green}  0m  0s{color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 16 new or modified test files. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 13s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  4m 50s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 55s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  2m 33s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  7m 19s{color} | {color:green} branch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 21s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 13s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:red}-1{color} | {color:red} mvninstall {color} | {color:red}  2m 10s{color} | {color:red} root in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} compile {color} | {color:red}  0m 47s{color} | {color:red} hbase-server in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} javac {color} | {color:red}  0m 47s{color} | {color:red} hbase-server in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 25s{color} | {color:green} The patch hbase-common passed checkstyle {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 32s{color} | {color:green} The patch hbase-client passed checkstyle {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 18s{color} | {color:green} hbase-server: The patch generated 0 new + 826 unchanged - 7 fixed = 826 total (was 833) {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 19s{color} | {color:green} The patch hbase-mapreduce passed checkstyle {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:red}-1{color} | {color:red} shadedjars {color} | {color:red}  3m 35s{color} | {color:red} patch has 40 errors when building our shaded downstream artifacts. {color} |
+| {color:red}-1{color} | {color:red} hadoopcheck {color} | {color:red}  5m 34s{color} | {color:red} The patch causes 40 errors with Hadoop v2.6.5. {color} |
+| {color:red}-1{color} | {color:red} hadoopcheck {color} | {color:red}  7m 31s{color} | {color:red} The patch causes 40 errors with Hadoop v2.7.4. {color} |
+| {color:red}-1{color} | {color:red} hadoopcheck {color} | {color:red}  9m 29s{color} | {color:red} The patch causes 40 errors with Hadoop v3.0.0. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 21s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  2m 17s{color} | {color:green} hbase-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  2m 46s{color} | {color:green} hbase-client in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}  0m 44s{color} | {color:red} hbase-server in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 31m 34s{color} | {color:red} hbase-mapreduce in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  1m 22s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 73m  2s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hbase.mapred.TestMultiTableSnapshotInputFormat |
+|   | hadoop.hbase.mapred.TestTableMapReduceUtil |
+|   | hadoop.hbase.mapreduce.TestImportTsv |
+|   | hadoop.hbase.mapreduce.TestImportTSVWithTTLs |
+|   | hadoop.hbase.mapreduce.TestTableInputFormatScan2 |
+|   | hadoop.hbase.mapreduce.TestTableMapReduce |
+|   | hadoop.hbase.mapreduce.TestTimeRangeMapRed |
+|   | hadoop.hbase.mapreduce.TestCopyTable |
+|   | hadoop.hbase.mapreduce.TestMultithreadedTableMapper |
+|   | hadoop.hbase.mapreduce.TestTableInputFormatScan1 |
+|   | hadoop.hbase.mapred.TestTableInputFormat |
+|   | hadoop.hbase.mapreduce.TestTableInputFormat |
+|   | hadoop.hbase.mapreduce.TestImportExport |
+|   | hadoop.hbase.mapreduce.TestSyncTable |
+|   | hadoop.hbase.mapreduce.TestWALPlayer |
+|   | hadoop.hbase.mapreduce.TestHRegionPartitioner |
+|   | hadoop.hbase.mapreduce.TestImportTSVWithVisibilityLabels |
+|   | hadoop.hbase.mapred.TestTableMapReduce |
+|   | hadoop.hbase.mapred.TestTableOutputFormatConnectionExhaust |
+|   | hadoop.hbase.mapreduce.TestRowCounter |
+|   | hadoop.hbase.mapreduce.TestImportTSVWithOperationAttributes |
+|   | hadoop.hbase.mapreduce.TestMultiTableInputFormat |
+|   | hadoop.hbase.replication.TestVerifyReplication |
+|   | hadoop.hbase.mapreduce.TestMultiTableSnapshotInputFormat |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hbase:eee3b01 |
+| JIRA Issue | HBASE-18294 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12907355/HBASE-18294.01.patch |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  shadedjars  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux 466c52ef590e 3.13.0-139-generic #188-Ubuntu SMP Tue Jan 9 14:43:09 UTC 2018 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build/component/dev-support/hbase-personality.sh |
+| git revision | master / d589b72382 |
+| maven | version: Apache Maven 3.5.2 (138edd61fd100ec658bfa2d307c43b76940a5d7d; 2017-10-18T07:58:13Z) |
+| Default Java | 1.8.0_151 |
+| mvninstall | https://builds.apache.org/job/PreCommit-HBASE-Build/11171/artifact/patchprocess/patch-mvninstall-root.txt |
+| compile | https://builds.apache.org/job/PreCommit-HBASE-Build/11171/artifact/patchprocess/patch-compile-hbase-server.txt |
+| javac | https://builds.apache.org/job/PreCommit-HBASE-Build/11171/artifact/patchprocess/patch-compile-hbase-server.txt |
+| unit | https://builds.apache.org/job/PreCommit-HBASE-Build/11171/artifact/patchprocess/patch-unit-hbase-server.txt |
+| unit | https://builds.apache.org/job/PreCommit-HBASE-Build/11171/artifact/patchprocess/patch-unit-hbase-mapreduce.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/11171/testReport/ |
+| modules | C: hbase-common hbase-client hbase-server hbase-mapreduce U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/11171/console |
+| Powered by | Apache Yetus 0.6.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 11s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:blue}0{color} | {color:blue} findbugs {color} | {color:blue}  0m  0s{color} | {color:blue} Findbugs executables are not available. {color} |
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green}  0m  0s{color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 16 new or modified test files. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 15s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  5m 26s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  2m  6s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  2m 57s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  8m 19s{color} | {color:green} branch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 34s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 14s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:red}-1{color} | {color:red} mvninstall {color} | {color:red}  2m 40s{color} | {color:red} root in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} compile {color} | {color:red}  0m 54s{color} | {color:red} hbase-server in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} javac {color} | {color:red}  0m 54s{color} | {color:red} hbase-server in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 29s{color} | {color:green} The patch hbase-common passed checkstyle {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 35s{color} | {color:green} The patch hbase-client passed checkstyle {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 23s{color} | {color:green} hbase-server: The patch generated 0 new + 826 unchanged - 7 fixed = 826 total (was 833) {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 18s{color} | {color:green} The patch hbase-mapreduce passed checkstyle {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:red}-1{color} | {color:red} shadedjars {color} | {color:red}  3m 48s{color} | {color:red} patch has 40 errors when building our shaded downstream artifacts. {color} |
+| {color:red}-1{color} | {color:red} hadoopcheck {color} | {color:red}  5m 53s{color} | {color:red} The patch causes 40 errors with Hadoop v2.6.5. {color} |
+| {color:red}-1{color} | {color:red} hadoopcheck {color} | {color:red}  7m 57s{color} | {color:red} The patch causes 40 errors with Hadoop v2.7.4. {color} |
+| {color:red}-1{color} | {color:red} hadoopcheck {color} | {color:red} 10m  5s{color} | {color:red} The patch causes 40 errors with Hadoop v3.0.0. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 34s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  2m 27s{color} | {color:green} hbase-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  3m  7s{color} | {color:green} hbase-client in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}  0m 51s{color} | {color:red} hbase-server in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 39m 10s{color} | {color:red} hbase-mapreduce in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 49s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 84m 34s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hbase.mapred.TestTableOutputFormatConnectionExhaust |
+|   | hadoop.hbase.snapshot.TestMobSecureExportSnapshot |
+|   | hadoop.hbase.mapreduce.TestTableInputFormat |
+|   | hadoop.hbase.mapreduce.TestTableInputFormatScan1 |
+|   | hadoop.hbase.mapreduce.TestCopyTable |
+|   | hadoop.hbase.mapreduce.TestTimeRangeMapRed |
+|   | hadoop.hbase.snapshot.TestExportSnapshot |
+|   | hadoop.hbase.snapshot.TestMobExportSnapshot |
+|   | hadoop.hbase.mapreduce.TestTableInputFormatScan2 |
+|   | hadoop.hbase.snapshot.TestSecureExportSnapshot |
+|   | hadoop.hbase.mapreduce.TestMultiTableSnapshotInputFormat |
+|   | hadoop.hbase.mapreduce.TestHRegionPartitioner |
+|   | hadoop.hbase.mapred.TestTableMapReduce |
+|   | hadoop.hbase.mapred.TestTableMapReduceUtil |
+|   | hadoop.hbase.mapreduce.TestImportTSVWithVisibilityLabels |
+|   | hadoop.hbase.mapreduce.TestHFileOutputFormat2 |
+|   | hadoop.hbase.mapreduce.TestImportExport |
+|   | hadoop.hbase.mapred.TestTableInputFormat |
+|   | hadoop.hbase.replication.TestVerifyReplication |
+|   | hadoop.hbase.mapred.TestMultiTableSnapshotInputFormat |
+|   | hadoop.hbase.mapreduce.TestMultiTableInputFormat |
+|   | hadoop.hbase.mapreduce.TestImportTSVWithTTLs |
+|   | hadoop.hbase.mapreduce.TestRowCounter |
+|   | hadoop.hbase.mapreduce.TestSyncTable |
+|   | hadoop.hbase.mapreduce.TestTableMapReduce |
+|   | hadoop.hbase.mapreduce.TestWALPlayer |
+|   | hadoop.hbase.mapreduce.TestHashTable |
+|   | hadoop.hbase.mapreduce.TestImportTSVWithOperationAttributes |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hbase:eee3b01 |
+| JIRA Issue | HBASE-18294 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12907355/HBASE-18294.01.patch |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  shadedjars  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux 285f270618e4 3.13.0-133-generic #182-Ubuntu SMP Tue Sep 19 15:49:21 UTC 2017 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build@2/component/dev-support/hbase-personality.sh |
+| git revision | master / 0b6422658c |
+| maven | version: Apache Maven 3.5.2 (138edd61fd100ec658bfa2d307c43b76940a5d7d; 2017-10-18T07:58:13Z) |
+| Default Java | 1.8.0_151 |
+| mvninstall | https://builds.apache.org/job/PreCommit-HBASE-Build/11180/artifact/patchprocess/patch-mvninstall-root.txt |
+| compile | https://builds.apache.org/job/PreCommit-HBASE-Build/11180/artifact/patchprocess/patch-compile-hbase-server.txt |
+| javac | https://builds.apache.org/job/PreCommit-HBASE-Build/11180/artifact/patchprocess/patch-compile-hbase-server.txt |
+| unit | https://builds.apache.org/job/PreCommit-HBASE-Build/11180/artifact/patchprocess/patch-unit-hbase-server.txt |
+| unit | https://builds.apache.org/job/PreCommit-HBASE-Build/11180/artifact/patchprocess/patch-unit-hbase-mapreduce.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/11180/testReport/ |
+| modules | C: hbase-common hbase-client hbase-server hbase-mapreduce U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/11180/console |
+| Powered by | Apache Yetus 0.6.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 26s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:blue}0{color} | {color:blue} findbugs {color} | {color:blue}  0m  1s{color} | {color:blue} Findbugs executables are not available. {color} |
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green}  0m  0s{color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 17 new or modified test files. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 27s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  5m 58s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 52s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  2m 32s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  7m 24s{color} | {color:green} branch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 19s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 13s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  4m 48s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 40s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  1m 40s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 25s{color} | {color:green} The patch hbase-common passed checkstyle {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 29s{color} | {color:green} The patch hbase-client passed checkstyle {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 14s{color} | {color:green} hbase-server: The patch generated 0 new + 826 unchanged - 7 fixed = 826 total (was 833) {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 17s{color} | {color:green} The patch hbase-mapreduce passed checkstyle {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  4m 36s{color} | {color:green} patch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green} 19m 26s{color} | {color:green} Patch does not cause any errors with Hadoop 2.6.5 2.7.4 or 3.0.0. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 16s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  2m 13s{color} | {color:green} hbase-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  2m 41s{color} | {color:green} hbase-client in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}101m 13s{color} | {color:red} hbase-server in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 12m 15s{color} | {color:green} hbase-mapreduce in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  1m 12s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}167m 34s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hbase.client.TestClientPushback |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hbase:eee3b01 |
+| JIRA Issue | HBASE-18294 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12907481/HBASE-18294.01.patch |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  shadedjars  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux 692927baf076 3.13.0-133-generic #182-Ubuntu SMP Tue Sep 19 15:49:21 UTC 2017 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build/component/dev-support/hbase-personality.sh |
+| git revision | master / 0b6422658c |
+| maven | version: Apache Maven 3.5.2 (138edd61fd100ec658bfa2d307c43b76940a5d7d; 2017-10-18T07:58:13Z) |
+| Default Java | 1.8.0_151 |
+| unit | https://builds.apache.org/job/PreCommit-HBASE-Build/11183/artifact/patchprocess/patch-unit-hbase-server.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/11183/testReport/ |
+| modules | C: hbase-common hbase-client hbase-server hbase-mapreduce U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/11183/console |
+| Powered by | Apache Yetus 0.6.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+[~anoop.hbase] when you get a chance sir, take a look at this one. Thanks.
+
+The failed test passes on my machine.
+
+So indeed any additional feedback would be valuable before we commit this.
+
+Thanks.
+
+[~eshcar] Looks like there is a blocking item up on rb....from our Anoop?
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m  0s{color} | {color:blue} Docker mode activated. {color} |
+| {color:red}-1{color} | {color:red} patch {color} | {color:red}  0m  4s{color} | {color:red} HBASE-18294 does not apply to master. Rebase required? Wrong Branch? See https://yetus.apache.org/documentation/0.7.0/precommit-patchnames for help. {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| JIRA Issue | HBASE-18294 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12908873/HBASE-18294.01.patch |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/11345/console |
+| Powered by | Apache Yetus 0.7.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Here is my response from RB regarding the change in HCD
+
+In the new implementation we compare on-heap size against on-heap threshold and off-heap size against off-heap threshold. Exceeding one of these two thresholds triggers a flush. If we only consider one unified threshold for on- and off-heap data we can get OOME.
+For example, consider an off-heap cluster with 96GB memory machines, and assume in each machine 90GB are allocated to off-heap data and 6GB are allocated to on-heap objects. Assume we manage 700 regions per RS, and the flush size is 128MB. It only requires 46 regions to get to 128MB on-heap or for all regions to exceed 8.5MB(!) on-heap to get an OOME.
+Therefore I think giving the user an optional(!) control on the flush size both for on-heap and off-heap sizes is essential. And they both fall back on default value so they are both optional and may not be an unnecessary burden on the user.
+
+ 
+
+I also see I need to re-base my patch. Waiting for review comments to create my next patch.
+
+I second [~eshcar]. Off-heap and on-heap memory are different resources, with potentially very different allocations within the same machine. The code already addresses them separately all the way long. The user does need this (optional) design knob.  
+
+[~eshcar] 
+
+How about we conside the RAM of the Memstore as a whole? We don't need to care this RAM is used by On-Heap or Off-Heap or both. What about we care is this RAM's water. Do flush when it access the Low Mark, Do blocking when access High Mark. Especially, when the memStore is self-managed memory, And in the furture this RAM maybe be used by diff memStores at same time (DefaultMemsotre and as SelfManageMemoryMemstore ).
+
+I would generally agree with your approach [~chancelq] - simple abstraction are usually the right way to go. However, the user controls the sizes of memory allocated on-heap and off-heap and if we are not care to respect both limits we may end up crossing one of them and getting OOME even if the "global" memory is not exhausted.
+
+Specifically, you can review the discussion from December 28 above.
+
+[~eshcar] The store will known the detail about the on-heap/off-heap/data size, it's strategy. The RegionServerAccounting not need to do this. I mean not all the memStore need to count data-size,on-heap size,off-heap size both. so it's not need to do in RegionServerAccounting, but in the store. 
+now the store's memstore can be on-heap or offheap or both, LAB or not, chunkPool or not, include CellArrayMap and CellChunkMap, And new CCSLM (self-managed memory Memstore, it's have not any over-heap).
+
+[~eshcar], [~anoop.hbase], [~ram_krish], maybe we can take the following approach to your dispute on RB. 
+
+The code makes the following config variable definitions: 
+{code:java}
+public static final String HREGION_MEMSTORE_FLUSH_SIZE =
+
+      "hbase.hregion.memstore.flush.size";
+ 
+public static final String HREGION_MEMSTORE_OFFHEAP_FLUSH_SIZE =
+      "hbase.hregion.memstore.offheap.flush.size";{code}
+The former is the legacy flush size threshold, whereas the latter is new. However, the further treatment is different - HREGION_MEMORY_FLUSH_SIZE is actually treated as *on-heap* threshold. This is confusing I guess - especially for admins. 
+
+Having said that, we do need separate accounting for on-heap and off-heap memory, as [~eshcar] explained above. Let me suggest a change that is more digestible for users imo. Let HREGION_MEMORY_FLUSH_SIZE retain its legacy meaning (and the 128M default) - namely, the overall max memory the system is willing to allocate for a store. Furthermore, let's define a new variable, HREGION_MEMSTORE_OFFHEAP_SIZE_RATIO, to define a fraction of the former that can be allocated offheap (0, by default). 
+
+How about that? 
+
+ 
+
+ 
+
+Hi All,
+
+Just want to add my 2 cents here. I believe that surely we should have an answer to OOME that is possible when working with majority of memory off-heap and some little on-heap. That can be answered with two on/off-heap-limit-flush-size counters as Eshcar suggested or something calculated as Eddie suggested. But we must give an answer to this problem. [~anoop.hbase], [~ram_krish] if you do not want MemStoreOffHeapFlushSize to be part of the description, then how do you suggest to resolve OOME having only one MemStoreFlushSize? We didn't hear from you for a while, please tell us what is your current opinion.
+
+Secondly, [~chancelq], where can I read more about self-managed memory Memstore? I am not aware about that. If you can explain it shortly, it will be very appreciated!
+
+Thanks,
+
+Anastasia
+
+ 
+
+Oh! And in my opinion adding MemStoreOffHeapFlushSize to be part of the description, while supported by good default (so it should almost never been changed by user) is an acceptable solution.
+
+[~anastas]
+
+Accutally, It's not a new thing. All cells in memstore will be put in a self-managed and contiguous RAM(on or off heap), with necessary meta(index) which physically co-locate the cell data. no overhead.
+
+I m new one , and trying to get your opinions.
+IMO the memory management of RS(RegionServerAccounting) need to be abstractly, which duty is only protecting the RAM(whatever on/off heap) overflow. This will be more clearly and efficiently. And the store(memstore) will have different rules to handle the size(on heap size or off heap size or overhead size or any combination of these sizes), And it's duty is avoiding flush small files.
+
+There have a little bad code smell when adding a new module.
+
+Just forget off heap usage and consider only on heap.
+For the flush decisions what we have now is per region flush decision making and globally forced flushes.  Per region we have 128 MB size threshold. When reaching this size, the region will initiate a flush. When the flush actually happens, the size may be more that this threshold. We wont block the writes once we decide to flush this region. By default we allow the region size to be 4x of this flush size. If the flushes are too slow, chances that the actual size of the region reaches this 4x mark and we will reject even writes. And all these sizes are heap sizes of memstore. So not just the cell data sizes (the size of key, values) but also the heap overhead because of the Cell pojos and other overhead because of entries into CSLM.
+
+The other decision making is globally at RS level. We have a water mark which defaults to 40% of heap size for all of the memstores. This is basically to avoid the OOME. Per region level we have flush decision but there may be more number of memstores in RS depending on the present number of regions/stores. Also the region level flush marker is not a hard marker. We allow the size to grow much larger and all matters is the IO speed of the cluster.   When the RS reaches this water mark, we will block writes and select some regions for the flush and do force flushes. This will make sure that the global memstore size is under control. And this is obviously heap size check.
+
+Now when we have off heap also in the picture and allow the cell data to be in off heap area, there has to be more consideration.  We have to continue with the per region level flush decisions. Also we should make sure that there wont be OOME from on heap side or off heap side. Right now we have a config to specify the off heap barrier for all memstore sizes. The off heap size occupied by all memstores. This is needed any way and seems no question on that.  Also we will have to have the old on heap barrier check (def to 40% of Xmx).. Because for memstores, there will be on heap usage for sure such as the Cell POJO overhead , CSLM entries etc etc.  That is why this check is if any of the size breach happens, we will do writes blocking and fdo forced flushes.
+For region level flushes, right now the 128 MB size check is against data size alone. We wont consider the overhead. This raised some Qs and backward behaviour consistency issues. So the general agreement we made is for on heap cases, we must continue to check for 128 MB limit against the memstore heap size. Not just data size.  Also we have agreed that for off heap also, we will consider the off heap size + heap overhead.  So the region level decision making is consistent for both on heap and off heap cases. Ideally checking the data size alone here would have been the best way. I mean for any decision per region level.
+Also there was a concern raised how we select region(s) for flushing because of global size breach. When the size breach is because of off heap size, we have to select regions having maximum data size and when breach because of on heap size limit, select the regions with more heap overhead.
+
+[~anoop.hbase]
+{quote} the general agreement we made is for on heap cases, we must continue to check for 128 MB limit against the memstore heap size. Not just data size. Also we have agreed that for off heap also, we will consider the off heap size + heap overhead.
+{quote}
+From the beginning I aimed to have as symmetric behavior as possible of on-heap and off-heap cases, so I don't believe I agreed on having two different computations. One way to make it symmetric is to compare the two counters against two thresholds. Another way to unify it is to always consider the sum of off-heap and on-heap sizes at the region level. We still need to manage two separate counters since the global bounds are different.
+bq.  Ideally checking the data size alone here would have been the best way. I mean for any decision per region level.
+You keep saying that but it seems to be based more on intuition rather than on experiments. While considering both data and heap overhead for region level flush have shown to improve the performance significantly.
+bq.When the size breach is because of off heap size, we have to select regions having maximum data size and when breach because of on heap size limit, select the regions with more heap overhead.
+Again, Why? you say we should have different decision making but you don't explain why, and don't have numbers to support your claims.
+I argue that unless shown there is a great performance benefit in making different rules, on-heap and off heap should follow the same set of rules, embedding them with their respective bounds.
+
+So, I will make a new patch, leave only one flush size configuration property (remove off-heap flush size), flush size at the region level will always consider on-heap+off-heap size. The rest will be similar to the current patch.
+Patch will be ready in a few days.
+
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 10s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:blue}0{color} | {color:blue} findbugs {color} | {color:blue}  0m  1s{color} | {color:blue} Findbugs executables are not available. {color} |
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green}  0m  0s{color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 17 new or modified test files. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 13s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  4m 34s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 52s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  2m 32s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  7m 15s{color} | {color:green} branch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 17s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 14s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  4m 21s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 37s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  1m 37s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red}  1m 17s{color} | {color:red} hbase-server: The patch generated 1 new + 806 unchanged - 7 fixed = 807 total (was 813) {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  4m 41s{color} | {color:green} patch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green} 18m 44s{color} | {color:green} Patch does not cause any errors with Hadoop 2.6.5 2.7.4 or 3.0.0. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 23s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  2m 16s{color} | {color:green} hbase-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  2m 55s{color} | {color:green} hbase-client in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 18m 59s{color} | {color:red} hbase-server in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 11m 57s{color} | {color:green} hbase-mapreduce in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 51s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 81m 45s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hbase.io.TestHeapSize |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hbase:eee3b01 |
+| JIRA Issue | HBASE-18294 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12910086/HBASE-18294.01.patch |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  shadedjars  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux 9a0ed54552aa 3.13.0-133-generic #182-Ubuntu SMP Tue Sep 19 15:49:21 UTC 2017 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build@2/component/dev-support/hbase-personality.sh |
+| git revision | master / 0593dda663 |
+| maven | version: Apache Maven 3.5.2 (138edd61fd100ec658bfa2d307c43b76940a5d7d; 2017-10-18T07:58:13Z) |
+| Default Java | 1.8.0_151 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HBASE-Build/11482/artifact/patchprocess/diff-checkstyle-hbase-server.txt |
+| unit | https://builds.apache.org/job/PreCommit-HBASE-Build/11482/artifact/patchprocess/patch-unit-hbase-server.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/11482/testReport/ |
+| Max. process+thread count | 4602 (vs. ulimit of 10000) |
+| modules | C: hbase-common hbase-client hbase-server hbase-mapreduce U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/11482/console |
+| Powered by | Apache Yetus 0.7.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  2m 24s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:blue}0{color} | {color:blue} findbugs {color} | {color:blue}  0m  0s{color} | {color:blue} Findbugs executables are not available. {color} |
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green}  0m  0s{color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 17 new or modified test files. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 13s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  5m  8s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  2m  6s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  2m 48s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  8m  7s{color} | {color:green} branch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 32s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 14s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  5m 25s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  2m 14s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  2m 14s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 34s{color} | {color:green} The patch hbase-common passed checkstyle {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 35s{color} | {color:green} The patch hbase-client passed checkstyle {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 25s{color} | {color:green} hbase-server: The patch generated 0 new + 806 unchanged - 7 fixed = 806 total (was 813) {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 22s{color} | {color:green} The patch hbase-mapreduce passed checkstyle {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  5m 34s{color} | {color:green} patch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green} 21m 36s{color} | {color:green} Patch does not cause any errors with Hadoop 2.6.5 2.7.4 or 3.0.0. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 39s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  2m 29s{color} | {color:green} hbase-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  3m  3s{color} | {color:green} hbase-client in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 99m 11s{color} | {color:red} hbase-server in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 11m 34s{color} | {color:green} hbase-mapreduce in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  1m 18s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}171m 58s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hbase.client.TestClientPushback |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hbase:eee3b01 |
+| JIRA Issue | HBASE-18294 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12910092/HBASE-18294.01.patch |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  shadedjars  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux 0871c058bac7 3.13.0-133-generic #182-Ubuntu SMP Tue Sep 19 15:49:21 UTC 2017 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build/component/dev-support/hbase-personality.sh |
+| git revision | master / 0593dda663 |
+| maven | version: Apache Maven 3.5.2 (138edd61fd100ec658bfa2d307c43b76940a5d7d; 2017-10-18T07:58:13Z) |
+| Default Java | 1.8.0_151 |
+| unit | https://builds.apache.org/job/PreCommit-HBASE-Build/11485/artifact/patchprocess/patch-unit-hbase-server.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/11485/testReport/ |
+| Max. process+thread count | 5181 (vs. ulimit of 10000) |
+| modules | C: hbase-common hbase-client hbase-server hbase-mapreduce U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/11485/console |
+| Powered by | Apache Yetus 0.7.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+TestClientPushback is a flaky test, sometimes passes sometimes fails; I am not sure if its failure is related to this patch.
+
+In the test the load of the region is calculated by asking the region for its heap size, and there is a comment above the calculation saying {color:#808080}"get the current load on RS. Hopefully memstore isn't flushed since we wrote the the data"{color} {color:#333333}(Hopefully ??!?), then this load is compared against the stats returned from the server and if they are not equal the test fails. The comment says "{color}{color:#808080}check to see we found some load on the memstore"{color}{color:#333333}  I guess it was meant to be "same load" but in some cases a flush causes the difference.{color}{color:#808080}
+{color}
+
+{color:#333333}It could be that due to this patch the memstore is flushed earlier than before and so the test fails more frequently, but it seems to be unreasonable to *hope* for no flush during the test.{color}
+
+{color:#333333}My solution was simply to double the flush size for this test. Any other more elegant suggestions for handling this?{color}
+
+| (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 10s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:blue}0{color} | {color:blue} findbugs {color} | {color:blue}  0m  0s{color} | {color:blue} Findbugs executables are not available. {color} |
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green}  0m  0s{color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 17 new or modified test files. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 13s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  4m 30s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 45s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  2m 26s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  7m 20s{color} | {color:green} branch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 38s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 14s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  5m 34s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 52s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  1m 52s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 28s{color} | {color:green} The patch hbase-common passed checkstyle {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 30s{color} | {color:green} The patch hbase-client passed checkstyle {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 24s{color} | {color:green} hbase-server: The patch generated 0 new + 806 unchanged - 7 fixed = 806 total (was 813) {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 19s{color} | {color:green} The patch hbase-mapreduce passed checkstyle {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  5m 14s{color} | {color:green} patch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green} 21m 44s{color} | {color:green} Patch does not cause any errors with Hadoop 2.6.5 2.7.4 or 3.0.0. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 37s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  2m 39s{color} | {color:green} hbase-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  3m 29s{color} | {color:green} hbase-client in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}112m 19s{color} | {color:green} hbase-server in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 11m 29s{color} | {color:green} hbase-mapreduce in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  1m 19s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}181m 21s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hbase:eee3b01 |
+| JIRA Issue | HBASE-18294 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12910125/HBASE-18294.01.patch |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  shadedjars  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux 4459deb8a78f 3.13.0-133-generic #182-Ubuntu SMP Tue Sep 19 15:49:21 UTC 2017 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build/component/dev-support/hbase-personality.sh |
+| git revision | master / 0593dda663 |
+| maven | version: Apache Maven 3.5.2 (138edd61fd100ec658bfa2d307c43b76940a5d7d; 2017-10-18T07:58:13Z) |
+| Default Java | 1.8.0_151 |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/11487/testReport/ |
+| Max. process+thread count | 4930 (vs. ulimit of 10000) |
+| modules | C: hbase-common hbase-client hbase-server hbase-mapreduce U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/11487/console |
+| Powered by | Apache Yetus 0.7.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+QA passed. Any additional comments on the code?
+
+I plan to commit this tomorrow.
+
+bq.You keep saying that but it seems to be based more on intuition rather than on experiments. While considering both data and heap overhead for region level flush have shown to improve the performance significantly.
+This said considering as a normal user. If I say 100 MB flush size, I would expect the flush will happen when there is a 100 MB data accumulation. Not on perf aspect. I never said when considering data size alone perf will be more. Again on perf why it is less when the decision making is based on data size alone - It is because of the more global data size breaches. That is like a blocking situation and forced flushes with all writes blocked. This can be well tuned. Either increase the global size available for all memstores or reduce the per region flush. All these points we discussed earlier in the old jiras. But I agree on existing clusters this can be a trouble. That is why we agreed to go back to old way.  So the above statement is not wrt perf.
+bq.Again, Why? you say we should have different decision making but you don't explain why, and don't have numbers to support your claims.
+This you only said in one older comments. I forgot where exactly.  That right now, when there is a breach because of data size or heap size, we tend to select region with max data size only. Ideally when heap size (overhead) based breach is there, better to select region having max heap occupancy (overhead)..  I agreed to your point at that time itself. Now seems you no longer agree to that?
+bq.So, I will make a new patch, leave only one flush size configuration property (remove off-heap flush size), flush size at the region level will always consider on-heap+off-heap size
+Ya we agreed to this in a general level. And in old patches again the off heap based region flush config came in. That is why I asked immediately then.
+
+I have updated the release notes, please see if this addresses your concern #1.
+
+Regarding concern #2: my intention across the patch was to have symmetric decision making for on-heap and off-heap cases. Please let me know if you find any inconsistency in the code so I can fix it. (code is in RB)
+
+Nice release note [~eshcar].
+
+bq. (2) A region is flushed when its on-heap+off-heap size exceeds the region flush threshold, 
+
+If the offheap is 100x the onheap in size, and the threshold is set to offheap (100x) + onheap (1x) -- i.e. 101x -- then what happens when the onheap occupancy exceeds 1x?
+
+Left feedback on RB. Thanks.
+
+On release note, named the configs to set?
+
+On the patch, couldn't the memstoreSize change... between leaving the synchronize block and going in here to do the check?
+
+checkNegativeMemStoreDataSize(size, -memStoreSize.getDataSize());
+
+Copy the datasize to a local variable inside the sync block?
+
+Or nvm... I see that we are passing in the passed-in param, not the data member content. In that case, its confusing have param same name as a data member. Can lead to confusion.
+
+We are doing this...
+
+1263	  public long getMemStoreDataSize() {
+1264	    return memStoreSize.getDataSize();
+1265	  }
+
+.. w/o a synchronize. Should there be one? ... Hmm... No, it should be ok. It is a volatile read. Ignore.
+
+Interesting, so looking for best region to flush, we'll do data size...
+
+176	        (regionToFlush != null && regionToFlush.getMemStoreDataSize() > 0) ||
+177	        (bestRegionReplica != null && bestRegionReplica.getMemStoreDataSize() > 0));
+
+
+The data size accounting is just a nice-to-have in the scheme of things? (A vestige held over from the back and forth here).
+
+This is right?
+
+91	  long getMemStoreSize() {
+92	    return region.getMemStoreSize();	92	    return region.getMemStoreDataSize();
+
+... i.e. returing data size when we ask for memstoresize? (We also have a getMemStoreDataSize ...)
+
+Did a pass. Looks good to me.
+
+
+
+
+
+bq.If the offheap is 100x the onheap in size, and the threshold is set to offheap (100x) + onheap (1x) – i.e. 101x – then what happens when the onheap occupancy exceeds 1x?
+This is about the per region flush decision boss.  Correct me if wrong [~eshcar].   Globally the decision should be with ||.  We have barrier  for off heap and on heap memory and when any of the barrier is about to be crossed, it will result in forced flushes.
+
+bq. Globally the decision should be with ||. We have barrier for off heap and on heap memory and when any of the barrier is about to be crossed, it will result in forced flushes.
+
+That sounds good. I did not get that from reading the release note (Yeah, add names of configs to toggle to Release Note).
+
+I'm good w/ this. You [~anoop.hbase] ?
+
+
+
+
+Stack the barriers for the RS (global) level are more complicated than just a single configuration property. It is some computation over parameters defined by
+ {color:#008000}hbase.regionserver.global.memstore.size{color}
+ {color:#008000}hbase.regionserver.global.memstore.size.lower.limit{color}
+ {color:#008000}hbase.regionserver.offheap.global.memstore.size{color}
+ DEFAULT_MEMSTORE_SIZE
+ DEFAULT_MEMSTORE_SIZE_LOWER_LIMIT
+ and some settings from hbase-env.sh
+
+I think it deserves a separate documentation since this Jira did not change the barriers computation but what we compare against them.
+
+Regarding the comments on the code I changed the implementation of getMemStoreSize to return region.getMemStoreDataSize() since that what was eventually returned in the previous implementation. I then went and changed the call from getMemStoreSize to getMemStoreOnHeapSize or getMemStoreOffHeapSize based on what I though appropriate for the case.
+
+If all is ok, I will commit later today.
+
+bq. I think it deserves a separate documentation since this Jira did not change the barriers computation but what we compare against them.
+
+Ok.
+
+bq. If all is ok, I will commit later today.
+
+Sounds good to me.
+
+Following a comment by Anoop on RB I made some additional changes. Specifically propagating the flush type which is the result of the global pressure checks to the MemStoreFlusher deciding which region to flush. This allows choosing the region based on its on/off heap size w.r.t. the global heap pressure triggering the flush.
+
+I think this also answers an earlier question by stack regarding the code in the MemStoreFlusher.
+
+Anoop the data size tracking at the RS is redundant as you suggested, but since it is already used in several tests I prefer to keep it.
+
+Let's see how QA ends up.
+
+ 
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 19s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:blue}0{color} | {color:blue} findbugs {color} | {color:blue}  0m  0s{color} | {color:blue} Findbugs executables are not available. {color} |
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green}  0m  0s{color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 17 new or modified test files. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 14s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  5m  0s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  2m  4s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  2m 48s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  8m 28s{color} | {color:green} branch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 43s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 16s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  5m  6s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  2m  8s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  2m  8s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red}  1m 40s{color} | {color:red} hbase-server: The patch generated 30 new + 807 unchanged - 7 fixed = 837 total (was 814) {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  5m 14s{color} | {color:green} patch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green} 18m 53s{color} | {color:green} Patch does not cause any errors with Hadoop 2.6.5 2.7.4 or 3.0.0. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 17s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  2m 17s{color} | {color:green} hbase-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  2m 54s{color} | {color:green} hbase-client in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}109m 49s{color} | {color:red} hbase-server in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 14m 18s{color} | {color:green} hbase-mapreduce in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  1m 31s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}180m 25s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hbase.client.TestSizeFailures |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hbase:eee3b01 |
+| JIRA Issue | HBASE-18294 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12910610/HBASE-18294.01.patch |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  shadedjars  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux e50ddc190aa4 3.13.0-139-generic #188-Ubuntu SMP Tue Jan 9 14:43:09 UTC 2018 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build/component/dev-support/hbase-personality.sh |
+| git revision | master / 8d26736bc2 |
+| maven | version: Apache Maven 3.5.2 (138edd61fd100ec658bfa2d307c43b76940a5d7d; 2017-10-18T07:58:13Z) |
+| Default Java | 1.8.0_151 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HBASE-Build/11526/artifact/patchprocess/diff-checkstyle-hbase-server.txt |
+| unit | https://builds.apache.org/job/PreCommit-HBASE-Build/11526/artifact/patchprocess/patch-unit-hbase-server.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/11526/testReport/ |
+| Max. process+thread count | 4989 (vs. ulimit of 10000) |
+| modules | C: hbase-common hbase-client hbase-server hbase-mapreduce U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/11526/console |
+| Powered by | Apache Yetus 0.7.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+bq. Anoop the data size tracking at the RS is redundant as you suggested, but since it is already used in several tests I prefer to keep it.
+
+[~eshcar] Fix test on commit? And add comment on above that it is redundant and could be removed also on commit?  Thanks boss.
+
+
+| (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 16s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:blue}0{color} | {color:blue} findbugs {color} | {color:blue}  0m  0s{color} | {color:blue} Findbugs executables are not available. {color} |
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green}  0m  0s{color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 18 new or modified test files. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 13s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  4m 37s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 52s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  2m 31s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  7m 22s{color} | {color:green} branch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 22s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 14s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  4m 35s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 52s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  1m 52s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 28s{color} | {color:green} The patch hbase-common passed checkstyle {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 30s{color} | {color:green} The patch hbase-client passed checkstyle {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 20s{color} | {color:green} hbase-server: The patch generated 0 new + 805 unchanged - 9 fixed = 805 total (was 814) {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 17s{color} | {color:green} The patch hbase-mapreduce passed checkstyle {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  4m 54s{color} | {color:green} patch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green} 19m  1s{color} | {color:green} Patch does not cause any errors with Hadoop 2.6.5 2.7.4 or 3.0.0. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 23s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  2m 33s{color} | {color:green} hbase-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  3m 26s{color} | {color:green} hbase-client in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}118m 45s{color} | {color:green} hbase-server in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 12m 23s{color} | {color:green} hbase-mapreduce in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  1m 29s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}184m 41s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hbase:eee3b01 |
+| JIRA Issue | HBASE-18294 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12910757/HBASE-18294.01.patch |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  shadedjars  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux 6c35054b83dd 3.13.0-139-generic #188-Ubuntu SMP Tue Jan 9 14:43:09 UTC 2018 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build@2/component/dev-support/hbase-personality.sh |
+| git revision | master / 50c705dad9 |
+| maven | version: Apache Maven 3.5.2 (138edd61fd100ec658bfa2d307c43b76940a5d7d; 2017-10-18T07:58:13Z) |
+| Default Java | 1.8.0_151 |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/11540/testReport/ |
+| Max. process+thread count | 4749 (vs. ulimit of 10000) |
+| modules | C: hbase-common hbase-client hbase-server hbase-mapreduce U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/11540/console |
+| Powered by | Apache Yetus 0.7.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m  0s{color} | {color:blue} Docker mode activated. {color} |
+| {color:red}-1{color} | {color:red} patch {color} | {color:red}  0m  6s{color} | {color:red} HBASE-18294 does not apply to branch-2. Rebase required? Wrong Branch? See https://yetus.apache.org/documentation/0.7.0/precommit-patchnames for help. {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| JIRA Issue | HBASE-18294 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12911057/HBASE-18294.branch-2.01.patch |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/11562/console |
+| Powered by | Apache Yetus 0.7.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+FAILURE: Integrated in Jenkins build HBase-Trunk_matrix #4605 (See [https://builds.apache.org/job/HBase-Trunk_matrix/4605/])
+HBASE-18294 Reduce global heap pressure: flush based on heap occupancy (eshcar: rev f3bb9b9613beaefbee0a53be1fb66b94fde1ce19)
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/StoreScanner.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreLAB.java
+* (edit) hbase-client/src/main/java/org/apache/hadoop/hbase/client/Mutation.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MetricsTableWrapperAggregateImpl.java
+* (edit) hbase-client/src/main/java/org/apache/hadoop/hbase/client/Result.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestClientPushback.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestCompactingToCellFlatMapMemStore.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreSizing.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/ImmutableSegment.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/wal/WALEdit.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/AbstractMemStore.java
+* (edit) hbase-client/src/main/java/org/apache/hadoop/hbase/client/ConnectionUtils.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/TestServerSideScanMetricsFromClientSide.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestPerColumnFamilyFlush.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/ImmutableMemStoreLAB.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreFlusher.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestCompactingMemStore.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestSizeFailures.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/TestPartialResultsFromClientSide.java
+* (edit) hbase-common/src/main/java/org/apache/hadoop/hbase/ByteBufferKeyValue.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CompactionPipeline.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CellArrayImmutableSegment.java
+* (edit) hbase-common/src/main/java/org/apache/hadoop/hbase/CellUtil.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestRegionServerAccounting.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestAsyncRegionAdminApi.java
+* (edit) hbase-mapreduce/src/main/java/org/apache/hadoop/hbase/util/MapReduceExtendedCell.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RegionServerAccounting.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/HFileBlockIndex.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CompositeImmutableSegment.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/coprocessor/TestNegativeMemStoreSizeWithSlowCoprocessor.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestHRegionReplayEvents.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestHRegion.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestWalAndCompactingMemStoreFlush.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/Region.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MutableSegment.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestWALLockup.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreSnapshot.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreSize.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/DefaultMemStore.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HStore.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/FlushLargeStoresPolicy.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RegionServicesForStores.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestHStore.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestFlushFromClient.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/Segment.java
+* (edit) hbase-common/src/main/java/org/apache/hadoop/hbase/PrivateCellUtil.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CompactingMemStore.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/FlushAllLargeStoresPolicy.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/FlushNonSloppyStoresFirstPolicy.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestEndToEndSplitTransaction.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CSLMImmutableSegment.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/MemStoreLABImpl.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/CellChunkImmutableSegment.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/TestGlobalMemStoreSize.java
+
+
+Pushed to master and branch-2.
+
+No test failures on master (still waiting for Hudson report on branch-2).
+
+Thanks all for the comments and feedback.
+

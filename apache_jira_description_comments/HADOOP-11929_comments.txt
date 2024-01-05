@@ -1,0 +1,581 @@
+All we really need to do is move the if exists check into a postcheckout plugin.  The folks can replace the plugin as needed. 
+
+there was some additional hackery I had to do, let me find my WIP patch
+
+it was postapply. I had to move plugin postapply to before the post-apply javac checks (because apply needed to be done at the top level).
+
+Oh wait, I have another outstanding local change that adds arguments for maven. I could then in postcheckout add to the args {{--file}} and that would probably work?
+
+Doesn't setting MAVEN_OPTS let you pass --file already?
+
+In any case, I'm surprised the preapply javac/javadoc checks don't blow up.  But I suppose we really don't have much of a choice here but to have a "maven starts here" kind of env var to use for all those places where it's assumed that BASEDIR is where maven starts.  I don't think plugins are the way to go here since it's pretty intrinsic to all kinds of things.  Command line option makes more sense to me since it's pretty core.  
+
+But let me go through the code once more and double check my thinking on this one.
+
+maybe? MAVEN_OPTS didn't allow setting --offline, so I wouldn't be surprised if --file didn't work either.
+
+I had to do it as a plugin and not a cli arg because for NIFI it varies based on what the patch touches. (if you're curious, it's [in a feature branch for NIFI in my forked repo|https://github.com/busbey/incubator-nifi/blob/NIFI-577/dev-support/test-patch.d/nifi-setup.sh#L23])
+
+This is really starting to feel like we're trying to work around not having a multi-module maven setup when multi-module maven is probably the thing to do.
+
+it's really that they should probably have multiple git repositories.
+
+like, how would we deal with the "Maven Parent Poms" project? [their svn repo is similarly laid out|http://svn.apache.org/repos/asf/maven/pom/trunk/]. Maybe I should just make a different build job for each of the components that shares a repo?
+
+Actually, we need to move this logic:
+
+https://github.com/apache/hadoop/blob/trunk/dev-support/test-patch.sh#L1946
+
+to be a plugin.  (It's always been a code smell to me, but I knew it wouldn't impact anyone else...)
+
+I have a suspicion that's very similar to what you're trying to accomplish in the NiFi plugin.  
+
+OK, how does this sound:
+
+* need the ability to specify "pom.xml files (must) exist in these directories", otherwise checkout is incompatible
+* before you run maven in directory x, make sure to also run maven in directory y
+
+I think this is a special type of plugin, not using the existing plugin system.  They can still live in testpatch.d though.  I need to noodle on this more.
+
+yeah that sounds reasonable. NiFi doesn't always need to build those other components, but they're both super fast to build and shouldn't change most of the time.
+
+[~busbey] and I had a chat about this at the Bug Bash.  Here's the proposal:
+
+* Introduce the concept of a 'personality module'.
+* There can be only *one* personality.
+* Personalities provide a single function that takes as input the name of the test current being processed
+* This function uses two other built-in functions to define two queues:  maven module name and profiles to use against those maven module names
+* If something needs to be compiled prior to this test (but not actually tested), the personality will be responsible for doing that compilation
+
+In hadoop, the classic example is hadoop-hdfs needs common compiled with the native bits.  So prior to the javac tests, the personality would check CHANGED_MODULES, see hadoop-hdfs, and compile common w/ -Pnative prior to letting test-patch.sh do the work in hadoop-hdfs.  Another example is our lack of test coverage of various native bits.  Since these require profiles to be defined prior to compilation, the personality could see that something touches native code, set the appropriate profile, and let test-patch.sh be on its way.
+
+One way to think of it is some higher order logic on top of the automated 'figure out what modules and what tests to run' functions.
+
+Note for me:  For hadoop, add -Pparallel-tests while we're here.
+
+bq. Note for me: For hadoop, add -Pparallel-tests while we're here.
+
+[~aw], I was thinking of turning on parallel-tests today in a separate jira and seeing how it goes for the hadoop-hdfs tests.  Any objection?  If you think you'll do this soon anyway, then I'll hold off.
+
+hadoop.sh:
+* an early cut at what the hadoop personality module might look like
+
+
+
+This cut clearly has some bugs\-\-like module manip not called in the javac code\-\-but wanted to post a sample of what I've been playing with to elicit feedback to see if this covers the usage cases.   This doesn't include the changes needed to test-patch.sh, which are pretty extensive, as you can imagine.
+
+[~cnauroth], go ahead and file a jira to get the parallel tests in.  That's a minor thing and should make any rebasing for docker or this patch too hard. ;)
+
+Thanks!
+
+Oh, because it's relatively easy to compare, here's what the new check_site test looks like.  The biggest change you'll notice is that what were formerly "global" tests are now module tests.  So instead of compiling the entire site, we only compile the modules that personality said we should do:
+
+{code}
+function check_site
+{
+  local -r mypwd=$(pwd)
+  local results=0
+
+  big_console_header "Determining if patched site still builds"
+
+  verify_needed_test site
+
+  if [[ $? == 0 ]]; then
+    echo "This patch does not appear to need site checks."
+    return 0
+  fi
+
+  start_clock
+  
+  personality patch site
+  
+  until [[ $i -eq ${#MODULE[@]} ]]; do
+    pushd ${BASEDIR}/${MODULE[${i}]} >/dev/null
+    echo_and_redirect "${PATCH_DIR}/patchSiteWarnings-${MODULE[${i}]}.txt" \
+       "${MVN}" clean site site:stage -Dmaven.javadoc.skip=true ${MODULEEXTRAPARAM[${i}]} -D${PROJECT_NAME}PatchProcess
+    if [[ $? != 0 ]] ; then
+      echo "Site compilation for ${MODULE[${i}]} is broken"
+      add_jira_table -1 site "Site compilation for ${MODULE[${i}]} is broken."
+      add_jira_footer site "@@BASE@@/patchSiteWarnings-${MODULE[${i}]}.txt"
+      ((results = results + 1))
+    fi
+    popd >/dev/null
+    ((i=i+1))
+  done
+
+  if [[ ${result} -eq 0 ]]; then
+    return 1
+  fi
+  
+  add_jira_table +1 site "Site still builds."
+  return 0
+}
+{code}
+
+updated the description to better reflect current goals.
+
+-00:
+* Introduce personality modules
+* Move all?/most? Hadoop-specific logic to a personality module, which in turn implements HADOOP-11937
+* Switch all maven bits to have a per-module view of the world instead of global
+* Rework the table output, log files, and more to be much more consistent across tests.
+* Rework how the clock works
+* Utilize OSTYPE everywhere instead of using uname -s directly in a few places
+* Remove REQUIRE_TEST_LIB_HADOOP var
+* Moved around some functions so they related functions were a bit closer together
+* Synced big_console_header, start_clock, and verify_needed_tests in many functions so that timings and user output were more consistent
+
+
+NOTES:
+* This is (not surprising) a big patch.  It'd be great if people could start looking at it early to spot problems.  It'd also be useful if HADOOP-11933 could get committed sooner rather than later since these two patches in their current states probably conflict.  It'll be easier to rebase this on 11933 than the other way around.
+* As I suspected, patch test times went *down* due dropping the requirement of building all of the modules for javac and javadoc.
+* That said, this raises the importance of the nightly build.  I don't necessarily see that as a bad thing.
+
+
+TODO:
+* checkstyle needs to be reworked
+* Figure out why cmake has different output depending for pre- and post -patch (which generates spurious test-patch results)
+* much more testing
+
+(!) A patch to test-patch or smart-apply-patch has been detected. 
+Re-executing against the patched versions to perform further tests. 
+The console is at https://builds.apache.org/job/PreCommit-HADOOP-Build/6809/console in case of problems.
+
+\\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | reexec |   0m  0s | dev-support patch detected. |
+| {color:blue}0{color} | @author |   0m  0s | Skipping @author checks as test-patch has been patched. |
+| {color:green}+1{color} | releaseaudit |   0m  0s | Patch does not generate release audit warnings. |
+| {color:red}-1{color} | shellcheck |   0m  8s | The applied patch generated  21 new shellcheck (v0.3.3) issues (total was 38, now 59). |
+| {color:green}+1{color} | whitespace |   0m  0s | The patch has no lines that end in whitespace. |
+| | |   0m 13s | |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12735080/HADOOP-11929.00.patch |
+| Optional Tests | shellcheck |
+| git revision | trunk / 446d515 |
+| shellcheck | https://builds.apache.org/job/PreCommit-HADOOP-Build/6809/artifact/patchprocess/diffpatchshellcheck.txt |
+| Java | 1.7.0_55 |
+| uname | Linux asf906.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/6809/console |
+
+
+This message was automatically generated.
+
+After using HADOOP-11984 to test for a bit:
+
+-01:
+* Fix some timing issues when some pass, some fail
+* Fix some multi-module patch issues
+* Fix libwebhdfs on OS X
+* hadoop's releaseaudit now always runs from root dir
+* fix shellcheck errors in hadoop.sh
+* hdfs modules were dropped on the floor; they are now recognized
+* suck in the test-patch.sh changes from HADOOP-11984
+* if module is set to ., make the filename be 'root' instead
+* added CHANGED_UNFILTERED_MODULES
+* remove some excess clock and console manipulation
+
+(!) A patch to test-patch or smart-apply-patch has been detected. 
+Re-executing against the patched versions to perform further tests. 
+The console is at https://builds.apache.org/job/PreCommit-HADOOP-Build/6811/console in case of problems.
+
+\\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | reexec |   0m  0s | dev-support patch detected. |
+| {color:blue}0{color} | @author |   0m  0s | Skipping @author checks as test-patch has been patched. |
+| {color:green}+1{color} | releaseaudit |   0m 15s | Patch does not generate release audit warnings. |
+| {color:red}-1{color} | shellcheck |   0m  8s | The applied patch generated  1 new shellcheck (v0.3.3) issues (total was 38, now 29). |
+| {color:green}+1{color} | whitespace |   0m  0s | The patch has no lines that end in whitespace. |
+| | |   0m 27s | |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12735097/HADOOP-11929.01.patch |
+| Optional Tests | shellcheck |
+| git revision | trunk / 446d515 |
+| shellcheck | https://builds.apache.org/job/PreCommit-HADOOP-Build/6811/artifact/patchprocess/diffpatchshellcheck.txt |
+| Java | 1.7.0_55 |
+| uname | Linux asf906.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/6811/console |
+
+
+This message was automatically generated.
+
+-02:
+* rebased
+* fix most of the cmake issues
+* disabled bzip2 on os x until HADOOP-12027 can get fixed
+
+The big problem right now is that the only cmake testing that can be done is pass/fail.  cmake ACTIVELY works against you by having completely non-deterministic output due to race conditions in how it handles stdout. :(
+
+(!) A patch to test-patch or smart-apply-patch has been detected. 
+Re-executing against the patched versions to perform further tests. 
+The console is at https://builds.apache.org/job/PreCommit-HADOOP-Build/6864/console in case of problems.
+
+-03:
+* woops, picked up other changes from the rebase. 
+
+(!) A patch to test-patch or smart-apply-patch has been detected. 
+Re-executing against the patched versions to perform further tests. 
+The console is at https://builds.apache.org/job/PreCommit-HADOOP-Build/6866/console in case of problems.
+
+\\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | reexec |   0m  0s | dev-support patch detected. |
+| {color:blue}0{color} | @author |   0m  0s | Skipping @author checks as test-patch has been patched. |
+| {color:green}+1{color} | releaseaudit |   0m 25s | Patch does not generate release audit warnings. |
+| {color:red}-1{color} | shellcheck |   0m  8s | The applied patch generated  1 new shellcheck (v0.3.3) issues (total was 38, now 27). |
+| {color:green}+1{color} | whitespace |   0m  0s | The patch has no lines that end in whitespace. |
+| | |   0m 38s | |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12736034/HADOOP-11929.03.patch |
+| Optional Tests | shellcheck |
+| git revision | trunk / d725dd8 |
+| shellcheck | https://builds.apache.org/job/PreCommit-HADOOP-Build/6866/artifact/patchprocess/diffpatchshellcheck.txt |
+| Java | 1.7.0_55 |
+| uname | Linux asf904.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/6866/console |
+
+
+This message was automatically generated.
+
+\\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | reexec |   0m  0s | dev-support patch detected. |
+| {color:red}-1{color} | javac |   0m 23s | branch / hadoop-common-project/hadoop-common compilation is broken. |
+| {color:blue}0{color} | @author |   5m  5s | Skipping @author checks as test-patch has been patched. |
+| {color:green}+1{color} | tests included |   0m  0s | The patch appears to include 2 new or modified test files. |
+| {color:red}-1{color} | javac |   0m 22s | patch / hadoop-common-project/hadoop-common javac is broken. |
+| {color:green}+1{color} | javadoc |   0m 58s | Patched hadoop-common-project/hadoop-common appears healthy. |
+| {color:green}+1{color} | javadoc |   2m 23s | Patched hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api appears healthy. |
+| {color:green}+1{color} | javadoc |   0m 27s | Patched hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common appears healthy. |
+| {color:green}+1{color} | javadoc |   0m 20s | Patched hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager appears healthy. |
+| {color:green}+1{color} | releaseaudit |   0m 36s | Patch does not generate release audit warnings. |
+| {color:red}-1{color} | checkstyle |   2m 26s | The applied patch generated  14 new checkstyle issues (total was 1, now 15). |
+| {color:red}-1{color} | checkstyle |   2m 59s | The applied patch generated  1 new checkstyle issues (total was 212, now 212). |
+| {color:red}-1{color} | checkstyle |   3m 50s | The applied patch generated  1 new checkstyle issues (total was 14, now 14). |
+| {color:red}-1{color} | shellcheck |   0m  8s | The applied patch generated  1 new shellcheck (v0.3.3) issues (total was 38, now 27). |
+| {color:red}-1{color} | whitespace |   0m  7s | The patch has 6  line(s) that end in whitespace. Use git apply --whitespace=fix. |
+| {color:red}-1{color} | mvninstall |   0m 36s | patch / hadoop-common-project/hadoop-common mvn install is broken. |
+| {color:red}-1{color} | unit |   0m 22s | patch / hadoop-common-project/hadoop-common unit tests are broken. |
+| {color:red}-1{color} | unit |   0m 20s | patch / hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api unit tests are broken. |
+| | |  81m 46s | |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12736018/HADOOP-11929.02.patch |
+| Optional Tests | shellcheck javadoc javac unit findbugs checkstyle |
+| git revision | trunk / 788bfa0 |
+| javac | /home/jenkins/jenkins-slave/workspace/PreCommit-HADOOP-Build/patchprocess/branch-javac-hadoop-common-project_hadoop-common.txt |
+| javac | /home/jenkins/jenkins-slave/workspace/PreCommit-HADOOP-Build/patchprocess/patch-javac-hadoop-common-project_hadoop-common.txt |
+| checkstyle |  https://builds.apache.org/job/PreCommit-HADOOP-Build/6864/artifact/patchprocess/diffcheckstylehadoop-common.txt https://builds.apache.org/job/PreCommit-HADOOP-Build/6864/artifact/patchprocess/diffcheckstylehadoop-yarn-api.txt https://builds.apache.org/job/PreCommit-HADOOP-Build/6864/artifact/patchprocess/diffcheckstylehadoop-yarn-server-resourcemanager.txt |
+| shellcheck | https://builds.apache.org/job/PreCommit-HADOOP-Build/6864/artifact/patchprocess/diffpatchshellcheck.txt |
+| whitespace | https://builds.apache.org/job/PreCommit-HADOOP-Build/6864/artifact/patchprocess/whitespace.txt |
+| mvninstall | /home/jenkins/jenkins-slave/workspace/PreCommit-HADOOP-Build/patchprocess/patch-mvninstall-hadoop-common-project_hadoop-common.txt |
+| unit | /home/jenkins/jenkins-slave/workspace/PreCommit-HADOOP-Build/patchprocess/patch-unit-hadoop-common-project_hadoop-common.txt |
+| unit | /home/jenkins/jenkins-slave/workspace/PreCommit-HADOOP-Build/patchprocess/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-api.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/6864/testReport/ |
+| Java | 1.7.0_55 |
+| uname | Linux asf900.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/6864/console |
+
+
+This message was automatically generated.
+
+OK, that bad run did highlight some things:
+
+* bzip2 is broken on the jenkins servers too.  So this might not just be an OS X problem.
+* javadoc output needs to be cleanedup
+* better hit checkstyle sooner rather than later
+* newer routines aren't using @@BASEDIR@@
+* I don't like the / separator.
+* Still some bugs in the clock. No way @author took 5 minutes and the framework took 80. lol
+
+Hi [~aw], [~busbey],
+
+We tried to be super-clever about detecting what modules to build in the past.  It never worked.
+
+The problem is there are hidden dependencies.  For example, if I change {{DomainSocketWatcher.java}}, I clearly want to build and test {{libhadoop.so}}, which contains the C domain socket code.  But no C files were changed, so how is your "super-clever" dependency solver going to figure that out?
+
+Similarly I could change {{BZip2Codec.java}} and expect the native bzip code in {{Bzip2Compressor.c}} to be built and tested.  But again, there is no way for the build system to know that these are related.
+
+Then there are even more subtle dependencies.  Let's say I make a change to a C file in hadoop-common.  Perhaps this changes a function that is only used in hadoop-hdfs-- for the sake of argument, let's say {{renameTo0}}.  But the hadoop-hdfs tests are not run since the dependency solver looks at the patch and says, "no files in hadoop-hdfs were changed, I'm done."
+
+The only sane thing to do is to always build {{libhadoop.so}} and {{libhdfs.so}} no matter what, and always turn on all the options.  The options don't increase compilation time by any significant amount (if you don't believe me, benchmark it for yourself).
+
+We could maybe avoid building fuse-dfs, the native mapreduce stuff in trunk, libhadooppipes, and libwebhdfs unless a file in there had changed.  Those subprojects are truly self-contained so that would work.  The native task stuff in particular is slow to compile, so that might actually be useful.  The rest of it I think we should just always build-- the build is flaky enough as-is.
+
+bq. so how is your "super-clever" dependency solver going to figure that out?
+
+It doesn't.  The user provides the ruleset.  See hadoop.sh.
+
+
+
+
+{quote}
+bq. so how is your "super-clever" dependency solver going to figure that out?
+
+It doesn't. The user provides the ruleset. See hadoop.sh.
+{quote}
+
+Right, this patch is expressly to stop trying to figure everything out in a clever way and just let the project declare what needs to happen.
+
+bq. We could maybe avoid building fuse-dfs, the native mapreduce stuff in trunk, libhadooppipes, and libwebhdfs unless a file in there had changed. Those subprojects are truly self-contained so that would work.
+
+I disagree with this statement, at least for the codebase as it stands now.  HDFS-8346 demonstrates that libwebhdfs has a dependency on libhdfs source files.  There also had been an incorrect assumption about being able to call libhadoop code.  fuse-dfs links to native_mini_dfs, so there is a chance that a change in libhdfs could break it.  I'm not sure about libhadooppipes and the native MR stuff.  I haven't looked at them in a while.
+
+A counter-proposal could be to break up some of these unusual dependencies, or more formally define a "hadoop-native-common" for the sub-projects to statically link to.  For now though, I filed HADOOP-11937 to request full native builds so that we catch regressions like HDFS-8346 during pre-commit.
+
+I think it's worthwhile pointing out that test-patch is NOT meant to be the nightly build.  It's meant to be an extremely quick check to see if the patch is relatively sane.  It shouldn't be catching every possible problem with a patch; that's what integration tests are for.  Hadoop has a bad culture of ignoring the nightly build, but it's increasingly important to catch some of these potential side-effects.
+
+BTW: I'm not particularly worried about the extra run time from enabling the C code (at least, based upon [~cnauroth]'s sketch in HADOOP-11937).  I've already more than made up that time by trimming large chunks of pre-check out.
+
+bq. Allen wrote: I think it's worthwhile pointing out that test-patch is NOT meant to be the nightly build. It's meant to be an extremely quick check to see if the patch is relatively sane. It shouldn't be catching every possible problem with a patch; that's what integration tests are for. Hadoop has a bad culture of ignoring the nightly build, but it's increasingly important to catch some of these potential side-effects.
+
+Allen, I could be misinterpreting here, but it sounds like you are advocating doing less testing in the precommit build and relying more on the nightly and weekly builds.  I strongly disagree with that sentiment.  It is much easier to catch bad changes before they go in than to clean up after the fact.  Diagnosing a problem in the nightly build usually requires digging through the git history and sometimes even bisecting.  It's more work for everyone.  Plus, having the bad change in during the day causes problems for other developers.
+
+Hadoop has always had robust precommit testing, and I think that's a very good thing.  If we should be doing anything, it is increasing the amount of precommit testing.
+
+bq. Sean wrote: Right, this patch is expressly to stop trying to figure everything out in a clever way and just let the project declare what needs to happen.
+
+Thanks for the clarification, Sean.  I agree that allowing people to explicitly declare dependencies could in theory lead to a faster build.  But what happens when the dependency rules are wrong?  Or people move a file, or create new files?  It seems like there is a high potential for mistakes to be made here.  We could get into a situation where a piece of code wasn't being tested for months or even years (it's happened in the past...)
+
+The whole premise of this change is that we should spend more human time building and maintaining a complex explicit dependency management infrastructure to save CPU time on the build cluster.  But that seems backwards to me.  CPU cycles are cheap and only getting cheaper.  Human time is very expensive, and (especially for the native build) hard to get.  I could point you to JIRAs for fixing problems in the native code that are years old.  Sometimes for very simple and basic things.
+
+I also think we could explore much simpler and more robust ways of saving time on the precommit build.  For example, we could parallelize our {{make}} invocations or set up a local mirror of the Maven jars to avoid downloading them from offsite.
+
+bq.  I could be misinterpreting here, but it sounds like you are advocating doing less testing in the precommit build and relying more on the nightly and weekly builds.
+
+Not only 'here', but pretty much the entire purpose of this JIRA.  
+
+I'm advocating *realistic* testing in precommit.  Doing everything, all the time isn't realistic with a project of this size and complexity while still serving the community in an efficient manner.  There is a happy medium. 
+
+bq.  If we should be doing anything, it is increasing the amount of precommit testing.
+
+.. and ultimately, this patch will do that.  It will turn on a lot of the things that are currently off and be a key enabler for other things in the future.
+
+bq. We could get into a situation where a piece of code wasn't being tested for months or even years (it's happened in the past...)
+
+Given your comments thus far, let me clue you in: it's happening now, even in the nightly build, because we don't have everything turned on and/or it's inappropriate for test-patch to do it and/or it's currently impossible to do so (e.g., missing dependencies, missing JVMs, etc).
+
+bq. The whole premise of this change is that we should spend more human time building and maintaining a complex explicit dependency management infrastructure to save CPU time on the build cluster.
+
+This is when I throw my hands up.  It's very obvious at this point you have zero understanding of the issues and the purpose of this JIRA.
+
+
+{quote}
+The whole premise of this change is that we should spend more human time building and maintaining a complex explicit dependency management infrastructure to save CPU time on the build cluster.
+{quote}
+
+I think there's been a misunderstanding. The point of this particular patch is just to enable test-patch users specify when they need to do something special. The most obvious use case would be when particular profiles are used (either specific to a project or for different test checks). The one I personally care about is the use of a single git repo for multiple related projects (i.e. NIFI-577 or the case of the maven-parent-pom project).
+
+The example personality (hadoop.sh) is just Allen moving the long-standing hadoop logic quirks into a single location so we can more easily maintain them. In the process he has found and fixed some errors, but that's strictly a side effect.
+
+After a lot of playing/debugging, I've learned that we have a bit of a dependency race.  
+
+As expected, running mvn install will fail for any modules that don't have their dependencies in the maven cache. Now here's the rub: if the Apache snapshot repo is out of date (like right now for some Hadoop subprojects), mvn install can't download those bits.
+
+Up until last night, I was only able to reproduce this locally and in particular with hadoop-tools.  But at about 11pm last night I *was* able to break it last night during a test run of this patch combo'd with HADOOP-11984.  I'm going to try again today (assuming the repos are still out of date) to reproduce this on the Jenkins servers.  
+
+It's unclear to me what impact this has on unit tests.
+
+What makes this particular hard to see are two things: 
+
+* This is a race due to the fact that there is a good chance the 2xdaily builds keep the local maven repos on the Jenkins boxes fairly fresh.
+* An extremely high amount of patches don't hit low activity areas (such as hadoop-tools) so this race is never exposed.
+
+I'm thinking about combating this in one or two ways:
+
+* Run a mvn install of the patched modules as part of pre-patch.  This will help explain failed mvn install in post-patch.  This is fairly cheap, but doesn't really fix the problem.
+* Run a full mvn install of the entire repo after the javac test.  This will keep the local repo as up to date as possible for all dependencies, even out of the way ones.  This is fairly expensive.
+
+Thoughts?
+
+I'll likely be posting another combo patch later today.  I have some issues in checkstyle to work out first though.  I can tell I'm getting very close to having something finished here.
+
+Can we make it a command line toggle? that way projects that don't maintain up-to-date snapshots (or that don't have an expensive {{mvn -DskipTests install}}) can go for the blanket approach?
+
+I am sort of leaning towards calling mvn install after the javac and letting the personality decide which which modules to build.  Effectively, when they are told that mvninstall is going to happen, they could enqueue . (or whatever module is appropriate) when told they are working on the branch but then just enqueue the impacted module at patch time.  
+
+I think we can avoid the toggle then too.
+
+If you go with running a full {{mvn install}}, then another way to speed it up is to skip the JavaDoc plugin by passing {{-Dmaven.javadoc.skip=true}}.  Alternatively, maybe there is a way to combine this new {{mvn install}} with the existing JavaDoc validation build, although that might be difficult.
+
+{quote}
+I am sort of leaning towards calling mvn install after the javac and letting the personality decide which which modules to build. Effectively, when they are told that mvninstall is going to happen, they could enqueue . (or whatever module is appropriate) when told they are working on the branch but then just enqueue the impacted module at patch time.
+
+I think we can avoid the toggle then too.
+{quote}
+
+sounds great to me.
+
+{quote}
+If you go with running a full mvn install, then another way to speed it up is to skip the JavaDoc plugin by passing -Dmaven.javadoc.skip=true. Alternatively, maybe there is a way to combine this new mvn install with the existing JavaDoc validation build, although that might be difficult.
+{quote}
+
+This would help the HBase build a bunch, I know that our javadoc run takes an unusually long amount of time. The personality could do this part to though, right? By defining a profile that skips the javadocs?
+
+-04:
+* big rebase
+* includes the current version of HADOOP-11984, just to give the patch some weight
+
+hadoop.sh changes:
+* hadoop personality forces tools to be last
+* checkstyle should be working now
+* mvn install run after javac run
+* removed more stuff out of the linux build to match jenkins capabilities.  (we'll build this back up later)
+* removed bzip out of the mac build due to bzip detection in our cmake files being broken
+* javadoc pre-reqs now specifically called out
+* mvn install adds -DskipTests
+* parallel tests support
+
+shellcheck.sh:
+* fixes for moved modules
+
+* checkstyle
+* significant update to use new per-module framework bits
+
+test-patch.sh:
+* fixes for moved modules. CHANGED_MODULES now recalculated after patch application
+* New CHANGED_UNFILTERED_MODULES.  CHANGED_MODULES has always had non-code modules stripped out of it.  CHANGED_UNFILTERED has every module in it.
+* new clock_display functions pulls code out of add_jira_table so other routines can print elapsed time themselves
+* jira_footer now has protoc version
+* maven log files now print the maven command used at the top of the file
+* mvninstall is now separate test type.  (almost, still some todo here)
+* reordered test lists in determine_tests
+* lots of bug fixes and API changes to the new mvn_module* routines, primarily so mvn_module_messages can be use for both success and fail, greatly reducing code elsewhere
+* much of the time handling has been cleaned up, with reported times now mostly being mvn times and not test-patch.sh overhead time.  global time reports maven + shell overhead.
+* even more file name consistency
+* almost all tests now report for *every* module *every* time rather than giving a blanket +1 for entire chunks
+
+
+FWIW, I know it's been that way in this version of test-patch for a while, but I think the current code also already skips javadoc during mvn install.
+
+bq. Given your comments thus far, let me clue you in: it's happening now, even in the nightly build, because we don't have everything turned on and/or it's inappropriate for test-patch to do it and/or it's currently impossible to do so (e.g., missing dependencies, missing JVMs, etc)..... This is when I throw my hands up. It's very obvious at this point you have zero understanding of the issues and the purpose of this JIRA.
+
+Allen, I don't appreciate your tone.  I implemented the current CMake native build that we have in HADOOP-8368, was a reviewer on libwebhdfs, fuse-dfs, and most of the other stuff we are discussing here.  You don't need to "clue me in" that our unit test coverage (and test coverage on Jenkins) is incomplete.  I am well aware of that.  If you look back at JIRAs like HDFS-4003 (test-patch should build the common native libs before running hdfs tests) and HDFS-3753, these issues have a long history.
+
+Sometimes the unit test coverage is incomplete because nobody bothered to write a good test.  Sometimes it's incomplete because we never bothered to install the relevant dependencies on the Jenkins machines (libwebhdfs seems to fall into this category.)  Up until recently openssl fell into this category too, until we fixed it.
+
+The obvious fix for the libwebhdfs issue is *not* continuing to disable the libwebhdfs testing, which this patch does.  It is to simply install the right binaries on the Jenkins machines.  In general, every native component we have should be built on every architecture, with three exceptions:
+* fuse-dfs.  Fuse is inherently Linux-specific.  (Please do not write a reply informing me about MacFUSE.  It's a different project with a different set of APIs.  Perhaps it will one day be supported, but not today.)
+* the cgroup stuff in yarn.  Again, this is inherently Linux-specific so it's fine and expected to skip it on other architectures, until we have a solution there.
+* the mapreduce native task stuff needs some work to be portable.  Actually the work needed is small, but apparently the manpower available to do it is as well, so... here we are.
+
+It sounds like there are a few issues here that you feel that this patch solves or helps to solve:
+1. setting the right combinations of profiles on relevant architectures
+2. ensuring that the right combination of maven builds are triggered (i.e. need to trigger mvn install first, need to compile hadoop-common if any other submodule is being compiled
+3. re-using the Hadoop build scripts for NiFi, HBase and other non-Hadoop projects
+4. fixing parallel test builds
+5. fixing issues with ClientBaseWithFixes.java, TestSSLHttpServer.java, KeyStoreTestUtil.java, and some other tests (possibly concurrency related?)
+
+I would like to see #5 split out into a separate patch so that it can be more thoroughly reviewed.  It seems like fairly straightforward test fixes.
+
+I am concerned about the complexity of this patch.  We have had regressions-- huge ones-- in the past in our testing of the native components and nobody noticed for a while.  While this may be a valuable change potentially, it adds a lot of complexity.  I would like to see a design document about this spelling out what the goals are, how this patch achieves those goals, and what the plans are for the future.  It doesn't have to be long, but it does have to spell out what concepts like "specializations" are, how the dependency management is supposed to work, and what Hadoop developers will have to do to maintain this infrastructure in the future.
+
+Until we get such a design document and get a chance to review it, I am -1 on this change.  I apologize for bringing out the -1, but I simply want to be clear.  I will most likely change my vote once we have time to review this and go through all the details.
+
+Given the statement 
+
+bq. . You don't need to "clue me in" that our unit test coverage (and test coverage on Jenkins) is incomplete.
+
+I'm sure you realize that test-patch.sh now re-executes itself when chunks of dev-support has been patched.  So it is an extremely common practice to include other patches with test-patch patches to validate the test-patch changes itself.   So I'm sure you were just busy with other things when you wrote:
+
+bq.  I would like to see #5 split out into a separate patch so that it can be more thoroughly reviewed. It seems like fairly straightforward test fixes.
+
+But I'll go ahead and cancel/remove -04 so that it doesn't cause you any other confusion.
+
+bq.  I would like to see a design document about this spelling out what the goals are, how this patch achieves those goals, and what the plans are for the future. It doesn't have to be long, but it does have to spell out what concepts like "specializations" are, how the dependency management is supposed to work, and what Hadoop developers will have to do to maintain this infrastructure in the future.
+
+Since there is no such thing as specializations in test-patch older, old, and new, do I have to make something up?  Or did you mean personalities which are defined in the JIRA description or even the sample code in the hadoop.sh prototype that's attached?  Again, I'm sure you've just been way too busy to read such details.
+
+
+[~aw], would you please consider responding to comments without expressing personal doubt in the reviewer?  A firm but simple statement that questions are already addressed in the description and prior comments would be effective.
+
+[~cmccabe], please do consider re-reading the full comment history and the patch again.  Allen pointed out the issue description and the sample code in particular.  Does that address your concerns?  My opinion is that this is sufficient to communicate the intent, and therefore a full design doc isn't necessary as long as we can resolve your open questions here in discussion.
+
+I don't see insurmountable differences here, but the last few rounds of discussion haven't been constructive.  Can we please try again and cut each other some slack?
+
+Based upon Colin's feedback, I've simplified the patch and will deal with these other issues in another JIRA.  In particular:
+
+bq.  1. setting the right combinations of profiles on relevant architectures
+
+I've ripped this out.  Builds are as they were before with just -Pnative if the appropriate native flag is enabled.  We will need to redo the research on what works and what doesn't at a later date.
+
+bq. 2. ensuring that the right combination of maven builds are triggered (i.e. need to trigger mvn install first, need to compile hadoop-common if any other submodule is being compiled
+
+I've mostly ripped this out.  The ordering of modules now the same as the currently running code, bugs and all.  mvn install is still done first since that's need for other projects.
+
+bq.  3. re-using the Hadoop build scripts for NiFi, HBase and other non-Hadoop projects
+
+I've kept this in since that's the entire reason this JIRA exists.
+
+bq. 4. fixing parallel test builds
+
+This was never part of this patch officially, so it's gone.
+
+bq. 5. fixing issues with ClientBaseWithFixes.java, TestSSLHttpServer.java, KeyStoreTestUtil.java, and some other tests (possibly concurrency related?)
+
+This was never part of this patch officially, so it's clearly been ripped out as well.
+
+
+-05:
+* a bunch of functionality has been ripped out.
+* fixed some bugs with findbugs handling
+
+Removed the prototype hadoop.sh personality file from the JIRA, to further the simplification goal.
+
+(!) A patch to test-patch or smart-apply-patch has been detected. 
+Re-executing against the patched versions to perform further tests. 
+The console is at https://builds.apache.org/job/PreCommit-HADOOP-Build/6891/console in case of problems.
+
+\\
+\\
+| (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | reexec |   0m  0s | dev-support patch detected. |
+| {color:blue}0{color} | @author |   0m  0s | Skipping @author checks as test-patch has been patched. |
+| {color:green}+1{color} | releaseaudit |   0m 16s | Patch does not generate release audit warnings. |
+| {color:green}+1{color} | shellcheck |   0m  8s | There were no new shellcheck (v0.3.3) issues. |
+| {color:green}+1{color} | whitespace |   0m  1s | The patch has no lines that end in whitespace. |
+| | |   0m 32s | |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12736673/HADOOP-11929.05.patch |
+| Optional Tests | shellcheck |
+| git revision | trunk / cdc13ef |
+| Java | 1.7.0_55 |
+| uname | Linux asf903.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| protoc |  |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/6891/console |
+
+
+This message was automatically generated.
+
+Stopping work on test-patch in hadoop.  Closing as won't fix.
+
+I don't think it's unfair to ask for a design doc on something so big that introduces a lot of new abstractions like "personalities" and "specializations" and also seems to come with quite a lot of philosophy about how builds should be run, what they're for, and so on.  We may have to maintain this stuff for years, we better have a reference we can point new people to.  I already clarified that I would most likely change my vote if this was better explained and broken down into reviewable chunks.
+

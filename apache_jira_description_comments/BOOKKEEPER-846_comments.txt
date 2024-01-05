@@ -1,0 +1,268 @@
+Attaching logs from failed run.
+
+Thanks [~fpj] for the logs. Apart from the test timeout value of 3000 milliseconds, I didn't find any other unusual things for the failures. Attached a patch where I have increased the time out from 3000 to 60000 milliseconds. I have modified all the testcases in this class to avoid future intermittent failures due to timeouts.
+
+Testing JIRA BOOKKEEPER-846
+
+
+Patch [BOOKKEEPER-846-001.patch|https://issues.apache.org/jira/secure/attachment/12706406/BOOKKEEPER-846-001.patch] downloaded at Sun Mar 22 18:50:15 UTC 2015
+
+----------------------------
+
+{color:green}+1 PATCH_APPLIES{color}
+{color:green}+1 CLEAN{color}
+{color:green}+1 RAW_PATCH_ANALYSIS{color}
+.    {color:green}+1{color} the patch does not introduce any @author tags
+.    {color:green}+1{color} the patch does not introduce any tabs
+.    {color:green}+1{color} the patch does not introduce any trailing spaces
+.    {color:green}+1{color} the patch does not introduce any line longer than 120
+.    {color:green}+1{color} the patch does adds/modifies 1 testcase(s)
+{color:green}+1 RAT{color}
+.    {color:green}+1{color} the patch does not seem to introduce new RAT warnings
+{color:green}+1 JAVADOC{color}
+.    {color:green}+1{color} the patch does not seem to introduce new Javadoc warnings
+{color:green}+1 COMPILE{color}
+.    {color:green}+1{color} HEAD compiles
+.    {color:green}+1{color} patch compiles
+.    {color:green}+1{color} the patch does not seem to introduce new javac warnings
+{color:green}+1 FINDBUGS{color}
+.    {color:green}+1{color} the patch does not seem to introduce new Findbugs warnings
+{color:green}+1 TESTS{color}
+.    Tests run: 949
+{color:green}+1 DISTRO{color}
+.    {color:green}+1{color} distro tarball builds with the patch 
+
+----------------------------
+{color:green}*+1 Overall result, good!, no -1s*{color}
+
+
+The full output of the test-patch run is available at
+
+.   https://builds.apache.org/job/bookkeeper-trunk-precommit-build/907/
+
+[~fpj] could you try the patch that [~rakeshr] attached? if it works, we could first unblock the 4.3.1 release.
+
+I'm sorry about the delay. Unfortunately, it is still failing for me, but not because of timeouts:
+
+{noformat}
+Failed tests:   testShouldNotGetAnyFragmentIfNoLedgerPresent(org.apache.bookkeeper.client.
+TestLedgerChecker): There should be 0 fragments. But returned fragments are 
+[Fragment(LedgerID: 3, FirstEntryID: 0[0], LastKnownEntryID: 0[0], Host: 127.0.0.1:15017, 
+Closed: false)] expected:<0> but was:<1>
+{noformat}
+
+Any thoughts on the test failure?
+
+[~fpj] 
+
+The test itself is pretty flaky. 
+
+{code}
+        BookieSocketAddress firstBookieFromEnsemble = firstEnsemble.get(0);
+        killBookie(firstBookieFromEnsemble);
+        startNewBookie();
+        lh.addEntry(TEST_LEDGER_ENTRY_DATA);
+        bkc.deleteLedger(lh.getId());
+
+        Set<LedgerFragment> result = getUnderReplicatedFragments(lh);
+{code}
+
+getUnderReplicatedFragments checking the fragment of ledger would still get a fragment before bookie run garbage collection. the behavior here is too sensitive to timing. we probably need to rewrite the test case to make more deterministic. coming out a patch tomorrow. 
+
+Sorry for the delay [~fpj]. Thanks [~hustlmsp] for the analysis, mostly the problem relates to the ledger deletion as it happens asynchronously.
+
+We have the checking conditions at [LedgerChecker.java|https://github.com/apache/bookkeeper/blob/master/bookkeeper-server/src/main/java/org/apache/bookkeeper/client/LedgerChecker.java#L128]
+{code}
+        public void readEntryComplete(int rc, long ledgerId, long entryId,
+                                      ChannelBuffer buffer, Object ctx) {
+            if (BKException.Code.NoSuchEntryException != rc &&
+                BKException.Code.NoSuchLedgerExistsException != rc) {
+                entryMayExist.set(true);
+            }
+
+{code}
+I'll also check the possible cases today.
+
+It took some good amount of time to dig into the code.
+
+I could see one corner case of processing BKException by the {{LedgerChecker#FullLedgerCallback}}. Git reference [LedgerChecker#FullLedgerCallback|https://github.com/apache/bookkeeper/blob/master/bookkeeper-server/src/main/java/org/apache/bookkeeper/client/LedgerChecker.java#L163]. Please see the {{operationComplete}} function of this callback, here it is not skipping {{BKException.Code.NoSuchLedgerExistsException}}. If it falls into this condition, it is considering as bad fragments. Since this is not re-producing in my env, [~fpj] can you please add a log message and see the possibility of occurring this condition.
+
+{code}
+LedgerChecker.java
+    private static class FullLedgerCallback implements
+             //...
+            if (rc != BKException.Code.OK) {
+                badFragments.add(result);
+            }
+{code}
+
+I'm not sure your assessment and sijie's agree. Why are you referring to BKException, rakesh?
+
+I tried again to increase the timeout (20s timeout for each case) and I haven't been able to reproduce. The total test time is over 300s, though, which is really long. If you guys have any idea for making the tests run reliably and faster, then I'd rather have this option over increasing the timeout value. In the particular sample that Sijie mentions above, I was wondering if we can simply start the GC instead of waiting for it to run. 
+
+Hi [~fpj],
+
+bq.I'm not sure your assessment and sijie's agree. Why are you referring to BKException, rakesh?
+
+IIUC, Sijie's point was "getUnderReplicatedFragments checking the fragment of ledger would still get a fragment before bookie run garbage collection." To understand more about this part, I've modified the test by adding sleep in between {{deleteLedger}} and {{getUnderReplicatedFragments}}.
+
+{code}
+        bkc.deleteLedger(lh.getId());
+        Thread.sleep(10000);
+        Set<LedgerFragment> result = getUnderReplicatedFragments(lh);
+{code}
+
+Below is the output log which shows that GC is triggered and deleted the ledger. Now, calling {{getUnderReplicatedFragments}} function, it receives 'NoSuchLedgerExistsException' and return the {{Set<LedgerFragment> result}} empty and passes the test case. After seeing the output, I ruled out the possibility of no GC cleanup and decided to dig(review) into the code to see any other possibilities in {{LedgerChecker}}. There I found one corner case of handling {{BKException}} inside {{FullLedgerCallback}} like I mentioned in my previous comment.
+
+{code}
+2015-04-16 07:51:46,112 - INFO  [GarbageCollectorThread:GarbageCollectorThread@335] - Garbage collector thread forced to perform GC before expiry of wait time.
+2015-04-16 07:51:46,112 - INFO  [GarbageCollectorThread:GarbageCollectorThread$1@250] - delete ledger : 3
+
+2015-04-16 07:51:55,162 - ERROR [BookieReadThread-15001-0:ReadEntryProcessorV3@121] - No ledger found while reading entry:0 from ledger: 3
+2015-04-16 07:51:55,162 - ERROR [BookieReadThread-15004-0:ReadEntryProcessorV3@121] - No ledger found while reading entry:0 from ledger: 3
+{code}
+
+Is this still failing in your env. If yes, can you please re-run with debug logs enabled and share the logs. 
+
+{quote}
+Below is the output log which shows that GC is triggered and deleted the ledger. Now, calling getUnderReplicatedFragments function, it receives 'NoSuchLedgerExistsException' and return the Set<LedgerFragment> result empty and passes the test case.
+{quote}
+
+Doesn't that mean what I said is correct?
+
+if the GC doesn't kick in, there is one fragment for this ledger. then the ledger checker will respond 1, which it fails the test as what Flavio encountered. right?
+
+taking a close at LedgerChecker implementation. the BKException that [~rakeshr] pointed out is actually not a big deal. since the ledger checker here is just doing the best effects to find the bad fragment. A fragment should be treated a bad fragment even a ledger is deleted as the checker itself doesn't know if NoLedgerExists means ledger is deleted or a ledger file deleted in a bookie. this bad fragment will be addressed when re-replicating it, since the replication worker will re-open ledger to do the re-replication, which it would find the ledger is actually deleted.
+
+so the exception part is totally correct. the bad thing here is purely on the test itself, which I think the test wasn't written in correct way to test ledger not exists case.
+
+The flakiness here is on handling the last ensemble in an non-closed ledger. Garbage collection could kick in between checking if that ensemble having entries and the actual checking fragment. If gc kick  in before/after checking last ensemble, it would always pass. but if gc kicks in between, it would always fail.
+
+so we should fix the test itself to make it test what it should test. we shouldn't fix the ledger checker part.
+
+{code}
+
+            // Check for the case that no last confirmed entry has
+            // been set.
+            if (curEntryId == lastEntry) {
+                final long entryToRead = curEntryId;
+
+                EntryExistsCallback eecb
+                    = new EntryExistsCallback(lh.getLedgerMetadata().getWriteQuorumSize(),
+                                              new GenericCallback<Boolean>() {
+                                                  public void operationComplete(int rc, Boolean result) {
+                                                      if (result) {
+                                                          fragments.addAll(finalSegmentFragments);
+                                                      }
+                                                      checkFragments(fragments, cb);
+                                                  }
+                                              });
+
+                for (int bi : lh.getDistributionSchedule().getWriteSet(entryToRead)) {
+                    BookieSocketAddress addr = curEnsemble.get(bi);
+                    bookieClient.readEntry(addr, lh.getId(),
+                                           entryToRead, eecb, null);
+                }
+                return;
+            } else {
+                fragments.addAll(finalSegmentFragments);
+            }
+        }
+
+        checkFragments(fragments, cb);
+{code}
+
+bq. if the GC doesn't kick in, there is one fragment for this ledger. then the ledger checker will respond 1, which it fails the test as what Flavio encountered. right?
+If the GC doesn't kick in, LedgerChecker will be able to read the ledger and will return OK. I think this is not a straight forward case.
+
+AFAIK, there are two places it is reading the entry from the ledger. For this we have two different callbacks {{EntryExistsCallback}} and {{FullLedgerCallback}}. Probably [~ivank@yahoo-inc.com] can add more on the reason, why two times ledger#read operation.
+
+I was suspecting one case where it returns OK during {{EntryExistsCallback}}. Then, it will go to read the ledger second time, now GC triggers and deletes the ledger. The read callback would get {{NoSuchLedgerExistsException}}. But {{FullLedgerCallback}} is handling in generic way {{rc != BKException.Code.OK}} and treated as badFragments. IMHO, instead it could have conditions to filter out {{NoSuchLedgerExistsException}} also, what do you say?
+
+{code}
+        public void operationComplete(int rc, LedgerFragment result) {
+            if (rc != BKException.Code.OK) {
+                badFragments.add(result);
+            }
+            if (numFragments.decrementAndGet() == 0) {
+                cb.operationComplete(BKException.Code.OK, badFragments);
+            }
+        }
+{code}
+
+[~rakeshr] please ignore my first comment. I already explained in my latest comment about EntryExistsCallback and FullLedgerCallback.
+
+oops I haven't seen your previous comment while adding my comment (I didn't refresh the page before I commented). 
+Thanks [~hustlmsp] for your time and detailed analysis. Its good we have identified the problem. I agree the test needs to be re-written as it is not testing the actual case due to the offline GC. But I feel there is no harm in doing an additional checks to skip the {{NoSuchLedgerExistsException}} in {{FullLedgerCallback}}. At least this will save some re-replication cycles and {{ReplicationWorker}} can do some useful work if there are other unreplicated ledgers. What do you say about handling/adding {{NoSuchLedgerExistsException}} to the callback?
+
+bq. the bad thing here is purely on the test itself, which I think the test wasn't written in correct way to test ledger not exists case.
+How about reading entries from the ledger until {{NoSuchLedgerExistsException}}. May be wait few seconds to see this exception. Does this sound good to you?
+
+{code}
+But I feel there is no harm in doing an additional checks to skip the NoSuchLedgerExistsException in FullLedgerCallback. At least this will save some re-replication cycles and ReplicationWorker can do some useful work if there are other unreplicated ledgers.
+{code}
+
+I explained that too. "A fragment should be treated a bad fragment even a ledger is deleted as the checker itself doesn't know if NoLedgerExists means ledger is deleted or a ledger file deleted in a bookie. this bad fragment will be addressed when re-replicating it, since the replication worker will re-open ledger to do the re-replication, which it would find the ledger is actually deleted."
+
+I am feeling the test itself need to cover multiple cases. Coming out a patch later today.
+
+bq. a ledger file deleted in a bookie
+OK. Thanks for pointing this case again. I missed this case.
+
+bq. I am feeling the test itself need to cover multiple cases. Coming out a patch later today.
+I've modified the tests and will upload the patch soon. Welcome any better one.
+
+Testing JIRA BOOKKEEPER-846
+
+
+Patch [BOOKKEEPER-846-002.patch|https://issues.apache.org/jira/secure/attachment/12725940/BOOKKEEPER-846-002.patch] downloaded at Thu Apr 16 19:07:31 UTC 2015
+
+----------------------------
+
+{color:green}+1 PATCH_APPLIES{color}
+{color:green}+1 CLEAN{color}
+{color:green}+1 RAW_PATCH_ANALYSIS{color}
+.    {color:green}+1{color} the patch does not introduce any @author tags
+.    {color:green}+1{color} the patch does not introduce any tabs
+.    {color:green}+1{color} the patch does not introduce any trailing spaces
+.    {color:green}+1{color} the patch does not introduce any line longer than 120
+.    {color:green}+1{color} the patch does adds/modifies 1 testcase(s)
+{color:green}+1 RAT{color}
+.    {color:green}+1{color} the patch does not seem to introduce new RAT warnings
+{color:green}+1 JAVADOC{color}
+.    {color:green}+1{color} the patch does not seem to introduce new Javadoc warnings
+{color:green}+1 COMPILE{color}
+.    {color:green}+1{color} HEAD compiles
+.    {color:green}+1{color} patch compiles
+.    {color:green}+1{color} the patch does not seem to introduce new javac warnings
+{color:green}+1 FINDBUGS{color}
+.    {color:green}+1{color} the patch does not seem to introduce new Findbugs warnings
+{color:green}+1 TESTS{color}
+.    Tests run: 949
+{color:green}+1 DISTRO{color}
+.    {color:green}+1{color} distro tarball builds with the patch 
+
+----------------------------
+{color:green}*+1 Overall result, good!, no -1s*{color}
+
+
+The full output of the test-patch run is available at
+
+.   https://builds.apache.org/job/bookkeeper-trunk-precommit-build/928/
+
++1 for the patch. committing.
+
+committed as 4926179 in branch 4.3. committed as 26b17cb in master
+
+[~fpj] could you help verifying if the latest master and branch 4.3 work for you?
+
+FAILURE: Integrated in bookkeeper-master #1029 (See [https://builds.apache.org/job/bookkeeper-master/1029/])
+BOOKKEEPER-846: TestLedgerChecker times out (rakeshr via sijie) (sijie: rev 26b17cba50aded931afb2e66d549fbeb8f4f1d39)
+* bookkeeper-server/src/test/java/org/apache/bookkeeper/client/TestLedgerChecker.java
+* CHANGES.txt
+
+
+Nice discussion with you. Thanks [~hustlmsp] for committing the patch.
+
+Closed as part of BookKeeper-4.4.0 release
+

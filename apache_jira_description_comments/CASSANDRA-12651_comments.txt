@@ -1,0 +1,72 @@
+I've tried to track the problem down, although it's flaking quite infrequently. So far I have several "working hypotheses", one of them is that that we have name clashes. There's some evidence to name clashes [here|http://cassci.datastax.com/view/Dev/view/carlyeks/job/carlyeks-ticket-11803-3.X-testall/lastCompletedBuild/testReport/org.apache.cassandra.index.internal/CassandraIndexTest/indexOnFirstClusteringColumn_compression/] and [here|http://cassci.datastax.com/job/ifesdjeen-11803-test-fix-trunk-testall/1/testReport/junit/org.apache.cassandra.index.internal/CassandraIndexTest/indexOnFirstClusteringColumn_compression/]. 
+
+|[trunk|https://github.com/ifesdjeen/cassandra/commits/12651-trunk]|[utest|https://cassci.datastax.com/view/Dev/view/ifesdjeen/job/ifesdjeen-12651-trunk-improved-testall/4/]|
+
+(dtest is not applicable since only test code was changed)
+
+Since the test fails quite infrequently, I just keep re-running with some code wrapped around the mentioned failure to re-try multiple times to gather more data. However, with this patch I could not reproduce after 30 test runs. I'll keep trying though.
+
+I'm not convinced that the issue is a name clash. Where we've previously seen name clashes (CASSANDRA-12834 for instance, which is the same failure as reported in the 2 supplementary CI runs mentioned above), the problem is reuse of an identifier by different tests within a fixture. In that case, the async cleanup in the teardown races with a CREATE statement. Here though, the index name is not reused anywhere and if it were, the CREATE INDEX has no IF NOT EXISTS, so we'd likely see that request rejected rather than spurious query results. 
+
+What seems odd to me is that in all of the SecondaryIndexTest failures above, the invalid results are returned only after flush. That is, the test does: 
+{code}
+run query X;
+flush;
+run query X;
+{code}
+So on each occasion, the exact same query executes and returns the expected results almost immediately prior to failure. I accept that 7 test runs is a small sample, but to me it points towards something flush related. 
+
+I've added some logging to try and pin down the cause a bit better, but as [~ifesdjeen] noted, this is pretty damn hard to repro on demand, so I've been running the test in pretty much a constant loop, but so far had no luck. I'll update if/when I see a failure.
+
+I've added some retrying and additional logging as well. I'll keep re-running as well.
+
+The root cause essentially what [~cam1982] described in CASSANDRA-12590 (specifically, [here|https://issues.apache.org/jira/browse/CASSANDRA-12590?focusedCommentId=15484088&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-15484088]). 
+Index tables use {{LocalPartitioner/LocalToken}} and {{LocalToken}} holds a reference to value object used to construct it. In this case, that value is a {{ByteBuffer}} representing a cell in the base table (i.e. the indexed value). When {{offheap_buffers}} or {{offheap_objects}} are in play (as they are in {{test/conf/cassandra.yaml}} on 3.X/trunk), this indexed cell value may be backed by a {{DirectByteBuffer}} which is recycled sometime after the memtable containing it is discarded. The reason this causes this particular test to fail is that the min/max {{DecoratedKey}} for the index's sstables are also references (at least, they are immediately after writing and until the table is next opened). The min/max keys are used on the read path to construct the interval tree which determines which sstables are used for a given read query. If one of these direct buffers gets recycled/cleaned/freed, this can corrupt the sstable, causing the interval tree search to fail which results in sstables being skipped incorrectly. 
+
+I added some logging to the test which captures this by reporting some metadata about the index sstable before running each query:
+
+This log failing test run shows the sstable being corrupted before the 5th query is executed. The token for key 5 changes from {{5}} to {{0}}, causing the interval tree search to fail & sstable to be skipped.
+{code}
+INFO  [main] 2016-11-17 09:57:48,577 Index CFS live memtables: [(DataFile: /home/automaton/cassandra/build/test/cassandra/data:0/cql_test_keyspace/table_37-3faeee00acac11e691265959e4dbcb49/.v_idx_1/mc-1-big-Data.db, Min: DecoratedKey(1, 00000001), Max: DecoratedKey(5, 00000005))] 
+INFO  [main] 2016-11-17 09:57:48,578 Index CFS live memtables: [(DataFile: /home/automaton/cassandra/build/test/cassandra/data:0/cql_test_keyspace/table_37-3faeee00acac11e691265959e4dbcb49/.v_idx_1/mc-1-big-Data.db, Min: DecoratedKey(1, 00000001), Max: DecoratedKey(5, 00000005))] 
+INFO  [main] 2016-11-17 09:57:48,580 Index CFS live memtables: [(DataFile: /home/automaton/cassandra/build/test/cassandra/data:0/cql_test_keyspace/table_37-3faeee00acac11e691265959e4dbcb49/.v_idx_1/mc-1-big-Data.db, Min: DecoratedKey(1, 00000001), Max: DecoratedKey(5, 00000005))] 
+INFO  [main] 2016-11-17 09:57:48,581 Index CFS live memtables: [(DataFile: /home/automaton/cassandra/build/test/cassandra/data:0/cql_test_keyspace/table_37-3faeee00acac11e691265959e4dbcb49/.v_idx_1/mc-1-big-Data.db, Min: DecoratedKey(1, 00000001), Max: DecoratedKey(5, 00000005))] 
+INFO  [main] 2016-11-17 09:57:48,582 Index CFS live memtables: [(DataFile: /home/automaton/cassandra/build/test/cassandra/data:0/cql_test_keyspace/table_37-3faeee00acac11e691265959e4dbcb49/.v_idx_1/mc-1-big-Data.db, Min: DecoratedKey(1, 00000001), Max: DecoratedKey(0, 00000005))] 
+{code}
+And here the 4th query failed. The sstable was actually corrupted before the 3rd query ran, but that expects to filter all index results which masks the index lookup failure.
+{code}
+INFO  [main] 2016-11-17 10:06:03,061 Index CFS live memtables: [(DataFile: /home/automaton/cassandra/build/test/cassandra/data:0/cql_test_keyspace/table_37-666d7d30acad11e6bb81b1960637036c/.v_idx_1/mc-1-big-Data.db, Min: DecoratedKey(1, 00000001), Max: DecoratedKey(5, 00000005))] 
+INFO  [main] 2016-11-17 10:06:03,062 Index CFS live memtables: [(DataFile: /home/automaton/cassandra/build/test/cassandra/data:0/cql_test_keyspace/table_37-666d7d30acad11e6bb81b1960637036c/.v_idx_1/mc-1-big-Data.db, Min: DecoratedKey(1, 00000001), Max: DecoratedKey(5, 00000005))] 
+INFO  [main] 2016-11-17 10:06:03,064 Index CFS live memtables: [(DataFile: /home/automaton/cassandra/build/test/cassandra/data:0/cql_test_keyspace/table_37-666d7d30acad11e6bb81b1960637036c/.v_idx_1/mc-1-big-Data.db, Min: DecoratedKey(1, 00000001), Max: DecoratedKey(0, 00000005))] 
+INFO  [main] 2016-11-17 10:06:03,064 Index CFS live memtables: [(DataFile: /home/automaton/cassandra/build/test/cassandra/data:0/cql_test_keyspace/table_37-666d7d30acad11e6bb81b1960637036c/.v_idx_1/mc-1-big-Data.db, Min: DecoratedKey(1, 00000001), Max: DecoratedKey(0, 00000005))] 
+{code}
+
+On CASSANDRA-12590, I suggested that this was probably only a problem for 2i tables, and advocated against having {{LocalToken}} make an on-heap copy of the buffer. I still think that the problem only affects indexes, but as the batchlog table is the only other user of {{LocalPartitioner}} the cost should be minimal and it's much cleaner to have the on heap copy made in {{LocalToken}}. Testing that locally with extra debug logging shows that the index sstables are no longer holding references to the direct buffers, so I'm pretty sure this will fix the problem. I've kicked off a jenkins job to run 200 iterations of the flaky test & if that reports 0 failures, I'll be pretty confident this is the fix.
+
+FTR, this isn't a problem in 2.2 as the insert into the index table is done using the original cell from the write, which is then cloned (potentially moving offheap) before being inserted into the base memtable.  
+
+
+There were no failures on the [200x run|http://cassci.datastax.com/view/Dev/view/beobal/job/beobal-testall-multiplex/18/], so I'm marking this patch available.
+
+I've pushed branches based on 3.0, 3.X and trunk only as there is really no significant differences between 3.11 & 3.X at this point. 
+
+This issue is one of those preventing us from having a green utest board for the 3.10 release. If vote #3 does fail due to the failing unit tests (as it looks like it might), we can create a 3.10 branch from the 3.10-tentative tag & commit just the fixes for those tests. Again, the delta between 3.10/3.11/3.X right now is negligible so I haven't done that yet.
+
+
+||branch||testall||dtest||
+|[12651-3.0|https://github.com/beobal/cassandra/tree/12651-3.0]|[testall|http://cassci.datastax.com/view/Dev/view/beobal/job/beobal-12651-3.0-testall]|[dtest|http://cassci.datastax.com/view/Dev/view/beobal/job/beobal-12651-3.0-dtest]|
+|[12651-3.X|https://github.com/beobal/cassandra/tree/12651-3.X]|[testall|http://cassci.datastax.com/view/Dev/view/beobal/job/beobal-12651-3.X-testall]|[dtest|http://cassci.datastax.com/view/Dev/view/beobal/job/beobal-12651-3.X-dtest]|
+|[12651-trunk|https://github.com/beobal/cassandra/tree/12651-trunk]|[testall|http://cassci.datastax.com/view/Dev/view/beobal/job/beobal-12651-trunk-testall]|[dtest|http://cassci.datastax.com/view/Dev/view/beobal/job/beobal-12651-trunk-dtest]|
+
+
+
+Brilliant research, [~beobal]! Sorry I couldn't repro / fix it myself. I guess I just got overly convinced in the fact it was something wrong with tests. The {{DecoratedKey}} jump from 5 to 0 certainly proves the point. I've also read the [CASSANDRA-12590] discussion, so it does look like these both are consequences of the same problem. As far as I understood, the second (empty) constructor was added in order to avoid assertion failure when {{null}} is passed (tried it locally without). 
+
+I have to mention that segfault results are shadowed by cassci, for example [here|https://cassci.datastax.com/view/Dev/view/ifesdjeen/job/ifesdjeen-12651-segfault-testall/1/]. We see that the VM exited abnormally, although all the other tests are just skipped, so this is why we may have never seen segfaults mentioned in [CASSANDRA-12590] (might be for other reasons). I'll open up the issue.
+
++1 from my side.
+
+I've created the issue about segfaults [CASSANDRA-12957] if it's of any interest for anyone.
+
+Thanks, committed to 3.0.x in {{820e7a8d810828d29f98a68dc35be33b40a5de62}} and merged up to trunk
+

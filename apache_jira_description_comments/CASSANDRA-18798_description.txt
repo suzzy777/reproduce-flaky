@@ -1,0 +1,58 @@
+Given the following schema:
+{code:java}
+CREATE KEYSPACE IF NOT EXISTS accord WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3};
+CREATE TABLE IF NOT EXISTS accord.list_append(id int PRIMARY KEY,contents LIST<bigint>);
+TRUNCATE accord.list_append;{code}
+And the following two possible queries executed by 10 threads in parallel:
+{code:java}
+BEGIN TRANSACTION
+  LET row = (SELECT * FROM list_append WHERE id = ?);
+  SELECT row.contents;
+COMMIT TRANSACTION;"
+BEGIN TRANSACTION
+  UPDATE list_append SET contents += ? WHERE id = ?;
+COMMIT TRANSACTION;"
+{code}
+there seems to be an issue with transaction guarantees. Here's an excerpt in the edn format from a test.
+{code:java}
+{:type :invoke    :process 8    :value [[:append 5 352]]    :tid 3    :n 52    :time 1692607285967116627}
+{:type :invoke    :process 9    :value [[:r 5 nil]]    :tid 1    :n 54    :time 1692607286078732473}
+{:type :invoke    :process 6    :value [[:append 5 553]]    :tid 5    :n 53    :time 1692607286133833428}
+{:type :invoke    :process 7    :value [[:append 5 455]]    :tid 4    :n 55    :time 1692607286149702511}
+{:type :ok    :process 8    :value [[:append 5 352]]    :tid 3    :n 52    :time 1692607286156314099}
+{:type :invoke    :process 5    :value [[:r 5 nil]]    :tid 9    :n 52    :time 1692607286167090389}
+{:type :ok    :process 9    :value [[:r 5 [303 304 604 6 306 509 909 409 912 411 514 415 719 419 19 623 22 425 24 926 25 832 130 733 430 533 29 933 333 537 934 538 740 139 744 938 544 42 646 749 242 546 547 548 753 450 150 349 48 852 352]]]    :tid 1    :n 54    :time 1692607286168657534}
+{:type :invoke    :process 1    :value [[:r 5 nil]]    :tid 0    :n 51    :time 1692607286201762938}
+{:type :ok    :process 7    :value [[:append 5 455]]    :tid 4    :n 55    :time 1692607286245571513}
+{:type :invoke    :process 7    :value [[:r 5 nil]]    :tid 4    :n 56    :time 1692607286245655775}
+{:type :ok    :process 5    :value [[:r 5 [303 304 604 6 306 509 909 409 912 411 514 415 719 419 19 623 22 425 24 926 25 832 130 733 430 533 29 933 333 537 934 538 740 139 744 938 544 42 646 749 242 546 547 548 753 450 150 349 48 852 352 455]]]    :tid 9    :n 52    :time 1692607286253928906}
+{:type :invoke    :process 5    :value [[:r 5 nil]]    :tid 9    :n 53    :time 1692607286254095215}
+{:type :ok    :process 6    :value [[:append 5 553]]    :tid 5    :n 53    :time 1692607286266263422}
+{:type :ok    :process 1    :value [[:r 5 [303 304 604 6 306 509 909 409 912 411 514 415 719 419 19 623 22 425 24 926 25 832 130 733 430 533 29 933 333 537 934 538 740 139 744 938 544 42 646 749 242 546 547 548 753 450 150 349 48 852 352 553 455]]]    :tid 0    :n 51    :time 1692607286271617955}
+{:type :ok    :process 7    :value [[:r 5 [303 304 604 6 306 509 909 409 912 411 514 415 719 419 19 623 22 425 24 926 25 832 130 733 430 533 29 933 333 537 934 538 740 139 744 938 544 42 646 749 242 546 547 548 753 450 150 349 48 852 352 553 455]]]    :tid 4    :n 56    :time 1692607286271816933}
+{:type :ok    :process 5    :value [[:r 5 [303 304 604 6 306 509 909 409 912 411 514 415 719 419 19 623 22 425 24 926 25 832 130 733 430 533 29 933 333 537 934 538 740 139 744 938 544 42 646 749 242 546 547 548 753 450 150 349 48 852 352 553 455]]]    :tid 9    :n 53    :time 1692607286281483026}
+{:type :invoke    :process 9    :value [[:r 5 nil]]    :tid 1    :n 56    :time 1692607286284097561}
+{:type :ok    :process 9    :value [[:r 5 [303 304 604 6 306 509 909 409 912 411 514 415 719 419 19 623 22 425 24 926 25 832 130 733 430 533 29 933 333 537 934 538 740 139 744 938 544 42 646 749 242 546 547 548 753 450 150 349 48 852 352 553 455]]]    :tid 1    :n 56    :time 1692607286306445242}
+{code}
+Processes process 6 and process 7 are appending the values 553 and 455 respectively. 455 succeeded and a read by process 5 confirms that. But then also 553 is appended and a read by process 1 confirms that as well, however it sees 553 before 455.
+
+process 5 reads [... 852 352 455] where as process 1 reads [... 852 352 553 455] and the latter order is returned in subsequent reads as well.
+
+[~blambov] suggested that one reason for that behavior could be the way how unfrozen lists are updated. The backing datatype is a _kind of a map_ which uses insertion timestamps as indexes which are used to sort the list when the list is composed from chunks from various sources/sstables before being returned to the client.
+In such a case it indeed can happen, that process 5 reads [... 852 352 455] but later process 1 reads [... 852 352 553 455] because 553 has been _appended_ with an earlier timestamp than 455 but it has been _committed_ with a later timestamp. 
+
+Now with Accord we have the timestamp _of the transaction_ at hand. Could Accord use that for the index instead? Which would lead to the correct behavior? The value 553 has been appended after 455 and using the transaction id/timestamp as the list index would place it properly in the underlying map, wouldn't it?
+
+Steps to reproduce:
+
+ 
+{code:java}
+git clone https://github.com/datastax/accordclient.git
+git checkout append-to-list-index
+lein run --list-append -t 10 -r 1,2,3,4,5 -n 1000 -H <host-ips> -s `date +%s%N` > test-la.edn
+ 
+curl -L -o elle-cli.zip https://github.com/ligurio/elle-cli/releases/download/0.1.6/elle-cli-bin-0.1.6.zip
+unzip -d elle-cli elle-cli.zip
+java -jar elle-cli/target/elle-cli-0.1.6-standalone.jar --model list-append --anomalies G0 --consistency-models strict-serializable --directory out-la --verbose test-la.edn
+{code}
+ 

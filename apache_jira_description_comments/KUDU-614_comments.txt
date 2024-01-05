@@ -1,0 +1,32 @@
+http://gerrit.sjc.cloudera.com:8080/#/c/5987/ will disable the flaky test for now, until someone has time to look into this
+
+Likely the same issue seen in this log. Look at the pstack at the end for Thread 1 and Thread 21-24
+
+Mike's issue is a client-only deadlock with an idle mini cluster. We looked at the code together and we think we found the deadlock. The following conditions have to be met:
+# Cold client metacache, or at least cache misses on the desired key range.
+# Multiple cache lookups in quick succession, such as from a loop around Session::Apply().
+# More than four LookupRpc retryable failures all around the same time. These include timeouts and generic network failures.
+
+Under these circumstances, the client will treat each LookupRpc failure as a sign that it should find a new leader master, and it'll generate one GetLeaderMasterRpc for each LookupRpc failure. Sending a GetLeaderMasterRpc means acquiring the rwlock KuduClient::Data::master_leader_sem_, so the first failure will grab the lock and send the RPC while the 4+ failures will block on acquiring the lock. The client is now deadlocked because:
+# All four reactor threads are blocked on the rwlock, and
+# The response that would trigger the rwlock-releasing callback has probably arrived, but there's no available reactor thread to service it.
+
+Acquiring a "cross-request" lock on the reactor thread is the underlying issue. We need to make that code path truly asynchronous, either via enforcing only one active GetLeaderMasterRpc by retrying the others with a delay, or by allowing multiple GetLeaderMasterRpcs to begin with.
+
+I know I've seen this deadlock now and then when testing locally, and it can certainly manifest with only one master too. But I don't think it's the underlying failure of TestRenameTableSync.
+
+yea, I managed to hit this by trying to run 64 client threads on a single KuduClient instance. Deadlocked pretty fast with the reactor threads stuck in:
+#0  0x00007f9c59aca41d in nanosleep () at ../sysdeps/unix/syscall-template.S:81
+#1  0x00007f9c5be122aa in boost::detail::yield (k=2023054) at /usr/include/boost/smart_ptr/detail/yield_k.hpp:123
+#2  0x00007f9c5be12191 in kudu::rw_semaphore::lock (this=0x1f9a970) at src/kudu/util/rw_semaphore.h:112
+#3  0x00007f9c5943cb51 in kudu::client::KuduClient::Data::SetMasterServerProxyAsync(kudu::client::KuduClient*, kudu::Callback<void (kudu::Status const&)> const&) (this=0x1f9a8d0, client=0x1f9a860, cb=...) at src/kudu/client/client-internal.cc:737
+#4  0x00007f9c5945abf0 in kudu::client::internal::LookupRpc::ResetMasterLeaderAndRetry (this=0x7f9be80094e0) at src/kudu/client/meta_cache.cc:432
+#5  0x00007f9c5945b27f in kudu::client::internal::LookupRpc::SendRpcCb (this=0x7f9be80094e0, status=...) at src/kudu/client/meta_cache.cc:476
+
+
+it's easy to hit this deadlock even with just 4 writer threads, if you set the write timeout low and inject delays in the TS. Bumping to blocker since it's pretty nasty.
+
+I have a patch up for the above deadlock in SetMasterServerProxyAsync. But, the test is still flaky due to KUDU-679. I bumped the priority of that JIRA.
+
+This is mostly non-flaky now since fixing KUDU-679 (b51698b873f2a270f1e8f75e620ff7016ea47a41). There's still some occasional failure of this test case, but looks unrelated, so we can file a new JIRA for it when we do some diagnose.
+

@@ -1,0 +1,2934 @@
+guozhangwang opened a new pull request #5421: KAFKA-7192: Wipe out if EOS is turned on and checkpoint file does not exist
+URL: https://github.com/apache/kafka/pull/5421
+ 
+ 
+   1. As titled and as described in comments.
+   2. Modified unit test slightly to insert for new keys in committed data to expose this issue.
+   
+   ### Committer Checklist (excluded from commit message)
+   - [ ] Verify design and implementation 
+   - [ ] Verify test coverage and CI build status
+   - [ ] Verify documentation (including upgrade notes)
+   
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on GitHub and use the
+URL above to go to the specific comment.
+ 
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+Hello [~jonmbates] Thanks for reporting this issue. I've successfully reproduced this issue and found the root cause.
+
+I've submitted the PR and added a unit test to expose this issue, and confirmed that without the PR that unit test will fail.
+
+Great; thanks! We came up with a similar general solution (delete state stores that don't have a checkpoint file), but don't have the insight into Kafka's internals.
+
+Just as a sanity check, if the checkpoint file points to a offset behind the changelog tail, does Kafka Streams continue syncing the state store before consuming from the source topics? (I believe this happens already, but its just to aid my understanding)1`
+
+It's expected that the checkpoint file is one lower, because the last "record" is the log is the commit marker eating up one offset. However, the checkpoint file always contains "last-restored-offset plus 1". Thus, the overall restore will not be corrupted by the offset being off by one.
+
+guozhangwang closed pull request #5421: KAFKA-7192: Wipe out if EOS is turned on and checkpoint file does not exist
+URL: https://github.com/apache/kafka/pull/5421
+ 
+ 
+   
+
+This is a PR merged from a forked repository.
+As GitHub hides the original diff on merge, it is displayed below for
+the sake of provenance:
+
+As this is a foreign pull request (from a fork), the diff is supplied
+below (as it won't show otherwise due to GitHub magic):
+
+diff --git a/streams/src/main/java/org/apache/kafka/streams/processor/internals/AbstractTask.java b/streams/src/main/java/org/apache/kafka/streams/processor/internals/AbstractTask.java
+index 188ff473038..94e4c71d9c2 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/processor/internals/AbstractTask.java
++++ b/streams/src/main/java/org/apache/kafka/streams/processor/internals/AbstractTask.java
+@@ -137,6 +137,10 @@ public String toString() {
+         return toString("");
+     }
+ 
++    public boolean isEosEnabled() {
++        return eosEnabled;
++    }
++
+     /**
+      * Produces a string representation containing useful information about a Task starting with the given indent.
+      * This is useful in debugging scenarios.
+diff --git a/streams/src/main/java/org/apache/kafka/streams/processor/internals/StateRestorer.java b/streams/src/main/java/org/apache/kafka/streams/processor/internals/StateRestorer.java
+index 33dce9e7558..c1a41cefc23 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/processor/internals/StateRestorer.java
++++ b/streams/src/main/java/org/apache/kafka/streams/processor/internals/StateRestorer.java
+@@ -55,6 +55,10 @@ public TopicPartition partition() {
+         return partition;
+     }
+ 
++    public String storeName() {
++        return storeName;
++    }
++
+     long checkpoint() {
+         return checkpoint == null ? NO_CHECKPOINT : checkpoint;
+     }
+diff --git a/streams/src/main/java/org/apache/kafka/streams/processor/internals/StoreChangelogReader.java b/streams/src/main/java/org/apache/kafka/streams/processor/internals/StoreChangelogReader.java
+index 07af8019aef..1927b5a7af7 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/processor/internals/StoreChangelogReader.java
++++ b/streams/src/main/java/org/apache/kafka/streams/processor/internals/StoreChangelogReader.java
+@@ -71,7 +71,7 @@ public void register(final StateRestorer restorer) {
+ 
+     public Collection<TopicPartition> restore(final RestoringTasks active) {
+         if (!needsInitializing.isEmpty()) {
+-            initialize();
++            initialize(active);
+         }
+ 
+         if (needsRestoring.isEmpty()) {
+@@ -111,7 +111,7 @@ public void register(final StateRestorer restorer) {
+         return completed();
+     }
+ 
+-    private void initialize() {
++    private void initialize(final RestoringTasks active) {
+         if (!restoreConsumer.subscription().isEmpty()) {
+             throw new StreamsException("Restore consumer should not be subscribed to any topics (" + restoreConsumer.subscription() + ")");
+         }
+@@ -165,11 +165,12 @@ private void initialize() {
+ 
+         // set up restorer for those initializable
+         if (!initializable.isEmpty()) {
+-            startRestoration(initializable);
++            startRestoration(initializable, active);
+         }
+     }
+ 
+-    private void startRestoration(final Map<TopicPartition, StateRestorer> initialized) {
++    private void startRestoration(final Map<TopicPartition, StateRestorer> initialized,
++                                  final RestoringTasks active) {
+         log.debug("Start restoring state stores from changelog topics {}", initialized.keySet());
+ 
+         final Set<TopicPartition> assignment = new HashSet<>(restoreConsumer.assignment());
+@@ -186,6 +187,18 @@ private void startRestoration(final Map<TopicPartition, StateRestorer> initializ
+                 restorer.setStartingOffset(restoreConsumer.position(restorer.partition()));
+                 restorer.restoreStarted();
+             } else {
++                final StreamTask task = active.restoringTaskFor(restorer.partition());
++
++                // If checkpoint does not exist it means the task was not shutdown gracefully before;
++                // and in this case if EOS is turned on we should wipe out the state and re-initialize the task
++                if (task.isEosEnabled()) {
++                    log.info("No checkpoint found for task {} state store {} changelog {} with EOS turned on. " +
++                            "Reinitializing the task and restore its state from the beginning.", task.id, restorer.storeName(), restorer.partition());
++                    task.reinitializeStateStoresForPartitions(Collections.singleton(restorer.partition()));
++                } else {
++                    log.info("Restoring task {}'s state store {} from beginning of the changelog {} ", task.id, restorer.storeName(), restorer.partition());
++                }
++
+                 restoreConsumer.seekToBeginning(Collections.singletonList(restorer.partition()));
+                 needsPositionUpdate.add(restorer);
+             }
+@@ -280,6 +293,9 @@ private long processNext(final List<ConsumerRecord<byte[], byte[]>> records,
+         if (!restoreRecords.isEmpty()) {
+             restorer.restore(restoreRecords);
+             restorer.restoreBatchCompleted(lastRestoredOffset, records.size());
++
++            log.trace("Restored from {} to {} with {} records, ending offset is {}, next starting position is {}",
++                    restorer.partition(), restorer.storeName(), records.size(), lastRestoredOffset, nextPosition);
+         }
+ 
+         return nextPosition;
+diff --git a/streams/src/test/java/org/apache/kafka/streams/integration/EosIntegrationTest.java b/streams/src/test/java/org/apache/kafka/streams/integration/EosIntegrationTest.java
+index 30c90c23bb3..770f579ad98 100644
+--- a/streams/src/test/java/org/apache/kafka/streams/integration/EosIntegrationTest.java
++++ b/streams/src/test/java/org/apache/kafka/streams/integration/EosIntegrationTest.java
+@@ -391,8 +391,9 @@ public void shouldNotViolateEosIfOneTaskFailsWithState() throws Exception {
+         // the app is supposed to emit all 40 update records into the output topic
+         // the app commits after each 10 records per partition, and thus will have 2*5 uncommitted writes
+         // and store updates (ie, another 5 uncommitted writes to a changelog topic per partition)
++        // in the uncommitted batch sending some data for the new key to validate that upon resuming they will not be shown up in the store
+         //
+-        // the failure gets inject after 20 committed and 30 uncommitted records got received
++        // the failure gets inject after 20 committed and 10 uncommitted records got received
+         // -> the failure only kills one thread
+         // after fail over, we should read 40 committed records and the state stores should contain the correct sums
+         // per key (even if some records got processed twice)
+@@ -402,7 +403,7 @@ public void shouldNotViolateEosIfOneTaskFailsWithState() throws Exception {
+             streams.start();
+ 
+             final List<KeyValue<Long, Long>> committedDataBeforeFailure = prepareData(0L, 10L, 0L, 1L);
+-            final List<KeyValue<Long, Long>> uncommittedDataBeforeFailure = prepareData(10L, 15L, 0L, 1L);
++            final List<KeyValue<Long, Long>> uncommittedDataBeforeFailure = prepareData(10L, 15L, 0L, 1L, 2L, 3L);
+ 
+             final List<KeyValue<Long, Long>> dataBeforeFailure = new ArrayList<>();
+             dataBeforeFailure.addAll(committedDataBeforeFailure);
+@@ -610,10 +611,6 @@ public void init(final ProcessorContext context) {
+ 
+                     @Override
+                     public KeyValue<Long, Long> transform(final Long key, final Long value) {
+-                        if (errorInjected.compareAndSet(true, false)) {
+-                            // only tries to fail once on one of the task
+-                            throw new RuntimeException("Injected test exception.");
+-                        }
+                         if (gcInjected.compareAndSet(true, false)) {
+                             while (doGC) {
+                                 try {
+@@ -631,16 +628,27 @@ public void init(final ProcessorContext context) {
+ 
+                         if (state != null) {
+                             Long sum = state.get(key);
++
+                             if (sum == null) {
+                                 sum = value;
+                             } else {
+                                 sum += value;
+                             }
+                             state.put(key, sum);
+-                            context.forward(key, sum);
+-                            return null;
++                            state.flush();
++                        }
++
++
++                        if (errorInjected.compareAndSet(true, false)) {
++                            // only tries to fail once on one of the task
++                            throw new RuntimeException("Injected test exception.");
++                        }
++
++                        if (state != null) {
++                            return new KeyValue<>(key, state.get(key));
++                        } else {
++                            return new KeyValue<>(key, value);
+                         }
+-                        return new KeyValue<>(key, value);
+                     }
+ 
+                     @Override
+diff --git a/streams/src/test/java/org/apache/kafka/streams/processor/internals/StoreChangelogReaderTest.java b/streams/src/test/java/org/apache/kafka/streams/processor/internals/StoreChangelogReaderTest.java
+index 90abf32477f..1e74d47808e 100644
+--- a/streams/src/test/java/org/apache/kafka/streams/processor/internals/StoreChangelogReaderTest.java
++++ b/streams/src/test/java/org/apache/kafka/streams/processor/internals/StoreChangelogReaderTest.java
+@@ -119,7 +119,10 @@ public void shouldRestoreAllMessagesFromBeginningWhenCheckpointNull() {
+         final int messages = 10;
+         setupConsumer(messages, topicPartition);
+         changelogReader.register(new StateRestorer(topicPartition, restoreListener, null, Long.MAX_VALUE, true, "storeName"));
++        expect(active.restoringTaskFor(topicPartition)).andStubReturn(task);
++        replay(active, task);
+         changelogReader.restore(active);
++
+         assertThat(callback.restored.size(), equalTo(messages));
+     }
+ 
+@@ -136,8 +139,8 @@ public void shouldRecoverFromInvalidOffsetExceptionAndFinishRestore() {
+         changelogReader.register(new StateRestorer(topicPartition, restoreListener, null, Long.MAX_VALUE, true,
+                                                    "storeName"));
+ 
+-        EasyMock.expect(active.restoringTaskFor(topicPartition)).andReturn(task);
+-        EasyMock.replay(active);
++        EasyMock.expect(active.restoringTaskFor(topicPartition)).andStubReturn(task);
++        EasyMock.replay(active, task);
+ 
+         // first restore call "fails" but we should not die with an exception
+         assertEquals(0, changelogReader.restore(active).size());
+@@ -164,7 +167,8 @@ public void shouldClearAssignmentAtEndOfRestore() {
+         setupConsumer(messages, topicPartition);
+         changelogReader.register(new StateRestorer(topicPartition, restoreListener, null, Long.MAX_VALUE, true,
+                                                    "storeName"));
+-
++        expect(active.restoringTaskFor(topicPartition)).andStubReturn(task);
++        replay(active, task);
+         changelogReader.restore(active);
+         assertThat(consumer.assignment(), equalTo(Collections.<TopicPartition>emptySet()));
+     }
+@@ -175,6 +179,8 @@ public void shouldRestoreToLimitWhenSupplied() {
+         final StateRestorer restorer = new StateRestorer(topicPartition, restoreListener, null, 3, true,
+                                                          "storeName");
+         changelogReader.register(restorer);
++        expect(active.restoringTaskFor(topicPartition)).andStubReturn(task);
++        replay(active, task);
+         changelogReader.restore(active);
+         assertThat(callback.restored.size(), equalTo(3));
+         assertThat(restorer.restoredOffset(), equalTo(3L));
+@@ -192,14 +198,14 @@ public void shouldRestoreMultipleStores() {
+         setupConsumer(5, one);
+         setupConsumer(3, two);
+ 
+-        changelogReader
+-            .register(new StateRestorer(topicPartition, restoreListener, null, Long.MAX_VALUE, true, "storeName1"));
++        changelogReader.register(new StateRestorer(topicPartition, restoreListener, null, Long.MAX_VALUE, true, "storeName1"));
+         changelogReader.register(new StateRestorer(one, restoreListener1, null, Long.MAX_VALUE, true, "storeName2"));
+         changelogReader.register(new StateRestorer(two, restoreListener2, null, Long.MAX_VALUE, true, "storeName3"));
+ 
+-        expect(active.restoringTaskFor(one)).andReturn(null);
+-        expect(active.restoringTaskFor(two)).andReturn(null);
+-        replay(active);
++        expect(active.restoringTaskFor(one)).andStubReturn(task);
++        expect(active.restoringTaskFor(two)).andStubReturn(task);
++        expect(active.restoringTaskFor(topicPartition)).andStubReturn(task);
++        replay(active, task);
+         changelogReader.restore(active);
+ 
+         assertThat(callback.restored.size(), equalTo(10));
+@@ -224,9 +230,13 @@ public void shouldRestoreAndNotifyMultipleStores() throws Exception {
+         changelogReader.register(new StateRestorer(one, restoreListener1, null, Long.MAX_VALUE, true, "storeName2"));
+         changelogReader.register(new StateRestorer(two, restoreListener2, null, Long.MAX_VALUE, true, "storeName3"));
+ 
+-        expect(active.restoringTaskFor(one)).andReturn(null);
+-        expect(active.restoringTaskFor(two)).andReturn(null);
+-        replay(active);
++        expect(active.restoringTaskFor(one)).andReturn(task);
++        expect(active.restoringTaskFor(two)).andReturn(task);
++        expect(active.restoringTaskFor(topicPartition)).andReturn(task);
++        expect(active.restoringTaskFor(topicPartition)).andStubReturn(task);
++        replay(active, task);
++        changelogReader.restore(active);
++
+         changelogReader.restore(active);
+ 
+         assertThat(callback.restored.size(), equalTo(10));
+@@ -248,6 +258,8 @@ public void shouldOnlyReportTheLastRestoredOffset() {
+         setupConsumer(10, topicPartition);
+         changelogReader
+             .register(new StateRestorer(topicPartition, restoreListener, null, 5, true, "storeName1"));
++        expect(active.restoringTaskFor(topicPartition)).andStubReturn(task);
++        replay(active, task);
+         changelogReader.restore(active);
+ 
+         assertThat(callback.restored.size(), equalTo(5));
+@@ -306,7 +318,10 @@ public void shouldNotRestoreAnythingWhenCheckpointAtEndOffset() {
+     public void shouldReturnRestoredOffsetsForPersistentStores() {
+         setupConsumer(10, topicPartition);
+         changelogReader.register(new StateRestorer(topicPartition, restoreListener, null, Long.MAX_VALUE, true, "storeName"));
++        expect(active.restoringTaskFor(topicPartition)).andStubReturn(task);
++        replay(active, task);
+         changelogReader.restore(active);
++
+         final Map<TopicPartition, Long> restoredOffsets = changelogReader.restoredOffsets();
+         assertThat(restoredOffsets, equalTo(Collections.singletonMap(topicPartition, 10L)));
+     }
+@@ -315,6 +330,8 @@ public void shouldReturnRestoredOffsetsForPersistentStores() {
+     public void shouldNotReturnRestoredOffsetsForNonPersistentStore() {
+         setupConsumer(10, topicPartition);
+         changelogReader.register(new StateRestorer(topicPartition, restoreListener, null, Long.MAX_VALUE, false, "storeName"));
++        expect(active.restoringTaskFor(topicPartition)).andStubReturn(task);
++        replay(active, task);
+         changelogReader.restore(active);
+         final Map<TopicPartition, Long> restoredOffsets = changelogReader.restoredOffsets();
+         assertThat(restoredOffsets, equalTo(Collections.<TopicPartition, Long>emptyMap()));
+@@ -330,6 +347,8 @@ public void shouldIgnoreNullKeysWhenRestoring() {
+         consumer.assign(Collections.singletonList(topicPartition));
+         changelogReader.register(new StateRestorer(topicPartition, restoreListener, null, Long.MAX_VALUE, false,
+                                                    "storeName"));
++        expect(active.restoringTaskFor(topicPartition)).andStubReturn(task);
++        replay(active, task);
+         changelogReader.restore(active);
+ 
+         assertThat(callback.restored, CoreMatchers.equalTo(Utils.mkList(KeyValue.pair(bytes, bytes), KeyValue.pair(bytes, bytes))));
+@@ -340,6 +359,9 @@ public void shouldCompleteImmediatelyWhenEndOffsetIs0() {
+         final Collection<TopicPartition> expected = Collections.singleton(topicPartition);
+         setupConsumer(0, topicPartition);
+         changelogReader.register(new StateRestorer(topicPartition, restoreListener, null, Long.MAX_VALUE, true, "store"));
++        expect(active.restoringTaskFor(topicPartition)).andStubReturn(task);
++        replay(active, task);
++
+         final Collection<TopicPartition> restored = changelogReader.restore(active);
+         assertThat(restored, equalTo(expected));
+     }
+@@ -354,10 +376,9 @@ public void shouldRestorePartitionsRegisteredPostInitialization() {
+         changelogReader.register(new StateRestorer(topicPartition, restoreListener, null, Long.MAX_VALUE, false, "storeName"));
+ 
+         final TopicPartition postInitialization = new TopicPartition("other", 0);
+-        expect(active.restoringTaskFor(topicPartition)).andReturn(null);
+-        expect(active.restoringTaskFor(topicPartition)).andReturn(null);
+-        expect(active.restoringTaskFor(postInitialization)).andReturn(null);
+-        replay(active);
++        expect(active.restoringTaskFor(topicPartition)).andStubReturn(task);
++        expect(active.restoringTaskFor(postInitialization)).andStubReturn(task);
++        replay(active, task);
+ 
+         assertTrue(changelogReader.restore(active).isEmpty());
+ 
+
+
+ 
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on GitHub and use the
+URL above to go to the specific comment.
+ 
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+guozhangwang opened a new pull request #5430: KAFKA-7192 Follow-up: update checkpoint to the reset beginning offset
+URL: https://github.com/apache/kafka/pull/5430
+ 
+ 
+   
+   
+   ### Committer Checklist (excluded from commit message)
+   - [ ] Verify design and implementation 
+   - [ ] Verify test coverage and CI build status
+   - [ ] Verify documentation (including upgrade notes)
+   
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on GitHub and use the
+URL above to go to the specific comment.
+ 
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+guozhangwang closed pull request #5430: KAFKA-7192 Follow-up: update checkpoint to the reset beginning offset
+URL: https://github.com/apache/kafka/pull/5430
+ 
+ 
+   
+
+This is a PR merged from a forked repository.
+As GitHub hides the original diff on merge, it is displayed below for
+the sake of provenance:
+
+As this is a foreign pull request (from a fork), the diff is supplied
+below (as it won't show otherwise due to GitHub magic):
+
+diff --git a/streams/src/main/java/org/apache/kafka/streams/processor/internals/StateRestorer.java b/streams/src/main/java/org/apache/kafka/streams/processor/internals/StateRestorer.java
+index c1a41cefc23..3bbf42ead27 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/processor/internals/StateRestorer.java
++++ b/streams/src/main/java/org/apache/kafka/streams/processor/internals/StateRestorer.java
+@@ -26,13 +26,13 @@
+ 
+     static final int NO_CHECKPOINT = -1;
+ 
+-    private final Long checkpoint;
+     private final long offsetLimit;
+     private final boolean persistent;
+     private final String storeName;
+     private final TopicPartition partition;
+     private final CompositeRestoreListener compositeRestoreListener;
+ 
++    private long checkpointOffset;
+     private long restoredOffset;
+     private long startingOffset;
+     private long endingOffset;
+@@ -45,7 +45,7 @@
+                   final String storeName) {
+         this.partition = partition;
+         this.compositeRestoreListener = compositeRestoreListener;
+-        this.checkpoint = checkpoint;
++        this.checkpointOffset = checkpoint == null ? NO_CHECKPOINT : checkpoint;
+         this.offsetLimit = offsetLimit;
+         this.persistent = persistent;
+         this.storeName = storeName;
+@@ -60,7 +60,11 @@ public String storeName() {
+     }
+ 
+     long checkpoint() {
+-        return checkpoint == null ? NO_CHECKPOINT : checkpoint;
++        return checkpointOffset;
++    }
++
++    void setCheckpointOffset(final long checkpointOffset) {
++        this.checkpointOffset = checkpointOffset;
+     }
+ 
+     void restoreStarted() {
+diff --git a/streams/src/main/java/org/apache/kafka/streams/processor/internals/StoreChangelogReader.java b/streams/src/main/java/org/apache/kafka/streams/processor/internals/StoreChangelogReader.java
+index 1927b5a7af7..9185920f242 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/processor/internals/StoreChangelogReader.java
++++ b/streams/src/main/java/org/apache/kafka/streams/processor/internals/StoreChangelogReader.java
+@@ -48,8 +48,9 @@
+     private final Map<TopicPartition, Long> endOffsets = new HashMap<>();
+     private final Map<String, List<PartitionInfo>> partitionInfo = new HashMap<>();
+     private final Map<TopicPartition, StateRestorer> stateRestorers = new HashMap<>();
+-    private final Map<TopicPartition, StateRestorer> needsRestoring = new HashMap<>();
+-    private final Map<TopicPartition, StateRestorer> needsInitializing = new HashMap<>();
++    private final Set<TopicPartition> needsRestoring = new HashSet<>();
++    private final Set<TopicPartition> needsInitializing = new HashSet<>();
++    private final Set<TopicPartition> completedRestorers = new HashSet<>();
+     private final Duration pollTime;
+ 
+     public StoreChangelogReader(final Consumer<byte[], byte[]> restoreConsumer,
+@@ -64,9 +65,14 @@ public StoreChangelogReader(final Consumer<byte[], byte[]> restoreConsumer,
+ 
+     @Override
+     public void register(final StateRestorer restorer) {
+-        restorer.setUserRestoreListener(userStateRestoreListener);
+-        stateRestorers.put(restorer.partition(), restorer);
+-        needsInitializing.put(restorer.partition(), restorer);
++        if (!stateRestorers.containsKey(restorer.partition())) {
++            restorer.setUserRestoreListener(userStateRestoreListener);
++            stateRestorers.put(restorer.partition(), restorer);
++
++            log.trace("Added restorer for changelog {}", restorer.partition());
++        }
++
++        needsInitializing.add(restorer.partition());
+     }
+ 
+     public Collection<TopicPartition> restore(final RestoringTasks active) {
+@@ -81,16 +87,15 @@ public void register(final StateRestorer restorer) {
+ 
+         try {
+             final ConsumerRecords<byte[], byte[]> records = restoreConsumer.poll(pollTime);
+-            final Iterator<TopicPartition> iterator = needsRestoring.keySet().iterator();
+-            while (iterator.hasNext()) {
+-                final TopicPartition partition = iterator.next();
++
++            for (final TopicPartition partition : needsRestoring) {
+                 final StateRestorer restorer = stateRestorers.get(partition);
+                 final long pos = processNext(records.records(partition), restorer, endOffsets.get(partition));
+                 restorer.setRestoredOffset(pos);
+                 if (restorer.hasCompleted(pos, endOffsets.get(partition))) {
+                     restorer.restoreDone();
+                     endOffsets.remove(partition);
+-                    iterator.remove();
++                    completedRestorers.add(partition);
+                 }
+             }
+         } catch (final InvalidOffsetException recoverableException) {
+@@ -98,12 +103,18 @@ public void register(final StateRestorer restorer) {
+             final Set<TopicPartition> partitions = recoverableException.partitions();
+             for (final TopicPartition partition : partitions) {
+                 final StreamTask task = active.restoringTaskFor(partition);
+-                log.info("Reinitializing StreamTask {}", task);
++                log.info("Reinitializing StreamTask {} for changelog {}", task, partition);
++
++                needsInitializing.remove(partition);
++                needsRestoring.remove(partition);
++
+                 task.reinitializeStateStoresForPartitions(recoverableException.partitions());
+             }
+             restoreConsumer.seekToBeginning(partitions);
+         }
+ 
++        needsRestoring.removeAll(completedRestorers);
++
+         if (needsRestoring.isEmpty()) {
+             restoreConsumer.unsubscribe();
+         }
+@@ -120,25 +131,24 @@ private void initialize(final RestoringTasks active) {
+         // the needsInitializing map is not empty, meaning we do not know the metadata for some of them yet
+         refreshChangelogInfo();
+ 
+-        final Map<TopicPartition, StateRestorer> initializable = new HashMap<>();
+-        for (final Map.Entry<TopicPartition, StateRestorer> entry : needsInitializing.entrySet()) {
+-            final TopicPartition topicPartition = entry.getKey();
++        final Set<TopicPartition> initializable = new HashSet<>();
++        for (final TopicPartition topicPartition : needsInitializing) {
+             if (hasPartition(topicPartition)) {
+-                initializable.put(entry.getKey(), entry.getValue());
++                initializable.add(topicPartition);
+             }
+         }
+ 
+         // try to fetch end offsets for the initializable restorers and remove any partitions
+         // where we already have all of the data
+         try {
+-            endOffsets.putAll(restoreConsumer.endOffsets(initializable.keySet()));
++            endOffsets.putAll(restoreConsumer.endOffsets(initializable));
+         } catch (final TimeoutException e) {
+             // if timeout exception gets thrown we just give up this time and retry in the next run loop
+             log.debug("Could not fetch end offset for {}; will fall back to partition by partition fetching", initializable);
+             return;
+         }
+ 
+-        final Iterator<TopicPartition> iter = initializable.keySet().iterator();
++        final Iterator<TopicPartition> iter = initializable.iterator();
+         while (iter.hasNext()) {
+             final TopicPartition topicPartition = iter.next();
+             final Long endOffset = endOffsets.get(topicPartition);
+@@ -146,13 +156,15 @@ private void initialize(final RestoringTasks active) {
+             // offset should not be null; but since the consumer API does not guarantee it
+             // we add this check just in case
+             if (endOffset != null) {
+-                final StateRestorer restorer = needsInitializing.get(topicPartition);
++                final StateRestorer restorer = stateRestorers.get(topicPartition);
+                 if (restorer.checkpoint() >= endOffset) {
+                     restorer.setRestoredOffset(restorer.checkpoint());
+                     iter.remove();
++                    completedRestorers.add(topicPartition);
+                 } else if (restorer.offsetLimit() == 0 || endOffset == 0) {
+                     restorer.setRestoredOffset(0);
+                     iter.remove();
++                    completedRestorers.add(topicPartition);
+                 } else {
+                     restorer.setEndingOffset(endOffset);
+                 }
+@@ -169,51 +181,59 @@ private void initialize(final RestoringTasks active) {
+         }
+     }
+ 
+-    private void startRestoration(final Map<TopicPartition, StateRestorer> initialized,
++    private void startRestoration(final Set<TopicPartition> initialized,
+                                   final RestoringTasks active) {
+-        log.debug("Start restoring state stores from changelog topics {}", initialized.keySet());
++        log.debug("Start restoring state stores from changelog topics {}", initialized);
+ 
+         final Set<TopicPartition> assignment = new HashSet<>(restoreConsumer.assignment());
+-        assignment.addAll(initialized.keySet());
++        assignment.addAll(initialized);
+         restoreConsumer.assign(assignment);
+ 
+         final List<StateRestorer> needsPositionUpdate = new ArrayList<>();
+-        for (final StateRestorer restorer : initialized.values()) {
++
++        for (final TopicPartition partition : initialized) {
++            final StateRestorer restorer = stateRestorers.get(partition);
+             if (restorer.checkpoint() != StateRestorer.NO_CHECKPOINT) {
+-                restoreConsumer.seek(restorer.partition(), restorer.checkpoint());
+-                logRestoreOffsets(restorer.partition(),
+-                                  restorer.checkpoint(),
+-                                  endOffsets.get(restorer.partition()));
+-                restorer.setStartingOffset(restoreConsumer.position(restorer.partition()));
++                restoreConsumer.seek(partition, restorer.checkpoint());
++                logRestoreOffsets(partition,
++                        restorer.checkpoint(),
++                        endOffsets.get(partition));
++                restorer.setStartingOffset(restoreConsumer.position(partition));
+                 restorer.restoreStarted();
+             } else {
+-                final StreamTask task = active.restoringTaskFor(restorer.partition());
+-
+-                // If checkpoint does not exist it means the task was not shutdown gracefully before;
+-                // and in this case if EOS is turned on we should wipe out the state and re-initialize the task
+-                if (task.isEosEnabled()) {
+-                    log.info("No checkpoint found for task {} state store {} changelog {} with EOS turned on. " +
+-                            "Reinitializing the task and restore its state from the beginning.", task.id, restorer.storeName(), restorer.partition());
+-                    task.reinitializeStateStoresForPartitions(Collections.singleton(restorer.partition()));
+-                } else {
+-                    log.info("Restoring task {}'s state store {} from beginning of the changelog {} ", task.id, restorer.storeName(), restorer.partition());
+-                }
+-
+-                restoreConsumer.seekToBeginning(Collections.singletonList(restorer.partition()));
++                restoreConsumer.seekToBeginning(Collections.singletonList(partition));
+                 needsPositionUpdate.add(restorer);
+             }
+         }
+ 
+         for (final StateRestorer restorer : needsPositionUpdate) {
+-            final long position = restoreConsumer.position(restorer.partition());
+-            logRestoreOffsets(restorer.partition(),
+-                              position,
+-                              endOffsets.get(restorer.partition()));
+-            restorer.setStartingOffset(position);
+-            restorer.restoreStarted();
++            final TopicPartition partition = restorer.partition();
++
++            // If checkpoint does not exist it means the task was not shutdown gracefully before;
++            // and in this case if EOS is turned on we should wipe out the state and re-initialize the task
++            final StreamTask task = active.restoringTaskFor(partition);
++            if (task.isEosEnabled()) {
++                log.info("No checkpoint found for task {} state store {} changelog {} with EOS turned on. " +
++                        "Reinitializing the task and restore its state from the beginning.", task.id, restorer.storeName(), partition);
++
++                needsInitializing.remove(partition);
++                initialized.remove(partition);
++                restorer.setCheckpointOffset(restoreConsumer.position(partition));
++
++                task.reinitializeStateStoresForPartitions(Collections.singleton(partition));
++            } else {
++                log.info("Restoring task {}'s state store {} from beginning of the changelog {} ", task.id, restorer.storeName(), partition);
++
++                final long position = restoreConsumer.position(restorer.partition());
++                logRestoreOffsets(restorer.partition(),
++                        position,
++                        endOffsets.get(restorer.partition()));
++                restorer.setStartingOffset(position);
++                restorer.restoreStarted();
++            }
+         }
+ 
+-        needsRestoring.putAll(initialized);
++        needsRestoring.addAll(initialized);
+     }
+ 
+     private void logRestoreOffsets(final TopicPartition partition,
+@@ -226,10 +246,7 @@ private void logRestoreOffsets(final TopicPartition partition,
+     }
+ 
+     private Collection<TopicPartition> completed() {
+-        final Set<TopicPartition> completed = new HashSet<>(stateRestorers.keySet());
+-        completed.removeAll(needsRestoring.keySet());
+-        log.trace("The set of restoration completed partitions so far: {}", completed);
+-        return completed;
++        return completedRestorers;
+     }
+ 
+     private void refreshChangelogInfo() {
+diff --git a/streams/src/main/java/org/apache/kafka/streams/processor/internals/StreamThread.java b/streams/src/main/java/org/apache/kafka/streams/processor/internals/StreamThread.java
+index 31de839b1a1..428aa1d938b 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/processor/internals/StreamThread.java
++++ b/streams/src/main/java/org/apache/kafka/streams/processor/internals/StreamThread.java
+@@ -1129,7 +1129,7 @@ private void maybeUpdateStandbyTasks(final long now) {
+                         throw new TaskMigratedException(task);
+                     }
+ 
+-                    log.info("Reinitializing StandbyTask {}", task);
++                    log.info("Reinitializing StandbyTask {} from changelogs {}", task, recoverableException.partitions());
+                     task.reinitializeStateStoresForPartitions(recoverableException.partitions());
+                 }
+                 restoreConsumer.seekToBeginning(partitions);
+diff --git a/streams/src/test/java/org/apache/kafka/streams/processor/internals/StoreChangelogReaderTest.java b/streams/src/test/java/org/apache/kafka/streams/processor/internals/StoreChangelogReaderTest.java
+index 1e74d47808e..ae48f57db31 100644
+--- a/streams/src/test/java/org/apache/kafka/streams/processor/internals/StoreChangelogReaderTest.java
++++ b/streams/src/test/java/org/apache/kafka/streams/processor/internals/StoreChangelogReaderTest.java
+@@ -100,7 +100,11 @@ public void shouldRequestTopicsAndHandleTimeoutException() {
+     public void shouldThrowExceptionIfConsumerHasCurrentSubscription() {
+         final StateRestorer mockRestorer = EasyMock.mock(StateRestorer.class);
+         mockRestorer.setUserRestoreListener(stateRestoreListener);
+-        expect(mockRestorer.partition()).andReturn(new TopicPartition("sometopic", 0)).andReturn(new TopicPartition("sometopic", 0));
++        expect(mockRestorer.partition())
++                .andReturn(new TopicPartition("sometopic", 0))
++                .andReturn(new TopicPartition("sometopic", 0))
++                .andReturn(new TopicPartition("sometopic", 0))
++                .andReturn(new TopicPartition("sometopic", 0));
+         EasyMock.replay(mockRestorer);
+         changelogReader.register(mockRestorer);
+ 
+@@ -144,6 +148,9 @@ public void shouldRecoverFromInvalidOffsetExceptionAndFinishRestore() {
+ 
+         // first restore call "fails" but we should not die with an exception
+         assertEquals(0, changelogReader.restore(active).size());
++
++        changelogReader.register(new StateRestorer(topicPartition, restoreListener, null, Long.MAX_VALUE, true,
++                "storeName"));
+         // retry restore should succeed
+         assertEquals(1, changelogReader.restore(active).size());
+         assertThat(callback.restored.size(), equalTo(messages));
+@@ -226,9 +233,9 @@ public void shouldRestoreAndNotifyMultipleStores() throws Exception {
+         setupConsumer(3, two);
+ 
+         changelogReader
+-            .register(new StateRestorer(topicPartition, restoreListener, null, Long.MAX_VALUE, true, "storeName1"));
+-        changelogReader.register(new StateRestorer(one, restoreListener1, null, Long.MAX_VALUE, true, "storeName2"));
+-        changelogReader.register(new StateRestorer(two, restoreListener2, null, Long.MAX_VALUE, true, "storeName3"));
++            .register(new StateRestorer(topicPartition, restoreListener, 0L, Long.MAX_VALUE, true, "storeName1"));
++        changelogReader.register(new StateRestorer(one, restoreListener1, 0L, Long.MAX_VALUE, true, "storeName2"));
++        changelogReader.register(new StateRestorer(two, restoreListener2, 0L, Long.MAX_VALUE, true, "storeName3"));
+ 
+         expect(active.restoringTaskFor(one)).andReturn(task);
+         expect(active.restoringTaskFor(two)).andReturn(task);
+@@ -257,7 +264,7 @@ public void shouldRestoreAndNotifyMultipleStores() throws Exception {
+     public void shouldOnlyReportTheLastRestoredOffset() {
+         setupConsumer(10, topicPartition);
+         changelogReader
+-            .register(new StateRestorer(topicPartition, restoreListener, null, 5, true, "storeName1"));
++            .register(new StateRestorer(topicPartition, restoreListener, 0L, 5, true, "storeName1"));
+         expect(active.restoringTaskFor(topicPartition)).andStubReturn(task);
+         replay(active, task);
+         changelogReader.restore(active);
+
+
+ 
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on GitHub and use the
+URL above to go to the specific comment.
+ 
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+mjsax opened a new pull request #5641: KAFKA-7192: Wipe out state store if EOS is turned on and checkpoint file does not exist
+URL: https://github.com/apache/kafka/pull/5641
+ 
+ 
+   Unified backport of PRs #5421 and #5430
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on GitHub and use the
+URL above to go to the specific comment.
+ 
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+mjsax closed pull request #5641: KAFKA-7192: Wipe out state store if EOS is turned on and checkpoint file does not exist
+URL: https://github.com/apache/kafka/pull/5641
+ 
+ 
+   
+
+This is a PR merged from a forked repository.
+As GitHub hides the original diff on merge, it is displayed below for
+the sake of provenance:
+
+As this is a foreign pull request (from a fork), the diff is supplied
+below (as it won't show otherwise due to GitHub magic):
+
+diff --git a/streams/src/main/java/org/apache/kafka/streams/processor/internals/AbstractProcessorContext.java b/streams/src/main/java/org/apache/kafka/streams/processor/internals/AbstractProcessorContext.java
+index 04af9f269b7..c094b838a1c 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/processor/internals/AbstractProcessorContext.java
++++ b/streams/src/main/java/org/apache/kafka/streams/processor/internals/AbstractProcessorContext.java
+@@ -193,4 +193,10 @@ public ThreadCache getCache() {
+     public void initialized() {
+         initialized = true;
+     }
++
++    @Override
++    public void uninitialize() {
++        initialized = false;
++    }
++
+ }
+diff --git a/streams/src/main/java/org/apache/kafka/streams/processor/internals/AbstractTask.java b/streams/src/main/java/org/apache/kafka/streams/processor/internals/AbstractTask.java
+index 7f6ac7ca614..f8f6416b3e5 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/processor/internals/AbstractTask.java
++++ b/streams/src/main/java/org/apache/kafka/streams/processor/internals/AbstractTask.java
+@@ -226,6 +226,10 @@ void initStateStores() {
+         }
+     }
+ 
++    void reinitializeStateStoresForPartitions(final TopicPartition partitions) {
++        stateMgr.reinitializeStateStoresForPartitions(partitions, processorContext);
++    }
++
+     /**
+      * @throws ProcessorStateException if there is an error while closing the state manager
+      * @param writeCheckpoint boolean indicating if a checkpoint file should be written
+diff --git a/streams/src/main/java/org/apache/kafka/streams/processor/internals/AssignedTasks.java b/streams/src/main/java/org/apache/kafka/streams/processor/internals/AssignedTasks.java
+index d59ec2b2c1b..ad4868f8fce 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/processor/internals/AssignedTasks.java
++++ b/streams/src/main/java/org/apache/kafka/streams/processor/internals/AssignedTasks.java
+@@ -298,7 +298,7 @@ private void describe(final StringBuilder builder,
+         return suspended.values();
+     }
+ 
+-    Collection<T> restoringTasks() {
++    public Collection<T> restoringTasks() {
+         return Collections.unmodifiableCollection(restoring.values());
+     }
+ 
+diff --git a/streams/src/main/java/org/apache/kafka/streams/processor/internals/ChangelogReader.java b/streams/src/main/java/org/apache/kafka/streams/processor/internals/ChangelogReader.java
+index 5ebc34c4e92..e82ee2c354f 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/processor/internals/ChangelogReader.java
++++ b/streams/src/main/java/org/apache/kafka/streams/processor/internals/ChangelogReader.java
+@@ -37,7 +37,7 @@
+      * Restore all registered state stores by reading from their changelogs.
+      * @return all topic partitions that have been restored
+      */
+-    Collection<TopicPartition> restore();
++    Collection<TopicPartition> restore(final Collection<StreamTask> restoringTasks);
+ 
+     /**
+      * @return the restored offsets for all persistent stores.
+diff --git a/streams/src/main/java/org/apache/kafka/streams/processor/internals/InternalProcessorContext.java b/streams/src/main/java/org/apache/kafka/streams/processor/internals/InternalProcessorContext.java
+index 57bb3ac81a6..b5719b111f0 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/processor/internals/InternalProcessorContext.java
++++ b/streams/src/main/java/org/apache/kafka/streams/processor/internals/InternalProcessorContext.java
+@@ -53,4 +53,9 @@
+      * Mark this contex as being initialized
+      */
+     void initialized();
++
++    /**
++     * Mark this context as being uninitialized
++     */
++    void uninitialize();
+ }
+diff --git a/streams/src/main/java/org/apache/kafka/streams/processor/internals/ProcessorStateManager.java b/streams/src/main/java/org/apache/kafka/streams/processor/internals/ProcessorStateManager.java
+index 34a87ce03be..93e7ffc5a06 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/processor/internals/ProcessorStateManager.java
++++ b/streams/src/main/java/org/apache/kafka/streams/processor/internals/ProcessorStateManager.java
+@@ -18,6 +18,7 @@
+ 
+ import org.apache.kafka.clients.consumer.ConsumerRecord;
+ import org.apache.kafka.common.TopicPartition;
++import org.apache.kafka.common.utils.Utils;
+ import org.apache.kafka.streams.errors.LockException;
+ import org.apache.kafka.streams.errors.ProcessorStateException;
+ import org.apache.kafka.streams.errors.StreamsException;
+@@ -33,9 +34,11 @@
+ import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.HashMap;
++import java.util.HashSet;
+ import java.util.LinkedHashMap;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Set;
+ 
+ 
+ public class ProcessorStateManager implements StateManager {
+@@ -50,6 +53,7 @@
+     private final String logPrefix;
+     private final boolean isStandby;
+     private final ChangelogReader changelogReader;
++    private final boolean eosEnabled;
+     private final Map<String, StateStore> stores;
+     private final Map<String, StateStore> globalStores;
+     private final Map<TopicPartition, Long> offsetLimits;
+@@ -106,6 +110,7 @@ public ProcessorStateManager(final TaskId taskId,
+         checkpoint = new OffsetCheckpoint(new File(baseDir, CHECKPOINT_FILE_NAME));
+         checkpointedOffsets = new HashMap<>(checkpoint.read());
+ 
++        this.eosEnabled = eosEnabled;
+         if (eosEnabled) {
+             // delete the checkpoint file after finish loading its stored offsets
+             checkpoint.delete();
+@@ -169,7 +174,8 @@ public void register(final StateStore store,
+                                                              stateRestoreCallback,
+                                                              checkpointedOffsets.get(storePartition),
+                                                              offsetLimit(storePartition),
+-                                                             store.persistent()
++                                                             store.persistent(),
++                                                             store.name()
+             );
+ 
+             changelogReader.register(restorer);
+@@ -178,6 +184,61 @@ public void register(final StateStore store,
+         stores.put(store.name(), store);
+     }
+ 
++    void reinitializeStateStoresForPartitions(final TopicPartition topicPartition,
++                                              final InternalProcessorContext processorContext) {
++        final Map<String, String> changelogTopicToStore = inverseOneToOneMap(storeToChangelogTopic);
++        final Set<String> storeToBeReinitialized = new HashSet<>();
++        final Map<String, StateStore> storesCopy = new HashMap<>(stores);
++
++        checkpointedOffsets.remove(topicPartition);
++        storeToBeReinitialized.add(changelogTopicToStore.get(topicPartition.topic()));
++
++        if (!eosEnabled) {
++            try {
++                checkpoint.write(checkpointedOffsets);
++            } catch (final IOException fatalException) {
++                log.error("Failed to write offset checkpoint file to {} while re-initializing {}: {}", checkpoint, stores, fatalException);
++                throw new StreamsException("Failed to reinitialize stores.", fatalException);
++            }
++        }
++
++        for (final Map.Entry<String, StateStore> entry : storesCopy.entrySet()) {
++            final StateStore stateStore = entry.getValue();
++            final String storeName = stateStore.name();
++            if (storeToBeReinitialized.contains(storeName)) {
++                try {
++                    stateStore.close();
++                } catch (final RuntimeException ignoreAndSwallow) { /* ignore */ }
++                processorContext.uninitialize();
++                stores.remove(entry.getKey());
++
++                try {
++                    Utils.delete(new File(baseDir + File.separator + "rocksdb" + File.separator + storeName));
++                } catch (final IOException fatalException) {
++                    log.error("Failed to reinitialize store {}.", storeName, fatalException);
++                    throw new StreamsException(String.format("Failed to reinitialize store %s.", storeName), fatalException);
++                }
++
++                try {
++                    Utils.delete(new File(baseDir + File.separator + storeName));
++                } catch (final IOException fatalException) {
++                    log.error("Failed to reinitialize store {}.", storeName, fatalException);
++                    throw new StreamsException(String.format("Failed to reinitialize store %s.", storeName), fatalException);
++                }
++
++                stateStore.init(processorContext, stateStore);
++            }
++        }
++    }
++
++    private Map<String, String> inverseOneToOneMap(final Map<String, String> origin) {
++        final Map<String, String> reversedMap = new HashMap<>();
++        for (final Map.Entry<String, String> entry : origin.entrySet()) {
++            reversedMap.put(entry.getValue(), entry.getKey());
++        }
++        return reversedMap;
++    }
++
+     @Override
+     public Map<TopicPartition, Long> checkpointed() {
+         final Map<TopicPartition, Long> partitionsAndOffsets = new HashMap<>();
+diff --git a/streams/src/main/java/org/apache/kafka/streams/processor/internals/StateRestorer.java b/streams/src/main/java/org/apache/kafka/streams/processor/internals/StateRestorer.java
+index 79bfd1d0f49..3c5efe8a1e7 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/processor/internals/StateRestorer.java
++++ b/streams/src/main/java/org/apache/kafka/streams/processor/internals/StateRestorer.java
+@@ -22,12 +22,13 @@
+ public class StateRestorer {
+     static final int NO_CHECKPOINT = -1;
+ 
+-    private final Long checkpoint;
+     private final long offsetLimit;
+     private final boolean persistent;
++    private final String storeName;
+     private final TopicPartition partition;
+     private final StateRestoreCallback stateRestoreCallback;
+ 
++    private long checkpointOffset;
+     private long restoredOffset;
+     private long startingOffset;
+ 
+@@ -35,12 +36,14 @@
+                   final StateRestoreCallback stateRestoreCallback,
+                   final Long checkpoint,
+                   final long offsetLimit,
+-                  final boolean persistent) {
++                  final boolean persistent,
++                  final String storeName) {
+         this.partition = partition;
+         this.stateRestoreCallback = stateRestoreCallback;
+-        this.checkpoint = checkpoint;
++        this.checkpointOffset = checkpoint == null ? NO_CHECKPOINT : checkpoint;
+         this.offsetLimit = offsetLimit;
+         this.persistent = persistent;
++        this.storeName = storeName;
+     }
+ 
+     public TopicPartition partition() {
+@@ -48,7 +51,15 @@ public TopicPartition partition() {
+     }
+ 
+     long checkpoint() {
+-        return checkpoint == null ? NO_CHECKPOINT : checkpoint;
++        return checkpointOffset;
++    }
++
++    void setCheckpointOffset(final long checkpointOffset) {
++        this.checkpointOffset = checkpointOffset;
++    }
++
++    public String storeName() {
++        return storeName;
+     }
+ 
+     void restore(final byte[] key, final byte[] value) {
+diff --git a/streams/src/main/java/org/apache/kafka/streams/processor/internals/StoreChangelogReader.java b/streams/src/main/java/org/apache/kafka/streams/processor/internals/StoreChangelogReader.java
+index 34dcb759d8a..305bf10997d 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/processor/internals/StoreChangelogReader.java
++++ b/streams/src/main/java/org/apache/kafka/streams/processor/internals/StoreChangelogReader.java
+@@ -60,13 +60,16 @@ public StoreChangelogReader(final Consumer<byte[], byte[]> consumer) {
+ 
+     @Override
+     public void register(final StateRestorer restorer) {
+-        stateRestorers.put(restorer.partition(), restorer);
++        if (!stateRestorers.containsKey(restorer.partition())) {
++            stateRestorers.put(restorer.partition(), restorer);
++            log.trace("Added restorer for changelog {}", restorer.partition());
++        }
+         needsInitializing.put(restorer.partition(), restorer);
+     }
+ 
+-    public Collection<TopicPartition> restore() {
++    public Collection<TopicPartition> restore(final Collection<StreamTask> restoringTasks) {
+         if (!needsInitializing.isEmpty()) {
+-            initialize();
++            initialize(restoringTasks);
+         }
+ 
+         if (needsRestoring.isEmpty()) {
+@@ -87,7 +90,7 @@ public void register(final StateRestorer restorer) {
+         return completed();
+     }
+ 
+-    private void initialize() {
++    private void initialize(final Collection<StreamTask> restoringTasks) {
+         if (!consumer.subscription().isEmpty()) {
+             throw new IllegalStateException("Restore consumer should not be subscribed to any topics (" + consumer.subscription() + ")");
+         }
+@@ -139,11 +142,12 @@ private void initialize() {
+ 
+         // set up restorer for those initializable
+         if (!initializable.isEmpty()) {
+-            startRestoration(initializable);
++            startRestoration(initializable, restoringTasks);
+         }
+     }
+ 
+-    private void startRestoration(final Map<TopicPartition, StateRestorer> initialized) {
++    private void startRestoration(final Map<TopicPartition, StateRestorer> initialized,
++                                  final Collection<StreamTask> restoringTasks) {
+         log.debug("{} Start restoring state stores from changelog topics {}", logPrefix, initialized.keySet());
+ 
+         final Set<TopicPartition> assignment = new HashSet<>(consumer.assignment());
+@@ -152,24 +156,48 @@ private void startRestoration(final Map<TopicPartition, StateRestorer> initializ
+ 
+         final List<StateRestorer> needsPositionUpdate = new ArrayList<>();
+         for (final StateRestorer restorer : initialized.values()) {
++            final TopicPartition restoringPartition = restorer.partition();
+             if (restorer.checkpoint() != StateRestorer.NO_CHECKPOINT) {
+-                consumer.seek(restorer.partition(), restorer.checkpoint());
+-                logRestoreOffsets(restorer.partition(),
+-                        restorer.checkpoint(),
+-                        endOffsets.get(restorer.partition()));
+-                restorer.setStartingOffset(consumer.position(restorer.partition()));
++                consumer.seek(restoringPartition, restorer.checkpoint());
++                logRestoreOffsets(
++                    restoringPartition,
++                    restorer.checkpoint(),
++                    endOffsets.get(restoringPartition));
++                restorer.setStartingOffset(consumer.position(restoringPartition));
+             } else {
+-                consumer.seekToBeginning(Collections.singletonList(restorer.partition()));
++                consumer.seekToBeginning(Collections.singletonList(restoringPartition));
+                 needsPositionUpdate.add(restorer);
+             }
+         }
+ 
+         for (final StateRestorer restorer : needsPositionUpdate) {
+-            final long position = consumer.position(restorer.partition());
+-            logRestoreOffsets(restorer.partition(),
+-                    position,
+-                    endOffsets.get(restorer.partition()));
+-            restorer.setStartingOffset(position);
++            final TopicPartition restoringPartition = restorer.partition();
++
++            for (final StreamTask task : restoringTasks) {
++                if (task.changelogPartitions().contains(restoringPartition) || task.partitions().contains(restoringPartition)) {
++                    if (task.eosEnabled) {
++                        log.info("No checkpoint found for task {} state store {} changelog {} with EOS turned on. " +
++                            "Reinitializing the task and restore its state from the beginning.", task.id, restorer.storeName(), restorer.partition());
++
++                        needsInitializing.remove(restoringPartition);
++                        initialized.put(restoringPartition, restorer);
++                        restorer.setCheckpointOffset(consumer.position(restoringPartition));
++
++                        task.reinitializeStateStoresForPartitions(restoringPartition);
++                    } else {
++                        log.info("Restoring task {}'s state store {} from beginning of the changelog {} ", task.id, restorer.storeName(), restorer.partition());
++
++                        final long position = consumer.position(restoringPartition);
++                        logRestoreOffsets(
++                            restoringPartition,
++                            position,
++                            endOffsets.get(restoringPartition));
++                        restorer.setStartingOffset(position);
++                    }
++                }
++            }
++
++
+         }
+ 
+         needsRestoring.putAll(initialized);
+@@ -220,7 +248,7 @@ public void reset() {
+     }
+ 
+     private void restorePartition(final ConsumerRecords<byte[], byte[]> allRecords,
+-                                    final TopicPartition topicPartition) {
++                                  final TopicPartition topicPartition) {
+         final StateRestorer restorer = stateRestorers.get(topicPartition);
+         final Long endOffset = endOffsets.get(topicPartition);
+         final long pos = processNext(allRecords.records(topicPartition), restorer, endOffset);
+diff --git a/streams/src/main/java/org/apache/kafka/streams/processor/internals/StreamThread.java b/streams/src/main/java/org/apache/kafka/streams/processor/internals/StreamThread.java
+index 210b070e852..6b7f4f1934e 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/processor/internals/StreamThread.java
++++ b/streams/src/main/java/org/apache/kafka/streams/processor/internals/StreamThread.java
+@@ -532,7 +532,7 @@ private void tryTransitToRunning() {
+         active.initializeNewTasks();
+         standby.initializeNewTasks();
+ 
+-        final Collection<TopicPartition> restored = storeChangelogReader.restore();
++        final Collection<TopicPartition> restored = storeChangelogReader.restore(active.restoringTasks());
+         final Set<TopicPartition> resumed = active.updateRestored(restored);
+ 
+         if (!resumed.isEmpty()) {
+diff --git a/streams/src/test/java/org/apache/kafka/streams/integration/EosIntegrationTest.java b/streams/src/test/java/org/apache/kafka/streams/integration/EosIntegrationTest.java
+index 0c3b36aa84b..7f709507e35 100644
+--- a/streams/src/test/java/org/apache/kafka/streams/integration/EosIntegrationTest.java
++++ b/streams/src/test/java/org/apache/kafka/streams/integration/EosIntegrationTest.java
+@@ -392,7 +392,7 @@ public void shouldNotViolateEosIfOneTaskFailsWithState() throws Exception {
+         // the app commits after each 10 records per partition, and thus will have 2*5 uncommitted writes
+         // and store updates (ie, another 5 uncommitted writes to a changelog topic per partition)
+         //
+-        // the failure gets inject after 20 committed and 30 uncommitted records got received
++        // the failure gets inject after 20 committed and 10 uncommitted records got received
+         // -> the failure only kills one thread
+         // after fail over, we should read 40 committed records and the state stores should contain the correct sums
+         // per key (even if some records got processed twice)
+@@ -402,7 +402,7 @@ public void shouldNotViolateEosIfOneTaskFailsWithState() throws Exception {
+             streams.start();
+ 
+             final List<KeyValue<Long, Long>> committedDataBeforeFailure = prepareData(0L, 10L, 0L, 1L);
+-            final List<KeyValue<Long, Long>> uncommittedDataBeforeFailure = prepareData(10L, 15L, 0L, 1L);
++            final List<KeyValue<Long, Long>> uncommittedDataBeforeFailure = prepareData(10L, 15L, 0L, 1L, 2L, 3L);
+ 
+             final List<KeyValue<Long, Long>> dataBeforeFailure = new ArrayList<>();
+             dataBeforeFailure.addAll(committedDataBeforeFailure);
+diff --git a/streams/src/test/java/org/apache/kafka/streams/processor/internals/StateRestorerTest.java b/streams/src/test/java/org/apache/kafka/streams/processor/internals/StateRestorerTest.java
+index 6968f3319ec..3a8ebdaf22f 100644
+--- a/streams/src/test/java/org/apache/kafka/streams/processor/internals/StateRestorerTest.java
++++ b/streams/src/test/java/org/apache/kafka/streams/processor/internals/StateRestorerTest.java
+@@ -28,7 +28,7 @@
+ 
+     private static final long OFFSET_LIMIT = 50;
+     private final MockRestoreCallback callback = new MockRestoreCallback();
+-    private final StateRestorer restorer = new StateRestorer(new TopicPartition("topic", 1), callback, null, OFFSET_LIMIT, true);
++    private final StateRestorer restorer = new StateRestorer(new TopicPartition("topic", 1), callback, null, OFFSET_LIMIT, true, "store");
+ 
+     @Test
+     public void shouldCallRestoreOnRestoreCallback() throws Exception {
+@@ -53,7 +53,7 @@ public void shouldBeCompletedIfEndOffsetAndRecordOffsetAreZero() throws Exceptio
+ 
+     @Test
+     public void shouldBeCompletedIfOffsetAndOffsetLimitAreZero() throws Exception {
+-        final StateRestorer restorer = new StateRestorer(new TopicPartition("topic", 1), callback, null, 0, true);
++        final StateRestorer restorer = new StateRestorer(new TopicPartition("topic", 1), callback, null, 0, true, "store");
+         assertTrue(restorer.hasCompleted(0, 10));
+     }
+ 
+diff --git a/streams/src/test/java/org/apache/kafka/streams/processor/internals/StoreChangelogReaderTest.java b/streams/src/test/java/org/apache/kafka/streams/processor/internals/StoreChangelogReaderTest.java
+index a43f08344bf..24820f840b2 100644
+--- a/streams/src/test/java/org/apache/kafka/streams/processor/internals/StoreChangelogReaderTest.java
++++ b/streams/src/test/java/org/apache/kafka/streams/processor/internals/StoreChangelogReaderTest.java
+@@ -59,8 +59,8 @@ public void shouldRequestTopicsAndHandleTimeoutException() throws Exception {
+         };
+ 
+         final StoreChangelogReader changelogReader = new StoreChangelogReader(consumer);
+-        changelogReader.register(new StateRestorer(topicPartition, callback, null, Long.MAX_VALUE, true));
+-        changelogReader.restore();
++        changelogReader.register(new StateRestorer(topicPartition, callback, null, Long.MAX_VALUE, true, "store"));
++        changelogReader.restore(Collections.<StreamTask>emptySet());
+         assertTrue(functionCalled.get());
+     }
+ 
+@@ -68,7 +68,7 @@ public void shouldRequestTopicsAndHandleTimeoutException() throws Exception {
+     public void shouldThrowExceptionIfConsumerHasCurrentSubscription() throws Exception {
+         consumer.subscribe(Collections.singleton("sometopic"));
+         try {
+-            changelogReader.restore();
++            changelogReader.restore(Collections.<StreamTask>emptySet());
+             fail("Should have thrown IllegalStateException");
+         } catch (final IllegalStateException e) {
+             // ok
+@@ -79,9 +79,9 @@ public void shouldThrowExceptionIfConsumerHasCurrentSubscription() throws Except
+     public void shouldRestoreAllMessagesFromBeginningWhenCheckpointNull() throws Exception {
+         final int messages = 10;
+         setupConsumer(messages, topicPartition);
+-        changelogReader.register(new StateRestorer(topicPartition, callback, null, Long.MAX_VALUE, true));
++        changelogReader.register(new StateRestorer(topicPartition, callback, null, Long.MAX_VALUE, true, "store"));
+ 
+-        changelogReader.restore();
++        changelogReader.restore(Collections.<StreamTask>emptySet());
+         assertThat(callback.restored.size(), equalTo(messages));
+     }
+ 
+@@ -89,9 +89,9 @@ public void shouldRestoreAllMessagesFromBeginningWhenCheckpointNull() throws Exc
+     public void shouldRestoreMessagesFromCheckpoint() throws Exception {
+         final int messages = 10;
+         setupConsumer(messages, topicPartition);
+-        changelogReader.register(new StateRestorer(topicPartition, callback, 5L, Long.MAX_VALUE, true));
++        changelogReader.register(new StateRestorer(topicPartition, callback, 5L, Long.MAX_VALUE, true, "store"));
+ 
+-        changelogReader.restore();
++        changelogReader.restore(Collections.<StreamTask>emptySet());
+         assertThat(callback.restored.size(), equalTo(5));
+     }
+ 
+@@ -99,18 +99,18 @@ public void shouldRestoreMessagesFromCheckpoint() throws Exception {
+     public void shouldClearAssignmentAtEndOfRestore() throws Exception {
+         final int messages = 1;
+         setupConsumer(messages, topicPartition);
+-        changelogReader.register(new StateRestorer(topicPartition, callback, null, Long.MAX_VALUE, true));
++        changelogReader.register(new StateRestorer(topicPartition, callback, null, Long.MAX_VALUE, true, "store"));
+ 
+-        changelogReader.restore();
++        changelogReader.restore(Collections.<StreamTask>emptySet());
+         assertThat(consumer.assignment(), equalTo(Collections.<TopicPartition>emptySet()));
+     }
+ 
+     @Test
+     public void shouldRestoreToLimitWhenSupplied() throws Exception {
+         setupConsumer(10, topicPartition);
+-        final StateRestorer restorer = new StateRestorer(topicPartition, callback, null, 3, true);
++        final StateRestorer restorer = new StateRestorer(topicPartition, callback, null, 3, true, "store");
+         changelogReader.register(restorer);
+-        changelogReader.restore();
++        changelogReader.restore(Collections.<StreamTask>emptySet());
+         assertThat(callback.restored.size(), equalTo(3));
+         assertThat(restorer.restoredOffset(), equalTo(3L));
+     }
+@@ -125,11 +125,11 @@ public void shouldRestoreMultipleStores() throws Exception {
+         setupConsumer(5, one);
+         setupConsumer(3, two);
+ 
+-        changelogReader.register(new StateRestorer(topicPartition, callback, null, Long.MAX_VALUE, true));
+-        changelogReader.register(new StateRestorer(one, callbackOne, null, Long.MAX_VALUE, true));
+-        changelogReader.register(new StateRestorer(two, callbackTwo, null, Long.MAX_VALUE, true));
++        changelogReader.register(new StateRestorer(topicPartition, callback, null, Long.MAX_VALUE, true, "store"));
++        changelogReader.register(new StateRestorer(one, callbackOne, null, Long.MAX_VALUE, true, "store"));
++        changelogReader.register(new StateRestorer(two, callbackTwo, null, Long.MAX_VALUE, true, "store"));
+ 
+-        changelogReader.restore();
++        changelogReader.restore(Collections.<StreamTask>emptySet());
+ 
+         assertThat(callback.restored.size(), equalTo(10));
+         assertThat(callbackOne.restored.size(), equalTo(5));
+@@ -138,11 +138,11 @@ public void shouldRestoreMultipleStores() throws Exception {
+ 
+     @Test
+     public void shouldNotRestoreAnythingWhenPartitionIsEmpty() throws Exception {
+-        final StateRestorer restorer = new StateRestorer(topicPartition, callback, null, Long.MAX_VALUE, true);
++        final StateRestorer restorer = new StateRestorer(topicPartition, callback, null, Long.MAX_VALUE, true, "store");
+         setupConsumer(0, topicPartition);
+         changelogReader.register(restorer);
+ 
+-        changelogReader.restore();
++        changelogReader.restore(Collections.<StreamTask>emptySet());
+         assertThat(callback.restored.size(), equalTo(0));
+         assertThat(restorer.restoredOffset(), equalTo(0L));
+     }
+@@ -151,11 +151,11 @@ public void shouldNotRestoreAnythingWhenPartitionIsEmpty() throws Exception {
+     public void shouldNotRestoreAnythingWhenCheckpointAtEndOffset() throws Exception {
+         final Long endOffset = 10L;
+         setupConsumer(endOffset, topicPartition);
+-        final StateRestorer restorer = new StateRestorer(topicPartition, callback, endOffset, Long.MAX_VALUE, true);
++        final StateRestorer restorer = new StateRestorer(topicPartition, callback, endOffset, Long.MAX_VALUE, true, "store");
+ 
+         changelogReader.register(restorer);
+ 
+-        changelogReader.restore();
++        changelogReader.restore(Collections.<StreamTask>emptySet());
+         assertThat(callback.restored.size(), equalTo(0));
+         assertThat(restorer.restoredOffset(), equalTo(endOffset));
+     }
+@@ -163,8 +163,8 @@ public void shouldNotRestoreAnythingWhenCheckpointAtEndOffset() throws Exception
+     @Test
+     public void shouldReturnRestoredOffsetsForPersistentStores() throws Exception {
+         setupConsumer(10, topicPartition);
+-        changelogReader.register(new StateRestorer(topicPartition, callback, null, Long.MAX_VALUE, true));
+-        changelogReader.restore();
++        changelogReader.register(new StateRestorer(topicPartition, callback, null, Long.MAX_VALUE, true, "store"));
++        changelogReader.restore(Collections.<StreamTask>emptySet());
+         final Map<TopicPartition, Long> restoredOffsets = changelogReader.restoredOffsets();
+         assertThat(restoredOffsets, equalTo(Collections.singletonMap(topicPartition, 10L)));
+     }
+@@ -172,8 +172,8 @@ public void shouldReturnRestoredOffsetsForPersistentStores() throws Exception {
+     @Test
+     public void shouldNotReturnRestoredOffsetsForNonPersistentStore() throws Exception {
+         setupConsumer(10, topicPartition);
+-        changelogReader.register(new StateRestorer(topicPartition, callback, null, Long.MAX_VALUE, false));
+-        changelogReader.restore();
++        changelogReader.register(new StateRestorer(topicPartition, callback, null, Long.MAX_VALUE, false, "store"));
++        changelogReader.restore(Collections.<StreamTask>emptySet());
+         final Map<TopicPartition, Long> restoredOffsets = changelogReader.restoredOffsets();
+         assertThat(restoredOffsets, equalTo(Collections.<TopicPartition, Long>emptyMap()));
+     }
+@@ -186,8 +186,8 @@ public void shouldIgnoreNullKeysWhenRestoring() throws Exception {
+         consumer.addRecord(new ConsumerRecord<>(topicPartition.topic(), topicPartition.partition(), 1, (byte[]) null, bytes));
+         consumer.addRecord(new ConsumerRecord<>(topicPartition.topic(), topicPartition.partition(), 2, bytes, bytes));
+         consumer.assign(Collections.singletonList(topicPartition));
+-        changelogReader.register(new StateRestorer(topicPartition, callback, null, Long.MAX_VALUE, false));
+-        changelogReader.restore();
++        changelogReader.register(new StateRestorer(topicPartition, callback, null, Long.MAX_VALUE, false, "store"));
++        changelogReader.restore(Collections.<StreamTask>emptySet());
+ 
+         assertThat(callback.restored, CoreMatchers.equalTo(Utils.mkList(KeyValue.pair(bytes, bytes), KeyValue.pair(bytes, bytes))));
+     }
+@@ -200,15 +200,15 @@ public void shouldReturnCompletedPartitionsOnEachRestoreCall() {
+             consumer.addRecord(new ConsumerRecord<>(topicPartition.topic(), topicPartition.partition(), i, bytes, bytes));
+         }
+         consumer.assign(Collections.singletonList(topicPartition));
+-        changelogReader.register(new StateRestorer(topicPartition, callback, null, Long.MAX_VALUE, false));
++        changelogReader.register(new StateRestorer(topicPartition, callback, null, Long.MAX_VALUE, false, "store"));
+ 
+-        final Collection<TopicPartition> completedFirstTime = changelogReader.restore();
++        final Collection<TopicPartition> completedFirstTime = changelogReader.restore(Collections.<StreamTask>emptySet());
+         assertTrue(completedFirstTime.isEmpty());
+         for (int i = 5; i < 10; i++) {
+             consumer.addRecord(new ConsumerRecord<>(topicPartition.topic(), topicPartition.partition(), i, bytes, bytes));
+         }
+         final Collection<TopicPartition> expected = Collections.singleton(topicPartition);
+-        assertThat(changelogReader.restore(), equalTo(expected));
++        assertThat(changelogReader.restore(Collections.<StreamTask>emptySet()), equalTo(expected));
+     }
+ 
+     private void setupConsumer(final long messages, final TopicPartition topicPartition) {
+@@ -237,8 +237,8 @@ private void assignPartition(final long messages, final TopicPartition topicPart
+     public void shouldCompleteImmediatelyWhenEndOffsetIs0() {
+         final Collection<TopicPartition> expected = Collections.singleton(topicPartition);
+         setupConsumer(0, topicPartition);
+-        changelogReader.register(new StateRestorer(topicPartition, callback, null, Long.MAX_VALUE, true));
+-        final Collection<TopicPartition> restored = changelogReader.restore();
++        changelogReader.register(new StateRestorer(topicPartition, callback, null, Long.MAX_VALUE, true, "store"));
++        final Collection<TopicPartition> restored = changelogReader.restore(Collections.<StreamTask>emptySet());
+         assertThat(restored, equalTo(expected));
+     }
+ 
+@@ -248,9 +248,9 @@ public void shouldRestorePartitionsRegisteredPostInitialization() {
+ 
+         setupConsumer(1, topicPartition);
+         consumer.updateEndOffsets(Collections.singletonMap(topicPartition, 10L));
+-        changelogReader.register(new StateRestorer(topicPartition, callback, null, Long.MAX_VALUE, false));
++        changelogReader.register(new StateRestorer(topicPartition, callback, null, Long.MAX_VALUE, false, "store"));
+ 
+-        assertTrue(changelogReader.restore().isEmpty());
++        assertTrue(changelogReader.restore(Collections.<StreamTask>emptySet()).isEmpty());
+ 
+         addRecords(9, topicPartition, 1);
+ 
+@@ -259,12 +259,12 @@ public void shouldRestorePartitionsRegisteredPostInitialization() {
+         consumer.updateBeginningOffsets(Collections.singletonMap(postInitialization, 0L));
+         consumer.updateEndOffsets(Collections.singletonMap(postInitialization, 3L));
+ 
+-        changelogReader.register(new StateRestorer(postInitialization, callbackTwo, null, Long.MAX_VALUE, false));
++        changelogReader.register(new StateRestorer(postInitialization, callbackTwo, null, Long.MAX_VALUE, false, "store"));
+ 
+         final Collection<TopicPartition> expected = Utils.mkSet(topicPartition, postInitialization);
+         consumer.assign(expected);
+ 
+-        assertThat(changelogReader.restore(), equalTo(expected));
++        assertThat(changelogReader.restore(Collections.<StreamTask>emptySet()), equalTo(expected));
+         assertThat(callback.restored.size(), equalTo(10));
+         assertThat(callbackTwo.restored.size(), equalTo(3));
+     }
+diff --git a/streams/src/test/java/org/apache/kafka/test/MockChangelogReader.java b/streams/src/test/java/org/apache/kafka/test/MockChangelogReader.java
+index 54fd858393c..93ce801be1c 100644
+--- a/streams/src/test/java/org/apache/kafka/test/MockChangelogReader.java
++++ b/streams/src/test/java/org/apache/kafka/test/MockChangelogReader.java
+@@ -19,6 +19,7 @@
+ import org.apache.kafka.common.TopicPartition;
+ import org.apache.kafka.streams.processor.internals.ChangelogReader;
+ import org.apache.kafka.streams.processor.internals.StateRestorer;
++import org.apache.kafka.streams.processor.internals.StreamTask;
+ 
+ import java.util.Collection;
+ import java.util.Collections;
+@@ -35,7 +36,7 @@ public void register(final StateRestorer restorer) {
+     }
+ 
+     @Override
+-    public Collection<TopicPartition> restore() {
++    public Collection<TopicPartition> restore(final Collection<StreamTask> restoringTasks) {
+         return registered;
+     }
+ 
+diff --git a/streams/src/test/java/org/apache/kafka/test/MockProcessorContext.java b/streams/src/test/java/org/apache/kafka/test/MockProcessorContext.java
+index cb56fa1b1a6..fed8752ba40 100644
+--- a/streams/src/test/java/org/apache/kafka/test/MockProcessorContext.java
++++ b/streams/src/test/java/org/apache/kafka/test/MockProcessorContext.java
+@@ -142,6 +142,9 @@ public ThreadCache getCache() {
+     @Override
+     public void initialized() {}
+ 
++    @Override
++    public void uninitialize() {}
++
+     @Override
+     public File stateDir() {
+         if (stateDir == null) {
+
+
+ 
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on GitHub and use the
+URL above to go to the specific comment.
+ 
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+mjsax opened a new pull request #5657: KAFKA-7192: Wipe out state store if EOS is turned on and checkpoint file does not exist
+URL: https://github.com/apache/kafka/pull/5657
+ 
+ 
+   Unified backport of PRs #5421 and #5430
+   
+   Also compare backport to `0.11.0` #5641
+   
+   ### Committer Checklist (excluded from commit message)
+   - [ ] Verify design and implementation 
+   - [ ] Verify test coverage and CI build status
+   - [ ] Verify documentation (including upgrade notes)
+   
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on GitHub and use the
+URL above to go to the specific comment.
+ 
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+mjsax closed pull request #5657: KAFKA-7192: Wipe out state store if EOS is turned on and checkpoint file does not exist
+URL: https://github.com/apache/kafka/pull/5657
+ 
+ 
+   
+
+This is a PR merged from a forked repository.
+As GitHub hides the original diff on merge, it is displayed below for
+the sake of provenance:
+
+As this is a foreign pull request (from a fork), the diff is supplied
+below (as it won't show otherwise due to GitHub magic):
+
+diff --git a/streams/src/main/java/org/apache/kafka/streams/processor/internals/AbstractProcessorContext.java b/streams/src/main/java/org/apache/kafka/streams/processor/internals/AbstractProcessorContext.java
+index 410212e1ff0..eeaed893482 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/processor/internals/AbstractProcessorContext.java
++++ b/streams/src/main/java/org/apache/kafka/streams/processor/internals/AbstractProcessorContext.java
+@@ -198,4 +198,10 @@ public ThreadCache getCache() {
+     public void initialized() {
+         initialized = true;
+     }
++
++    @Override
++    public void uninitialize() {
++        initialized = false;
++    }
++
+ }
+diff --git a/streams/src/main/java/org/apache/kafka/streams/processor/internals/AbstractTask.java b/streams/src/main/java/org/apache/kafka/streams/processor/internals/AbstractTask.java
+index baea4af62f1..fcf2f6b13b7 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/processor/internals/AbstractTask.java
++++ b/streams/src/main/java/org/apache/kafka/streams/processor/internals/AbstractTask.java
+@@ -107,7 +107,7 @@ public final String applicationId() {
+     }
+ 
+     @Override
+-    public final Set<TopicPartition> partitions() {
++    public Set<TopicPartition> partitions() {
+         return partitions;
+     }
+ 
+@@ -226,6 +226,9 @@ void registerStateStores() {
+         }
+     }
+ 
++    void reinitializeStateStoresForPartitions(final TopicPartition partitions) {
++        stateMgr.reinitializeStateStoresForPartitions(partitions, processorContext);
++    }
+ 
+     /**
+      * @throws ProcessorStateException if there is an error while closing the state manager
+diff --git a/streams/src/main/java/org/apache/kafka/streams/processor/internals/AssignedTasks.java b/streams/src/main/java/org/apache/kafka/streams/processor/internals/AssignedTasks.java
+index 0d9d04de5cc..cfce57588e0 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/processor/internals/AssignedTasks.java
++++ b/streams/src/main/java/org/apache/kafka/streams/processor/internals/AssignedTasks.java
+@@ -50,7 +50,7 @@
+     // IQ may access this map.
+     private Map<TaskId, Task> running = new ConcurrentHashMap<>();
+     private Map<TopicPartition, Task> runningByPartition = new HashMap<>();
+-    private Map<TopicPartition, Task> restoringByPartition = new HashMap<>();
++    private Map<TopicPartition, StreamTask> restoringByPartition = new HashMap<>();
+     private int committed = 0;
+ 
+ 
+@@ -122,7 +122,8 @@ void addNewTask(final Task task) {
+             try {
+                 if (!entry.getValue().initializeStateStores()) {
+                     log.debug("Transitioning {} {} to restoring", taskTypeName, entry.getKey());
+-                    addToRestoring(entry.getValue());
++                    // cast is safe, because StandbyTasks always returns `true` in `initializeStateStores()` above
++                    addToRestoring((StreamTask) entry.getValue());
+                 } else {
+                     transitionToRunning(entry.getValue(), readyPartitions);
+                 }
+@@ -278,7 +279,7 @@ boolean maybeResumeSuspendedTask(final TaskId taskId, final Set<TopicPartition>
+         return false;
+     }
+ 
+-    private void addToRestoring(final Task task) {
++    private void addToRestoring(final StreamTask task) {
+         restoring.put(task.id(), task);
+         for (TopicPartition topicPartition : task.partitions()) {
+             restoringByPartition.put(topicPartition, task);
+@@ -307,7 +308,7 @@ private void transitionToRunning(final Task task, final Set<TopicPartition> read
+     }
+ 
+     @Override
+-    public Task restoringTaskFor(final TopicPartition partition) {
++    public StreamTask restoringTaskFor(final TopicPartition partition) {
+         return restoringByPartition.get(partition);
+     }
+ 
+diff --git a/streams/src/main/java/org/apache/kafka/streams/processor/internals/InternalProcessorContext.java b/streams/src/main/java/org/apache/kafka/streams/processor/internals/InternalProcessorContext.java
+index 57bb3ac81a6..b5719b111f0 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/processor/internals/InternalProcessorContext.java
++++ b/streams/src/main/java/org/apache/kafka/streams/processor/internals/InternalProcessorContext.java
+@@ -53,4 +53,9 @@
+      * Mark this contex as being initialized
+      */
+     void initialized();
++
++    /**
++     * Mark this context as being uninitialized
++     */
++    void uninitialize();
+ }
+diff --git a/streams/src/main/java/org/apache/kafka/streams/processor/internals/ProcessorStateManager.java b/streams/src/main/java/org/apache/kafka/streams/processor/internals/ProcessorStateManager.java
+index 5536ac12be7..9ccb458cf66 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/processor/internals/ProcessorStateManager.java
++++ b/streams/src/main/java/org/apache/kafka/streams/processor/internals/ProcessorStateManager.java
+@@ -19,8 +19,10 @@
+ import org.apache.kafka.clients.consumer.ConsumerRecord;
+ import org.apache.kafka.common.TopicPartition;
+ import org.apache.kafka.common.utils.LogContext;
++import org.apache.kafka.common.utils.Utils;
+ import org.apache.kafka.streams.KeyValue;
+ import org.apache.kafka.streams.errors.ProcessorStateException;
++import org.apache.kafka.streams.errors.StreamsException;
+ import org.apache.kafka.streams.processor.BatchingStateRestoreCallback;
+ import org.apache.kafka.streams.processor.StateRestoreCallback;
+ import org.apache.kafka.streams.processor.StateStore;
+@@ -33,9 +35,11 @@
+ import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.HashMap;
++import java.util.HashSet;
+ import java.util.LinkedHashMap;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Set;
+ 
+ 
+ public class ProcessorStateManager implements StateManager {
+@@ -49,6 +53,7 @@
+     private final String logPrefix;
+     private final boolean isStandby;
+     private final ChangelogReader changelogReader;
++    private final boolean eosEnabled;
+     private final Map<String, StateStore> stores;
+     private final Map<String, StateStore> globalStores;
+     private final Map<TopicPartition, Long> offsetLimits;
+@@ -98,6 +103,7 @@ public ProcessorStateManager(final TaskId taskId,
+         checkpoint = new OffsetCheckpoint(new File(baseDir, CHECKPOINT_FILE_NAME));
+         checkpointedOffsets = new HashMap<>(checkpoint.read());
+ 
++        this.eosEnabled = eosEnabled;
+         if (eosEnabled) {
+             // delete the checkpoint file after finish loading its stored offsets
+             checkpoint.delete();
+@@ -176,6 +182,61 @@ public void register(final StateStore store,
+         return partitionsAndOffsets;
+     }
+ 
++    void reinitializeStateStoresForPartitions(final TopicPartition topicPartition,
++                                              final InternalProcessorContext processorContext) {
++        final Map<String, String> changelogTopicToStore = inverseOneToOneMap(storeToChangelogTopic);
++        final Set<String> storeToBeReinitialized = new HashSet<>();
++        final Map<String, StateStore> storesCopy = new HashMap<>(stores);
++
++        checkpointedOffsets.remove(topicPartition);
++        storeToBeReinitialized.add(changelogTopicToStore.get(topicPartition.topic()));
++
++        if (!eosEnabled) {
++            try {
++                checkpoint.write(checkpointedOffsets);
++            } catch (final IOException fatalException) {
++                log.error("Failed to write offset checkpoint file to {} while re-initializing {}: {}", checkpoint, stores, fatalException);
++                throw new StreamsException("Failed to reinitialize stores.", fatalException);
++            }
++        }
++
++        for (final Map.Entry<String, StateStore> entry : storesCopy.entrySet()) {
++            final StateStore stateStore = entry.getValue();
++            final String storeName = stateStore.name();
++            if (storeToBeReinitialized.contains(storeName)) {
++                try {
++                    stateStore.close();
++                } catch (final RuntimeException ignoreAndSwallow) { /* ignore */ }
++                processorContext.uninitialize();
++                stores.remove(entry.getKey());
++
++                try {
++                    Utils.delete(new File(baseDir + File.separator + "rocksdb" + File.separator + storeName));
++                } catch (final IOException fatalException) {
++                    log.error("Failed to reinitialize store {}.", storeName, fatalException);
++                    throw new StreamsException(String.format("Failed to reinitialize store %s.", storeName), fatalException);
++                }
++
++                try {
++                    Utils.delete(new File(baseDir + File.separator + storeName));
++                } catch (final IOException fatalException) {
++                    log.error("Failed to reinitialize store {}.", storeName, fatalException);
++                    throw new StreamsException(String.format("Failed to reinitialize store %s.", storeName), fatalException);
++                }
++
++                stateStore.init(processorContext, stateStore);
++            }
++        }
++    }
++
++    private Map<String, String> inverseOneToOneMap(final Map<String, String> origin) {
++        final Map<String, String> reversedMap = new HashMap<>();
++        for (final Map.Entry<String, String> entry : origin.entrySet()) {
++            reversedMap.put(entry.getValue(), entry.getKey());
++        }
++        return reversedMap;
++    }
++
+     List<ConsumerRecord<byte[], byte[]>> updateStandbyStates(final TopicPartition storePartition,
+                                                              final List<ConsumerRecord<byte[], byte[]>> records) {
+         final long limit = offsetLimit(storePartition);
+diff --git a/streams/src/main/java/org/apache/kafka/streams/processor/internals/RestoringTasks.java b/streams/src/main/java/org/apache/kafka/streams/processor/internals/RestoringTasks.java
+index 6ed28fdf63c..3671b493f19 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/processor/internals/RestoringTasks.java
++++ b/streams/src/main/java/org/apache/kafka/streams/processor/internals/RestoringTasks.java
+@@ -19,5 +19,5 @@
+ import org.apache.kafka.common.TopicPartition;
+ 
+ public interface RestoringTasks {
+-    Task restoringTaskFor(final TopicPartition partition);
++    StreamTask restoringTaskFor(final TopicPartition partition);
+ }
+diff --git a/streams/src/main/java/org/apache/kafka/streams/processor/internals/StateRestorer.java b/streams/src/main/java/org/apache/kafka/streams/processor/internals/StateRestorer.java
+index 33dce9e7558..e0bac939b8b 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/processor/internals/StateRestorer.java
++++ b/streams/src/main/java/org/apache/kafka/streams/processor/internals/StateRestorer.java
+@@ -26,13 +26,13 @@
+ 
+     static final int NO_CHECKPOINT = -1;
+ 
+-    private final Long checkpoint;
+     private final long offsetLimit;
+     private final boolean persistent;
+     private final String storeName;
+     private final TopicPartition partition;
+     private final CompositeRestoreListener compositeRestoreListener;
+ 
++    private long checkpointOffset;
+     private long restoredOffset;
+     private long startingOffset;
+     private long endingOffset;
+@@ -45,7 +45,7 @@
+                   final String storeName) {
+         this.partition = partition;
+         this.compositeRestoreListener = compositeRestoreListener;
+-        this.checkpoint = checkpoint;
++        this.checkpointOffset = checkpoint == null ? NO_CHECKPOINT : checkpoint;
+         this.offsetLimit = offsetLimit;
+         this.persistent = persistent;
+         this.storeName = storeName;
+@@ -56,7 +56,15 @@ public TopicPartition partition() {
+     }
+ 
+     long checkpoint() {
+-        return checkpoint == null ? NO_CHECKPOINT : checkpoint;
++        return checkpointOffset;
++    }
++
++    void setCheckpointOffset(final long checkpointOffset) {
++        this.checkpointOffset = checkpointOffset;
++    }
++
++    public String storeName() {
++        return storeName;
+     }
+ 
+     void restoreStarted() {
+@@ -67,7 +75,8 @@ void restoreDone() {
+         compositeRestoreListener.onRestoreEnd(partition, storeName, restoredNumRecords());
+     }
+ 
+-    void restoreBatchCompleted(long currentRestoredOffset, int numRestored) {
++    void restoreBatchCompleted(final long currentRestoredOffset,
++                               final int numRestored) {
+         compositeRestoreListener.onBatchRestored(partition, storeName, currentRestoredOffset, numRestored);
+     }
+ 
+@@ -79,7 +88,7 @@ boolean isPersistent() {
+         return persistent;
+     }
+ 
+-    void setUserRestoreListener(StateRestoreListener userRestoreListener) {
++    void setUserRestoreListener(final StateRestoreListener userRestoreListener) {
+         this.compositeRestoreListener.setUserRestoreListener(userRestoreListener);
+     }
+ 
+diff --git a/streams/src/main/java/org/apache/kafka/streams/processor/internals/StoreChangelogReader.java b/streams/src/main/java/org/apache/kafka/streams/processor/internals/StoreChangelogReader.java
+index 8d85b1d8faf..34350c17eb0 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/processor/internals/StoreChangelogReader.java
++++ b/streams/src/main/java/org/apache/kafka/streams/processor/internals/StoreChangelogReader.java
+@@ -69,7 +69,7 @@ public void register(final StateRestorer restorer) {
+      */
+     public Collection<TopicPartition> restore(final RestoringTasks active) {
+         if (!needsInitializing.isEmpty()) {
+-            initialize();
++            initialize(active);
+         }
+ 
+         if (needsRestoring.isEmpty()) {
+@@ -90,7 +90,7 @@ public void register(final StateRestorer restorer) {
+         return completed();
+     }
+ 
+-    private void initialize() {
++    private void initialize(final RestoringTasks active) {
+         if (!consumer.subscription().isEmpty()) {
+             throw new IllegalStateException("Restore consumer should not be subscribed to any topics (" + consumer.subscription() + ")");
+         }
+@@ -99,8 +99,8 @@ private void initialize() {
+         // the needsInitializing map is not empty, meaning we do not know the metadata for some of them yet
+         refreshChangelogInfo();
+ 
+-        Map<TopicPartition, StateRestorer> initializable = new HashMap<>();
+-        for (Map.Entry<TopicPartition, StateRestorer> entry : needsInitializing.entrySet()) {
++        final Map<TopicPartition, StateRestorer> initializable = new HashMap<>();
++        for (final Map.Entry<TopicPartition, StateRestorer> entry : needsInitializing.entrySet()) {
+             final TopicPartition topicPartition = entry.getKey();
+             if (hasPartition(topicPartition)) {
+                 initializable.put(entry.getKey(), entry.getValue());
+@@ -144,11 +144,12 @@ private void initialize() {
+ 
+         // set up restorer for those initializable
+         if (!initializable.isEmpty()) {
+-            startRestoration(initializable);
++            startRestoration(initializable, active);
+         }
+     }
+ 
+-    private void startRestoration(final Map<TopicPartition, StateRestorer> initialized) {
++    private void startRestoration(final Map<TopicPartition, StateRestorer> initialized,
++                                  final RestoringTasks active) {
+         log.debug("Start restoring state stores from changelog topics {}", initialized.keySet());
+ 
+         final Set<TopicPartition> assignment = new HashSet<>(consumer.assignment());
+@@ -157,26 +158,47 @@ private void startRestoration(final Map<TopicPartition, StateRestorer> initializ
+ 
+         final List<StateRestorer> needsPositionUpdate = new ArrayList<>();
+         for (final StateRestorer restorer : initialized.values()) {
++            final TopicPartition restoringPartition = restorer.partition();
+             if (restorer.checkpoint() != StateRestorer.NO_CHECKPOINT) {
+-                consumer.seek(restorer.partition(), restorer.checkpoint());
+-                logRestoreOffsets(restorer.partition(),
+-                        restorer.checkpoint(),
+-                        endOffsets.get(restorer.partition()));
+-                restorer.setStartingOffset(consumer.position(restorer.partition()));
++                consumer.seek(restoringPartition, restorer.checkpoint());
++                logRestoreOffsets(restoringPartition,
++                                  restorer.checkpoint(),
++                                  endOffsets.get(restoringPartition));
++                restorer.setStartingOffset(consumer.position(restoringPartition));
+                 restorer.restoreStarted();
+             } else {
+-                consumer.seekToBeginning(Collections.singletonList(restorer.partition()));
++                consumer.seekToBeginning(Collections.singletonList(restoringPartition));
+                 needsPositionUpdate.add(restorer);
+             }
+         }
+ 
+         for (final StateRestorer restorer : needsPositionUpdate) {
+-            final long position = consumer.position(restorer.partition());
+-            logRestoreOffsets(restorer.partition(),
+-                              position,
+-                              endOffsets.get(restorer.partition()));
+-            restorer.setStartingOffset(position);
+-            restorer.restoreStarted();
++            final TopicPartition restoringPartition = restorer.partition();
++            final StreamTask task = active.restoringTaskFor(restoringPartition);
++
++            // If checkpoint does not exist it means the task was not shutdown gracefully before;
++            // and in this case if EOS is turned on we should wipe out the state and re-initialize the task
++            if (task.eosEnabled) {
++                log.info("No checkpoint found for task {} state store {} changelog {} with EOS turned on. " +
++                    "Reinitializing the task and restore its state from the beginning.", task.id, restorer.storeName(), restoringPartition);
++
++                // we move the partitions here, because they will be added back within
++                // `task.reinitializeStateStoresForPartitions()` that calls `register()` internally again
++                needsInitializing.remove(restoringPartition);
++                restorer.setCheckpointOffset(consumer.position(restoringPartition));
++
++                task.reinitializeStateStoresForPartitions(restoringPartition);
++                stateRestorers.get(restoringPartition).restoreStarted();
++            } else {
++                log.info("Restoring task {}'s state store {} from beginning of the changelog {} ", task.id, restorer.storeName(), restoringPartition);
++
++                final long position = consumer.position(restoringPartition);
++                logRestoreOffsets(restoringPartition,
++                                  position,
++                                  endOffsets.get(restoringPartition));
++                restorer.setStartingOffset(position);
++                restorer.restoreStarted();
++            }
+         }
+ 
+         needsRestoring.putAll(initialized);
+diff --git a/streams/src/test/java/org/apache/kafka/streams/integration/EosIntegrationTest.java b/streams/src/test/java/org/apache/kafka/streams/integration/EosIntegrationTest.java
+index 6c7b2b43c9d..d07781f5b24 100644
+--- a/streams/src/test/java/org/apache/kafka/streams/integration/EosIntegrationTest.java
++++ b/streams/src/test/java/org/apache/kafka/streams/integration/EosIntegrationTest.java
+@@ -392,7 +392,7 @@ public void shouldNotViolateEosIfOneTaskFailsWithState() throws Exception {
+         // the app commits after each 10 records per partition, and thus will have 2*5 uncommitted writes
+         // and store updates (ie, another 5 uncommitted writes to a changelog topic per partition)
+         //
+-        // the failure gets inject after 20 committed and 30 uncommitted records got received
++        // the failure gets inject after 20 committed and 10 uncommitted records got received
+         // -> the failure only kills one thread
+         // after fail over, we should read 40 committed records and the state stores should contain the correct sums
+         // per key (even if some records got processed twice)
+@@ -402,7 +402,7 @@ public void shouldNotViolateEosIfOneTaskFailsWithState() throws Exception {
+             streams.start();
+ 
+             final List<KeyValue<Long, Long>> committedDataBeforeFailure = prepareData(0L, 10L, 0L, 1L);
+-            final List<KeyValue<Long, Long>> uncommittedDataBeforeFailure = prepareData(10L, 15L, 0L, 1L);
++            final List<KeyValue<Long, Long>> uncommittedDataBeforeFailure = prepareData(10L, 15L, 0L, 1L, 2L, 3L);
+ 
+             final List<KeyValue<Long, Long>> dataBeforeFailure = new ArrayList<>();
+             dataBeforeFailure.addAll(committedDataBeforeFailure);
+diff --git a/streams/src/test/java/org/apache/kafka/streams/processor/internals/AssignedTasksTest.java b/streams/src/test/java/org/apache/kafka/streams/processor/internals/AssignedTasksTest.java
+index 5c8b7c44033..01439add706 100644
+--- a/streams/src/test/java/org/apache/kafka/streams/processor/internals/AssignedTasksTest.java
++++ b/streams/src/test/java/org/apache/kafka/streams/processor/internals/AssignedTasksTest.java
+@@ -40,8 +40,8 @@
+ 
+ public class AssignedTasksTest {
+ 
+-    private final Task t1 = EasyMock.createMock(Task.class);
+-    private final Task t2 = EasyMock.createMock(Task.class);
++    private final StreamTask t1 = EasyMock.createMock(StreamTask.class);
++    private final StreamTask t2 = EasyMock.createMock(StreamTask.class);
+     private final TopicPartition tp1 = new TopicPartition("t1", 0);
+     private final TopicPartition tp2 = new TopicPartition("t2", 0);
+     private final TopicPartition changeLog1 = new TopicPartition("cl1", 0);
+diff --git a/streams/src/test/java/org/apache/kafka/streams/processor/internals/StoreChangelogReaderTest.java b/streams/src/test/java/org/apache/kafka/streams/processor/internals/StoreChangelogReaderTest.java
+index bb0c51e1546..a0e2140e92d 100644
+--- a/streams/src/test/java/org/apache/kafka/streams/processor/internals/StoreChangelogReaderTest.java
++++ b/streams/src/test/java/org/apache/kafka/streams/processor/internals/StoreChangelogReaderTest.java
+@@ -59,7 +59,7 @@
+     @Mock(type = MockType.NICE)
+     private RestoringTasks active;
+     @Mock(type = MockType.NICE)
+-    private Task task;
++    private StreamTask task;
+ 
+     private final MockStateRestoreListener callback = new MockStateRestoreListener();
+     private final CompositeRestoreListener restoreListener = new CompositeRestoreListener(callback);
+@@ -107,6 +107,10 @@ public void shouldRestoreAllMessagesFromBeginningWhenCheckpointNull() {
+         final int messages = 10;
+         setupConsumer(messages, topicPartition);
+         changelogReader.register(new StateRestorer(topicPartition, restoreListener, null, Long.MAX_VALUE, true, "storeName"));
++
++        expect(active.restoringTaskFor(topicPartition)).andStubReturn(task);
++        replay(active, task);
++
+         changelogReader.restore(active);
+         assertThat(callback.restored.size(), equalTo(messages));
+     }
+@@ -115,8 +119,7 @@ public void shouldRestoreAllMessagesFromBeginningWhenCheckpointNull() {
+     public void shouldRestoreMessagesFromCheckpoint() {
+         final int messages = 10;
+         setupConsumer(messages, topicPartition);
+-        changelogReader.register(new StateRestorer(topicPartition, restoreListener, 5L, Long.MAX_VALUE, true,
+-                                                   "storeName"));
++        changelogReader.register(new StateRestorer(topicPartition, restoreListener, 5L, Long.MAX_VALUE, true, "storeName"));
+ 
+         changelogReader.restore(active);
+         assertThat(callback.restored.size(), equalTo(5));
+@@ -126,9 +129,9 @@ public void shouldRestoreMessagesFromCheckpoint() {
+     public void shouldClearAssignmentAtEndOfRestore() {
+         final int messages = 1;
+         setupConsumer(messages, topicPartition);
+-        changelogReader.register(new StateRestorer(topicPartition, restoreListener, null, Long.MAX_VALUE, true,
+-                                                   "storeName"));
+-
++        changelogReader.register(new StateRestorer(topicPartition, restoreListener, null, Long.MAX_VALUE, true, "storeName"));
++        expect(active.restoringTaskFor(topicPartition)).andStubReturn(task);
++        replay(active, task);
+         changelogReader.restore(active);
+         assertThat(consumer.assignment(), equalTo(Collections.<TopicPartition>emptySet()));
+     }
+@@ -136,9 +139,10 @@ public void shouldClearAssignmentAtEndOfRestore() {
+     @Test
+     public void shouldRestoreToLimitWhenSupplied() {
+         setupConsumer(10, topicPartition);
+-        final StateRestorer restorer = new StateRestorer(topicPartition, restoreListener, null, 3, true,
+-                                                         "storeName");
++        final StateRestorer restorer = new StateRestorer(topicPartition, restoreListener, null, 3, true, "storeName");
+         changelogReader.register(restorer);
++        expect(active.restoringTaskFor(topicPartition)).andStubReturn(task);
++        replay(active, task);
+         changelogReader.restore(active);
+         assertThat(callback.restored.size(), equalTo(3));
+         assertThat(restorer.restoredOffset(), equalTo(3L));
+@@ -156,14 +160,14 @@ public void shouldRestoreMultipleStores() {
+         setupConsumer(5, one);
+         setupConsumer(3, two);
+ 
+-        changelogReader
+-            .register(new StateRestorer(topicPartition, restoreListener, null, Long.MAX_VALUE, true, "storeName1"));
++        changelogReader.register(new StateRestorer(topicPartition, restoreListener, null, Long.MAX_VALUE, true, "storeName1"));
+         changelogReader.register(new StateRestorer(one, restoreListener1, null, Long.MAX_VALUE, true, "storeName2"));
+         changelogReader.register(new StateRestorer(two, restoreListener2, null, Long.MAX_VALUE, true, "storeName3"));
+ 
+-        expect(active.restoringTaskFor(one)).andReturn(null);
+-        expect(active.restoringTaskFor(two)).andReturn(null);
+-        replay(active);
++        expect(active.restoringTaskFor(one)).andStubReturn(task);
++        expect(active.restoringTaskFor(two)).andStubReturn(task);
++        expect(active.restoringTaskFor(topicPartition)).andStubReturn(task);
++        replay(active, task);
+         changelogReader.restore(active);
+ 
+         assertThat(callback.restored.size(), equalTo(10));
+@@ -188,9 +192,10 @@ public void shouldRestoreAndNotifyMultipleStores() throws Exception {
+         changelogReader.register(new StateRestorer(one, restoreListener1, null, Long.MAX_VALUE, true, "storeName2"));
+         changelogReader.register(new StateRestorer(two, restoreListener2, null, Long.MAX_VALUE, true, "storeName3"));
+ 
+-        expect(active.restoringTaskFor(one)).andReturn(null);
+-        expect(active.restoringTaskFor(two)).andReturn(null);
+-        replay(active);
++        expect(active.restoringTaskFor(one)).andStubReturn(task);
++        expect(active.restoringTaskFor(two)).andStubReturn(task);
++        expect(active.restoringTaskFor(topicPartition)).andStubReturn(task);
++        replay(active, task);
+         changelogReader.restore(active);
+ 
+         assertThat(callback.restored.size(), equalTo(10));
+@@ -210,8 +215,10 @@ public void shouldRestoreAndNotifyMultipleStores() throws Exception {
+     @Test
+     public void shouldOnlyReportTheLastRestoredOffset() {
+         setupConsumer(10, topicPartition);
+-        changelogReader
+-            .register(new StateRestorer(topicPartition, restoreListener, null, 5, true, "storeName1"));
++        changelogReader.register(new StateRestorer(topicPartition, restoreListener, null, 5, true, "storeName1"));
++        expect(active.restoringTaskFor(topicPartition)).andStubReturn(task);
++        replay(active, task);
++
+         changelogReader.restore(active);
+ 
+         assertThat(callback.restored.size(), equalTo(5));
+@@ -270,6 +277,8 @@ public void shouldNotRestoreAnythingWhenCheckpointAtEndOffset() {
+     public void shouldReturnRestoredOffsetsForPersistentStores() {
+         setupConsumer(10, topicPartition);
+         changelogReader.register(new StateRestorer(topicPartition, restoreListener, null, Long.MAX_VALUE, true, "storeName"));
++        expect(active.restoringTaskFor(topicPartition)).andStubReturn(task);
++        replay(active, task);
+         changelogReader.restore(active);
+         final Map<TopicPartition, Long> restoredOffsets = changelogReader.restoredOffsets();
+         assertThat(restoredOffsets, equalTo(Collections.singletonMap(topicPartition, 10L)));
+@@ -279,6 +288,8 @@ public void shouldReturnRestoredOffsetsForPersistentStores() {
+     public void shouldNotReturnRestoredOffsetsForNonPersistentStore() {
+         setupConsumer(10, topicPartition);
+         changelogReader.register(new StateRestorer(topicPartition, restoreListener, null, Long.MAX_VALUE, false, "storeName"));
++        expect(active.restoringTaskFor(topicPartition)).andStubReturn(task);
++        replay(active, task);
+         changelogReader.restore(active);
+         final Map<TopicPartition, Long> restoredOffsets = changelogReader.restoredOffsets();
+         assertThat(restoredOffsets, equalTo(Collections.<TopicPartition, Long>emptyMap()));
+@@ -292,8 +303,9 @@ public void shouldIgnoreNullKeysWhenRestoring() {
+         consumer.addRecord(new ConsumerRecord<>(topicPartition.topic(), topicPartition.partition(), 1, (byte[]) null, bytes));
+         consumer.addRecord(new ConsumerRecord<>(topicPartition.topic(), topicPartition.partition(), 2, bytes, bytes));
+         consumer.assign(Collections.singletonList(topicPartition));
+-        changelogReader.register(new StateRestorer(topicPartition, restoreListener, null, Long.MAX_VALUE, false,
+-                                                   "storeName"));
++        changelogReader.register(new StateRestorer(topicPartition, restoreListener, null, Long.MAX_VALUE, false, "storeName"));
++        expect(active.restoringTaskFor(topicPartition)).andStubReturn(task);
++        replay(active, task);
+         changelogReader.restore(active);
+ 
+         assertThat(callback.restored, CoreMatchers.equalTo(Utils.mkList(KeyValue.pair(bytes, bytes), KeyValue.pair(bytes, bytes))));
+@@ -318,10 +330,11 @@ public void shouldRestorePartitionsRegisteredPostInitialization() {
+         changelogReader.register(new StateRestorer(topicPartition, restoreListener, null, Long.MAX_VALUE, false, "storeName"));
+ 
+         final TopicPartition postInitialization = new TopicPartition("other", 0);
+-        expect(active.restoringTaskFor(topicPartition)).andReturn(null);
+-        expect(active.restoringTaskFor(topicPartition)).andReturn(null);
+-        expect(active.restoringTaskFor(postInitialization)).andReturn(null);
+-        replay(active);
++        expect(active.restoringTaskFor(topicPartition)).andStubReturn(task);
++        expect(active.restoringTaskFor(topicPartition)).andStubReturn(task);
++        expect(active.restoringTaskFor(postInitialization)).andStubReturn(task);
++        expect(active.restoringTaskFor(topicPartition)).andStubReturn(task);
++        replay(active, task);
+ 
+         assertTrue(changelogReader.restore(active).isEmpty());
+ 
+@@ -348,7 +361,7 @@ public void shouldThrowTaskMigratedExceptionIfEndOffsetGetsExceededDuringRestore
+         consumer.updateEndOffsets(Collections.singletonMap(topicPartition, 5L));
+         changelogReader.register(new StateRestorer(topicPartition, restoreListener, null, Long.MAX_VALUE, true, "storeName"));
+ 
+-        expect(active.restoringTaskFor(topicPartition)).andReturn(task);
++        expect(active.restoringTaskFor(topicPartition)).andStubReturn(task);
+         replay(active);
+ 
+         try {
+@@ -371,8 +384,8 @@ public void shouldThrowTaskMigratedExceptionIfEndOffsetGetsExceededDuringRestore
+         consumer.updateEndOffsets(Collections.singletonMap(topicPartition, 6L));
+         changelogReader.register(new StateRestorer(topicPartition, restoreListener, null, Long.MAX_VALUE, true, "storeName"));
+ 
+-        expect(active.restoringTaskFor(topicPartition)).andReturn(task);
+-        replay(active);
++        expect(active.restoringTaskFor(topicPartition)).andStubReturn(task);
++        replay(active, task);
+         try {
+             changelogReader.restore(active);
+             fail("Should have thrown task migrated exception");
+
+
+ 
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on GitHub and use the
+URL above to go to the specific comment.
+ 
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+mjsax opened a new pull request #5767: KAFKA-7192: Wipe out state store if EOS is turned on and checkpoint file does not exist
+URL: https://github.com/apache/kafka/pull/5767
+ 
+ 
+   Unified backport of PRs #5421 and #5430
+   
+   Also compare backport to `0.11.0` #5641 and `1.0` #5657
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on GitHub and use the
+URL above to go to the specific comment.
+ 
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+Will this be fixed in Kafka v1.1.2?
+
+I hope so. Did not have time yet, to port the fix into 1.1 branch.
+
+[~mjsax] thanks! Is the issue only on client side (would updated client lib fix it)? And would disabling RocksDB mitigate the issue in the meantime? I haven't been able to re-produce the issue with RocksDB disabled.
+
+Yes, it's a client side bug and related to RocksDB. If you run with in-memory store, you won't see this issue.
+
+mjsax opened a new pull request #5915: KAFKA-7192: Wipe out state store if EOS is turned on and checkpoint file does not exist
+URL: https://github.com/apache/kafka/pull/5915
+ 
+ 
+   Follow up PR to #5657. Fixes buggy back port.
+   
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on GitHub and use the
+URL above to go to the specific comment.
+ 
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+guozhangwang closed pull request #5915: KAFKA-7192: Wipe out state store if EOS is turned on and checkpoint file does not exist
+URL: https://github.com/apache/kafka/pull/5915
+ 
+ 
+   
+
+This is a PR merged from a forked repository.
+As GitHub hides the original diff on merge, it is displayed below for
+the sake of provenance:
+
+As this is a foreign pull request (from a fork), the diff is supplied
+below (as it won't show otherwise due to GitHub magic):
+
+diff --git a/streams/src/main/java/org/apache/kafka/streams/processor/internals/StoreChangelogReader.java b/streams/src/main/java/org/apache/kafka/streams/processor/internals/StoreChangelogReader.java
+index 34350c17eb0..c03de2d4a2d 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/processor/internals/StoreChangelogReader.java
++++ b/streams/src/main/java/org/apache/kafka/streams/processor/internals/StoreChangelogReader.java
+@@ -59,9 +59,14 @@ public StoreChangelogReader(final Consumer<byte[], byte[]> consumer,
+ 
+     @Override
+     public void register(final StateRestorer restorer) {
+-        restorer.setUserRestoreListener(userStateRestoreListener);
+-        stateRestorers.put(restorer.partition(), restorer);
+-        needsInitializing.put(restorer.partition(), restorer);
++        final StateRestorer existingRestorer = stateRestorers.get(restorer.partition());
++        if (existingRestorer == null) {
++            restorer.setUserRestoreListener(userStateRestoreListener);
++            stateRestorers.put(restorer.partition(), restorer);
++            needsInitializing.put(restorer.partition(), restorer);
++        } else {
++            needsInitializing.put(restorer.partition(), existingRestorer);
++        }
+     }
+ 
+     /**
+@@ -188,7 +193,6 @@ private void startRestoration(final Map<TopicPartition, StateRestorer> initializ
+                 restorer.setCheckpointOffset(consumer.position(restoringPartition));
+ 
+                 task.reinitializeStateStoresForPartitions(restoringPartition);
+-                stateRestorers.get(restoringPartition).restoreStarted();
+             } else {
+                 log.info("Restoring task {}'s state store {} from beginning of the changelog {} ", task.id, restorer.storeName(), restoringPartition);
+ 
+
+
+ 
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on GitHub and use the
+URL above to go to the specific comment.
+ 
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+mjsax closed pull request #5767: KAFKA-7192: Wipe out state store if EOS is turned on and checkpoint file does not exist
+URL: https://github.com/apache/kafka/pull/5767
+ 
+ 
+   
+
+This is a PR merged from a forked repository.
+As GitHub hides the original diff on merge, it is displayed below for
+the sake of provenance:
+
+As this is a foreign pull request (from a fork), the diff is supplied
+below (as it won't show otherwise due to GitHub magic):
+
+diff --git a/streams/src/main/java/org/apache/kafka/streams/processor/internals/AssignedStandbyTasks.java b/streams/src/main/java/org/apache/kafka/streams/processor/internals/AssignedStandbyTasks.java
+index a99e45147b9..40ce79c289e 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/processor/internals/AssignedStandbyTasks.java
++++ b/streams/src/main/java/org/apache/kafka/streams/processor/internals/AssignedStandbyTasks.java
+@@ -24,4 +24,8 @@
+         super(logContext, "standby task");
+     }
+ 
++    void addToRestoring(final StandbyTask task) {
++        throw new UnsupportedOperationException("Standby tasks cannot be restored actively.");
++    }
++
+ }
+diff --git a/streams/src/main/java/org/apache/kafka/streams/processor/internals/AssignedStreamsTasks.java b/streams/src/main/java/org/apache/kafka/streams/processor/internals/AssignedStreamsTasks.java
+index 7b05f6488e7..98c2bbd2563 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/processor/internals/AssignedStreamsTasks.java
++++ b/streams/src/main/java/org/apache/kafka/streams/processor/internals/AssignedStreamsTasks.java
+@@ -23,12 +23,21 @@
+ import org.apache.kafka.streams.processor.TaskId;
+ import org.slf4j.Logger;
+ 
++import java.util.Collection;
++import java.util.Collections;
+ import java.util.HashMap;
++import java.util.HashSet;
+ import java.util.Iterator;
++import java.util.List;
+ import java.util.Map;
++import java.util.Set;
++import java.util.concurrent.atomic.AtomicReference;
+ 
+ class AssignedStreamsTasks extends AssignedTasks<StreamTask> implements RestoringTasks {
+     private final Logger log;
++    private final Map<TaskId, StreamTask> restoring = new HashMap<>();
++    private final Set<TopicPartition> restoredPartitions = new HashSet<>();
++    private final Map<TopicPartition, StreamTask> restoringByPartition = new HashMap<>();
+     private final TaskAction<StreamTask> maybeCommitAction;
+     private int committed = 0;
+ 
+@@ -59,6 +68,52 @@ public StreamTask restoringTaskFor(final TopicPartition partition) {
+         return restoringByPartition.get(partition);
+     }
+ 
++    void updateRestored(final Collection<TopicPartition> restored) {
++        if (restored.isEmpty()) {
++            return;
++        }
++        log.trace("Stream task changelog partitions that have completed restoring so far: {}", restored);
++        restoredPartitions.addAll(restored);
++        for (final Iterator<Map.Entry<TaskId, StreamTask>> it = restoring.entrySet().iterator(); it.hasNext(); ) {
++            final Map.Entry<TaskId, StreamTask> entry = it.next();
++            final StreamTask task = entry.getValue();
++            if (restoredPartitions.containsAll(task.changelogPartitions())) {
++                transitionToRunning(task);
++                it.remove();
++                log.trace("Stream task {} completed restoration as all its changelog partitions {} have been applied to restore state",
++                    task.id(),
++                    task.changelogPartitions());
++            } else {
++                if (log.isTraceEnabled()) {
++                    final HashSet<TopicPartition> outstandingPartitions = new HashSet<>(task.changelogPartitions());
++                    outstandingPartitions.removeAll(restoredPartitions);
++                    log.trace("Stream task {} cannot resume processing yet since some of its changelog partitions have not completed restoring: {}",
++                        task.id(),
++                        outstandingPartitions);
++                }
++            }
++        }
++        if (allTasksRunning()) {
++            restoredPartitions.clear();
++        }
++    }
++
++    void addToRestoring(final StreamTask task) {
++        restoring.put(task.id(), task);
++        for (final TopicPartition topicPartition : task.partitions()) {
++            restoringByPartition.put(topicPartition, task);
++        }
++        for (final TopicPartition topicPartition : task.changelogPartitions()) {
++            restoringByPartition.put(topicPartition, task);
++        }
++    }
++
++    boolean allTasksRunning() {
++        return created.isEmpty()
++            && suspended.isEmpty()
++            && restoring.isEmpty();
++    }
++
+     /**
+      * @throws TaskMigratedException if committing offsets failed (non-EOS)
+      *                               or if the task producer got fenced (EOS)
+@@ -139,4 +194,43 @@ int punctuate() {
+         return punctuated;
+     }
+ 
++    RuntimeException suspend() {
++        final AtomicReference<RuntimeException> firstException = new AtomicReference<>(super.suspend());
++        log.trace("Close restoring stream task {}", restoring.keySet());
++        firstException.compareAndSet(null, closeNonRunningTasks(restoring.values()));
++        restoring.clear();
++        restoringByPartition.clear();
++        return firstException.get();
++    }
++
++    public String toString(final String indent) {
++        final StringBuilder builder = new StringBuilder();
++        builder.append(super.toString(indent));
++        describe(builder, restoring.values(), indent, "Restoring:");
++        return builder.toString();
++    }
++
++    List<StreamTask> allTasks() {
++        final List<StreamTask> tasks = super.allTasks();
++        tasks.addAll(restoring.values());
++        return tasks;
++    }
++
++    Collection<StreamTask> restoringTasks() {
++        return Collections.unmodifiableCollection(restoring.values());
++    }
++
++    Set<TaskId> allAssignedTaskIds() {
++        final Set<TaskId> taskIds = super.allAssignedTaskIds();
++        taskIds.addAll(restoring.keySet());
++        return taskIds;
++    }
++
++    void clear() {
++        super.clear();
++        restoring.clear();
++        restoringByPartition.clear();
++        restoredPartitions.clear();
++    }
++
+ }
+diff --git a/streams/src/main/java/org/apache/kafka/streams/processor/internals/AssignedTasks.java b/streams/src/main/java/org/apache/kafka/streams/processor/internals/AssignedTasks.java
+index da402bc251c..52b1335f951 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/processor/internals/AssignedTasks.java
++++ b/streams/src/main/java/org/apache/kafka/streams/processor/internals/AssignedTasks.java
+@@ -40,15 +40,12 @@
+     private final Logger log;
+     private final String taskTypeName;
+     private final TaskAction<T> commitAction;
+-    private Map<TaskId, T> created = new HashMap<>();
+-    private Map<TaskId, T> suspended = new HashMap<>();
+-    private Map<TaskId, T> restoring = new HashMap<>();
+-    private Set<TopicPartition> restoredPartitions = new HashSet<>();
+-    private Set<TaskId> previousActiveTasks = new HashSet<>();
++    Map<TaskId, T> created = new HashMap<>();
++    Map<TaskId, T> suspended = new HashMap<>();
++    private final Set<TaskId> previousActiveTasks = new HashSet<>();
+     // IQ may access this map.
+     Map<TaskId, T> running = new ConcurrentHashMap<>();
+-    private Map<TopicPartition, T> runningByPartition = new HashMap<>();
+-    Map<TopicPartition, T> restoringByPartition = new HashMap<>();
++    private final Map<TopicPartition, T> runningByPartition = new HashMap<>();
+ 
+     AssignedTasks(final LogContext logContext,
+                   final String taskTypeName) {
+@@ -99,42 +96,11 @@ void initializeNewTasks() {
+         }
+     }
+ 
+-    void updateRestored(final Collection<TopicPartition> restored) {
+-        if (restored.isEmpty()) {
+-            return;
+-        }
+-        log.trace("{} changelog partitions that have completed restoring so far: {}", taskTypeName, restored);
+-        restoredPartitions.addAll(restored);
+-        for (final Iterator<Map.Entry<TaskId, T>> it = restoring.entrySet().iterator(); it.hasNext(); ) {
+-            final Map.Entry<TaskId, T> entry = it.next();
+-            final T task = entry.getValue();
+-            if (restoredPartitions.containsAll(task.changelogPartitions())) {
+-                transitionToRunning(task);
+-                it.remove();
+-                log.trace("{} {} completed restoration as all its changelog partitions {} have been applied to restore state",
+-                        taskTypeName,
+-                        task.id(),
+-                        task.changelogPartitions());
+-            } else {
+-                if (log.isTraceEnabled()) {
+-                    final HashSet<TopicPartition> outstandingPartitions = new HashSet<>(task.changelogPartitions());
+-                    outstandingPartitions.removeAll(restoredPartitions);
+-                    log.trace("{} {} cannot resume processing yet since some of its changelog partitions have not completed restoring: {}",
+-                              taskTypeName,
+-                              task.id(),
+-                              outstandingPartitions);
+-                }
+-            }
+-        }
+-        if (allTasksRunning()) {
+-            restoredPartitions.clear();
+-        }
+-    }
++    abstract void addToRestoring(final T task);
+ 
+     boolean allTasksRunning() {
+         return created.isEmpty()
+-                && suspended.isEmpty()
+-                && restoring.isEmpty();
++                && suspended.isEmpty();
+     }
+ 
+     Collection<T> running() {
+@@ -145,21 +111,17 @@ RuntimeException suspend() {
+         final AtomicReference<RuntimeException> firstException = new AtomicReference<>(null);
+         log.trace("Suspending running {} {}", taskTypeName, runningTaskIds());
+         firstException.compareAndSet(null, suspendTasks(running.values()));
+-        log.trace("Close restoring {} {}", taskTypeName, restoring.keySet());
+-        firstException.compareAndSet(null, closeNonRunningTasks(restoring.values()));
+         log.trace("Close created {} {}", taskTypeName, created.keySet());
+         firstException.compareAndSet(null, closeNonRunningTasks(created.values()));
+         previousActiveTasks.clear();
+         previousActiveTasks.addAll(running.keySet());
+         running.clear();
+-        restoring.clear();
+         created.clear();
+         runningByPartition.clear();
+-        restoringByPartition.clear();
+         return firstException.get();
+     }
+ 
+-    private RuntimeException closeNonRunningTasks(final Collection<T> tasks) {
++    RuntimeException closeNonRunningTasks(final Collection<T> tasks) {
+         RuntimeException exception = null;
+         for (final T task : tasks) {
+             try {
+@@ -176,7 +138,7 @@ private RuntimeException closeNonRunningTasks(final Collection<T> tasks) {
+ 
+     private RuntimeException suspendTasks(final Collection<T> tasks) {
+         final AtomicReference<RuntimeException> firstException = new AtomicReference<>(null);
+-        for (Iterator<T> it = tasks.iterator(); it.hasNext(); ) {
++        for (final Iterator<T> it = tasks.iterator(); it.hasNext(); ) {
+             final T task = it.next();
+             try {
+                 task.suspend();
+@@ -247,27 +209,17 @@ boolean maybeResumeSuspendedTask(final TaskId taskId, final Set<TopicPartition>
+         return false;
+     }
+ 
+-    private void addToRestoring(final T task) {
+-        restoring.put(task.id(), task);
+-        for (TopicPartition topicPartition : task.partitions()) {
+-            restoringByPartition.put(topicPartition, task);
+-        }
+-        for (TopicPartition topicPartition : task.changelogPartitions()) {
+-            restoringByPartition.put(topicPartition, task);
+-        }
+-    }
+-
+     /**
+      * @throws TaskMigratedException if the task producer got fenced (EOS only)
+      */
+-    private void transitionToRunning(final T task) {
++    void transitionToRunning(final T task) {
+         log.debug("transitioning {} {} to running", taskTypeName, task.id());
+         running.put(task.id(), task);
+         task.initializeTopology();
+-        for (TopicPartition topicPartition : task.partitions()) {
++        for (final TopicPartition topicPartition : task.partitions()) {
+             runningByPartition.put(topicPartition, task);
+         }
+-        for (TopicPartition topicPartition : task.changelogPartitions()) {
++        for (final TopicPartition topicPartition : task.changelogPartitions()) {
+             runningByPartition.put(topicPartition, task);
+         }
+     }
+@@ -288,15 +240,14 @@ public String toString(final String indent) {
+         final StringBuilder builder = new StringBuilder();
+         describe(builder, running.values(), indent, "Running:");
+         describe(builder, suspended.values(), indent, "Suspended:");
+-        describe(builder, restoring.values(), indent, "Restoring:");
+         describe(builder, created.values(), indent, "New:");
+         return builder.toString();
+     }
+ 
+-    private void describe(final StringBuilder builder,
+-                          final Collection<T> tasks,
+-                          final String indent,
+-                          final String name) {
++    void describe(final StringBuilder builder,
++                  final Collection<T> tasks,
++                  final String indent,
++                  final String name) {
+         builder.append(indent).append(name);
+         for (final T t : tasks) {
+             builder.append(indent).append(t.toString(indent + "\t\t"));
+@@ -304,35 +255,27 @@ private void describe(final StringBuilder builder,
+         builder.append("\n");
+     }
+ 
+-    private List<T> allTasks() {
++    List<T> allTasks() {
+         final List<T> tasks = new ArrayList<>();
+         tasks.addAll(running.values());
+         tasks.addAll(suspended.values());
+-        tasks.addAll(restoring.values());
+         tasks.addAll(created.values());
+         return tasks;
+     }
+ 
+-    Collection<T> restoringTasks() {
+-        return Collections.unmodifiableCollection(restoring.values());
+-    }
+-
+     Set<TaskId> allAssignedTaskIds() {
+         final Set<TaskId> taskIds = new HashSet<>();
+         taskIds.addAll(running.keySet());
+         taskIds.addAll(suspended.keySet());
+-        taskIds.addAll(restoring.keySet());
+         taskIds.addAll(created.keySet());
+         return taskIds;
+     }
+ 
+     void clear() {
+         runningByPartition.clear();
+-        restoringByPartition.clear();
+         running.clear();
+         created.clear();
+         suspended.clear();
+-        restoredPartitions.clear();
+     }
+ 
+     Set<TaskId> previousTaskIds() {
+@@ -351,7 +294,7 @@ int commit() {
+     void applyToRunningTasks(final TaskAction<T> action) {
+         RuntimeException firstException = null;
+ 
+-        for (Iterator<T> it = running().iterator(); it.hasNext(); ) {
++        for (final Iterator<T> it = running().iterator(); it.hasNext(); ) {
+             final T task = it.next();
+             try {
+                 action.apply(task);
+diff --git a/streams/src/main/java/org/apache/kafka/streams/processor/internals/StateRestorer.java b/streams/src/main/java/org/apache/kafka/streams/processor/internals/StateRestorer.java
+index 33dce9e7558..e0bac939b8b 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/processor/internals/StateRestorer.java
++++ b/streams/src/main/java/org/apache/kafka/streams/processor/internals/StateRestorer.java
+@@ -26,13 +26,13 @@
+ 
+     static final int NO_CHECKPOINT = -1;
+ 
+-    private final Long checkpoint;
+     private final long offsetLimit;
+     private final boolean persistent;
+     private final String storeName;
+     private final TopicPartition partition;
+     private final CompositeRestoreListener compositeRestoreListener;
+ 
++    private long checkpointOffset;
+     private long restoredOffset;
+     private long startingOffset;
+     private long endingOffset;
+@@ -45,7 +45,7 @@
+                   final String storeName) {
+         this.partition = partition;
+         this.compositeRestoreListener = compositeRestoreListener;
+-        this.checkpoint = checkpoint;
++        this.checkpointOffset = checkpoint == null ? NO_CHECKPOINT : checkpoint;
+         this.offsetLimit = offsetLimit;
+         this.persistent = persistent;
+         this.storeName = storeName;
+@@ -56,7 +56,15 @@ public TopicPartition partition() {
+     }
+ 
+     long checkpoint() {
+-        return checkpoint == null ? NO_CHECKPOINT : checkpoint;
++        return checkpointOffset;
++    }
++
++    void setCheckpointOffset(final long checkpointOffset) {
++        this.checkpointOffset = checkpointOffset;
++    }
++
++    public String storeName() {
++        return storeName;
+     }
+ 
+     void restoreStarted() {
+@@ -67,7 +75,8 @@ void restoreDone() {
+         compositeRestoreListener.onRestoreEnd(partition, storeName, restoredNumRecords());
+     }
+ 
+-    void restoreBatchCompleted(long currentRestoredOffset, int numRestored) {
++    void restoreBatchCompleted(final long currentRestoredOffset,
++                               final int numRestored) {
+         compositeRestoreListener.onBatchRestored(partition, storeName, currentRestoredOffset, numRestored);
+     }
+ 
+@@ -79,7 +88,7 @@ boolean isPersistent() {
+         return persistent;
+     }
+ 
+-    void setUserRestoreListener(StateRestoreListener userRestoreListener) {
++    void setUserRestoreListener(final StateRestoreListener userRestoreListener) {
+         this.compositeRestoreListener.setUserRestoreListener(userRestoreListener);
+     }
+ 
+diff --git a/streams/src/main/java/org/apache/kafka/streams/processor/internals/StoreChangelogReader.java b/streams/src/main/java/org/apache/kafka/streams/processor/internals/StoreChangelogReader.java
+index 5fcba76570e..e0fc82de016 100644
+--- a/streams/src/main/java/org/apache/kafka/streams/processor/internals/StoreChangelogReader.java
++++ b/streams/src/main/java/org/apache/kafka/streams/processor/internals/StoreChangelogReader.java
+@@ -61,9 +61,14 @@ public StoreChangelogReader(final Consumer<byte[], byte[]> restoreConsumer,
+ 
+     @Override
+     public void register(final StateRestorer restorer) {
+-        restorer.setUserRestoreListener(userStateRestoreListener);
+-        stateRestorers.put(restorer.partition(), restorer);
+-        needsInitializing.put(restorer.partition(), restorer);
++        final StateRestorer existingRestorer = stateRestorers.get(restorer.partition());
++        if (existingRestorer == null) {
++            restorer.setUserRestoreListener(userStateRestoreListener);
++            stateRestorers.put(restorer.partition(), restorer);
++            needsInitializing.put(restorer.partition(), restorer);
++        } else {
++            needsInitializing.put(restorer.partition(), existingRestorer);
++        }
+     }
+ 
+     /**
+@@ -71,7 +76,7 @@ public void register(final StateRestorer restorer) {
+      */
+     public Collection<TopicPartition> restore(final RestoringTasks active) {
+         if (!needsInitializing.isEmpty()) {
+-            initialize();
++            initialize(active);
+         }
+ 
+         if (needsRestoring.isEmpty()) {
+@@ -103,7 +108,7 @@ public void register(final StateRestorer restorer) {
+         return completed();
+     }
+ 
+-    private void initialize() {
++    private void initialize(final RestoringTasks active) {
+         if (!restoreConsumer.subscription().isEmpty()) {
+             throw new StreamsException("Restore consumer should not be subscribed to any topics (" + restoreConsumer.subscription() + ")");
+         }
+@@ -112,8 +117,8 @@ private void initialize() {
+         // the needsInitializing map is not empty, meaning we do not know the metadata for some of them yet
+         refreshChangelogInfo();
+ 
+-        Map<TopicPartition, StateRestorer> initializable = new HashMap<>();
+-        for (Map.Entry<TopicPartition, StateRestorer> entry : needsInitializing.entrySet()) {
++        final Map<TopicPartition, StateRestorer> initializable = new HashMap<>();
++        for (final Map.Entry<TopicPartition, StateRestorer> entry : needsInitializing.entrySet()) {
+             final TopicPartition topicPartition = entry.getKey();
+             if (hasPartition(topicPartition)) {
+                 initializable.put(entry.getKey(), entry.getValue());
+@@ -157,11 +162,12 @@ private void initialize() {
+ 
+         // set up restorer for those initializable
+         if (!initializable.isEmpty()) {
+-            startRestoration(initializable);
++            startRestoration(initializable, active);
+         }
+     }
+ 
+-    private void startRestoration(final Map<TopicPartition, StateRestorer> initialized) {
++    private void startRestoration(final Map<TopicPartition, StateRestorer> initialized,
++                                  final RestoringTasks active) {
+         log.debug("Start restoring state stores from changelog topics {}", initialized.keySet());
+ 
+         final Set<TopicPartition> assignment = new HashSet<>(restoreConsumer.assignment());
+@@ -170,26 +176,42 @@ private void startRestoration(final Map<TopicPartition, StateRestorer> initializ
+ 
+         final List<StateRestorer> needsPositionUpdate = new ArrayList<>();
+         for (final StateRestorer restorer : initialized.values()) {
++            final TopicPartition restoringPartition = restorer.partition();
+             if (restorer.checkpoint() != StateRestorer.NO_CHECKPOINT) {
+-                restoreConsumer.seek(restorer.partition(), restorer.checkpoint());
+-                logRestoreOffsets(restorer.partition(),
++                restoreConsumer.seek(restoringPartition, restorer.checkpoint());
++                logRestoreOffsets(restoringPartition,
+                                   restorer.checkpoint(),
+-                                  endOffsets.get(restorer.partition()));
+-                restorer.setStartingOffset(restoreConsumer.position(restorer.partition()));
++                                  endOffsets.get(restoringPartition));
++                restorer.setStartingOffset(restoreConsumer.position(restoringPartition));
+                 restorer.restoreStarted();
+             } else {
+-                restoreConsumer.seekToBeginning(Collections.singletonList(restorer.partition()));
++                restoreConsumer.seekToBeginning(Collections.singletonList(restoringPartition));
+                 needsPositionUpdate.add(restorer);
+             }
+         }
+ 
+         for (final StateRestorer restorer : needsPositionUpdate) {
+-            final long position = restoreConsumer.position(restorer.partition());
+-            logRestoreOffsets(restorer.partition(),
+-                              position,
+-                              endOffsets.get(restorer.partition()));
+-            restorer.setStartingOffset(position);
+-            restorer.restoreStarted();
++            final TopicPartition restoringPartition = restorer.partition();
++            final StreamTask task = active.restoringTaskFor(restoringPartition);
++            // If checkpoint does not exist it means the task was not shutdown gracefully before;
++            // and in this case if EOS is turned on we should wipe out the state and re-initialize the task
++            if (task.eosEnabled) {
++                log.info("No checkpoint found for task {} state store {} changelog {} with EOS turned on. " +
++                    "Reinitializing the task and restore its state from the beginning.", task.id, restorer.storeName(), restoringPartition);
++                // we move the partitions here, because they will be added back within
++                // `task.reinitializeStateStoresForPartitions()` that calls `register()` internally again
++                needsInitializing.remove(restoringPartition);
++                restorer.setCheckpointOffset(restoreConsumer.position(restoringPartition));
++                task.reinitializeStateStoresForPartitions(Collections.singleton(restoringPartition));
++            } else {
++                log.info("Restoring task {}'s state store {} from beginning of the changelog {} ", task.id, restorer.storeName(), restoringPartition);
++                final long position = restoreConsumer.position(restoringPartition);
++                logRestoreOffsets(restoringPartition,
++                    position,
++                    endOffsets.get(restoringPartition));
++                restorer.setStartingOffset(position);
++                restorer.restoreStarted();
++            }
+         }
+ 
+         needsRestoring.putAll(initialized);
+@@ -280,7 +302,7 @@ private long processNext(final List<ConsumerRecord<byte[], byte[]>> records,
+                              final Long endOffset) {
+         final List<KeyValue<byte[], byte[]>> restoreRecords = new ArrayList<>();
+         long nextPosition = -1;
+-        int numberRecords = records.size();
++        final int numberRecords = records.size();
+         int numberRestored = 0;
+         long lastRestoredOffset = -1;
+         for (final ConsumerRecord<byte[], byte[]> record : records) {
+diff --git a/streams/src/test/java/org/apache/kafka/streams/integration/EosIntegrationTest.java b/streams/src/test/java/org/apache/kafka/streams/integration/EosIntegrationTest.java
+index 6c7b2b43c9d..f6811c66702 100644
+--- a/streams/src/test/java/org/apache/kafka/streams/integration/EosIntegrationTest.java
++++ b/streams/src/test/java/org/apache/kafka/streams/integration/EosIntegrationTest.java
+@@ -317,7 +317,7 @@ public void shouldNotViolateEosIfOneTaskFails() throws Exception {
+         // the app is supposed to copy all 40 records into the output topic
+         // the app commits after each 10 records per partition, and thus will have 2*5 uncommitted writes
+         //
+-        // the failure gets inject after 20 committed and 30 uncommitted records got received
++        // the failure gets inject after 20 committed and 10 uncommitted records got received
+         // -> the failure only kills one thread
+         // after fail over, we should read 40 committed records (even if 50 record got written)
+ 
+@@ -392,7 +392,7 @@ public void shouldNotViolateEosIfOneTaskFailsWithState() throws Exception {
+         // the app commits after each 10 records per partition, and thus will have 2*5 uncommitted writes
+         // and store updates (ie, another 5 uncommitted writes to a changelog topic per partition)
+         //
+-        // the failure gets inject after 20 committed and 30 uncommitted records got received
++        // the failure gets inject after 20 committed and 10 uncommitted records got received
+         // -> the failure only kills one thread
+         // after fail over, we should read 40 committed records and the state stores should contain the correct sums
+         // per key (even if some records got processed twice)
+@@ -402,7 +402,7 @@ public void shouldNotViolateEosIfOneTaskFailsWithState() throws Exception {
+             streams.start();
+ 
+             final List<KeyValue<Long, Long>> committedDataBeforeFailure = prepareData(0L, 10L, 0L, 1L);
+-            final List<KeyValue<Long, Long>> uncommittedDataBeforeFailure = prepareData(10L, 15L, 0L, 1L);
++            final List<KeyValue<Long, Long>> uncommittedDataBeforeFailure = prepareData(10L, 15L, 0L, 1L, 2L, 3L);
+ 
+             final List<KeyValue<Long, Long>> dataBeforeFailure = new ArrayList<>();
+             dataBeforeFailure.addAll(committedDataBeforeFailure);
+diff --git a/streams/src/test/java/org/apache/kafka/streams/processor/internals/StoreChangelogReaderTest.java b/streams/src/test/java/org/apache/kafka/streams/processor/internals/StoreChangelogReaderTest.java
+index c65d4efadb1..a117dc30adf 100644
+--- a/streams/src/test/java/org/apache/kafka/streams/processor/internals/StoreChangelogReaderTest.java
++++ b/streams/src/test/java/org/apache/kafka/streams/processor/internals/StoreChangelogReaderTest.java
+@@ -100,7 +100,10 @@ public void shouldRequestTopicsAndHandleTimeoutException() {
+     public void shouldThrowExceptionIfConsumerHasCurrentSubscription() {
+         final StateRestorer mockRestorer = EasyMock.mock(StateRestorer.class);
+         mockRestorer.setUserRestoreListener(stateRestoreListener);
+-        expect(mockRestorer.partition()).andReturn(new TopicPartition("sometopic", 0)).andReturn(new TopicPartition("sometopic", 0));
++        expect(mockRestorer.partition())
++            .andReturn(new TopicPartition("sometopic", 0))
++            .andReturn(new TopicPartition("sometopic", 0))
++            .andReturn(new TopicPartition("sometopic", 0));
+         EasyMock.replay(mockRestorer);
+         changelogReader.register(mockRestorer);
+ 
+@@ -119,6 +122,10 @@ public void shouldRestoreAllMessagesFromBeginningWhenCheckpointNull() {
+         final int messages = 10;
+         setupConsumer(messages, topicPartition);
+         changelogReader.register(new StateRestorer(topicPartition, restoreListener, null, Long.MAX_VALUE, true, "storeName"));
++
++        expect(active.restoringTaskFor(topicPartition)).andReturn(task);
++        replay(active);
++
+         changelogReader.restore(active);
+         assertThat(callback.restored.size(), equalTo(messages));
+     }
+@@ -133,10 +140,9 @@ public void shouldRecoverFromInvalidOffsetExceptionAndFinishRestore() {
+                 return Collections.singleton(topicPartition);
+             }
+         });
+-        changelogReader.register(new StateRestorer(topicPartition, restoreListener, null, Long.MAX_VALUE, true,
+-                                                   "storeName"));
++        changelogReader.register(new StateRestorer(topicPartition, restoreListener, null, Long.MAX_VALUE, true, "storeName"));
+ 
+-        EasyMock.expect(active.restoringTaskFor(topicPartition)).andReturn(task);
++        EasyMock.expect(active.restoringTaskFor(topicPartition)).andReturn(task).andReturn(task);
+         EasyMock.replay(active);
+ 
+         // first restore call "fails" but we should not die with an exception
+@@ -165,6 +171,9 @@ public void shouldClearAssignmentAtEndOfRestore() {
+         changelogReader.register(new StateRestorer(topicPartition, restoreListener, null, Long.MAX_VALUE, true,
+                                                    "storeName"));
+ 
++        expect(active.restoringTaskFor(topicPartition)).andReturn(task);
++        replay(active);
++
+         changelogReader.restore(active);
+         assertThat(consumer.assignment(), equalTo(Collections.<TopicPartition>emptySet()));
+     }
+@@ -175,6 +184,10 @@ public void shouldRestoreToLimitWhenSupplied() {
+         final StateRestorer restorer = new StateRestorer(topicPartition, restoreListener, null, 3, true,
+                                                          "storeName");
+         changelogReader.register(restorer);
++
++        expect(active.restoringTaskFor(topicPartition)).andReturn(task);
++        replay(active);
++
+         changelogReader.restore(active);
+         assertThat(callback.restored.size(), equalTo(3));
+         assertThat(restorer.restoredOffset(), equalTo(3L));
+@@ -197,8 +210,9 @@ public void shouldRestoreMultipleStores() {
+         changelogReader.register(new StateRestorer(one, restoreListener1, null, Long.MAX_VALUE, true, "storeName2"));
+         changelogReader.register(new StateRestorer(two, restoreListener2, null, Long.MAX_VALUE, true, "storeName3"));
+ 
+-        expect(active.restoringTaskFor(one)).andReturn(null);
+-        expect(active.restoringTaskFor(two)).andReturn(null);
++        expect(active.restoringTaskFor(one)).andReturn(task);
++        expect(active.restoringTaskFor(two)).andReturn(task);
++        expect(active.restoringTaskFor(topicPartition)).andReturn(task);
+         replay(active);
+         changelogReader.restore(active);
+ 
+@@ -224,8 +238,9 @@ public void shouldRestoreAndNotifyMultipleStores() throws Exception {
+         changelogReader.register(new StateRestorer(one, restoreListener1, null, Long.MAX_VALUE, true, "storeName2"));
+         changelogReader.register(new StateRestorer(two, restoreListener2, null, Long.MAX_VALUE, true, "storeName3"));
+ 
+-        expect(active.restoringTaskFor(one)).andReturn(null);
+-        expect(active.restoringTaskFor(two)).andReturn(null);
++        expect(active.restoringTaskFor(one)).andReturn(task);
++        expect(active.restoringTaskFor(two)).andReturn(task);
++        expect(active.restoringTaskFor(topicPartition)).andReturn(task);
+         replay(active);
+         changelogReader.restore(active);
+ 
+@@ -246,8 +261,11 @@ public void shouldRestoreAndNotifyMultipleStores() throws Exception {
+     @Test
+     public void shouldOnlyReportTheLastRestoredOffset() {
+         setupConsumer(10, topicPartition);
+-        changelogReader
+-            .register(new StateRestorer(topicPartition, restoreListener, null, 5, true, "storeName1"));
++        changelogReader.register(new StateRestorer(topicPartition, restoreListener, null, 5, true, "storeName1"));
++
++        expect(active.restoringTaskFor(topicPartition)).andReturn(task);
++        replay(active);
++
+         changelogReader.restore(active);
+ 
+         assertThat(callback.restored.size(), equalTo(5));
+@@ -306,6 +324,10 @@ public void shouldNotRestoreAnythingWhenCheckpointAtEndOffset() {
+     public void shouldReturnRestoredOffsetsForPersistentStores() {
+         setupConsumer(10, topicPartition);
+         changelogReader.register(new StateRestorer(topicPartition, restoreListener, null, Long.MAX_VALUE, true, "storeName"));
++
++        expect(active.restoringTaskFor(topicPartition)).andReturn(task);
++        replay(active);
++
+         changelogReader.restore(active);
+         final Map<TopicPartition, Long> restoredOffsets = changelogReader.restoredOffsets();
+         assertThat(restoredOffsets, equalTo(Collections.singletonMap(topicPartition, 10L)));
+@@ -315,6 +337,10 @@ public void shouldReturnRestoredOffsetsForPersistentStores() {
+     public void shouldNotReturnRestoredOffsetsForNonPersistentStore() {
+         setupConsumer(10, topicPartition);
+         changelogReader.register(new StateRestorer(topicPartition, restoreListener, null, Long.MAX_VALUE, false, "storeName"));
++
++        expect(active.restoringTaskFor(topicPartition)).andReturn(task);
++        replay(active);
++
+         changelogReader.restore(active);
+         final Map<TopicPartition, Long> restoredOffsets = changelogReader.restoredOffsets();
+         assertThat(restoredOffsets, equalTo(Collections.<TopicPartition, Long>emptyMap()));
+@@ -328,8 +354,11 @@ public void shouldIgnoreNullKeysWhenRestoring() {
+         consumer.addRecord(new ConsumerRecord<>(topicPartition.topic(), topicPartition.partition(), 1, (byte[]) null, bytes));
+         consumer.addRecord(new ConsumerRecord<>(topicPartition.topic(), topicPartition.partition(), 2, bytes, bytes));
+         consumer.assign(Collections.singletonList(topicPartition));
+-        changelogReader.register(new StateRestorer(topicPartition, restoreListener, null, Long.MAX_VALUE, false,
+-                                                   "storeName"));
++        changelogReader.register(new StateRestorer(topicPartition, restoreListener, null, Long.MAX_VALUE, false, "storeName"));
++
++        expect(active.restoringTaskFor(topicPartition)).andReturn(task);
++        replay(active);
++
+         changelogReader.restore(active);
+ 
+         assertThat(callback.restored, CoreMatchers.equalTo(Utils.mkList(KeyValue.pair(bytes, bytes), KeyValue.pair(bytes, bytes))));
+@@ -354,9 +383,10 @@ public void shouldRestorePartitionsRegisteredPostInitialization() {
+         changelogReader.register(new StateRestorer(topicPartition, restoreListener, null, Long.MAX_VALUE, false, "storeName"));
+ 
+         final TopicPartition postInitialization = new TopicPartition("other", 0);
+-        expect(active.restoringTaskFor(topicPartition)).andReturn(null);
+-        expect(active.restoringTaskFor(topicPartition)).andReturn(null);
+-        expect(active.restoringTaskFor(postInitialization)).andReturn(null);
++        expect(active.restoringTaskFor(topicPartition)).andReturn(task);
++        expect(active.restoringTaskFor(topicPartition)).andReturn(task);
++        expect(active.restoringTaskFor(postInitialization)).andReturn(task);
++        expect(active.restoringTaskFor(topicPartition)).andReturn(task);
+         replay(active);
+ 
+         assertTrue(changelogReader.restore(active).isEmpty());
+
+
+ 
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on GitHub and use the
+URL above to go to the specific comment.
+ 
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+[~tobiajo] Back ported to 1.1 branch :)
+
+guozhangwang commented on pull request #6546: KAFKA-7192: Cherry-pick 5430 to 1.1
+URL: https://github.com/apache/kafka/pull/6546
+ 
+ 
+   The first PR of KAFKA-7192 is cherry-picked to 1.1 but the follow-up (https://github.com/apache/kafka/pull/5430) is not. This is causing flaky EOS system test failures.
+   
+   Some test results:
+   
+   In 2.0 branch, running 25 times (the streams_eos_test has 4 tests, so = 100 tests), no failures:
+   
+   http://confluent-kafka-2-0-system-test-results.s3-us-west-2.amazonaws.com/2019-04-05--001.1554466177--apache--2.0--db22e3d/report.html
+   
+   In 1.1 branch before this PR, running 5 times, failed 10 tests:
+   
+   http://confluent-kafka-branch-builder-system-test-results.s3-us-west-2.amazonaws.com/2019-04-02--001.1554239700--guozhangwang--KMinor-1.1-eos-test--8395fce/report.html
+   
+   In this branch (after this PR), running 25 times, no failures:
+   
+   http://confluent-kafka-branch-builder-system-test-results.s3-us-west-2.amazonaws.com/2019-04-05--001.1554465488--guozhangwang--KMinor-1.1-eos-test--897aa03/report.html
+   
+   ### Committer Checklist (excluded from commit message)
+   - [ ] Verify design and implementation 
+   - [ ] Verify test coverage and CI build status
+   - [ ] Verify documentation (including upgrade notes)
+   
+ 
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+ 
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+

@@ -1,0 +1,721 @@
+This test was added by HDFS-14130 but I'm not sure it was failing since then.
+[~shv], [~xiangheng], can you take a look to see what is the source?
+
+An example here:
+https://builds.apache.org/job/PreCommit-HDFS-Build/28264/testReport/
+
+I remember checking this couple of days back. It was failing expecting the state OBSERVER and the actual state what it was getting was STANDBY.
+[~xkrogen] [~vagarychen] can you give a check.
+
+I don't have any experience in the ZKFC area, maybe [~csun] can chime in?
+
+Not familiar with ZKFC either, but I ran the test locally several times, hasn't been failing for me...
+
+Well I was able to reproduce this : 
+Sharing the log part which I suspect could be the reason, (It directs it was able to transition to Observer, then moved to standby)
+
+{noformat}
+You have specified the --forcemanual flag. This flag is dangerous, as it can induce a split-brain scenario that WILL CORRUPT your HDFS namespace, possibly irrecoverably.
+
+It is recommended not to use this flag, but instead to shut down the cluster and disable automatic failover if you prefer to manually manage your HA state.
+
+You may abort safely by answering 'n' or hitting ^C now.
+
+Are you sure you want to continue? (Y or N) 2019-11-07 23:43:24,936 [Listener at localhost/10022] WARN  ha.HAAdmin (HAAdmin.java:checkManualStateManagementOK(269)) - Proceeding with manual HA state management even though
+automatic failover is enabled for NameNode at localhost/127.0.0.1:10022
+2019-11-07 23:43:24,940 [IPC Server handler 5 on default port 10022] WARN  namenode.NameNode (NameNode.java:checkHaStateChange(2106)) - Allowing manual HA control from 127.0.0.1 even though automatic HA is enabled, because the user specified the force flag
+2019-11-07 23:43:24,941 [IPC Server handler 5 on default port 10022] INFO  namenode.FSNamesystem (FSNamesystem.java:stopStandbyServices(1445)) - Stopping services started for standby state
+2019-11-07 23:43:24,941 [Edit log tailer] WARN  ha.EditLogTailer (EditLogTailer.java:doWork(528)) - Edit log tailer interrupted: sleep interrupted
+2019-11-07 23:43:24,941 [IPC Server handler 5 on default port 10022] INFO  namenode.FSNamesystem (FSNamesystem.java:startStandbyServices(1402)) - Starting services required for observer state
+2019-11-07 23:43:24,944 [IPC Server handler 5 on default port 10022] INFO  ha.EditLogTailer (EditLogTailer.java:<init>(205)) - Will roll logs on active node every 120 seconds.
+2019-11-07 23:43:24,955 [IPC Server handler 2 on default port 10024-EventThread] INFO  ha.ZKFailoverController (ZKFailoverController.java:becomeStandby(491)) - ZK Election indicated that NameNode at localhost/127.0.0.1:10022 should become standby
+2019-11-07 23:43:24,964 [IPC Server handler 9 on default port 10022] INFO  namenode.FSNamesystem (FSNamesystem.java:stopStandbyServices(1445)) - Stopping services started for standby state
+2019-11-07 23:43:24,966 [Edit log tailer] WARN  ha.EditLogTailer (EditLogTailer.java:doWork(528)) - Edit log tailer interrupted: sleep interrupted
+2019-11-07 23:43:24,966 [IPC Server handler 9 on default port 10022] INFO  namenode.FSNamesystem (FSNamesystem.java:startStandbyServices(1402)) - Starting services required for standby state
+2019-11-07 23:43:24,971 [IPC Server handler 9 on default port 10022] INFO  ha.EditLogTailer (EditLogTailer.java:<init>(205)) - Will roll logs on active node every 120 seconds.
+2019-11-07 23:43:24,972 [IPC Server handler 2 on default port 10024-EventThread] INFO  ha.ZKFailoverController (ZKFailoverController.java:becomeStandby(496)) - Successfully transitioned NameNode at localhost/127.0.0.1:10022 to standby state
+2019-11-07 23:43:34,499 [ZKFC Delay timer #0] INFO  ha.ActiveStandbyElector (ActiveStandbyElector.java:joinElection(300)) - Already in election. Not re-connecting.
+2019-11-07 23:43:34,728 [ZKFC Delay timer #0] INFO  ha.ActiveStandbyElector (ActiveStandbyElector.java:joinElection(300)) - Already in election. Not re-connecting.
+2019-11-07 23:43:50,021 [Listener at localhost/10022] INFO  zookeeper.JUnit4ZKTestRunner (JUnit4ZKTestRunner.java:evaluate(99)) - TEST METHOD FAILED testManualFailoverWithDFSHAAdmin
+{noformat}
+
+
+Well I tried to check this put some sleeps in the test to get this reproduced a couple of times(It doesn't get repro that easily)
+
+I feel the reason is, since the zkfc is running in the node which we tend to convert to Observer, Before we send the command to turn it to Observer, if that NN is in election, It gets a command becomeStandby() from ZKFC, if the present state is OBSERVER, than this command converts it into STANDBY.
+
+For the test, it passes if becomeStandby() comes before we give command to turn to OBSERVER. Or becomeStandby() comes after the test has captured the OBSERVER state.
+
+As of Now OBSERVER can't participate in Election, but can take instructions from ZKFC as part of previous participation.
+
+Seems to me a kind of Race Condition, Not just a test issue.
+
+How to handle the situation, I still need to think, Not sure there is a simple way to distinguish whether the call to becomeStandby() is from ZKFC or other.
+
+I may be wrong...Not very much into ZKFC stuff either. Just tried!!!
+
+Any opinions or idea on this??
+
+Can try something like this :
+
+{code:java}
+  @Override // HAServiceProtocol
+  public synchronized void transitionToStandby(StateChangeRequestInfo req) 
+      throws ServiceFailedException, AccessControlException, IOException {
+    checkNNStartup();
+    if (nn.getState() == NameNode.OBSERVER_STATE.toString()
+        && req.getSource() == RequestSource.REQUEST_BY_ZKFC) {
+      // Throw Some Exception....
+    }
+    nn.checkHaStateChange(req);
+    nn.transitionToStandby();
+  }
+{code}
+
+
+Have uploaded a patch, with the fix as said above.
+
+The test can be reproduced by putting a {{Thread.sleep(10000)}} just before {{ waitForHAState(1, HAServiceState.OBSERVER);}} (In most cases it works for me.)
+
+Fix : Once the namenode is transitioned to OBSERVER, It ignores Request of turning to STANDBY by ZKFC as OBSERVER isn't suppose to participate in election.
+
+Have introduced a separate test to verify the exception.
+
+The LOG for {{testManualFailoverWithDFSHAAdmin}} with the fix, in the failing case looks like :
+
+
+{noformat}
+2019-11-20 01:39:21,219 [IPC Server handler 4 on default port 10022] INFO  namenode.FSNamesystem (FSNamesystem.java:startStandbyServices(1402)) - Starting services required for observer state
+2019-11-20 01:39:21,222 [IPC Server handler 4 on default port 10022] INFO  ha.EditLogTailer (EditLogTailer.java:<init>(205)) - Will roll logs on active node every 120 seconds.
+2019-11-20 01:39:21,670 [Health Monitor for NameNode at localhost/127.0.0.1:10022] INFO  ha.ActiveStandbyElector (ActiveStandbyElector.java:quitElection(412)) - Yielding from election
+2019-11-20 01:39:21,824 [Health Monitor for NameNode at localhost/127.0.0.1:10022] INFO  zookeeper.ZooKeeper (ZooKeeper.java:close(1422)) - Session: 0x10001326a8a0004 closed
+2019-11-20 01:39:21,825 [IPC Server handler 2 on default port 10024-EventThread] WARN  ha.ActiveStandbyElector (ActiveStandbyElector.java:isStaleClient(1124)) - Ignoring stale result from old client with sessionId 0x10001326a8a0004
+2019-11-20 01:39:21,825 [IPC Server handler 2 on default port 10024-EventThread] INFO  zookeeper.ClientCnxn (ClientCnxn.java:run(524)) - EventThread shut down for session: 0x10001326a8a0004
+2019-11-20 01:39:22,836 [Health Monitor for NameNode at localhost/127.0.0.1:10022] INFO  ha.ActiveStandbyElector (ActiveStandbyElector.java:quitElection(412)) - Yielding from election
+2019-11-20 01:39:23,850 [Health Monitor for NameNode at localhost/127.0.0.1:10022] INFO  ha.ActiveStandbyElector (ActiveStandbyElector.java:quitElection(412)) - Yielding from election
+2019-11-20 01:39:24,856 [Health Monitor for NameNode at localhost/127.0.0.1:10022] INFO  ha.ActiveStandbyElector (ActiveStandbyElector.java:quitElection(412)) - Yielding from election
+2019-11-20 01:39:25,864 [Health Monitor for NameNode at localhost/127.0.0.1:10022] INFO  ha.ActiveStandbyElector (ActiveStandbyElector.java:quitElection(412)) - Yielding from election
+2019-11-20 01:39:26,871 [Health Monitor for NameNode at localhost/127.0.0.1:10022] INFO  ha.ActiveStandbyElector (ActiveStandbyElector.java:quitElection(412)) - Yielding from election
+2019-11-20 01:39:27,879 [Health Monitor for NameNode at localhost/127.0.0.1:10022] INFO  ha.ActiveStandbyElector (ActiveStandbyElector.java:quitElection(412)) - Yielding from election
+2019-11-20 01:39:28,881 [Health Monitor for NameNode at localhost/127.0.0.1:10022] INFO  ha.ActiveStandbyElector (ActiveStandbyElector.java:quitElection(412)) - Yielding from election
+2019-11-20 01:39:29,888 [Health Monitor for NameNode at localhost/127.0.0.1:10022] INFO  ha.ActiveStandbyElector (ActiveStandbyElector.java:quitElection(412)) - Yielding from election
+2019-11-20 01:39:30,097 [ZKFC Delay timer #0] INFO  ha.ActiveStandbyElector (ActiveStandbyElector.java:joinElection(300)) - Already in election. Not re-connecting.
+2019-11-20 01:39:30,752 [ZKFC Delay timer #0] INFO  zookeeper.ZooKeeper (ZooKeeper.java:<init>(868)) - Initiating client connection, connectString=127.0.0.1:6958 sessionTimeout=10000 watcher=org.apache.hadoop.ha.ActiveStandbyElector$WatcherWithClientRef@2ebd10bf
+2019-11-20 01:39:30,752 [ZKFC Delay timer #0] INFO  zookeeper.ClientCnxnSocket (ClientCnxnSocket.java:initProperties(237)) - jute.maxbuffer value is 4194304 Bytes
+2019-11-20 01:39:30,753 [ZKFC Delay timer #0] INFO  zookeeper.ClientCnxn (ClientCnxn.java:initRequestTimeout(1653)) - zookeeper.request.timeout value is 0. feature enabled=
+2019-11-20 01:39:30,754 [ZKFC Delay timer #0-SendThread(127.0.0.1:6958)] INFO  zookeeper.ClientCnxn (ClientCnxn.java:logStartConnect(1112)) - Opening socket connection to server localhost/127.0.0.1:6958. Will not attempt to authenticate using SASL (unknown error)
+2019-11-20 01:39:30,754 [ZKFC Delay timer #0-SendThread(127.0.0.1:6958)] INFO  zookeeper.ClientCnxn (ClientCnxn.java:primeConnection(959)) - Socket connection established, initiating session, client: /127.0.0.1:50524, server: localhost/127.0.0.1:6958
+2019-11-20 01:39:30,803 [ZKFC Delay timer #0-SendThread(127.0.0.1:6958)] INFO  zookeeper.ClientCnxn (ClientCnxn.java:onConnected(1394)) - Session establishment complete on server localhost/127.0.0.1:6958, sessionid = 0x10001326a8a0005, negotiated timeout = 10000
+2019-11-20 01:39:30,804 [ZKFC Delay timer #0-EventThread] INFO  ha.ActiveStandbyElector (ActiveStandbyElector.java:processWatchEvent(611)) - Session connected.
+2019-11-20 01:39:30,821 [ZKFC Delay timer #0-EventThread] INFO  ha.ZKFailoverController (ZKFailoverController.java:becomeStandby(491)) - ZK Election indicated that NameNode at localhost/127.0.0.1:10022 should become standby
+2019-11-20 01:39:30,823 [IPC Server handler 1 on default port 10022] INFO  ipc.Server (Server.java:logException(2981)) - IPC Server handler 1 on default port 10022, call Call#65 Retry#0 org.apache.hadoop.ha.HAServiceProtocol.transitionToStandby from 127.0.0.1:57646: org.apache.hadoop.security.AccessControlException: Request from ZK failover controller at 127.0.0.1 denied since the namenode is in Observer state.
+2019-11-20 01:39:30,877 [ZKFC Delay timer #0-EventThread] ERROR ha.ZKFailoverController (ZKFailoverController.java:becomeStandby(499)) - Couldn't transition NameNode at localhost/127.0.0.1:10022 to standby state
+org.apache.hadoop.ipc.RemoteException(org.apache.hadoop.security.AccessControlException): Request from ZK failover controller at 127.0.0.1 denied since the namenode is in Observer state.
+	at org.apache.hadoop.hdfs.server.namenode.NameNodeRpcServer.transitionToStandby(NameNodeRpcServer.java:1797)
+	at org.apache.hadoop.ha.protocolPB.HAServiceProtocolServerSideTranslatorPB.transitionToStandby(HAServiceProtocolServerSideTranslatorPB.java:124)
+	at org.apache.hadoop.ha.proto.HAServiceProtocolProtos$HAServiceProtocolService$2.callBlockingMethod(HAServiceProtocolProtos.java:6220)
+	at org.apache.hadoop.ipc.ProtobufRpcEngine$Server$ProtoBufRpcInvoker.call(ProtobufRpcEngine.java:529)
+	at org.apache.hadoop.ipc.RPC$Server.call(RPC.java:1070)
+	at org.apache.hadoop.ipc.Server$RpcCall.run(Server.java:1007)
+	at org.apache.hadoop.ipc.Server$Call.run(Server.java:1)
+	at java.security.AccessController.doPrivileged(Native Method)
+	at javax.security.auth.Subject.doAs(Subject.java:422)
+	at org.apache.hadoop.security.UserGroupInformation.doAs(UserGroupInformation.java:1863)
+	at org.apache.hadoop.ipc.Server$Handler.run(Server.java:2927)
+
+	at org.apache.hadoop.ipc.Client.getRpcResponse(Client.java:1553)
+	at org.apache.hadoop.ipc.Client.call(Client.java:1499)
+	at org.apache.hadoop.ipc.Client.call(Client.java:1396)
+	at org.apache.hadoop.ipc.ProtobufRpcEngine$Invoker.invoke(ProtobufRpcEngine.java:233)
+	at org.apache.hadoop.ipc.ProtobufRpcEngine$Invoker.invoke(ProtobufRpcEngine.java:1)
+	at com.sun.proxy.$Proxy25.transitionToStandby(Unknown Source)
+	at org.apache.hadoop.ha.protocolPB.HAServiceProtocolClientSideTranslatorPB.transitionToStandby(HAServiceProtocolClientSideTranslatorPB.java:113)
+	at org.apache.hadoop.ha.ZKFailoverController.becomeStandby(ZKFailoverController.java:495)
+	at org.apache.hadoop.ha.ZKFailoverController.access$1(ZKFailoverController.java:490)
+	at org.apache.hadoop.ha.ZKFailoverController$ElectorCallbacks.becomeStandby(ZKFailoverController.java:932)
+	at org.apache.hadoop.ha.ActiveStandbyElector.becomeStandby(ActiveStandbyElector.java:1001)
+	at org.apache.hadoop.ha.ActiveStandbyElector.processResult(ActiveStandbyElector.java:488)
+	at org.apache.zookeeper.ClientCnxn$EventThread.processEvent(ClientCnxn.java:642)
+	at org.apache.zookeeper.ClientCnxn$EventThread.run(ClientCnxn.java:510)
+2019-11-20 01:39:30,891 [Health Monitor for NameNode at localhost/127.0.0.1:10022] INFO  ha.ActiveStandbyElector (ActiveStandbyElector.java:quitElection(412)) - Yielding from election
+2019-11-20 01:39:31,028 [Health Monitor for NameNode at localhost/127.0.0.1:10022] INFO  zookeeper.ZooKeeper (ZooKeeper.java:close(1422)) - Session: 0x10001326a8a0005 closed
+2019-11-20 01:39:31,028 [ZKFC Delay timer #0-EventThread] WARN  ha.ActiveStandbyElector (ActiveStandbyElector.java:isStaleClient(1124)) - Ignoring stale result from old client with sessionId 0x10001326a8a0005
+2019-11-20 01:39:31,029 [ZKFC Delay timer #0-EventThread] INFO  zookeeper.ClientCnxn (ClientCnxn.java:run(524)) - EventThread shut down for session: 0x10001326a8a0005
+{noformat}
+
+
+[~elgoiri] can you help review. 
+
+
+If I understand correctly, this is not a flaky test but the logic is not correct.
+Here we are preventing ZKFC making an OBSERVER NN STANDBY, right?
+Do we have any place where we explain the flow?
+We should change the title and adapt the description accordingly.
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  1m  5s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 22m 42s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 10s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 50s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 20s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green}  4m  6s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 39s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 27s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m 17s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m  8s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  1m  8s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 47s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 18s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 16m 12s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:red}-1{color} | {color:red} findbugs {color} | {color:red}  2m 57s{color} | {color:red} hadoop-hdfs-project/hadoop-hdfs generated 1 new + 0 unchanged - 0 fixed = 1 total (was 0) {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 21s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}102m 36s{color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 31s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}163m 13s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| FindBugs | module:hadoop-hdfs-project/hadoop-hdfs |
+|  |  Comparison of String objects using == or != in org.apache.hadoop.hdfs.server.namenode.NameNodeRpcServer.transitionToStandby(HAServiceProtocol$StateChangeRequestInfo)   At NameNodeRpcServer.java:== or != in org.apache.hadoop.hdfs.server.namenode.NameNodeRpcServer.transitionToStandby(HAServiceProtocol$StateChangeRequestInfo)   At NameNodeRpcServer.java:[line 1795] |
+| Failed junit tests | hadoop.fs.viewfs.TestViewFileSystemLinkMergeSlash |
+|   | hadoop.hdfs.server.blockmanagement.TestBlockTokenWithDFSStriped |
+|   | hadoop.hdfs.server.balancer.TestBalancerService |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=19.03.5 Server=19.03.5 Image:yetus/hadoop:104ccca9169 |
+| JIRA Issue | HDFS-14961 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12986274/HDFS-14961-01.patch |
+| Optional Tests |  dupname  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  |
+| uname | Linux 8d4af092a956 4.15.0-66-generic #75-Ubuntu SMP Tue Oct 1 05:24:09 UTC 2019 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 0b50aa2 |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_222 |
+| findbugs | v3.1.0-RC1 |
+| findbugs | https://builds.apache.org/job/PreCommit-HDFS-Build/28345/artifact/out/new-findbugs-hadoop-hdfs-project_hadoop-hdfs.html |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/28345/artifact/out/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/28345/testReport/ |
+| Max. process+thread count | 2780 (vs. ulimit of 5500) |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs U: hadoop-hdfs-project/hadoop-hdfs |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/28345/console |
+| Powered by | Apache Yetus 0.8.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+I think the test case it not correct. Doc for ObserverNameNode is that
+{quote}
+NOTE: the feature for Observer NameNode to participate in failover is not implemented yet. Therefore, as described in the next section, you should only use transitionToObserver to bring up an observer and put it outside the ZooKeeper controlled failover group. You should not use transitionToStandby since the host for the Observer NameNode cannot have ZKFC running.
+{quote}
+Maybe we should create 3 namenodes and test 3rd namenode without zkfc for observer namenode
+
+Thanx [~ferhui] for giving a check, In the starting it was supposed to be like that, ZKFC shouldn't be running for the ONN, but post HDFS-14130, it is allowed. It made Observer ZKFC aware and it works in all cases, If you check, apart from this Race condition, Seems every case is handled, ONN will not participate in Election and all.
+Ofcourse, Stopping the third ZKFC would make the test pass, but I think it will break the intent for which it was added. After HDFS-14130, it is supposed that ZKFC shouldn't bother ONN and doesn't try converting it to SNN. check description of HDFS-14130 :
+
+{noformat}
+Need to fix automatic failover with ZKFC. Currently it does not know about ObserverNodes trying to convert them to SBNs.
+{noformat}
+
+If I just fix the test by closing the ZKFC for third ONN, Then it would be like ZKFC can run with ONN, but once ONN has started then only ZKFC can start, so as to avoid ZKFC seeing the NN in a previous state than OBSERVER, which allows participation in election. 
+
+The present fix, Just ensures ONN doesn't get instructed by ZKFC. Since ONN isn't suppose to participate in election. Seems safe enough.
+
+[~elgoiri]
+
+bq. If I understand correctly, this is not a flaky test but the logic is not correct.
+
+Yes, There seems a problem with the logic itself.
+
+bq. Here we are preventing ZKFC making an OBSERVER NN STANDBY, right?
+
+Yes, We are preventing ZKFC to turn ONN to SNN, Since ONN isn't suppose to participate in Election. 
+
+ bq. Do we have any place where we explain the flow?
+
+Flow as in the ZKFC election part? I don't think so, there is much detailing of the process. I too have limited knowledge only on the flow. The ZKFC managing states of Namenode runs parallel, and is independent of DFSAdmin Commands instructing change of states. 
+
+bq. We should change the title and adapt the description accordingly.
+
+Sure, will change it accordingly.
+
+[~ayushtkn] Thanks for your explanation.
+After HDFS-14130, doc for Observer Namenode should be update. Will file a new jira to fix the doc
+
+[~ayushtkn] Dig into the code. zkfc makes observer namenode election if health checking passed.
+Maybe we should fix zkfc behavior, UT with sleep as you mentioned passed, code follows
+{code}
+  private void recheckElectability() {
+    // Maintain lock ordering of elector -> ZKFC
+    synchronized (elector) {
+      synchronized (this) {
+        boolean healthy = lastHealthState == State.SERVICE_HEALTHY;
+    
+        long remainingDelay = delayJoiningUntilNanotime - System.nanoTime(); 
+        if (remainingDelay > 0) {
+          if (healthy) {
+            LOG.info("Would have joined master election, but this node is " +
+                "prohibited from doing so for " +
+                TimeUnit.NANOSECONDS.toMillis(remainingDelay) + " more ms");
+          }
+          scheduleRecheck(remainingDelay);
+          return;
+        }
+    
+        switch (lastHealthState) {
+        case SERVICE_HEALTHY:
+          if(serviceState != HAServiceState.OBSERVER) {
+            elector.joinElection(targetToData(localTarget));
+          }
+          if (quitElectionOnBadState) {
+            quitElectionOnBadState = false;
+          }
+          break;
+{code}
+
+code changes are
+{code}
+          if(serviceState != HAServiceState.OBSERVER) {
+            elector.joinElection(targetToData(localTarget));
+          }
+{code}
+ 
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 18s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 19m  9s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m  0s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 46s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m  8s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 14m 57s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 30s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 14s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m  0s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 56s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 56s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 37s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m  3s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 13m 33s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 24s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 10s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 93m 54s{color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 34s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}155m 54s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hdfs.TestClientProtocolForPipelineRecovery |
+|   | hadoop.hdfs.TestFileChecksum |
+|   | hadoop.hdfs.TestFileChecksumCompositeCrc |
+|   | hadoop.hdfs.TestErasureCodingPoliciesWithRandomECPolicy |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=19.03.4 Server=19.03.4 Image:yetus/hadoop:104ccca9169 |
+| JIRA Issue | HDFS-14961 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12986300/HDFS-14961-02.patch |
+| Optional Tests |  dupname  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  |
+| uname | Linux b70cc7681ee2 4.15.0-66-generic #75-Ubuntu SMP Tue Oct 1 05:24:09 UTC 2019 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 0b50aa2 |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_222 |
+| findbugs | v3.1.0-RC1 |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/28351/artifact/out/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/28351/testReport/ |
+| Max. process+thread count | 3073 (vs. ulimit of 5500) |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs U: hadoop-hdfs-project/hadoop-hdfs |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/28351/console |
+| Powered by | Apache Yetus 0.8.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+In this case, when the Namenode Joined election it was a Standby Namenode only. It is very much allowed to participate in election. We can't predict when it started participating in the election that by the time conclusion will come, the Namenode will turn to OBSERVER.
+I think The case isn't that OBSERVER participated in election, It just received the result of the previous participation.
+I think that is very much doable at the namenode side itself, by checking whether the state is OBSERVER and the instruction is from ZKFC, as it was OBSERVER, who doesn't need to participate. The ZKFC worked as normal and intended. Maybe staying at the culprit side(Namenode side) feels little safe to me. As it clarifies the idea directly, that ONN ignores any ZKFC calls as it is prohibited to participate in ZK election.
+
+Well, I don't object the idea that it couldn't be tried at ZKFC either, but I am not pretty sure that, it will possibly eliminate all such chances.(Rae Conditions).
+
+Whereas if done at NN, this would definitelly ensure ONN can't change state as a result of ZKFC action. So, I felt it more safe.
+
+Do you see any issues fixing at NN side?
+
+{quote}
+In this case, when the Namenode Joined election it was a Standby Namenode only. 
+{quote}
+I debug and print some logs.  while it joined election, it was an observer namenode.
+MonitorDaemon thread callchain is that
+doHealthChecks -> enterState(State.SERVICE_HEALTHY) -> recheckElectability() -> elector.joinElection(targetToData(localTarget)) -> joinElectionInternal -> createLockNodeAsync
+
+callBack for zookeeper
+processResult -> becomeStandby
+
+UT you mentioned can always reproduce this issue if sleep time greater than 10s
+{code}
+    int result = tool.run(
+        new String[]{"-transitionToObserver", "-forcemanual", "nn2"});
+    assertEquals("State transition returned: " + result, 0, result);
+    Thread.sleep(10000);
+    waitForHAState(1, HAServiceState.OBSERVER);
+{code}
+
+ha.failover-controller.graceful-fence.rpc-timeout.ms is 5000ms by default and timeout is 10s because of the following code.
+{code}
+  private void doGracefulFailover()
+      throws ServiceFailedException, IOException, InterruptedException {
+    int timeout = FailoverController.getGracefulFenceTimeout(conf) * 2;
+{code}
+
+Test for failover from nn2 to nn1 has been done, and then nn2 will not participate in the election until 10s timeout. After this, HealthMonitor can run into the function elector.joinElection elector.joinElection(targetToData(localTarget)) and change observer namenode to standby.
+
+I tried adding the line that you said and a sleep of 10s, the test still failed for me.
+
+[~ayushtkn] I think your fix is ok and it can resolve the problem. I just mean that the logic for zkfc also has a problem. Maybe It should not  participate in the election if it was an observer namenode
+
+Added a line for state in the log, just before the check you said, sharing part of log :
+
+{noformat}
+019-11-20 15:52:47,061 [IPC Server handler 2 on default port 10024-EventThread] INFO  ha.ZKFailoverController (ZKFailoverController.java:becomeStandby(491)) - ZK Election indicated that NameNode at localhost/127.0.0.1:10022 should become standby
+2019-11-20 15:52:47,065 [IPC Server handler 2 on default port 10022] WARN  namenode.NameNode (NameNode.java:checkHaStateChange(2106)) - Allowing manual HA control from 127.0.0.1 even though automatic HA is enabled, because the user specified the force flag
+2019-11-20 15:52:47,066 [IPC Server handler 2 on default port 10022] INFO  namenode.FSNamesystem (FSNamesystem.java:stopStandbyServices(1445)) - Stopping services started for standby state
+2019-11-20 15:52:47,070 [Edit log tailer] WARN  ha.EditLogTailer (EditLogTailer.java:doWork(528)) - Edit log tailer interrupted: sleep interrupted
+2019-11-20 15:52:47,070 [IPC Server handler 2 on default port 10022] INFO  namenode.FSNamesystem (FSNamesystem.java:startStandbyServices(1402)) - Starting services required for observer state
+2019-11-20 15:52:47,077 [IPC Server handler 2 on default port 10022] INFO  ha.EditLogTailer (EditLogTailer.java:<init>(205)) - Will roll logs on active node every 120 seconds.
+2019-11-20 15:52:47,078 [IPC Server handler 3 on default port 10022] INFO  namenode.FSNamesystem (FSNamesystem.java:stopStandbyServices(1445)) - Stopping services started for standby state
+2019-11-20 15:52:47,080 [IPC Server handler 3 on default port 10022] INFO  namenode.FSNamesystem (FSNamesystem.java:startStandbyServices(1402)) - Starting services required for standby state
+2019-11-20 15:52:47,084 [IPC Server handler 3 on default port 10022] INFO  ha.EditLogTailer (EditLogTailer.java:<init>(205)) - Will roll logs on active node every 120 seconds.
+2019-11-20 15:52:47,085 [IPC Server handler 2 on default port 10024-EventThread] INFO  ha.ZKFailoverController (ZKFailoverController.java:becomeStandby(496)) - Successfully transitioned NameNode at localhost/127.0.0.1:10022 to standby state
+2019-11-20 15:52:56,642 [ZKFC Delay timer #0] INFO  ha.ZKFailoverController (ZKFailoverController.java:recheckElectability(802)) - STATE is : active
+2019-11-20 15:52:56,642 [ZKFC Delay timer #0] INFO  ha.ActiveStandbyElector (ActiveStandbyElector.java:joinElection(300)) - Already in election. Not re-connecting.
+2019-11-20 15:52:56,870 [ZKFC Delay timer #0] INFO  ha.ZKFailoverController (ZKFailoverController.java:recheckElectability(802)) - STATE is : standby
+2019-11-20 15:52:56,871 [ZKFC Delay timer #0] INFO  ha.ActiveStandbyElector (ActiveStandbyElector.java:joinElection(300)) - Already in election. Not re-connecting.
+2019-11-20 15:53:12,123 [Time-limited test] INFO  zookeeper.JUnit4ZKTestRunner (JUnit4ZKTestRunner.java:evaluate(99)) - TEST METHOD FAILED testManualFailoverWithDFSHAAdmin
+
+{noformat}
+
+The test still fails for me.
+
+
+:(
+UT can always pass locally, it can always fail locally without if clause
+Upload the test patch
+
+Anyway, Thanx For the agreement.
+bq. I just mean that the logic for zkfc also has a problem.
+Agreed, I didn't check why this logic is not working here. This is the problem, with threads running in parallel, They become too much environment specific, For me the state is coming standby from start, As there in the LOG, I shared too. I tried in a different environment, it worked as you said.
+
+I don't deny the fact that logically, we can have the check that you said to prevent ZK effort too. That is logically correct, but for this case I think we should be at the last site where the action takes place i.e the Namenode, and eliminate any chances of Race Conditions.
+
+IMO  We can do that ZK check separately, post we solve this. :)
+
+[~ayushtkn] Thanks. If no other comments, Will file a new jira after this
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 52s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 28s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 23m 48s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 23m  3s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  3m 21s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  3m 21s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 23m 31s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  5m  1s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  3m  6s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 26s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  2m 19s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 21m 45s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 21m 45s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  3m 18s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  3m 21s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 15m 30s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  5m 30s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  3m 18s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 10m 39s{color} | {color:green} hadoop-common in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}127m  5s{color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 47s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}277m 33s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hdfs.TestDecommission |
+|   | hadoop.hdfs.tools.TestDFSZKFailoverController |
+|   | hadoop.hdfs.server.balancer.TestBalancerWithMultipleNameNodes |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=19.03.5 Server=19.03.5 Image:yetus/hadoop:104ccca9169 |
+| JIRA Issue | HDFS-14961 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12986320/ZKFC-TEST-14961.patch |
+| Optional Tests |  dupname  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  |
+| uname | Linux 62b968007466 4.15.0-66-generic #75-Ubuntu SMP Tue Oct 1 05:24:09 UTC 2019 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / dfc61d8 |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_222 |
+| findbugs | v3.1.0-RC1 |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/28353/artifact/out/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/28353/testReport/ |
+| Max. process+thread count | 2763 (vs. ulimit of 5500) |
+| modules | C: hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/28353/console |
+| Powered by | Apache Yetus 0.8.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+[~ferhui] the test failed in your test patch here too :
+https://builds.apache.org/job/PreCommit-HDFS-Build/28353/testReport/org.apache.hadoop.hdfs.tools/TestDFSZKFailoverController/testManualFailoverWithDFSHAAdmin/
+
+v2 approach seems working. The test passes there with the sleep too and would eliminate any race condition too. 
+Pls Review!!!
+
+[~elgoiri] [~vinayakumarb] can you give a check once. :)
+
+[~ayushtkn] Thanks.
+A potential race condition occurs when both user and zkfc want to transition NN to other states. NN can judge that whether it is  a reasonable request.
+LGTM +1
+
+
+Changing the documentation is good but I feel we should clarify these things in the method itself.
+Probably in the javadoc for {{transitionToStandby()}} we should add a high level description and probably a pointer to the doc.
+Similar for the test case.
+
+Thanx [~ferhui] and [~elgoiri] for the reviews.
+I have added a comment in the {{transitionToStandby}} explaining the logic of the check, with a pointer to this JIRA. Should clear things for anyone coming later there.
+Have also added a javadoc for the test explaining why I want to have a exception thrown.
+Pls Review. :)
+
++1 on  [^ZKFC-TEST-14961.patch].
+It'd be nice to get more feedback.
+
+[~elgoiri] seems you tagged the wrong patch in the comment. That’s the test patch. Maybe you can edit and correct to avoid any confusion for somebody coming here in future.
+
+
+
+My bad, +1 on [^HDFS-14961-03.patch] which is basically [^HDFS-14961-02.patch] with comments.
+
+Sorry for chiming in late. I'll also take a look today to understand this issue and the patch.
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 54s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 19m  7s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 58s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 42s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m  3s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 14m 29s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 12s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 13s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 58s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 56s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 56s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 37s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m  0s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 13m 33s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 21s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 10s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}106m  8s{color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 33s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}167m 49s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hdfs.server.datanode.TestDataNodeUUID |
+|   | hadoop.hdfs.web.TestWebHDFS |
+|   | hadoop.hdfs.TestReconstructStripedFile |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=19.03.5 Server=19.03.5 Image:yetus/hadoop:104ccca9169 |
+| JIRA Issue | HDFS-14961 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12986458/HDFS-14961-03.patch |
+| Optional Tests |  dupname  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  |
+| uname | Linux 699592609ca6 4.15.0-66-generic #75-Ubuntu SMP Tue Oct 1 05:24:09 UTC 2019 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / b89fd4d |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_222 |
+| findbugs | v3.1.0-RC1 |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/28369/artifact/out/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/28369/testReport/ |
+| Max. process+thread count | 2730 (vs. ulimit of 5500) |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs U: hadoop-hdfs-project/hadoop-hdfs |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/28369/console |
+| Powered by | Apache Yetus 0.8.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+[~ayushtkn] Just remind, this is related to Observer NameNode, please add '[SBN read]' to commit message like other related issues when you commit this. Other users could easily port patches related to the feature of SBN read. Thanks
+
+Added in the description.
+
+Thanks [~ayushtkn]. The analysis and the fix also looks good to me. The race conditions is between the manual failover and the ZKFC auto failover. There is a gap between when the NN state is changed and when that is reflected on the ZK failover controller, through the health monitor, which can contribute to this.
+
+In the log I also observed this though:
+
+{code}
+2019-11-22 11:04:41,630 [IPC Server handler 7 on default port 10021] INFO  namenode.FSImage (FSEditLogLoader.java:loadFSEdits(178)) - Starbility(797)) - Would have joined master election, but this node is prohibited from doing so for 9896 more ms
+...
+2019-11-22 11:04:41,733 [IPC Server handler 2 on default port 10024-EventThread] INFO  ha.ZKFailoverController (ZKFailoverController.java:becomeStandby(491)) - ZK Election indicated that NameNode at localhost/127.0.0.1:10022 should become standby
+{code}
+
+It is interesting that the SBN, after ceding active role, is supposed to rejoin the election after ~10s. But it happened much sooner than that and therefore caused the race condition.
+
+One minor comment on the doc:
+{code}
+    // This is to eliminate any race condition between manually transition of
+    // namenode into Observer, when the namenode has already participated in the
+    // ZKFC election, before transition to Observer state as Standby Node.
+    // For more details check : HDFS-14961.
+{code}
+Maybe we should change it to
+{code}
+    // This is to eliminate any race condition between manually transition of
+    // namenode into Observer, and ZKFC auto failover election, when the namenode has already participated in the
+    // ZKFC election, before transition to Observer state as Standby Node.
+    // For more details check : HDFS-14961.
+{code}
+
+
+
+
+
+Thanx [~csun] for the review, Have updated as per suggestion.
+Pls Review!!!
+
+| (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 50s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 19m 31s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 58s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 43s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m  5s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 14m 35s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 12s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 14s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 59s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 53s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 53s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 39s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 59s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 13m 22s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 20s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m  7s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}102m 42s{color} | {color:green} hadoop-hdfs in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 31s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}164m 29s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=19.03.5 Server=19.03.5 Image:yetus/hadoop:104ccca9169 |
+| JIRA Issue | HDFS-14961 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12986545/HDFS-14961-04.patch |
+| Optional Tests |  dupname  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  |
+| uname | Linux 17a7ac399d8e 4.15.0-66-generic #75-Ubuntu SMP Tue Oct 1 05:24:09 UTC 2019 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 4c1a128 |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_222 |
+| findbugs | v3.1.0-RC1 |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/28380/testReport/ |
+| Max. process+thread count | 3154 (vs. ulimit of 5500) |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs U: hadoop-hdfs-project/hadoop-hdfs |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/28380/console |
+| Powered by | Apache Yetus 0.8.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Thanks [~ayushtkn]. +1 on this from me (non-binding).
+
+Thanks [~ayushtkn] for the analysis and the fix.
+ Fix looks good to me. +1.
+
+There is already a check present in HealthMonitor thread to quitElection when namenode state found to be OBSERVER.
+{code:java}
+        if (changedState == HAServiceState.OBSERVER) {
+          elector.quitElection(true);
+          serviceState = HAServiceState.OBSERVER;
+          return;
+        }{code}
+But this is an async monitoring happening every 1 second. In case of manual transition, state can change directly in NameNode. So ZKFC syncs during monitoring and quits election.
+
+As [~ferhui] suggested, checking for the state before joining the election also doesn't hurt. Can be added as a separate Improvement Jira as [~ayushtkn] already said.
+{code:java}          if(serviceState != HAServiceState.OBSERVER) {
+            elector.joinElection(targetToData(localTarget));
+          }{code}
+ 
+
+Committed to trunk.
+Thanx [~elgoiri] for the report and review, [~vinayakumarb], [~ferhui] and [~csun] for the reviews!!!
+
+SUCCESS: Integrated in Jenkins build Hadoop-trunk-Commit #17708 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/17708/])
+HDFS-14961. [SBN read] Prevent ZKFC changing Observer Namenode state. (ayushsaxena: rev 46166bd8d1be6f25bd38703fb9b0a417e3ef750b)
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/tools/TestDFSZKFailoverController.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeRpcServer.java
+
+

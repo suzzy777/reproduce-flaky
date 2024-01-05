@@ -1,0 +1,894 @@
+Just to be completely explicit, this is being presented as an alternative to using a separate ZKFC daemon?
+
+FWIW, in HDFS we deliberately opted to not do this so that the ZKFC could be completely logically separate from the NN, and so that the ZKFC could one day be made to monitor garbage collections and potentially not trigger a failover if one of those were going on. We have yet to get to the latter.
+
+Yes. Thats correct. I am aware of the HDFS discussions. ZKFC is definitely going to be part of RM failover and supported. Given RM's lower memory consumption and sane values of ZK timeouts the GC problem may not be severe in the RM's case. On the other hand, with RM state being also stored in ZK, having an embedded FC may considerably simplify deployment and maintenance of RM failover. So its not a bad option to have.
+
+Sounds good to me. I think we should seriously consider moving the ZKFC functionality into the NN as well, since in practice I don't think it's bought us much of anything and definitely complicates the deployment. But, that's another discussion for another day.
+
+Thanks, Bikas.
+
+[~kkambatl]  I have time to do this ticket. Can I take over ?
+
+[~xgong]: I am actively working on this, actually refactoring a previous version of the patch I have. Would be a huge help if you could review it. I ll try to post something early next week? 
+
+[~kkambatl] Or if YARN-1177 is our first step, I can do that too
+
+[~xgong]: YARN-1177 and this JIRA are tightly related - they share some of the configs. While initially working on automatic failover, I implemented YARN-1177 before this, but I think we should do it the other way round. How about I try to post both patches early next week? I can finish this first, and we can work together on YARN-1177? 
+
+
+
+
+Posting a patch that outlines the approach: RM starts a service that directly uses ActiveStandbyElector for leader election. 
+
+Manually testing the posted patch on a cluster showed that automatic failover works. However, automatic failover fails to take over after an explicit manual failover. To address this RMActiveStandbyElector should implement ZKFCProtocol and RMHAServiceTarget#getZKFCProxy should return a proxy to this. Will address this and other minor details in the next patch.
+
+What are the pros and cons of using ZKFC embedded vs ActiveStandbyElector? If ActiveStandbyElector has to implement ZKFC protocol then are we better off just using ZKFC embedded directly?
+
+Correction: Actually, it would be the AdminService that will have to implement ZKFCProtocol, not ActiveStandbyElector.
+
+bq. What are the pros and cons of using ZKFC embedded vs ActiveStandbyElector?
+Indeed, my first implementation was embedding ZKFC. While it works fine, I found it round about and has some avoidable overhead. Embedding ActiveStandbyElector definitely seems like a simpler, cleaner approach.
+
+Cons of ZKFC / Pros of ActiveStandbyElector:
+# ZKFC communicates to the RM through RPC; when embedded, both are in the same process.
+# In addition to ActiveStandbyElector, ZKFC has other overheads - health monitoring, fencing etc. which might not be required in a simple embedded option.
+# ZKFC#formatZK() needs to be exposed through rmadmin, which complicates it further.
+# Embedding ZKFC isn't very clean.
+
+Cons of ActiveStandbyElector: AFAIK, the only drawback of ActiveStandbyElector is having AdminService implement ZKFCProtocol - two methods: cedeActive() and gracefulFailover(). These methods are simple and straight-forward and are needed only to be able to safely failover manually when automatic-failover is enabled. 
+
+Implementing ActiveStandbyElector sounds like a good approach, and the patch is a good start. From a work sequencing point of view wouldn't it be preferable to implement the standalone ZKFC first, since it will share a lot of the code with HDFS (i.e. implement the equivalent of DFSZKFailoverController)?
+
+I think so too. Typical installations will need YARN-1177 more than this option? So sequence that first?
+
+Re this patch, seems like embedding ZKFC is beneficial.
+
+bq. However, automatic failover fails to take over after an explicit manual failover. To address this RMActiveStandbyElector should implement ZKFCProtocol and RMHAServiceTarget#getZKFCProxy should return a proxy to this.
+bq. In addition to ActiveStandbyElector, ZKFC has other overheads - health monitoring, fencing etc. which might not be required in a simple embedded option.I see that 
+ZKFC = health-monitoring + leader election + graceful failover (ZKFCProtocol). Seems like for the embedded case, we want to use leader-election + fencing. To that end, may be we should refactor ZKFC itself for reuse?
+
+bq. ZKFC communicates to the RM through RPC; when embedded, both are in the same process.
+We've done similar local RPC short-circuits for token renewal. That should fix it?
+
+bq. ZKFC#formatZK() needs to be exposed through rmadmin, which complicates it further.
+If I understand it correctly, it can be implemented as a standalone command instead of a RMAdmin call. Right?
+
+yarn-1029-0.patch is a working patch that uses ActiveStandbyElector directly. 
+
+The ZKFCProtocol implementation of the code is straight-forward - 60 lines of code between AdminService and RMZKActiveStandbyElector along with error/ exception handling. 
+
+Also uploading embedded-zkfc-approach that I worked on earlier. It might not apply to trunk/ branch-2 anymore though. The uploaded patch doesn't remove any of the overheads or handle short-circuit. 
+
+After having implemented both approaches, I sincerely feel the ActiveStandbyElector approach is simpler, cleaner, straight-forward than the embedded ZKFC approach. Refactoring ZKFC will only add more work, without apparent gains. 
+
+When working on the embedded ZKFC approach, I ran it by Todd and he suggested we might want to use ActiveStandbyElector directly and do away with unnecessary failover code paths if we are not using rest of the ZKFC features. Thanks to his suggestion, the code definitely looks simpler that way. 
+
+[~vinodkv] - is there a good technical reason for using ZKFC instead of ActiveStandbyElector directly. In this case, we only need election and will be using ZKFC for the elector. 
+
+Patch with tests for automatic and manual failover. The major pending item is adding the configs and description to yarn-default.xml. Will address that once we agree using ActiveStandbyElector is a simpler approach.
+
+BTW, this patch is to be applied on top of the latest one for YARN-1028.
+
+I agree with Karthik here -- the main reasons to pursue a separate ZKFC in HDFS were:
+- avoid failover in the case of GC (since ZKFC has a very low heap requirement) but still failover fast in machine failure.
+- avoid adding any dependency on ZK within the NN
+- allow the option to use other resource managers
+-- in practice no one has done this and I think the extra complexity all of our pluggability introduces is not worth it
+
+In the case of RM HA, as I understand it (apologies if I got anything wrong - only tangentially followed this discussion):
+- RM HA uses ZK itself for shared storage, so it already has a dependency on ZK.
+- Given that the shared state is in ZK, we don't need fencing if the same ZK client does election. The reason is that, if an RM loses its ZK lease, it will simultaneously trigger the failover _and_ be unable to make further changes in ZK. This exactly the semantics that we want.
+
+Having a separate ZKFC actually complicates things, because we may have to reintroduce some kind of fencing. What does it mean if the ZKFC loses its ZK lease, but the RM itself continues to have access to ZK? It multiplies the 'state diagram' in two, and doesn't seem to offer any particular advantages.
+
+As for embedding ZKFC (and refactoring it so it can (a) not do health checks, (b) not control the RM via RPC, but directly, (c) re-use the same ZK session) seems more complicated than it's worth. Given we'd be throwing away all of the ZKFC features beyond the elector, why not just use the elector?
+
+I'm also not sure why we want to preserve the "external ZKFC" option - per above it's a more complicated deployment scenario and seems to offer little tangible benefit.
+
+> RM HA uses ZK itself for shared storage, so it already has a dependency on ZK.
+
+This is true when using the ZKRMStateStore, but there are other stores, like the FileSystemRMStateStore which don't introduce a ZK dependency. However, I agree with your and Karthik's argument about not needing an external ZKFC option, or at least doing this JIRA before YARN-1177. That's because supporting different RMStateStore implementations for RM HA is more work and potentially confusing for users, so we could say to them that for RM HA you have to use the ZKRMStateStore, and leader election is embedded in the RM so there is no external ZKFC to use.
+
+bq. I'm also not sure why we want to preserve the "external ZKFC" option - per above it's a more complicated deployment scenario and seems to offer little tangible benefit.
+It was confusing to me when both this and YARN-1177 were filed. The ZKStateStore implementation did implement a fence operation (YARN-1222) but it wasn't integrated with the leader election (AFAIU) even in the current set of patches.
+
+bq. This is true when using the ZKRMStateStore, but there are other stores, like the FileSystemRMStateStore which don't introduce a ZK dependency.
+We shipped FileSystemRMStateStore as just a backing store, there isn't a way to fence multiple FS stores and so it cannot be used for fail-over.
+
+Agree with the general suggestion - If we use the leader election by the ZK client itself, then we don't need a separate ZKFC. So let's do that and close YARN-1177 as won't fix?
+
+bq. Given that the shared state is in ZK, we don't need fencing if the same ZK client does election. The reason is that, if an RM loses its ZK lease, it will simultaneously trigger the failover and be unable to make further changes in ZK. This exactly the semantics that we want.
+bq. The ZKStateStore implementation did implement a fence operation (YARN-1222) but it wasn't integrated with the leader election (AFAIU) even in the current set of patches.
+That is correct. The current patches don't reuse the same session for leader election and store operations, and would be nice to add this.
+
+That said, IIUC (please correct me otherwise), this is required only if we don't have any fencing method. Currently, the ZK store already supports fencing by allowing only a single RM modify the store. Given that the store supports fencing, it should be okay for the leader election to use a separate session (or even a separate quorum) - this interaction is similar to the ZKFC case.
+
+If it is not a correctness issue, I would like to integrate the leader election and store operations in a separate JIRA.
+
+I am not sure what additional work is needed in YARN-1177 given that the RM already implements the HAServiceProtocol. There shouldnt be any since the API needed for ZKFC to manage the RM are already there. Perhaps we only need some logic in the RM for some additional checks during automatic failover. So functionally ZKFC supports should already be there. 
+This jira was meant to add built-in failover in the RM given that RM already uses ZK store and to simplify deployments. I think our initial guess was the ZKFC would be simpler to embed but Karthiks observation after writing some code is that the elector library is simpler to embed. Lets review the patches to see the merits in the code.
+I agree that we dont need to merge the sessions for leader election and storage right now. They are notionally separate and lets observe a case where one session gets lost but not the other before trying to merge them together.
+
+I think we should be enable and verify ZKFC support for multiple reasons. ZKFC is kind of standard in Hadoop HA and people are already using it. It will also validate that people can hook up any external fencing agent (as long as it talks HAServiceProtocol).
+
+I took a quick look at the patch
+1) I dont quite agree with the ZKFCProtocol being added to the AdminService. The RM should have only 1 interface for HA related commands to be sent to it. That interface is the HAServiceProtocol. External ZKFC or embedded elector or the cluster admin. All of them should have the same entry point to the RM. I dont think the RM should setup different protocols for the embedded elector case.
+2) there are a lot of new zk related options being added here which overlap with the zkstore options. IMO, to make this really easy to use, we should be offering zk-store and embedded leader election as a package. If ZKStore is used then leader election can be embedded and the store is auto-fenced. If using some other store, please use standard ZKFC which has fencing support to fence the other RM/store. By doing this we get rid of fencing as a feature in embedded leader election and we get rid of redundant ZK options. The elector can just reuse the ZK options for the the store. This may also help reduce the changes needed to embed the elector. 
+
+bq.  I dont quite agree with the ZKFCProtocol being added to the AdminService. The RM should have only 1 interface for HA related commands to be sent to it. That interface is the HAServiceProtocol. External ZKFC or embedded elector or the cluster admin. All of them should have the same entry point to the RM. I dont think the RM should setup different protocols for the embedded elector case.
+If I have to sum up the two protocols, 
+# HAServiceProtocol is to perform HA-related operations on one master (NN/ RM) that concern only that master: transition *this master* to active, standby or what is *this master*'s status, health? 
+# ZKFCProtocol is HA-related operations on one master that concern multiple masters: failover from one master to the other, cede being active (while ceding from leader election). My understanding is that - ZKFCProtocol is *not specific to ZKFC*. In fact, it might even make sense to merge this with the HAServiceProtocol given that we want all HA implementations to handle multiple-master interactions.
+That said, given how the common code is currently laid out, even though it appears the AdminService is implementing multiple protocols for HA, the AdminService should handle the functionalities of both protocols. No? 
+
+Phrasing it differently, ZKFCProtocol is related to leader election and allowing a graceful failover. ZKFC implements this because it runs the leader election. When using the ActiveStandbyElector directly, I think the easiest way is for the RM - AdminService or RMZKActiveStandbyElector - to also implement this protocol.
+
+bq. The elector can just reuse the ZK options for the the store.
+Agree. The configs for zk-store and the elector can be unified. Given the store hasn't been a part of any release yet, I think it makes most sense to unify all configs to yarn.zk.* and have store-specific or elector-specific configs where appropriate.
+
+[~bikassaha] - thanks for the inputs. Want to make sure I understand your proposal right. 
+
+bq. IMO, to make this really easy to use, we should be offering zk-store and embedded leader election as a package. 
+We should probably discuss the specifics here. Does this mean we have a single config to turn on both zk-store and embedded leader election. Do the rest of the configs - ZK ACLs etc. continue to exist. If we unify the zk configs, what advantages does the package approach offer in addition to the user not having to explicitly enable embedded-leader-election and dummy-fencing? 
+
+If the proposal is to reduce the configuration steps for the embedded leader election, I am onboard to unify the zk configs and set the leader-election configs automatically when using ZK store.
+
+I also spoke to Vinod offline about this JIRA. The approach (patch) should do the following:
+# When automatic failover is enabled, one of the RMs should automatically assume the Active mode.
+# When the Active RM goes down, the other RM should take over the Active role.
+# Admins should be able to gracefully failover from one RM to the other.
+# During failovers, only a single RM should be able to access the store. 
+
+Point 4 is taken care of by the ZKRMStateStore. Point 1, 2 and 3 are implemented in the patch posted here, graceful failover comes from implementing ZKFCProtocol. 
+
+
+I am a little confused here - I am not sure if we have consensus on whether the patch posted here is in the right direction and I should go ahead and incorporate comments to improve it (unify zk configs, automatically set leader election configs) or if we would want to change the fundamental approach of addressing this. 
+
+Current patch summary:
+# RM starts a service, RMZKActiveStandbyElector, when automatic failover is enabled and configured to be embedded.
+# RMZKActiveStandbyElector spawns a thread that participates in leader election through the ActiveStandbyElector
+# RMZKActiveStandbyElector implements ElectorCallBacks for transitioning the RM to active, standby.
+# AdminService and RMZKActiveStandbyElector implement ZKFCProtocol (a.ka. GracefulFailoverProtocol) for graceful failover through "yarn rmadmin -failover rm1 rm2" (HAAdmin)
+# TestRMFailover verifies both automatic failover and manual graceful failover
+
+Spoke to Bikas offline. 
+
+Bikas thinks we are trying to do too many things in this JIRA and it would be good to cut the scope down and create follow up JIRAs for the remaining items. With all the confusion created by the various items, I agree with him. The proposal is to capture only the following in this JIRA:
+# When automatic embedded failover is enabled (two configs), start the RMZKActiveStandbyElector (embedded leader election).
+# Unify the zookeeper connection related configs (timeouts, ACLs, etc.) between the embedded election and zk-store. 
+# Address only automatic failover (if an Active RM goes down, the other RM takes over as Active). 
+
+Follow-up items (will create separate JIRAs for these): 
+# Manual graceful failover (yarn rmadmin -failover rm1 rm2) - we might not want to support it in the first place when automatic failover is enabled. Users can forcefully failover (transition to standby, followed by transition to active)
+# Simplify the configuration - IOW, use a single config to turn on both ZK store and embedded leader election.
+
+
+
+
+[~vinodkv]: does this sound reasonable to you? 
+
+Here is an updated patch that implements only automatic failover. The patch also unifies the zk-connection-related configs. 
+
+The patch also fixes a bug in RMProxy (YARN-1028) - the number of failovers should be tuned, not the policy. I thought I tested this on a cluster, but looks like I forgot to remove yarn.client.failover-max-attempts from the config. Now, fixed TestRMFailover to test this.
+
+Is it okay to set the zk-connection-timeout to 10 seconds? Would the store need longer timeout. This timeout affects the actual failover time.
+
+Testing: TestRMFailover and TestRMHA test the new code. Ran a 2-node cluster and killed the Active RM while running a job. 
+
+Pending: Documentation of config changes in yarn-default.xml. Will add these in the next revision along with any other suggestions.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12619726/yarn-1029-1.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 6 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 7 new Findbugs (version 1.3.9) warnings.
+
+        {color:red}-1 release audit{color}.  The applied patch generated 1 release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-common-project/hadoop-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-tests:
+
+                  org.apache.hadoop.yarn.server.TestMiniYARNClusterForHA
+                  org.apache.hadoop.yarn.server.TestRMNMSecretKeys
+                  org.apache.hadoop.yarn.server.TestContainerManagerSecurity
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-YARN-Build/2705//testReport/
+Release audit warnings: https://builds.apache.org/job/PreCommit-YARN-Build/2705//artifact/trunk/patchprocess/patchReleaseAuditProblems.txt
+Findbugs warnings: https://builds.apache.org/job/PreCommit-YARN-Build/2705//artifact/trunk/patchprocess/newPatchFindbugsWarningshadoop-common.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-YARN-Build/2705//artifact/trunk/patchprocess/newPatchFindbugsWarningshadoop-yarn-server-resourcemanager.html
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/2705//console
+
+This message is automatically generated.
+
+would be good to reopen YARN-1028 and include the bug fix as an addendum patch so that things are in one place.
+
+Why fencing configurable when ZK store is self-fenced? I dont think we need to add an fencing related code for embedded FC except for a dummy fencer to pass into the elector code.
+{code}+  public static final String RM_HA_FENCER = RM_HA_PREFIX + "fencer";{code}
+
+Can we please consolidate all zk configs in one place in the file
+
+Isnt rmId enough because the rest of its is available from config. The port is anyways one of many rm ports.
+{code}+  required int32 port = 1;
++  required string hostname = 2;
++  required string clusterid = 3;
++  required string rmId = 4;{code}
+
+There is a separate jira open to add a cluster-id
+
+dropped the synchronized? 
+{code}-  private synchronized boolean isRMActive() {{code}
+
+there is no fencer in embedded election, right?
+{code}+  @Override
++  public void becomeStandby() {
++    try {
++      rm.transitionToStandby(true);
++    } catch (Exception e) {
++      // Log the exception. The fencer should be able to fence this node
++      LOG.error("RM could not transition to Standby mode", e);
++    }
++  }{code}
+
+this is probably not enough. we need to notify the rm.
+{code}@Override
++  public void notifyFatalError(String errorMessage) {
++    LOG.fatal("Received " + errorMessage);
++    throw new YarnRuntimeException(errorMessage);
++  }{code}
+
+this should be empty. there is no fencing in embedded election because zk store is self-fenced.
+{code}@Override
++  public void fenceOldActive(byte[] oldActiveData) {
++    RMHAServiceTarget target = dataToTarget(oldActiveData);
++
++    try {
++      target.checkFencingConfigured();
++    } catch (BadFencingConfigurationException e) {
++      throw new YarnBadConfigurationException(e.getMessage());
++    }
++
++    if (!target.getFencer().fence(target)) {
++      throw new YarnRuntimeException("Could not fence old active");
++    }
++  }{code}
+
+Didnt quite get the purpose of the new thread. Why can we not call elector.joinElection() in serviceStart(). There is no need for us to loop and keep calling joinElection() in a thread.
+
+Use newly created HAUtil helper methods?
+{code}
++      if (conf.getBoolean(YarnConfiguration.AUTO_FAILOVER_ENABLED,
++          YarnConfiguration.DEFAULT_AUTO_FAILOVER_ENABLED)) {
++        // Automatic failover enabled
++        if (conf.getBoolean(YarnConfiguration.AUTO_FAILOVER_EMBEDDED,
++            YarnConfiguration.DEFAULT_AUTO_FAILOVER_EMBEDDED)) {
++          // Embedded automatic failover enabled
++          electorService = createRMZKActiveStandbyElectorService();
++          addIfService(electorService);
+{code}
+
+In the embedded failover test how do we know that the ZK based failover is being triggered? I did not understand how failover can happen so quickly when the zk session timeout is 10s.
+
+IMO the ElectorService should not be calling RM.transitionToActive/Standby. It should be calling AdminService.transitionToActive/Standby. The AdminService is the only HA entry point into the system. By calling directly into the RM we are breaking the abstractions that everything else is going to follow.
+
+Also, an alternative layering would be if the ElectorService would be made a member of the AdminService. There is no need for the main body of the RM to know about failover or failover controllers (FC) etc. Interaction with any FC for failover is abstracted in the AdminService. So IMO if FC is configured to be embedded then we can maintain the abstraction and embed it into the AdminService. 
+
+
+bq. There is a separate jira open to add a cluster-id
+Here, we use cluster-id to make sure the RM to which the bread-crumb corresponds to is in the same cluster. In HDFS, they directly check for the other NN's id, which restricts us to a single standby. For RM HA, there is no reason to limit ourselves to two RMs, even though that is probably going to be default deployment. The actual token-related logic can be handled in the other JIRA. 
+
+bq. this is probably not enough. we need to notify the rm.
+Just to be sure, are you suggesting we add a new event and a handler in the RM for that event? 
+
+I have addressed other comments, and looking at the test failure from the previous patch. Will incorporate any other comments and post a patch at the earliest.
+
+Patch that incorporates suggestions from [~bikassaha].
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12620257/yarn-1029-2.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 6 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 4 new Findbugs (version 1.3.9) warnings.
+
+        {color:red}-1 release audit{color}.  The applied patch generated 1 release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-common-project/hadoop-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-tests:
+
+                  org.apache.hadoop.yarn.server.TestContainerManagerSecurity
+                  org.apache.hadoop.yarn.server.TestRMNMSecretKeys
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-YARN-Build/2717//testReport/
+Release audit warnings: https://builds.apache.org/job/PreCommit-YARN-Build/2717//artifact/trunk/patchprocess/patchReleaseAuditProblems.txt
+Findbugs warnings: https://builds.apache.org/job/PreCommit-YARN-Build/2717//artifact/trunk/patchprocess/newPatchFindbugsWarningshadoop-common.html
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/2717//console
+
+This message is automatically generated.
+
+Patch that fixes the release audit warning. 
+
+I don't think we should be fixing the findbugs warnings here - they were not introduced by the changes here, and the test failures are unrelated.
+
+[~bikassaha], [~vinodkv]: please take a look when you get a chance.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12620386/yarn-1029-3.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 6 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 4 new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-common-project/hadoop-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-tests:
+
+                  org.apache.hadoop.yarn.server.TestContainerManagerSecurity
+                  org.apache.hadoop.yarn.server.TestRMNMSecretKeys
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-YARN-Build/2721//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-YARN-Build/2721//artifact/trunk/patchprocess/newPatchFindbugsWarningshadoop-common.html
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/2721//console
+
+This message is automatically generated.
+
+I see that the patch has increased the node manager connect time in the test from 5s to 11s. Its not clear to me how the test earlier worked or works now.
+
+This method used to be synchronized
+{code}-  private synchronized boolean isRMActive() {{code}
+
+Should we clear or fail to start? The data seems to be in error.
+{code}+    if (elector.parentZNodeExists() && !isParentZnodeSafe(clusterId)) {
++      elector.clearParentZNode();
++    }{code}
+
+Is it necessary to mention ZKFC here?
+{code}+  private static final HAServiceProtocol.StateChangeRequestInfo req =
++      new HAServiceProtocol.StateChangeRequestInfo(
++          HAServiceProtocol.RequestSource.REQUEST_BY_ZKFC);{code}
+
+Can we share the terminate functianality with RMStateStoreOperationFailedEventDispatcher in a common function?
+{code}+  public static class RMEmbeddedElectorEventDispatcher implements
++      EventHandler<RMEmbeddedElectorEvent> {
++    @Override
++    public void handle(RMEmbeddedElectorEvent event) {
++      LOG.fatal("Shutting down on receiving a " +
++          RMEmbeddedElectorEvent.class.getName() + " of type " +
++          event.getType().name());
++      ExitUtil.terminate(1, event.getCause());
++    }{code}
+
+We probably need some unified method of notifying the RM about something bad. One example being embedded leader election reporting an error. Else we may end up with a proliferation of event handlers.
+
+The patch overall looks good to me. Would like some reviews from other committers, specially around the MiniYARNCluster changes. I am not that familiar with the mini cluster code.
+
+Thanks Bikas.
+
+bq. I see that the patch has increased the node manager connect time in the test from 5s to 11s. Its not clear to me how the test earlier worked or works now.
+Good catch! Forgot to reset the node manager connect time to 5s, even that is a guess. Based on your comment earlier about the ZK-interval being higher than the time we are waiting for failover, I ran the test several times and figured it fails sometimes, which makes sense. So, now, {{MiniYARNCluster#getActiveRMIndex()}} waits for 10 seconds (by default) for the RM to failover. So, the NM/client connection verification need not wait for the failover itself. 
+
+bq. Should we clear or fail to start? The data seems to be in error.
+Good point! When using ZKFC, the format command takes care of clearing the parentZNode. Ideally, we should have a similar option to be able to format the znode, and the elector should fail if the znode is not safe. In the next patch, let me fail to start and open another JIRA for adding the admin option.
+
+bq. This method used to be synchronized
+The method should have been synchronized in YARN-1481, [~vinodkv] and I thought we could handle it here. Could do an addendum patch there instead if that is preferred.
+
+bq. Is it necessary to mention ZKFC here?
+Yes. The alternative is to add another RequestSource or rename the ZKFC source to something else. I think it is okay to leave it as is. 
+
+bq. Can we share the terminate functianality with RMStateStoreOperationFailedEventDispatcher in a common function?
+Not sure how advantageous that will be - we ll end up calling the common method instead of ExitUtil.terminate only for the common method to call it? Also, getCause() doesn't exist in AbstractEvent requiring us to add a new kind of event (CausedEvent?) that both these events extend. Seems too complicated for the gain.
+
+bq. We probably need some unified method of notifying the RM about something bad. One example being embedded leader election reporting an error. Else we may end up with a proliferation of event handlers.
+Agree - 100%, but would like to do it lazily when another such case pops up. 
+
+[~vinodkv], [~sandyr] - can one of you take a look at least at the MiniYARNCluster changes?
+
+Meant YARN-1481 should have changed it from removed the synchronization in the method {{AdminService#isRMActive()}}. We are removing it here instead.
+
+New patch: EmbeddedElectorService fails if the data in the znode is incorrect, instead of blindly clearing it.
+
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12620444/yarn-1029-4.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 6 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 4 new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-common-project/hadoop-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-tests:
+
+                  org.apache.hadoop.metrics2.impl.TestMetricsSystemImpl
+                  org.apache.hadoop.yarn.server.TestRMNMSecretKeys
+                  org.apache.hadoop.yarn.server.TestContainerManagerSecurity
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-YARN-Build/2726//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-YARN-Build/2726//artifact/trunk/patchprocess/newPatchFindbugsWarningshadoop-common.html
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/2726//console
+
+This message is automatically generated.
+
+Not sure why TestMetricsSystemImpl failed - it passes locally. The other two tests are from YARN-1463. 
+
+
+
+bq. The method should have been synchronized in YARN-1481, Vinod Kumar Vavilapalli and I thought we could handle it here. Could do an addendum patch there instead if that is preferred.
+Please take care of it wherever appropriate.
+
+bq. Not sure how advantageous that will be - we ll end up calling the common method instead of ExitUtil.terminate only for the common method to call it? Also, getCause() doesn't exist in AbstractEvent requiring us to add a new kind of event (CausedEvent?) that both these events extend. Seems too complicated for the gain.
+The advantage is that future changes will need to edit one place in the code and forget about other places. Not a major point though. Making life easier for future devs.
+
+bq. Agree - 100%, but would like to do it lazily when another such case pops up.
+Again, if we organize the newly added code such that its a common event for any module to inform the RM about a fatal error then we are good for the future. Embedded elector can use that event instead of a custom named event.
+
+I am sorry I could not understand your comment explaining how the test passes with these timeouts. Been sick for a while. Probably my brain is running slow :P
+
+
+
+
+bq. Please take care of it wherever appropriate.
+Re-opened YARN-1481 to take care of it there. If it isn't too much trouble, please take a look at it. 
+
+bq. Again, if we organize the newly added code such that its a common event for any module to inform the RM about a fatal error then we are good for the future. Embedded elector can use that event instead of a custom named event.
+Oh! I understand it now - will add a RMFatalErrorEvent, the handler for which just terminates the RM. And, update RMStateStoreOperationFailedEvent to use that event instead of calling terminate directly. 
+
+bq. I am sorry I could not understand your comment explaining how the test passes with these timeouts.
+# ZK timeout comes from RM_ZK_TIMEOUT_MS (2 seconds), the failover could take as long as this. MiniYARNCluster#getActiveRMIndex() waits for this duration to find the active RM. 
+# NM->RM connection is verified after a successful failover. The timeout there corresponds to the maximum time taken by failovers until the NM connects to an RM. 5 seconds seems a long enough time for this.
+
+Patch that adds RMFatalEvent to handle all fatal RM events, embedded elector uses this.
+
+[~vinodkv], I believe the latest patch addresses all of Bikas' comments. Please take a look at the patch (at least MiniYARNCluster changes) when possible. 
+
+Kicking Jenkins. Can't believe I forgot to.
+
+Thanks for addressing the comments. I was expecting RMStateStoreOperationFailedEvent to be replaced by the new RMFatalErrorEvent just like the Embedded elector event got replaced. Not much use in the store sending an event to the RM and then the RM sending an event to itself again, right?
+
+RMStateStoreOperationFailedEvent is not always fatal and might not require terminating the RM; events of type RMStateStoreOperationFailedEventType.FENCED require the RM to transition to standby, and terminate the RM if the transition fails. 
+
+bq. Not much use in the store sending an event to the RM and then the RM sending an event to itself again, right?
+Right. That was the reason for my reluctance earlier. But, I guess this addresses any future fatal events. 
+
+* terminate the RM *only* if the transition to standby fails.
+
+The action taken when the event comes in would be determined by the handler right? TransitionToStandby in one case or terminate is some other case. The event is just a uniform method by which different modules can report fatal errors to the RM. The store sends RMFatalError.STORE and the elector sends RMFatalError.ELECTOR. 
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12620657/yarn-1029-5.patch
+  against trunk revision .
+
+    {color:red}-1 patch{color}.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/2748//console
+
+This message is automatically generated.
+
+The new patch uses RMFatalEvent for both elector and store fatal events - the RM transitions to active if the store is fenced, shuts down otherwise. 
+
+Deployed on a 2-node cluster and verified failover while running an example job. 
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12620758/yarn-1029-6.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 6 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 5 new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-common-project/hadoop-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-tests.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-YARN-Build/2749//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-YARN-Build/2749//artifact/trunk/patchprocess/newPatchFindbugsWarningshadoop-common.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-YARN-Build/2749//artifact/trunk/patchprocess/newPatchFindbugsWarningshadoop-yarn-server-resourcemanager.html
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/2749//console
+
+This message is automatically generated.
+
+Fix the YARN findbugs warning.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12620764/yarn-1029-7.patch
+  against trunk revision .
+
+    {color:red}-1 patch{color}.  Trunk compilation may be broken.
+
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/2751//console
+
+This message is automatically generated.
+
+I must be miss-reading the patch. I dont see the following event types being handled.
+{code}+  STORE_OP_FAILED,
++
++  // Source <- Embedded Elector
++  EMBEDDED_ELECTOR{code}
+
+All RMFatalEvents of type other than STORE_FENCED fall through to {{ExitUtil#terminate()}}? Do you suggest we handle them explicitly? 
+
+Resubmitting the same patch.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12620780/yarn-1029-7.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 6 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 4 new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-common-project/hadoop-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-tests.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-YARN-Build/2753//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-YARN-Build/2753//artifact/trunk/patchprocess/newPatchFindbugsWarningshadoop-common.html
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/2753//console
+
+This message is automatically generated.
+
+That is what I was missing because I did not apply the patch to the code. Thanks!
+
+[~bikassaha] - thanks for the reviews. Are you +1 on everything but the MiniYARNCluster changes?
+
+[~vinodkv], [~sandyr]: will either of you able to take a look at the MiniYARNCluster changes? 
+
+Noticed occasional failures of TestRMFailover in some Jenkins builds (e.g. https://builds.apache.org/job/PreCommit-YARN-Build/2750//testReport/org.apache.hadoop.yarn.client/TestRMFailover/testExplicitFailover/). New patch that bumps up the timeout for NM->RM connection to 10 seconds (granularity remains 100 ms). 
+
+Looked over the minicluster changes.
+
+A couple tiny nits, otherwise LGTM:
+* In MiniYarnCluster, failoverTimeout does not need to be initialized to 0 because it will always get set in serviceInit.
+* In initResourceManager, index does not need to be final
+* In initResourceManager, having the open paren on the line after register looks a little weird, and new EventHandler<RMAppAttemptEvent>()  should be at the same indentation level as RMAppAttemptEventType.class.
+* The thread in startResourceManager should be given a name (including the index).  Though if that's unrelated to this patch, leaving it how it is is fine.
+* Why the added null check in getActiveRMIndex?  When would one of the entries in the resourceManagers array be null?
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12620865/yarn-1029-8.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 6 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 4 new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-common-project/hadoop-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-tests:
+
+                  org.apache.hadoop.ha.TestZKFailoverController
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-YARN-Build/2758//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-YARN-Build/2758//artifact/trunk/patchprocess/newPatchFindbugsWarningshadoop-common.html
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/2758//console
+
+This message is automatically generated.
+
+Thanks Sandy. Posted a new patch that addresses most of your comments.
+
+bq. Why the added null check in getActiveRMIndex? When would one of the entries in the resourceManagers array be null?
+stopResourceManager(i) stops and nullifies resourceManagers[i]. restart() resets this and points to a new RM. Currently, we are forced to do this because a stopped service can't be restarted, and the only way to trigger a failover automatically is to kill the RM. Have marked these two methods @Private to limit their access to YARN.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12620883/yarn-1029-9.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 6 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 4 new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-common-project/hadoop-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-tests.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-YARN-Build/2764//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-YARN-Build/2764//artifact/trunk/patchprocess/newPatchFindbugsWarningshadoop-common.html
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/2764//console
+
+This message is automatically generated.
+
+[~vinodkv] - did you get a chance to look at the latest patch?
+
+Patch looks good to me. Although the flakiness of the new Test needs to be monitored. One option would be to walk through the test in a debugger to satisfy yourself that things are indeed happening the way they should.
+Lets commit the patch and move onto the next items. I think this patch may have partially covered some of the work of the ZKFC jira. We can address further comments as they come.
+
+Thanks for your patience through the review. These things are pretty subtle and the more time we spent making it simple and thinking through stuff the better later on. Although I am sure we will be surprised by real life later on :P
+
+bq. Vinod Kumar Vavilapalli - did you get a chance to look at the latest patch?
+Looking at it right now..
+
+Some comments/questions on the last patch:
+ - yarn_server_resourcemanager_service_protos.proto: RMActiveNodeInfoProto -> ActiveRMInfoProto ?
+ - yarn-default.xml: "This kind of failover is embedded in the RM and does not explicitly fence stores.” - “does not” or “does”?
+  - I think we should force admins to set yarn.resourcemanager.cluster-id explicitly (only in case HA is enabled for now). Defaults don’t tend to be changed and a default cluster-id can potentially cause hard-to-debug issues.
+ - No need for YarnBadConfigurationException. It isn’t adding any value and is inconsistent with how we tackle misconfigs everywhere. Let’s just use YarnRuntimeException.
+ - Why is ZK added to hadoop-yarn-client module? It should be only in server-common?
+ - RMFatalEventType.EMBEDDED_ELECTOR -> EMBEDDED_ELECTOR_FAILED or something like that? Similarly STORE_FENCED to STATE_STORE_FENCED and STORE_OP_FAILED to STATE_STORE_OP_FAILED for making it explicit.
+
+EmbeddedElectorService
+ - Initialized in AdminService? It can be initialize in ResourceManager class itself and it can access AdminService via RMContext.
+ - It can similarly access rmDispatcher from RMContext.
+
+Testing
+ - We should have one test that switches off the automatic failover. May be retain the old testExplicitFailover test in TestRMFailover?
+ - TestRMHA.testTransitionsWhenAutomaticFailoverEnabled: After each transition, check the state?
+
+bq. Initialized in AdminService? It can be initialize in ResourceManager class itself and it can access AdminService via RMContext.
+We initially had it in the RM, but thought AdminService is a better place. http://tinyurl.com/qdo2vos
+
+bq. Why is ZK added to hadoop-yarn-client module? It should be only in server-common?
+TestRMFailover needs it.
+
+bq. yarn-default.xml: "This kind of failover is embedded in the RM and does not explicitly fence stores.” - “does not” or “does”?
+The elector doesn't explicitly fence (as in the way HDFS does), it is implicit and the store is supposed to ensure a single RM can modify it at any point in time.
+
+bq. I think we should force admins to set yarn.resourcemanager.cluster-id explicitly (only in case HA is enabled for now). Defaults don’t tend to be changed and a default cluster-id can potentially cause hard-to-debug issues.
+I am okay either way, but I think the fewer configs we *force* admins to set the better. If there is a single cluster, it should be perfectly okay to just use the default. No? 
+
+Will address remaining suggestions. 
+
+bq. We initially had it in the RM, but thought AdminService is a better place. http://tinyurl.com/qdo2vos
+Sure. It's not a big deal either ways. Let's leave it the way you had in the latest patch. But the comment about using fields from RMContext holds.
+
+bq. TestRMFailover needs it.
+Hm.. then let's put it in server-common as a compile-time dependency and specifically in hadop-yarn-client as a test-dependency. Okay?
+
+bq. The elector doesn't explicitly fence [...]
+May be state that somehow? It did confuse me a little.
+
+bq. I am okay either way, but I think the fewer configs we force admins to set the better. If there is a single cluster, it should be perfectly okay to just use the default. No? 
+Yeah, thought about it. But it seemed to me that the problem of debugging bad issues with conflicting cluster-ids is worse than the little convenience the default value is bringing.
+
+
+Oh, and apologies for the delayed review, holidays and all. And tx for being patient too. I hope to commit this over this week-end or as soon as you can make it available. Tx.
+
+No problem. Thanks for the clarification, Vinod. Will take care of these changes as well.
+
+While adding testExplicitFailover back, ran into YARN-1559. Might make sense to fix that first.
+
+The embedded elector was explicitly placed inside the adminservice because that service is handling HA on behalf of the RM. Failover controller may be external and talk to the admin service. In embedded case, its cleaner to contain the elector inside it so that the RM main code body remains logically separate from any of the failover controller logic.
+
+Uploading patch that addresses all of [~vinodkv]'s comments.
+
+Cancelled patch to fix YARN-1559 first.
+
+Submitting patch post YARN-1559.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12621525/yarn-1029-10.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 6 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:red}-1 javadoc{color}.  The javadoc tool appears to have generated 14 warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 4 new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-common-project/hadoop-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-tests:
+
+                  org.apache.hadoop.yarn.client.api.impl.TestYarnClient
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-YARN-Build/2804//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-YARN-Build/2804//artifact/trunk/patchprocess/newPatchFindbugsWarningshadoop-common.html
+Console output: https://builds.apache.org/job/PreCommit-YARN-Build/2804//console
+
+This message is automatically generated.
+
+Weird. Running javadoc locally doesn't reveal any warnings - I ran mvn javadoc:javadoc with and without the patch for the hadoop-yarn-project. The findbugs are in common code, and the test failure is unrelated.
+
+The same javadoc warnings showed up on YARN-1482 aas well. I think the latest patch is good to go.
+
+Excellent. Looks good. Checking this in.
+
+Let's make sure the common findBugs warnings are tracked somewhere.
+
+Committed this to trunk and branch-2. Thanks Karthik!
+
+Tx again for being patient with the prolonged release cycles!
+
+SUCCESS: Integrated in Hadoop-trunk-Commit #4966 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/4966/])
+YARN-1029. Added embedded leader election in the ResourceManager. Contributed by Karthik Kambatla. (vinodkv: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1556103)
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ha/ActiveStandbyElector.java
+* /hadoop/common/trunk/hadoop-yarn-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/conf/HAUtil.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/conf/YarnConfiguration.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/proto/server/yarn_server_resourcemanager_service_protos.proto
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/pom.xml
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/test/java/org/apache/hadoop/yarn/client/TestRMFailover.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/client/RMHAServiceTarget.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/resources/yarn-default.xml
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/AdminService.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/EmbeddedElectorService.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMFatalEvent.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMFatalEventType.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/ResourceManager.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStore.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreOperationFailedEvent.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreOperationFailedEventType.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/ZKRMStateStore.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/MockRM.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestRMHA.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/TestZKRMStateStore.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/TestZKRMStateStoreZKClientConnections.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-tests/src/test/java/org/apache/hadoop/yarn/server/MiniYARNCluster.java
+
+
+Awesome. Thanks Bikas, Sandy and Vinod for your reviews.
+
+Create HADOOP-10209 to track the findBugs warnings in ActiveStandbyElector.
+
+SUCCESS: Integrated in Hadoop-Yarn-trunk #445 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/445/])
+YARN-1029. Added embedded leader election in the ResourceManager. Contributed by Karthik Kambatla. (vinodkv: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1556103)
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ha/ActiveStandbyElector.java
+* /hadoop/common/trunk/hadoop-yarn-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/conf/HAUtil.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/conf/YarnConfiguration.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/proto/server/yarn_server_resourcemanager_service_protos.proto
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/pom.xml
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/test/java/org/apache/hadoop/yarn/client/TestRMFailover.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/client/RMHAServiceTarget.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/resources/yarn-default.xml
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/AdminService.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/EmbeddedElectorService.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMFatalEvent.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMFatalEventType.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/ResourceManager.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStore.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreOperationFailedEvent.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreOperationFailedEventType.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/ZKRMStateStore.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/MockRM.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestRMHA.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/TestZKRMStateStore.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/TestZKRMStateStoreZKClientConnections.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-tests/src/test/java/org/apache/hadoop/yarn/server/MiniYARNCluster.java
+
+
+FAILURE: Integrated in Hadoop-Hdfs-trunk #1637 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/1637/])
+YARN-1029. Added embedded leader election in the ResourceManager. Contributed by Karthik Kambatla. (vinodkv: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1556103)
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ha/ActiveStandbyElector.java
+* /hadoop/common/trunk/hadoop-yarn-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/conf/HAUtil.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/conf/YarnConfiguration.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/proto/server/yarn_server_resourcemanager_service_protos.proto
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/pom.xml
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/test/java/org/apache/hadoop/yarn/client/TestRMFailover.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/client/RMHAServiceTarget.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/resources/yarn-default.xml
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/AdminService.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/EmbeddedElectorService.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMFatalEvent.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMFatalEventType.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/ResourceManager.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStore.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreOperationFailedEvent.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreOperationFailedEventType.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/ZKRMStateStore.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/MockRM.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestRMHA.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/TestZKRMStateStore.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/TestZKRMStateStoreZKClientConnections.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-tests/src/test/java/org/apache/hadoop/yarn/server/MiniYARNCluster.java
+
+
+SUCCESS: Integrated in Hadoop-Mapreduce-trunk #1662 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/1662/])
+YARN-1029. Added embedded leader election in the ResourceManager. Contributed by Karthik Kambatla. (vinodkv: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1556103)
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ha/ActiveStandbyElector.java
+* /hadoop/common/trunk/hadoop-yarn-project/CHANGES.txt
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/conf/HAUtil.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/conf/YarnConfiguration.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/proto/server/yarn_server_resourcemanager_service_protos.proto
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/pom.xml
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-client/src/test/java/org/apache/hadoop/yarn/client/TestRMFailover.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/client/RMHAServiceTarget.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/resources/yarn-default.xml
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/AdminService.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/EmbeddedElectorService.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMFatalEvent.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMFatalEventType.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/ResourceManager.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStore.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreOperationFailedEvent.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/RMStateStoreOperationFailedEventType.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/ZKRMStateStore.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/MockRM.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestRMHA.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/TestZKRMStateStore.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/recovery/TestZKRMStateStoreZKClientConnections.java
+* /hadoop/common/trunk/hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-tests/src/test/java/org/apache/hadoop/yarn/server/MiniYARNCluster.java
+
+

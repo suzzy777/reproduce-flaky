@@ -1,0 +1,174 @@
+Second run passed. There was no sign of this failure in the past two weeks so this may be a rare failure which is timing dependent.
+
+http://sandbox.jenkins.cloudera.com/view/Impala/view/Nightly-Builds/job/impala-master-repeated-runs-cdh5/378/testReport/query_test.test_mem_usage_scaling/TestTpchMemLimitError/test_low_mem_limit_q21_mem_limit__700___exec_option____disable_codegen___False___abort_on_error___1___exec_single_node_rows_threshold___0___batch_size___0___num_nodes___0____table_format__parquet_none_/?
+
+[~kwho] this seems to keep happening, several times this week. Any ideas about why this might happen and how to fix/avoid?
+
+Tim, could you dig in to see why this test fails sporadically?
+
+I'll take a look. Unfortunately the minimum memory consumption is non-deterministic for a lot of queries so we may just need to try increasing this limit.
+
+Sure, we can consider doing that. Let's try to first get a deeper understanding of why this test is failing. Maybe mem limit is too aggressive.
+
+I agree, I'm looking into it now to see if it's an actual bug (we've certainly had some of those).
+
+Do you have any examples of recent failures of this test?
+
+I was able to get some info out of the logs for a recent failure. Unfortunately the stack for the memory limit exceeded is corrupted so we don't know which node was the problem. It looks like it's some kind of race between operators spilling and other operators trying to pin new blocks. I'll continue trying to replicate locally (no luck so far).
+
+{code}
+I0104 03:33:45.490566 21948 buffered-block-mgr.cc:981] Query id=b44d33f3e88a324a:f46fc0f3cdbaf7a3 was unable to get minimum required buffers.
+Buffered block mgr
+  Num writes outstanding: 0
+  Num free io buffers: 0
+  Num unpinned blocks: 0
+  Num available buffers: -232
+  Total pinned buffers: 337
+  Unfullfilled reserved buffers: 232
+  Remaining memory: 7602160 (#blocks=0)
+  Block write threshold: 2
+Client 0x2a0b22a0
+  num_reserved_buffers=34
+  num_tmp_reserved_buffers=0
+  num_pinned_buffers=32
+I0104 03:33:45.570643 21948 status.cc:45] Memory limit exceeded
+    @           0xfe1a74  impala::Status::Status()
+    @           0xfe17e0  impala::Status::MemLimitExceeded()
+    @          0x12ca5d2  impala::BufferedBlockMgr::FindBufferForBlock()
+    @          0x12c3762  impala::BufferedBlockMgr::GetNewBlock()
+    @          0x16128d3  impala::BufferedTupleStream::NewBlockForWrite()
+    @     0x7f0129c06c20  (unknown)
+{code}
+
+{code}
+I0104 03:33:45.793747 21787 runtime-state.cc:229] Error from query b44d33f3e88a324a:f46fc0f3cdbaf7a3: Memory Limit Exceeded
+Query(b44d33f3e88a324a:f46fc0f3cdbaf7a3) Limit: Limit=700.00 MB Consumption=605.92 MB
+  Fragment b44d33f3e88a324a:f46fc0f3cdbaf7a4: Consumption=8.00 KB
+    EXCHANGE_NODE (id=20): Consumption=0
+    DataStreamRecvr: Consumption=0
+  Block Manager: Limit=560.00 MB Consumption=552.50 MB
+  Fragment b44d33f3e88a324a:f46fc0f3cdbaf7a8: Consumption=605.91 MB
+    AGGREGATION_NODE (id=11): Consumption=2.25 MB
+    HASH_JOIN_NODE (id=10): Consumption=266.03 MB
+    HASH_JOIN_NODE (id=9): Consumption=146.03 MB
+    HASH_JOIN_NODE (id=8): Consumption=88.02 KB
+    HASH_JOIN_NODE (id=7): Consumption=1.50 MB
+    HASH_JOIN_NODE (id=6): Consumption=169.06 MB
+    HDFS_SCAN_NODE (id=1): Consumption=20.93 MB
+    EXCHANGE_NODE (id=13): Consumption=0
+    DataStreamRecvr: Consumption=0
+    EXCHANGE_NODE (id=14): Consumption=0
+    DataStreamRecvr: Consumption=0
+    EXCHANGE_NODE (id=15): Consumption=0
+    DataStreamRecvr: Consumption=0
+    EXCHANGE_NODE (id=16): Consumption=0
+    EXCHANGE_NODE (id=17): Consumption=0
+    DataStreamSender: Consumption=12.00 KB
+{code}
+
+I compared the failed query with a successful run of the same query with the same mem_limit. The difference seems to be that join nodes 9 and 10 got different amounts of memory: in the failed run, node 10 accumulated memory more quickly than node 9.
+
+{code}
+Operator              #Hosts  Avg Time  Max Time    #Rows  Est. #Rows   Peak Mem  Est. Peak Mem  Detail                      
+-----------------------------------------------------------------------------------------------------------------------------
+21:MERGING-EXCHANGE        1     463us     463us      300         100          0        -1.00 B  UNPARTITIONED               
+12:TOP-N                   3       1ms       1ms      300         100   20.00 KB        4.10 KB                              
+20:AGGREGATE               3     141ms     143ms      411       9.96K    2.28 MB       10.00 MB  FINALIZE                    
+19:EXCHANGE                3     242us     308us    1.20K       9.96K          0              0  HASH(s_name)                
+11:AGGREGATE               3     221ms     235ms    1.20K       9.96K    7.06 MB       10.00 MB                              
+10:HASH JOIN               3     889ms     917ms    4.14K     617.92K  148.93 MB       14.27 MB  LEFT ANTI JOIN, PARTITIONED 
+|--18:EXCHANGE             3     405ms     416ms    3.79M     600.12K          0              0  HASH(l3.l_orderkey)         
+|  05:SCAN HDFS            3   3s799ms   4s985ms    3.79M     600.12K   20.92 MB        1.25 GB  tpch_parquet.lineitem l3    
+09:HASH JOIN               3   2s086ms   2s193ms   73.09K     617.92K  280.80 MB       33.58 MB  LEFT SEMI JOIN, PARTITIONED 
+|--17:EXCHANGE             3     558ms     656ms    6.00M       6.00M          0              0  HASH(l2.l_orderkey)         
+|  04:SCAN HDFS            3   1s250ms   1s398ms    6.00M       6.00M   11.60 MB        1.25 GB  tpch_parquet.lineitem l2    
+16:EXCHANGE                3       7ms       8ms   75.87K     617.92K          0              0  HASH(l1.l_orderkey)         
+08:HASH JOIN               3     691ms     830ms   75.87K     617.92K    2.04 MB        28.00 B  INNER JOIN, BROADCAST       
+|--15:EXCHANGE             3      22us      24us        1           1          0              0  BROADCAST                   
+|  03:SCAN HDFS            1      19ms      19ms        1           1   50.00 KB       32.00 MB  tpch_parquet.nation         
+07:HASH JOIN               3     188ms     225ms    1.83M     617.92K    2.61 MB      472.66 KB  INNER JOIN, BROADCAST       
+|--14:EXCHANGE             3       2ms       2ms   10.00K      10.00K          0              0  BROADCAST                   
+|  00:SCAN HDFS            1      35ms      35ms   10.00K      10.00K    1.07 MB       48.00 MB  tpch_parquet.supplier       
+06:HASH JOIN               3   1s249ms   1s299ms    1.83M     600.12K  170.24 MB       13.11 MB  INNER JOIN, BROADCAST       
+|--13:EXCHANGE             3     216ms     273ms  729.41K     500.00K          0              0  BROADCAST                   
+|  02:SCAN HDFS            2   2s177ms   3s524ms  729.41K     500.00K    9.90 MB       80.00 MB  tpch_parquet.orders         
+01:SCAN HDFS               3   3s552ms   3s782ms    3.79M     600.12K   17.87 MB      320.00 MB  tpch_parquet.lineitem l1   
+{code}
+
+Committed a possible fix. Will continue to monitor jobs to see if the problem reoccurs.
+
+IMPALA-2728: add tolerates_oversubscription option to block mgr client
+
+This commit changes how oversubscription of reservations in the block
+mgr is handled. Now clients can decided whether a reserved buffer
+allocation failure should result in a MEM_LIMIT_EXCEEDED error (if the
+client can't continue without its reserved buffers), or whether it
+should not result in an error, the same as for a non-reserved buffer.
+
+The aggregation and hash join nodes can both use this new option: when
+they fail to get a reserved buffer, they will attempt to spill more
+partitions instead of immediately aborting.
+
+This can avoid queries failing with MEM_LIMIT_EXCEEDED in some
+scenarios, e.g. if two joins are competing for memory but are able to
+complete with only part of their reservations by spilling some partitions.
+Before this patch, if one of the joins failed to allocate the first I/O
+buffer in a stream, it would give up instead of spilling a partition.
+
+Change-Id: I929272a6ba331213948dc78cc7415be4a8ef78e3
+Reviewed-on: http://gerrit.cloudera.org:8080/1718
+Reviewed-by: Tim Armstrong <tarmstrong@cloudera.com>
+Tested-by: Internal Jenkins
+
+
+IMPALA-2728: workaround by xfailing tpch-q21 mem limit
+
+This change only affects behaviour when the query is expected to succeed
+at the given memory limit and it instead fails with memory limit
+exceeded. In this case the test is xfailed.
+
+Also remove unnecessary semicolons in Python file.
+
+Change-Id: Ifae64b2653ee3ab7b59d27b6abbb5215db838190
+Reviewed-on: http://gerrit.cloudera.org:8080/1737
+Reviewed-by: Alex Behm <alex.behm@cloudera.com>
+Reviewed-by: Dan Hecht <dhecht@cloudera.com>
+Tested-by: Internal Jenkins
+---
+M tests/query_test/test_mem_usage_scaling.py
+1 file changed, 29 insertions(+), 26 deletions(-)
+
+Approvals:
+  Internal Jenkins: Verified
+  Alex Behm: Looks good to me, approved
+  Dan Hecht: Looks good to me, approved
+
+Downgrade priority since it is no longer blocking builds. Still need to understand why this started failing.
+
+I looked through the test history on to see if there were any instances of this being xfailed, and I can't find any. I'm going to try to reproduce the problem locally again.
+
+I wasn't able to reproduce this locally and it hasn't happened in the jobs in a long time. I was actually able to run the query with a 473MB limit.
+
+I'm going to change the target to Impala 2.6: it doesn't seem worthwhile reenabling the test for the current release even thoguh it seems safe to do.
+
+
+
+IMPALA-2728: reenable mem limit test now that it is stable
+
+The test has not xfailed in a long time, so we believe that various
+memory usage fixes have fixed the flakiness.
+
+Change-Id: Idff06791e9d880cc8ddf54c0c977a556d3701bea
+Reviewed-on: http://gerrit.cloudera.org:8080/2442
+Reviewed-by: Dan Hecht <dhecht@cloudera.com>
+Tested-by: Internal Jenkins
+---
+M tests/query_test/test_mem_usage_scaling.py
+1 file changed, 1 insertion(+), 2 deletions(-)
+
+Approvals:
+  Internal Jenkins: Verified
+  Dan Hecht: Looks good to me, approved
+
+
+

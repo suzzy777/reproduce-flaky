@@ -1,0 +1,285 @@
+I didn't find a previous issue report even though I know that lots of folks know about these shortcomings. I think the way I've written it this is reasonable to merge into 3.0 / 3.11 but for now here is the trunk patch
+
+ 
+||trunk||
+|[patch|https://github.com/apache/cassandra/compare/trunk...jolynch:CASSANDRA-14459]|
+|[unit tests|https://github.com/apache/cassandra/compare/trunk...jolynch:CASSANDRA-14459#diff-f1baf62fd510947bf60e9a9def69810b] [!https://circleci.com/gh/jolynch/cassandra/tree/CASSANDRA-14459.png?circle-token= 1102a59698d04899ec971dd36e925928f7b521f5!|https://circleci.com/gh/jolynch/cassandra/tree/CASSANDRA-14459]|
+
+lgtm. Couple of comments
+ # Wondering what makes more sense for retaining a latency for a host upon reset -  min latency, or the most recent latency in the reservoir.
+ # Minor: Based on this code, MAYBE latency is taken into account if there is zero or one latency record for that host
+
+{quote}if (sample == null || sample.size() <= 1)
+{quote}
+ while the definition of MAYBE enum value indicates
+{quote}// If no other measurements are available, use this
+{quote}
+You may want to update the definition maybe?
+
+Took a quick look, and on the whole I like where this goes. The biggest problem I have is {{DynamicEndpointSnitch#reset(boolean)}} gets a snapshot of the existing {{reservoir}}. Unfortunately, generating that that snapshot is *very* heavyweight (copies a bunch of data, creates a bunch of garbage), just to get one value and then throw it all away. You should consider a different mechanism for getting the min value. Perhaps instead of {{DynamicEndpointSnitch#samples}} being defined as {{ConcurrentHashMap<InetAddressAndPort, ExponentiallyDecayingReservoir>}}, maybe the value class is something like:
+
+{code}
+static class Holder
+{
+    private final ExponentiallyDecayingReservoir res;
+    private volatile long minValue;
+
+    void update(long val)
+    {
+        res.update(...)
+
+        // It's probably ok if there's a race on minValue. better a small/irrelevant race than any real coordination
+        if (val < minValue)
+            minValue = val;
+    }
+}
+{code}
+
+Suit to taste, if you find this useful.
+
+fwiw, [circleci|https://circleci.com/gh/jasobrown/workflows/cassandra/tree/14459] with [~jolynch]'s patch was all GREEN.
+
+[~sumanth.pasupuleti]
+Regarding lowest or latest latency, if I do additional bookkeeping either is viable, but without additional bookkeeping it becomes slightly complex to do the latest value. Either strategy would achieve allowing temporarily slow nodes to receive traffic again, but I worry that resetting a host to a recent large value would temporarily remove it from replica consideration entirely until the next reset/EchoMessage. I'll fix the enum documentation.
+
+[~jasobrown] Thanks for taking a look! I figured since {{getSnapshot}} is called every 100ms in {{updateScore}}, calling it once more every 10 minutes wouldn't be a huge deal? Separate bookeeping is certainly possible if you prefer, I just figured it was better to minimize the complexity of the change. While testing this I think that I need to hook in somewhere to the 3-way gossiping messaging since {{EchoMessages}} only get sent if the node is alive in gossip but not in the local failure detector. I'll work on a test that a round of gossip has latency numbers added and then fix it :-)
+
+
+
+bq.  I figured since getSnapshot is called every 100ms in updateScore ...
+
+Huh, you are correct. I didn't realize we did that (grab a snapshot when we calculate scores). OK, well, then ... I guess once every ten minutes isn't as egregious as I thought. Ignore my earlier comment, then.
+
+
+Ok, I've pushed another version of the patch to that branch which:
+ # Adds a guaranteed {{EchoMessage}} to live hosts in addition to the GossipSyn request during the first step of gossip so that we can get some latency measurements from even latent nodes at some point. Increasing the gossip messaging slightly concerns me so the other option is I can have DES send explicit {{EchoMessages}} when it notices that a host doesn't have any data in {{reset}}. That is more deterministic (we can guarantee that after 2 reset intervals we'll probe the host), but also has the DES actively sending messages...
+ # Creates a JMX method on {{DynamicEndpointSnitchMBean}} to allow users to force timing resets (if someone wants the old behavior back they can just call it on a cron ;)).
+
+I've been playing around with a local CCM cluster using `netem` to delay traffic to a particular localhost node with a small (~5s) reset interval and testing the reset logic out and it appears to work well. The only issue I ran into is that if a node is really fast once and then it becomes slow it will get some traffic after every reset because we reset to the fast measurement. This is no worse than the status quo but I tried to mitigate it by special casing a host which only has two measurements (a fast and a subsequent slow one) to use the mean instead of the minimum which eventually converges either up or down to the new RTT.
+
+tbqh, I am -1 on sending an {{EchoMessage}} on every gossip round. This increases the gossip traffic by 66% [1], if not 100%, adds more processing demands to the single-threaded Gossip stage, and will not even give you realistic latency data (except, possibly, a rudimentary floor latency, but that assumes a small cluster that is rather quiescent). Seed nodes would also bear a lot of this additional traffic. 
+
+If we don't have any latency data in DES for a host, it's because we have not communicated meaningfully with it (as far as latency numbers go). I am totally fine with that, and we don't need to goose the traffic to get latencies for a node which we don't talk to.
+
+Your original patch was probably good enough to start a proper review, as I believe this behavior is a worthwhile addition.
+
+[1] Currently there's 2-3 msgs per gossip round (Ack2 is optional), EchoMsg + response adds two more.
+
+I think that we need some way to get latency measurements for hosts that have been excluded from traffic due to high minimums. For example if during the initial {{PingMessages}} a local DC host gets a very high measurement (e.g. 100ms) we will never send traffic to it ever. My understanding is that's why we reset in the first place.
+
+I'll try to come up with a solution that doesn't involve additional traffic.
+
+I've uploaded a patch which I think goes in the right direction. The Gossiper only sends an extra {{PingMessage}} if the latency subscribers need latency information. The DES only needs latency information if it has 2 or fewer measurements in the preceding 10 minute period. This would mean a maximum of one additional message to a host per 10 minute period under the assumption of no traffic (may want this to be Echo if we want to support mixed mode clusters, I'm somewhat ambivalent if it's an {{EchoMessage}} coming in on {{REQUEST_RESPONSE}} or a {{PingMessage}} coming in on READ, but it sounds like you dislike the latter). This avoids extra traffic to seeds as well as most hosts under most conditions.
+
+I think at this point I'm pretty convinced that we need some active healthchecks _somewhere_, and at the start of this I was hoping to piggy back on the existing ones in the Gossiper. If the {{Ack}} used {{sendReply}} then I could get away with no additional traffic by adding callback handling in {{GossipDigestAckVerbHandler}} but I don't see how to do that in a backwards compatible way (where old hosts are not using reply leading to a 10s measurement). I can also take a different approach and have a task that runs separately from gossiper and sends out {{PingMessages}} from a different thread all together. I could even unify that with the {{StartupConnectivityChecker}} to form a {{HealthcheckService}}. This would be consistent with how e.g. load balancers like HAProxy work (where they have background healthchecks that run all at once on startup and then periodically after that).
+
+Ok based on the feedback I've moved the latency probes into a scheduled executor that runs every second and sends a single message to one node needing latency probes. If no probes are needed then they are not sent. I've gone a step further and posted a follow up commit which replaces all the uses of histograms with a simpler (and 10x more performant) EMA implementation. The second patch is very optional but I know that some folks have mentioned they don't like all the garbage that the Histograms create so I fixed it.
+
+||trunk||trunk+EMA||
+|[patch|https://github.com/apache/cassandra/compare/trunk...jolynch:CASSANDRA-14459]|[patch|https://github.com/apache/cassandra/compare/trunk...jolynch:CASSANDRA-14459-EMA]|
+|[unit tests|https://github.com/apache/cassandra/compare/trunk...jolynch:CASSANDRA-14459#diff-f1baf62fd510947bf60e9a9def69810b] [!https://circleci.com/gh/jolynch/cassandra/tree/CASSANDRA-14459.png?circle-token= 1102a59698d04899ec971dd36e925928f7b521f5!|https://circleci.com/gh/jolynch/cassandra/tree/CASSANDRA-14459]|[unit tests|https://github.com/apache/cassandra/compare/trunk...jolynch:CASSANDRA-14459-EMA#diff-f1baf62fd510947bf60e9a9def69810b] [microbenchmark|https://github.com/apache/cassandra/compare/trunk...jolynch:CASSANDRA-14459-EMA#diff-f48455469e3cd6a2e225e3cb2b389d93] [!https://circleci.com/gh/jolynch/cassandra/tree/CASSANDRA-14459.png?circle-token= 1102a59698d04899ec971dd36e925928f7b521f5!|https://circleci.com/gh/jolynch/cassandra/tree/CASSANDRA-14459-EMA]|
+
+
+[~aweisberg] if you have cycles to take a look at this let me know and I can do a quick rebase to fix the merge conflicts and if you want me to open a PR for reviewing purposes I can do that too. Let me know what is easiest for you.
+
+A PR would be great. I'm still digesting context.
+
+Ok, I'll get the patch rebased and a PR opened for review today. Please reach out to me if anything is unclear :-)
+
+I'll try to summarize what I think our current plan is.
+ * Add active probing to the snitch
+ * Remove resetting of reservoir
+ * Deprecate reset interval
+ * In the map in dynamic snitch wrap the reservoir so we can store extra boolean flags
+ * Store a volatile boolean flag for whether a score has been requested, check if the flag is not set, and set it when checking the score
+ * Store a volatile boolean flag for whether a real latency sample has been received, check if the flag is not set, and set it when receiving a real latency sample
+ * Only send probes to nodes that have been involved in a query (score requested) since the last time a probe was sent && have not received a real latency sample since we last checked.
+ * Add tunable configuring probes sent by each node per second (float?), or alternatively just seconds between probes. Probes could be sent by a dedicated thread blocking on a rate limiter vs. scheduling it with the dynamic snitch update thread. I wonder if the snitch thread ever becomes busy since it updates scores every 100 milliseconds which on a large cluster seems like it could be a lot.
+ * Add EMA as a pluggable option, but keep the current default
+ * Thread checking for active probes to send iterates the map and generates a list of all nodes needing a probe. As it iterates the list it unsets the flags. The list is then shuffled. It then sends the probes either rate limited or on a schedule executor.
+ * Stop using echo message and gossip stage as samples.
+ * When active probing send the probe over the large message channel and small message channel (response should be routed similarly) and the score will be the worse of the two for that active probe so we can detect if either socket has issues.
+
+ 
+
+[~aweisberg] Alright I think that I've accomplished all of the bullet points that you listed . Along the way I made DES 100% pluggable by class name as well as significantly more testable because I know that various folks want to experiment with further improvements and having it be as easy as implementing a new subclass and dropping a jar will make experimentation much easier going forwards... I've also gone ahead and factored out the "measurement" parts of the DES into subclasses (default Histogram and new EMA option) from the "ranking" parts of the DES in the abstract base class (ranking, probing, etc).
+||trunk||
+|[Pull Request for Review|https://github.com/apache/cassandra/pull/283]|
+|[!https://circleci.com/gh/jolynch/cassandra/tree/CASSANDRA-14459.png?circle-token= 1102a59698d04899ec971dd36e925928f7b521f5!|https://circleci.com/gh/jolynch/cassandra/tree/CASSANDRA-14459]|
+
+There are a couple of points that I'm unsure about:
+ * I was able to send small + large messages, but trying to pick the maximum result is hard. I think that it should be ok because if there is a serious problem with a stage it'll basically average the "good" stage and "bad" stage and still get a pretty bad number most likely.
+ * Right now I've removed the reset interval but I actually think it's a good idea to keep it in and just re-define what it does. Specifically that would be the interval that we get to determine the probe list, vs the probe interval which actually sends a probe. I also think it's nice because we could have the old Histogram implementation as the default, and then users could _opt in_ to the new Histogram or the EMA approach as they want to. This would also remove the somewhat awkward (imo) use of the ping timeout to rate limit how often we get to generate probe lists.
+ * The current algorithm only sends probes to nodes that were requested recently, but it's still potentially a lot of messages at the default interval of 1s which I know you think is ok but e.g. Jason above didn't like it (e.g. for a 300 * 3 dc 256 vnode cluster operating at LOCAL_ONE CL we'd be essentially sending out a probe per second always since there are so many ranked replicas including remote dcs). We could mitigate this somewhat by changing the local filtering step in {{ReplicaPlans::forRead}} to happen before we ask the DES to rank rather than after (this seems like a good idea regardless).
+
+While I was making it way more testable I ran a quick microbenchmark to show the CPU and memory benefits of the EMA approach. The tradoff of course is that the EMA reacts less quickly when the sample size is small and way faster when there is a significant outlier (e.g. if there is a single 10s timing the EMA will deprefer that host almost immediately compared to the histogram which ... won't).
+{noformat}
+Benchmark                                                                      Mode     Cnt       Score       Error   Units
+SnitchMetricsBench.emaSnitchThreadedUpdate                                   sample  190609       1.573 ±     0.016   ms/op
+SnitchMetricsBench.emaSnitchThreadedUpdate:emaSnitchThreadedUpdate·p0.00     sample               0.283               ms/op
+SnitchMetricsBench.emaSnitchThreadedUpdate:emaSnitchThreadedUpdate·p0.50     sample               1.288               ms/op
+SnitchMetricsBench.emaSnitchThreadedUpdate:emaSnitchThreadedUpdate·p0.90     sample               1.456               ms/op
+SnitchMetricsBench.emaSnitchThreadedUpdate:emaSnitchThreadedUpdate·p0.95     sample               1.597               ms/op
+SnitchMetricsBench.emaSnitchThreadedUpdate:emaSnitchThreadedUpdate·p0.99     sample              15.286               ms/op
+SnitchMetricsBench.emaSnitchThreadedUpdate:emaSnitchThreadedUpdate·p0.999    sample              21.594               ms/op
+SnitchMetricsBench.emaSnitchThreadedUpdate:emaSnitchThreadedUpdate·p0.9999   sample              31.319               ms/op
+SnitchMetricsBench.emaSnitchThreadedUpdate:emaSnitchThreadedUpdate·p1.00     sample              49.086               ms/op
+SnitchMetricsBench.emaSnitchThreadedUpdate:·gc.alloc.rate                    sample       3       4.158 ±    10.217  MB/sec
+SnitchMetricsBench.emaSnitchThreadedUpdate:·gc.alloc.rate.norm               sample       3     722.283 ±    55.616    B/op
+SnitchMetricsBench.emaSnitchThreadedUpdate:·gc.churn.PS_Eden_Space           sample       3       3.949 ±    62.392  MB/sec
+SnitchMetricsBench.emaSnitchThreadedUpdate:·gc.churn.PS_Eden_Space.norm      sample       3     745.116 ± 11782.387    B/op
+SnitchMetricsBench.emaSnitchThreadedUpdate:·gc.churn.PS_Survivor_Space       sample       3       0.108 ±     3.405  MB/sec
+SnitchMetricsBench.emaSnitchThreadedUpdate:·gc.churn.PS_Survivor_Space.norm  sample       3      19.861 ±   627.604    B/op
+SnitchMetricsBench.emaSnitchThreadedUpdate:·gc.count                         sample       3       2.000              counts
+SnitchMetricsBench.emaSnitchThreadedUpdate:·gc.time                          sample       3       6.000                  ms
+SnitchMetricsBench.emaSnitchUpdate                                           sample  101392       0.296 ±     0.001   ms/op
+SnitchMetricsBench.emaSnitchUpdate:emaSnitchUpdate·p0.00                     sample               0.263               ms/op
+SnitchMetricsBench.emaSnitchUpdate:emaSnitchUpdate·p0.50                     sample               0.297               ms/op
+SnitchMetricsBench.emaSnitchUpdate:emaSnitchUpdate·p0.90                     sample               0.326               ms/op
+SnitchMetricsBench.emaSnitchUpdate:emaSnitchUpdate·p0.95                     sample               0.351               ms/op
+SnitchMetricsBench.emaSnitchUpdate:emaSnitchUpdate·p0.99                     sample               0.417               ms/op
+SnitchMetricsBench.emaSnitchUpdate:emaSnitchUpdate·p0.999                    sample               0.523               ms/op
+SnitchMetricsBench.emaSnitchUpdate:emaSnitchUpdate·p0.9999                   sample               0.635               ms/op
+SnitchMetricsBench.emaSnitchUpdate:emaSnitchUpdate·p1.00                     sample               5.300               ms/op
+SnitchMetricsBench.emaSnitchUpdate:·gc.alloc.rate                            sample       3       2.120 ±     2.248  MB/sec
+SnitchMetricsBench.emaSnitchUpdate:·gc.alloc.rate.norm                       sample       3     690.546 ±     5.915    B/op
+SnitchMetricsBench.emaSnitchUpdate:·gc.churn.PS_Eden_Space                   sample       3       1.984 ±    62.688  MB/sec
+SnitchMetricsBench.emaSnitchUpdate:·gc.churn.PS_Eden_Space.norm              sample       3     606.680 ± 19170.514    B/op
+SnitchMetricsBench.emaSnitchUpdate:·gc.count                                 sample       3       1.000              counts
+SnitchMetricsBench.emaSnitchUpdate:·gc.time                                  sample       3       4.000                  ms
+SnitchMetricsBench.histogramSnitchThreaded                                   sample   31134       9.627 ±     0.097   ms/op
+SnitchMetricsBench.histogramSnitchThreaded:histogramSnitchThreaded·p0.00     sample               4.030               ms/op
+SnitchMetricsBench.histogramSnitchThreaded:histogramSnitchThreaded·p0.50     sample               7.545               ms/op
+SnitchMetricsBench.histogramSnitchThreaded:histogramSnitchThreaded·p0.90     sample              17.662               ms/op
+SnitchMetricsBench.histogramSnitchThreaded:histogramSnitchThreaded·p0.95     sample              23.003               ms/op
+SnitchMetricsBench.histogramSnitchThreaded:histogramSnitchThreaded·p0.99     sample              29.119               ms/op
+SnitchMetricsBench.histogramSnitchThreaded:histogramSnitchThreaded·p0.999    sample              39.697               ms/op
+SnitchMetricsBench.histogramSnitchThreaded:histogramSnitchThreaded·p0.9999   sample              53.506               ms/op
+SnitchMetricsBench.histogramSnitchThreaded:histogramSnitchThreaded·p1.00     sample              55.575               ms/op
+SnitchMetricsBench.histogramSnitchThreaded:·gc.alloc.rate                    sample       3     668.096 ±    61.306  MB/sec
+SnitchMetricsBench.histogramSnitchThreaded:·gc.alloc.rate.norm               sample       3  708597.630 ± 32119.534    B/op
+SnitchMetricsBench.histogramSnitchThreaded:·gc.churn.PS_Eden_Space           sample       3     673.780 ±   134.265  MB/sec
+SnitchMetricsBench.histogramSnitchThreaded:·gc.churn.PS_Eden_Space.norm      sample       3  714612.589 ± 88018.271    B/op
+SnitchMetricsBench.histogramSnitchThreaded:·gc.churn.PS_Survivor_Space       sample       3       0.154 ±     0.009  MB/sec
+SnitchMetricsBench.histogramSnitchThreaded:·gc.churn.PS_Survivor_Space.norm  sample       3     163.122 ±    19.745    B/op
+SnitchMetricsBench.histogramSnitchThreaded:·gc.count                         sample       3     273.000              counts
+SnitchMetricsBench.histogramSnitchThreaded:·gc.time                          sample       3     303.000                  ms
+SnitchMetricsBench.histogramSnitchUpdate                                     sample   23007       1.303 ±     0.003   ms/op
+SnitchMetricsBench.histogramSnitchUpdate:histogramSnitchUpdate·p0.00         sample               1.204               ms/op
+SnitchMetricsBench.histogramSnitchUpdate:histogramSnitchUpdate·p0.50         sample               1.268               ms/op
+SnitchMetricsBench.histogramSnitchUpdate:histogramSnitchUpdate·p0.90         sample               1.368               ms/op
+SnitchMetricsBench.histogramSnitchUpdate:histogramSnitchUpdate·p0.95         sample               1.466               ms/op
+SnitchMetricsBench.histogramSnitchUpdate:histogramSnitchUpdate·p0.99         sample               2.121               ms/op
+SnitchMetricsBench.histogramSnitchUpdate:histogramSnitchUpdate·p0.999        sample               2.830               ms/op
+SnitchMetricsBench.histogramSnitchUpdate:histogramSnitchUpdate·p0.9999       sample               3.926               ms/op
+SnitchMetricsBench.histogramSnitchUpdate:histogramSnitchUpdate·p1.00         sample               5.218               ms/op
+SnitchMetricsBench.histogramSnitchUpdate:·gc.alloc.rate                      sample       3     236.317 ±     3.365  MB/sec
+SnitchMetricsBench.histogramSnitchUpdate:·gc.alloc.rate.norm                 sample       3  339325.737 ±    47.087    B/op
+SnitchMetricsBench.histogramSnitchUpdate:·gc.churn.PS_Eden_Space             sample       3     236.374 ±    15.878  MB/sec
+SnitchMetricsBench.histogramSnitchUpdate:·gc.churn.PS_Eden_Space.norm        sample       3  339407.281 ± 21325.135    B/op
+SnitchMetricsBench.histogramSnitchUpdate:·gc.churn.PS_Survivor_Space         sample       3       0.142 ±     0.462  MB/sec
+SnitchMetricsBench.histogramSnitchUpdate:·gc.churn.PS_Survivor_Space.norm    sample       3     203.675 ±   663.495    B/op
+SnitchMetricsBench.histogramSnitchUpdate:·gc.count                           sample       3     223.000              counts
+SnitchMetricsBench.histogramSnitchUpdate:·gc.time                            sample       3     232.000                  ms
+{noformat}
+As you can see the traditional histogram snitch generates 700MBps of garbage vs the EMA which generates 4MBps, and the Histogram snitch was slower at 9.6ms avg vs EMA at 1.5 avg. So while the speed improvement of 6x is nice, the reduced garbage is going to be the really nice part.
+
+[~aweisberg] Ok I've pushed changes to the branch which I believe address all your comments (including recording only the maximum latencies). I also finished the pluggability work so that we can swap out snitches live as well as implementing the ~20 lines needed to provide a backwards compatible option. To make the snitch more or less equivalent to the old snitch behavior you can do either live reconfiguration:
+
+{noformat}
+$ jmxterm
+Welcome to JMX terminal. Type "help" for available commands.
+$>open localhost:7199
+#Connection to localhost:7199 is opened
+$>bean org.apache.cassandra.db:type=StorageService
+#bean is set to org.apache.cassandra.db:type=StorageService
+$>run updateSnitch -t string,string,java.lang.Integer,java.lang.Integer,java.lang.Double null "DynamicEndpointSnitchLegacyHistogram" null 5000 null
+#calling operation updateSnitch of mbean org.apache.cassandra.db:type=StorageService with params [null, DynamicEndpointSnitchLegacyHistogram, null, 1000, null]
+#operation returns: 
+null
+{noformat}
+
+Or this can be updated in {{cassandra.yaml}} with the (intentionally) undocumented {{dynamic_snitch_class_name}} option. If a user does set that to not the default probing Histogram, we log a warning that it is not supported. I imagine that this pluggability will allow us to rapidly experiment with different metrics and load balancing implementations in  CASSANDRA-14817.
+
+Summary of the patch:
+# Makes the {{DynamicEndpointSnitch}} pluggable and live swappable (the underlying {{IEndpointSnitch}} already was)
+# Refactors {{DynamicEndpointSnitch}} to send latency probes to interesting nodes instead of resetting the samples and losing all latency information
+# Refactors {{DynamicEndpointSnitch}} to be a lot more testable so we can test our future changes.
+# Provide three implementations, the new default as {{DynamicEndpointSnitchHistogram}} old legacy as {{DynamicEndpointSnitchLegacyHistogram}} and an experimental EMA based snitch as {{DynamicEndpointSnitchEMA}}. All three are run through the dynamic snitching ranking test.
+# Adds a bunch of unit tests of all the implementations.
+
+
+Alright, finally got around to writing those messaging service tests you asked for :), although if you're ok with it I'd prefer to refactor the methods to be slightly more unit testable and not even bother doing an e2e on the latency probe components as in my opinion the tests of that are just gnarly (and while I think that they won't flake because I ran them 2k times locally to check for race conditions, those kinds of multi-threading tests just worry me).
+
+Some notable changes in behavior since the last patch:
+ * The StartupConnectivityChecker now sends a second ping that counts after all the first round ones come back. While I was testing this patch with CCM I noticed that the first Ping is not very good quality data (since it includes the handshake).
+ * I refactored {{ScheduledExecutors}} so that we can't leak threads out of random STPE's (e.g. DES will not break the jvm dtests because it won't leak a thread). If you don't like this let me know and I can change the close method to be called from {{Instance.java}}
+ * DES now has microsecond resolution instead of millisecond, I noticed that in my CCM clusters all the nodes have latency 0 (less than a millisecond) which also appears true on many of our production clusters.
+ * When the DES lacks latency information about a peer we defer to the subsnitch instead of scoring it zero (which will essentially prefer it over everything), we then rely on the latency probes to find out where it belongs
+ * Refactored and payed down a bunch of tech debt with a lot of tests
+
+On my side I'd like to give this more testing using CCM and on a real cluster with real cross datacenter latency to ensure the probes are working as expected, and I'd like to refactor the unit tests of the probe logic so that we don't actually have to hook into the MessagingService (which leads to a bunch of semi-gross test code imo)
+
+I finished my first round of review of the implementation. I still need to spend some time looking at the tests and docs.
+
+Some general notes:
+ * I don't think we need a dynamicsnitch package, the 2 implementations could just live in the locator package.
+ * I can't find anywhere that we validate the various dynamic snitch values? I didn't look super hard, but if we're not, it would be good to check people are using sane values on startup and jmx update.
+ * It's probably a good time to rebase onto current trunk.
+
+ScheduledExecutors:
+ * {{getOrCreateSharedExecutor}} could be private
+ * shutdown times accumulate in the wait section. ie: if we have 2 executors with a shutdown time of 2 seconds, we'll wait up to 4 seconds for them to stop.
+ * we should validate shutdown hasn't been called in {{getOrCreateSharedExecutor}}
+ * I don't see any benefit to making this class lock free. Making the {{getOrCreateSharedExecutor}} and {{shutdownAndWait}} methods synchronized and just using a normal hash map for {{executors}} would make this class easier to reason about. As it stands, you could argue there's some raciness with creating and shutting down at the same time, although it's unlikely to be a problem in practice. I do think I might be borderline nit picking here though.
+
+StorageService
+ * {{doLocalReadTest}} method is unused
+
+MessagingService
+ * Fix class declaration indentation
+ * remove unused import
+
+DynamicEndpointSnitch
+ * I don't think we need to check {{logger.isTraceEnabled}} before calling {{logger.trace()}}? At least I don't see any toString computation that would happen in the calls.
+ * The class hierarchy could be improved a bit. There's code in {{DynamicEndpointSnitchHistogram}} that's also used in the legacy snitch, and code in {{DynamicEndpointSnitch}} that's only used in {{DynamicEndpointSnitchHistogram}}. The boundary between DynamicEndpointSnitch and DynamicEndpointSnitchHistogram in particular feels kind of arbitrary.
+
+DynamicEndpointLegacySnitch
+ * If we're going to keep the old behavior around as a failsafe (and we should), I think we should avoid improving it by changing the reset behavior. Only resetting under some situations intuitively feels like the right thing to do, but it would suck if there were unforeseen problems with it that made it a regression from the 3.x behavior.
+
+[~bdeggleston] alright I finally got this rebase sorted out. The messaging patches and in-jvm dtests conflicted a lot unfortunately; but on the bright side they actually did a lot of the cleanups for us so that was nice. I still have a few test cases to fixup (testScheduleProbes and the DESLongTest), but I figured getting this patch moving again is a good idea.
+||trunk||
+|[branch|https://github.com/apache/cassandra/compare/trunk...jolynch:CASSANDRA-14459-rebase]|
+|[!https://circleci.com/gh/jolynch/cassandra/tree/CASSANDRA-14459.png?circle-token= 1102a59698d04899ec971dd36e925928f7b521f5!|https://circleci.com/gh/jolynch/cassandra/tree/CASSANDRA-14459-rebase]|
+{quote}Some general notes:
+ * I don't think we need a dynamicsnitch package, the 2 implementations could just live in the locator package.
+ * I can't find anywhere that we validate the various dynamic snitch values? I didn't look super hard, but if we're not, it would be good to check people are using sane values on startup and jmx update.
+ * It's probably a good time to rebase onto current trunk.{quote}
+Ok I've removed the package and rebased. I've also validated the snitch values in {{applyConfigChanges}} which I believe is called in all paths (constructor, dynamic swap, etc ...).
+{quote}ScheduledExecutors:
+ * {{getOrCreateSharedExecutor}} could be private
+ * shutdown times accumulate in the wait section. ie: if we have 2 executors with a shutdown time of 2 seconds, we'll wait up to 4 seconds for them to stop.
+ * we should validate shutdown hasn't been called in {{getOrCreateSharedExecutor}}
+ * I don't see any benefit to making this class lock free. Making the {{getOrCreateSharedExecutor}} and {{shutdownAndWait}} methods synchronized and just using a normal hash map for {{executors}} would make this class easier to reason about. As it stands, you could argue there's some raciness with creating and shutting down at the same time, although it's unlikely to be a problem in practice. I do think I might be borderline nit picking here though.{quote}
+My intention for {{getOrCreateSharedExecutor}} is that it is {{public}} so that we can safely create STPEs elsewhere in the codebase without running the risk of failing to shutdown the executors (e.g. during in jvm dtests). Are you just referring to the overloaded one that doesn't provide the constructor?
+
+I also am not sure I agree we need to validate shutdown since the executors themselves will throw exceptions if a task is scheduled and I can't think of a better thing to do than throw an exception. Curious what you'd prefer we do in that case?
+
+I've fixed the shutdown slowness you mentioned by re-using the existing shutdown multiple threadpool logic and I've made it just use regular hashmaps.
+{quote}StorageService
+ * {{doLocalReadTest}} method is unused{quote}
+Oops, missed that in the refactors (I was planning on making PingMessage's require a local disk read to make the ping messages a little more realistic but then I decided against it. Removed.
+{quote}MessagingService
+ * Fix class declaration indentation
+ * remove unused import{quote}
+Fixed.
+{quote}DynamicEndpointSnitch
+ * I don't think we need to check {{logger.isTraceEnabled}} before calling {{logger.trace()}}? At least I don't see any toString computation that would happen in the calls.
+ * The class hierarchy could be improved a bit. There's code in {{DynamicEndpointSnitchHistogram}} that's also used in the legacy snitch, and code in {{DynamicEndpointSnitch}} that's only used in {{DynamicEndpointSnitchHistogram}}. The boundary between DynamicEndpointSnitch and DynamicEndpointSnitchHistogram in particular feels kind of arbitrary.{quote}
+Agreed on the logging point, I've taken it out since fwict there isn't any hot path that's doing logging.
+
+Regarding the class hierarchy I agree now that the whole DES is pluggable these seams don't make much sense (since you can just load your own dsnitch). I've still tried making specific methods protected that I hope to play around with in CASSANDRA-14817 to test out different snitch implementations but I've gotten rid of the inheritance for DES and DESH (leaving only {{DynamicEndpointSnitchLegacy}}). I hope that's acceptable?
+{quote}DynamicEndpointLegacySnitch
+ * If we're going to keep the old behavior around as a failsafe (and we should), I think we should avoid improving it by changing the reset behavior. Only resetting under some situations intuitively feels like the right thing to do, but it would suck if there were unforeseen problems with it that made it a regression from the 3.x behavior.{quote}
+Ok, we will dump the entire map every 10 minutes by default in the Legacy behavior.
+

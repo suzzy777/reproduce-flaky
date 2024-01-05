@@ -1,0 +1,144 @@
+Saw this again in [https://jenkins.impala.io/job/ubuntu-16.04-dockerised-tests/7668/]
+
+The code comes from a logging:
+{code:java}
+2329   private Table replaceTableIfUnchanged(Table updatedTbl, long expectedCatalogVersion,
+2330       long tableId) throws DatabaseNotFoundException {
+...
+2350       if (existingTbl == null
+2351           || (existingTbl.getCatalogVersion() != expectedCatalogVersion
+2352                  && (!(existingTbl instanceof HdfsTable)
+2353                         || AcidUtils.compare((HdfsTable) existingTbl,
+2354                                updatedTbl.getValidWriteIds(), tableId)
+2355                             >= 0))) {
+2356         LOG.trace("returning existing table {} with last synced id: ",
+2357             existingTbl.getFullName(), existingTbl.getLastSyncedEventId());  // 'existingTbl' can be null here!
+2358         return existingTbl;
+2359       }{code}
+
+I checked the logs the other day and for me it seems that the table migration to Iceberg was successful, but the first following query in that converted table failed, I recall it was a simple select count(*). It's a bit strange that this is flaky. I suspect that the issue is only with the GVO build, most probably with local catalog mode turned on. So there might be some timing issues when we have converted the table but some of the coordinators don't see it under the original name.
+
+Saw this in
+* https://jenkins.impala.io/job/ubuntu-20.04-dockerised-tests/336/testReport
+* https://jenkins.impala.io/job/ubuntu-20.04-dockerised-tests/340/testReport/
+
+This is actually more than just a flaky tests as it comes in various scenarios. I'll rename the ticket to reflect this.
+
+I managed to repro this with running the following SQL in a loop:
+{code:java}
+create table tmp_conv_tbl (i int) stored as parquet;
+insert into tmp_conv_tbl values (1), (2), (3);
+alter table tmp_conv_tbl convert to iceberg;
+alter table tmp_conv_tbl set tblproperties ('format-version'='2');
+drop table tmp_conv_tbl; {code}
+For me the DROP TABLE statement failed with "Table doesn not exist" error. I guess it depends on which command is run on a different coordinator after the table conversion.
+
+Note, that this repro came in local catalog mode, however, I wouldn't be surprised if this repro-ed in normal catalog mode.
+
+This is how I enabled local catalog mode:
+{code:java}
+bin/start-impala-cluster.py --impalad_args='--use_local_catalog=true' --catalogd_args='--catalog_topic_mode=minimal' {code}
+
+Saw the test failed by a different error: https://jenkins.impala.io/job/ubuntu-20.04-dockerised-tests/393
+
+
+With the repros steps I found 3 different issues that randomly can occur: 1) the one mentioned in the description, 2) Could not resolve path 3) Table does not exist. I believe that all 3 are for the same root cause.
+
+Same occurrence here? [https://jenkins.impala.io/job/ubuntu-20.04-dockerised-tests/505/] 
+
+Saw a similar failure in: [https://jenkins.impala.io/job/ubuntu-20.04-dockerised-tests/818/testReport/junit/query_test.test_iceberg/TestIcebergTable/test_convert_table_protocol__beeswax___exec_option____test_replan___1___batch_size___0___num_nodes___0___disable_codegen_rows_threshold___0___disable_codegen___False___abort_on_error___1___exec_single_node_rows_threshold___0____table_format__parquet_none_/]
+
+Saw a failure in the same test: https://jenkins.impala.io/job/ubuntu-20.04-dockerised-tests/871/testReport/junit/query_test.test_iceberg/TestIcebergTable/test_convert_table_protocol__beeswax___exec_option____test_replan___1___batch_size___0___num_nodes___0___disable_codegen_rows_threshold___0___disable_codegen___False___abort_on_error___1___exec_single_node_rows_threshold___0____table_format__parquet_none_/
+
+{code}
+query_test/test_iceberg.py:1129: in test_convert_table
+    vector, unique_database)
+common/impala_test_suite.py:720: in run_test_case
+    result = exec_fn(query, user=test_section.get('USER', '').strip() or None)
+common/impala_test_suite.py:658: in __exec_in_impala
+    result = self.__execute_query(target_impalad_client, query, user=user)
+common/impala_test_suite.py:994: in __execute_query
+    return impalad_client.execute(query, user=user)
+common/impala_connection.py:214: in execute
+    return self.__beeswax_client.execute(sql_stmt, user=user)
+beeswax/impala_beeswax.py:191: in execute
+    handle = self.__execute_query(query_string.strip(), user=user)
+beeswax/impala_beeswax.py:367: in __execute_query
+    handle = self.execute_query_async(query_string, user=user)
+beeswax/impala_beeswax.py:361: in execute_query_async
+    handle = self.__do_rpc(lambda: self.imp_service.query(query,))
+beeswax/impala_beeswax.py:524: in __do_rpc
+    raise ImpalaBeeswaxException(self.__build_error_message(b), b)
+E   ImpalaBeeswaxException: ImpalaBeeswaxException:
+E    INNER EXCEPTION: <class 'beeswaxd.ttypes.BeeswaxException'>
+E    MESSAGE: AnalysisException: Could not resolve path: 'decimal_tbl'
+{code}
+
+Queries:
+{noformat}
+create table decimal_tbl (
+    d2 decimal(10,0),
+    d3 decimal(20,10),
+    d4 decimal(38,38),
+    d5 decimal(10,5),
+    d6 decimal(9,0))
+partitioned by (d1 decimal(9,0))
+stored as parquet;
+
+-- 2023-11-30 03:23:18,050 INFO     MainThread: Started query b34c5b9235887e3e:08127bf800000000
+-- executing against localhost:21000
+
+
+insert into decimal_tbl partition (d1)
+    select d2, d3, d4, d5, d6, d1 from functional_parquet.decimal_tbl;
+
+-- 2023-11-30 03:23:18,121 INFO     MainThread: Started query fe4ca22a87ce9b3f:fe88a9f300000000
+-- executing against localhost:21000
+
+
+describe formatted decimal_tbl;
+
+-- 2023-11-30 03:23:18,889 INFO     MainThread: Started query 494682d4c10965a9:4c59f91f00000000
+-- executing against localhost:21000
+
+alter table decimal_tbl convert to iceberg;
+
+-- 2023-11-30 03:23:19,435 INFO     MainThread: Started query 224ca0c80e98163b:1d72a5be00000000
+-- executing against localhost:21000
+
+describe formatted decimal_tbl;
+{noformat}
+
+Another one?
+[https://jenkins.impala.io/job/ubuntu-20.04-dockerised-tests/904/testReport/junit/query_test.test_iceberg/TestIcebergTable/test_convert_table_protocol__beeswax___exec_option____test_replan___1___batch_size___0___num_nodes___0___disable_codegen_rows_threshold___0___disable_codegen___False___abort_on_error___1___exec_single_node_rows_threshold___0____table_format__parquet_none_/]
+{code:java}
+query_test/test_iceberg.py:1129: in test_convert_table
+    vector, unique_database)
+common/impala_test_suite.py:720: in run_test_case
+    result = exec_fn(query, user=test_section.get('USER', '').strip() or None)
+common/impala_test_suite.py:658: in __exec_in_impala
+    result = self.__execute_query(target_impalad_client, query, user=user)
+common/impala_test_suite.py:994: in __execute_query
+    return impalad_client.execute(query, user=user)
+common/impala_connection.py:214: in execute
+    return self.__beeswax_client.execute(sql_stmt, user=user)
+beeswax/impala_beeswax.py:191: in execute
+    handle = self.__execute_query(query_string.strip(), user=user)
+beeswax/impala_beeswax.py:367: in __execute_query
+    handle = self.execute_query_async(query_string, user=user)
+beeswax/impala_beeswax.py:361: in execute_query_async
+    handle = self.__do_rpc(lambda: self.imp_service.query(query,))
+beeswax/impala_beeswax.py:524: in __do_rpc
+    raise ImpalaBeeswaxException(self.__build_error_message(b), b)
+E   ImpalaBeeswaxException: ImpalaBeeswaxException:
+E    INNER EXCEPTION: <class 'beeswaxd.ttypes.BeeswaxException'>
+E    MESSAGE: AnalysisException: Could not resolve path: 'table_at_random_location' {code}
+
+Hi [~gaborkaszab], are you still working on this? It seems a bug of the Iceberg convert table implementation in local catalog mode. I can take it if you don't have bandwidth.
+
+Hey [~stigahuang],
+
+I'm not actively working on this due to lack of bandwidth just monitoring the situation. I did manage to repro the issue locally, see my comment from August (already that long ago?? :) ) but wasn't able to progress from that. For me this seems a timing issue, where a query right after a CONVERT TABLE might not see the converted table, but if you re-run it, it will succeed. I was wondering if a SYNC_DDL would help, but didn't have the time to try it out.
+
+I'd be really grateful if you could take a look!
+

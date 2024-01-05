@@ -1,0 +1,689 @@
+[~stack] why was this change in {{ServerManager}}?
+
+{code:java}
+public void shutdownCluster() {
+  String statusStr = "Cluster shutdown requested of master=" + this.master.getServerName();
+  LOG.info(statusStr);
+  this.clusterShutdown.set(true);
+  this.master.stop(statusStr); // <-- THIS LINE WAS REMOVED
+}
+{code}
+
+If I put it back, the test passes.
+
+It was removed because it was immediately causing Master to go down.
+
+In branch-1, Master was last to go down, like the captain of a ship. In branch-2, we probably want it the same. At a minimum, RS are sending notification of closed Regions as they are going down to the Master. We currently do nothing w/ this info. We could be updating hbase:meta that the Regions are closing out but currently we don't.
+
+Cluster shutdown was a little dance in hbase-1. In hbase-2, it is a crashdown. Need to fix. See HBASE-19533
+
+For this issue, where is the problem? On shutdown? What is it waiting for?
+
+I have identified several problems:
+
+1. The initialization hangs in {{HMaster.waitForMasterActive}}:
+
+{code:java}
+protected void waitForMasterActive(){
+  boolean tablesOnMaster = LoadBalancer.isTablesOnMaster(conf);
+  while (!(tablesOnMaster && activeMaster) && !isStopped() && !isAborted()) {
+    sleeper.sleep();
+  }
+}
+{code}
+
+TablesOnMaster=false in this test case, so {{HMaster}} thread waits here. It is called from {{HRegionServer.run}} -> {{preRegistrationInitialization}} -> {{initializeZooKeeper}}.
+
+2. Nobody calls {{HMaster.stop}}.
+
+When we call {{TEST_UTIL.shutdownMiniCluster}} from the test case, then it shuts down HBase mini cluster. After some function calls it enters into {{JVMClusterUtil.shutdown}} and it calls {{HMaster.shutdown}}, which calls {{ServerManager.shutdownCluster}}, but nobody calls {{HMaster.stop}}. That's the reason why it hangs.
+
+So how should we properly shut down the mini cluster?
+
+Thanks [~meszibalu] So, we are in Master startup, and then the cluster is supposed to go down? Elsewhere, while the Master is waiting on RegionServers to check in, we check too if we should exit Master startup. We need another such check here?
+
+This is a little piecemeal though. Need to figure HBASE-19533
+
+I wrote the simplest test case which can demonstrate the issue (TestUtil.java attachment). If we abort a region server, then {{TEST_UTIL.shutdownMiniCluster()}} hangs forever.
+
+Test helped [~meszibalu]
+
+.001 Root issue is that Master was stuck in waitForMasterActive, regions were being assigned to Master, and the metrics we were expecting were incorrect (if the killed regionserver was hosting user-space and hbase:meta region).
+
+Master never left waitForMasterActive because it never checked state of the clusterUp flag. The test here was aborting regionserver and then just exiting. The minihbasecluster shutdown sets the cluster down flag but we were never looking at it so Master thread was staying up.
+
+M hbase-server/src/main/java/org/apache/hadoop/hbase/master/ActiveMasterManager.java Changed log from ERROR to WARN and suppressed stack trace. This is the 'stop' method. It should allow that we may be going down a little unclean. No need of spew in logs.
+
+M hbase-server/src/main/java/org/apache/hadoop/hbase/master/HMaster.java The tableOnMaster check in waitForMasterActive looks wrong. It was making it so a 'normal' Master was getting stuck in here. This is not the place to worry about tablesOnMaster. That is for the balancer to be concerned with. There is a problem with Master hosting system-tables-only. After further study, Master can carry regions like a regionserver but making it so it carries system tables only is tricky given meta assign happens ahead of all others which means that the Master needs to have checked-in as a regionserver super early... It needs work. Punted for now. M hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/AssignmentManager.java Mostly renaming so lists and maps of region infos have same name as they have elsewhere in code base and cleaning up confusion that may arise when we talk of servers-for-system-tables....It is talking about something else in the code changes here that is other than the normal understanding. It is about filtering regionservers by their version numbers so we favor regions with higher version numbers. Needs to go back up into the balancer.
+
+M hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/BaseLoadBalancer.java It was possible for the Master to be given regions if no regionservers available (as per the failing unit test in this case).
+
+M hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java Minor reordering moving the waitForMasterActive later in the initialize and wrapping each test in a check if we are to keep looping (which checks cluster status flag).
+
+M hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestAssignmentManagerMetrics.java This was an old test from the days when Master carried system tables. Updated test and fixed metrics. Metrics count the hbase:meta along with the userspace region so upped expected numbers (previously the hbase:meta was hosted on the master so metrics were not incremented).
+
+M hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/TestRegionsOnMasterOptions.java I took a look at this test again but nope, needs a load of work still to make it pass.
+
+M hbase-zookeeper/src/main/java/org/apache/hadoop/hbase/zookeeper/ZKUtil.java Stop being so whiney.
+
+.002 Address [~Apache9] review comments up on rb.
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  2m 42s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:blue}0{color} | {color:blue} findbugs {color} | {color:blue}  0m  1s{color} | {color:blue} Findbugs executables are not available. {color} |
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green}  0m  0s{color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 32s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  6m 56s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 32s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 53s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  7m 12s{color} | {color:green} branch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 40s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 13s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  4m 42s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 56s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 56s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red}  1m 11s{color} | {color:red} hbase-server: The patch generated 2 new + 472 unchanged - 0 fixed = 474 total (was 472) {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  4m 44s{color} | {color:green} patch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green} 24m 37s{color} | {color:green} Patch does not cause any errors with Hadoop 2.6.5 2.7.4 or 3.0.0. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 11s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  1m  0s{color} | {color:green} hbase-zookeeper in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 23m 23s{color} | {color:red} hbase-server in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 20s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 77m 39s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hbase.TestClientClusterMetrics |
+|   | hadoop.hbase.TestClientClusterStatus |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hbase:eee3b01 |
+| JIRA Issue | HBASE-19598 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12906340/HBASE-19598.master.001.patch |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  shadedjars  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux c5cd7d19f611 3.13.0-133-generic #182-Ubuntu SMP Tue Sep 19 15:49:21 UTC 2017 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build/component/dev-support/hbase-personality.sh |
+| git revision | master / a3c98b2dd8 |
+| maven | version: Apache Maven 3.5.2 (138edd61fd100ec658bfa2d307c43b76940a5d7d; 2017-10-18T07:58:13Z) |
+| Default Java | 1.8.0_151 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HBASE-Build/11082/artifact/patchprocess/diff-checkstyle-hbase-server.txt |
+| unit | https://builds.apache.org/job/PreCommit-HBASE-Build/11082/artifact/patchprocess/patch-unit-hbase-server.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/11082/testReport/ |
+| modules | C: hbase-zookeeper hbase-server U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/11082/console |
+| Powered by | Apache Yetus 0.6.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+.003 Fix checkstyle and failing test
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  1m 55s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:blue}0{color} | {color:blue} findbugs {color} | {color:blue}  0m  0s{color} | {color:blue} Findbugs executables are not available. {color} |
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green}  0m  0s{color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 12s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  4m 34s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 56s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 25s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  6m  9s{color} | {color:green} branch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 40s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 14s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  4m 37s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 56s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 56s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red}  1m 13s{color} | {color:red} hbase-server: The patch generated 2 new + 472 unchanged - 0 fixed = 474 total (was 472) {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  4m 40s{color} | {color:green} patch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green} 20m 27s{color} | {color:green} Patch does not cause any errors with Hadoop 2.6.5 2.7.4 or 3.0.0. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 40s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 42s{color} | {color:green} hbase-zookeeper in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 35m 13s{color} | {color:red} hbase-server in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 22s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 79m 24s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hbase.TestClientClusterStatus |
+|   | hadoop.hbase.TestClientClusterMetrics |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hbase:eee3b01 |
+| JIRA Issue | HBASE-19598 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12906340/HBASE-19598.master.001.patch |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  shadedjars  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux 9b4dff3cbbda 3.13.0-139-generic #188-Ubuntu SMP Tue Jan 9 14:43:09 UTC 2018 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build/component/dev-support/hbase-personality.sh |
+| git revision | master / a3c98b2dd8 |
+| maven | version: Apache Maven 3.5.2 (138edd61fd100ec658bfa2d307c43b76940a5d7d; 2017-10-18T07:58:13Z) |
+| Default Java | 1.8.0_151 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HBASE-Build/11083/artifact/patchprocess/diff-checkstyle-hbase-server.txt |
+| unit | https://builds.apache.org/job/PreCommit-HBASE-Build/11083/artifact/patchprocess/patch-unit-hbase-server.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/11083/testReport/ |
+| modules | C: hbase-zookeeper hbase-server U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/11083/console |
+| Powered by | Apache Yetus 0.6.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  2m 22s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:blue}0{color} | {color:blue} findbugs {color} | {color:blue}  0m  1s{color} | {color:blue} Findbugs executables are not available. {color} |
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green}  0m  0s{color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 12s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  4m  9s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 52s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 19s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  5m 34s{color} | {color:green} branch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 38s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 14s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  4m 13s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 52s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 52s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red}  1m  9s{color} | {color:red} hbase-server: The patch generated 2 new + 472 unchanged - 0 fixed = 474 total (was 472) {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  4m 13s{color} | {color:green} patch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green} 22m 25s{color} | {color:green} Patch does not cause any errors with Hadoop 2.6.5 2.7.4 or 3.0.0. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 33s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  1m 12s{color} | {color:green} hbase-zookeeper in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 32m 59s{color} | {color:red} hbase-server in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 23s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 79m 23s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hbase.TestClientClusterMetrics |
+|   | hadoop.hbase.TestClientClusterStatus |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hbase:eee3b01 |
+| JIRA Issue | HBASE-19598 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12906340/HBASE-19598.master.001.patch |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  shadedjars  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux b98224059562 4.4.0-43-generic #63-Ubuntu SMP Wed Oct 12 13:48:03 UTC 2016 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build/component/dev-support/hbase-personality.sh |
+| git revision | master / 7224546b1e |
+| maven | version: Apache Maven 3.5.2 (138edd61fd100ec658bfa2d307c43b76940a5d7d; 2017-10-18T07:58:13Z) |
+| Default Java | 1.8.0_151 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HBASE-Build/11085/artifact/patchprocess/diff-checkstyle-hbase-server.txt |
+| unit | https://builds.apache.org/job/PreCommit-HBASE-Build/11085/artifact/patchprocess/patch-unit-hbase-server.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/11085/testReport/ |
+| modules | C: hbase-zookeeper hbase-server U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/11085/console |
+| Powered by | Apache Yetus 0.6.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+for ~2 weeks this has been the test holding up nightlies on master. I could run it down if folks are busy elsewhere?
+
+Doesn't fail in branch-2. Looking at the thread-dump, I see master in startup (probably active master trying to take over) and a procedure stuck trying to alter table. I have a bunch of practice on these issue types [~busbey] and I should cleanup the mess I've left here.
+
+Linking JIRA that DISABLED this test.
+
+So, to bring this issue up to date, TestAssignmentManagerMetrics has not been fixed on branch-2 nor on master branch. It was disabled by HBASE-19656 so could cut hbase-2.0.0-beta-1. It was not disabled in master at the time. I just cherry-picked the HBASE-19656 disabling JIRA to master so hopefully master builds will start passing. In meantime, we can figure out what is going on in this issue.
+
+It fails for me locally. We are supposed to be shutting down but in thread dump, there is a Master trying to become active Master
+
+{code}
+"M:0;localhost:52152" #169 daemon prio=5 os_prio=31 tid=0x00007fe16556e800 nid=0x13203 in Object.wait() [0x000070000a6ca000]
+   java.lang.Thread.State: TIMED_WAITING (on object monitor)
+  at java.lang.Object.wait(Native Method)
+  at org.apache.hadoop.hbase.util.Sleeper.sleep(Sleeper.java:92)
+  - locked <0x000000071519c020> (a java.lang.Object)
+  at org.apache.hadoop.hbase.util.Sleeper.sleep(Sleeper.java:56)
+  at org.apache.hadoop.hbase.master.HMaster.waitForMasterActive(HMaster.java:664)
+  at org.apache.hadoop.hbase.regionserver.HRegionServer.initializeZooKeeper(HRegionServer.java:881)
+  at org.apache.hadoop.hbase.regionserver.HRegionServer.preRegistrationInitialization(HRegionServer.java:825)
+  at org.apache.hadoop.hbase.regionserver.HRegionServer.run(HRegionServer.java:927)
+  at org.apache.hadoop.hbase.master.HMaster.run(HMaster.java:571)
+  at java.lang.Thread.run(Thread.java:745)
+{code}
+
+... and a Master thread is latched trying to run a modify table procedure.
+
+There is a missing check on whether cluster/master is up in here somewhere. TODO.
+
+Let me update the current state of this patch.
+
+.002 rebase, address [~busbey] comment from rb. Test does not hang any more but metrics compares fail asserts. Progress?
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 11s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green}  0m  0s{color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 4 new or modified test files. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 32s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  4m 49s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 56s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 22s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  6m  1s{color} | {color:green} branch has no errors when building our shaded downstream artifacts. {color} |
+| {color:red}-1{color} | {color:red} findbugs {color} | {color:red}  0m 25s{color} | {color:red} hbase-zookeeper in master has 3 extant Findbugs warnings. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 38s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 13s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  4m 19s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 55s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 55s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red}  1m 11s{color} | {color:red} hbase-server: The patch generated 1 new + 417 unchanged - 0 fixed = 418 total (was 417) {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  4m 38s{color} | {color:green} patch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green} 18m 26s{color} | {color:green} Patch does not cause any errors with Hadoop 2.6.5 2.7.4 or 3.0.0. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 39s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 38s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 41s{color} | {color:green} hbase-zookeeper in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}187m 44s{color} | {color:red} hbase-server in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 47s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}233m 52s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hbase.client.TestAdmin1 |
+|   | hadoop.hbase.replication.TestMultiSlaveReplication |
+|   | hadoop.hbase.regionserver.TestShutdownWhileWALBroken |
+|   | hadoop.hbase.client.TestAsyncDecommissionAdminApi |
+|   | hadoop.hbase.replication.TestReplicationStatus |
+|   | hadoop.hbase.replication.multiwal.TestReplicationKillMasterRSCompressedWithMultipleWAL |
+|   | hadoop.hbase.replication.regionserver.TestGlobalThrottler |
+|   | hadoop.hbase.regionserver.TestClusterId |
+|   | hadoop.hbase.replication.TestReplicationSource |
+|   | hadoop.hbase.replication.multiwal.TestReplicationKillMasterRSCompressedWithMultipleAsyncWAL |
+|   | hadoop.hbase.replication.multiwal.TestReplicationSyncUpToolWithMultipleWAL |
+|   | hadoop.hbase.replication.regionserver.TestRegionReplicaReplicationEndpoint |
+|   | hadoop.hbase.regionserver.TestRegionReplicaFailover |
+|   | hadoop.hbase.replication.TestReplicationDisableInactivePeer |
+|   | hadoop.hbase.replication.TestReplicationSmallTests |
+|   | hadoop.hbase.replication.TestReplicationWithTags |
+|   | hadoop.hbase.client.TestReplicaWithCluster |
+|   | hadoop.hbase.replication.TestReplicationKillMasterRSCompressed |
+|   | hadoop.hbase.replication.multiwal.TestReplicationEndpointWithMultipleWAL |
+|   | hadoop.hbase.replication.TestReplicationSyncUpTool |
+|   | hadoop.hbase.replication.TestReplicationEndpoint |
+|   | hadoop.hbase.security.visibility.TestVisibilityLabelsReplication |
+|   | hadoop.hbase.replication.TestNamespaceReplication |
+|   | hadoop.hbase.replication.TestReplicationKillMasterRS |
+|   | hadoop.hbase.security.visibility.TestVisibilityLabelReplicationWithExpAsString |
+|   | hadoop.hbase.replication.TestReplicationChangingPeerRegionservers |
+|   | hadoop.hbase.TestIOFencing |
+|   | hadoop.hbase.client.TestFromClientSide |
+|   | hadoop.hbase.replication.TestPerTableCFReplication |
+|   | hadoop.hbase.client.replication.TestReplicationAdminWithClusters |
+|   | hadoop.hbase.client.TestFromClientSideWithCoprocessor |
+|   | hadoop.hbase.client.replication.TestReplicationAdminWithTwoDifferentZKClusters |
+|   | hadoop.hbase.client.TestAsyncTableBatch |
+|   | hadoop.hbase.client.TestAsyncReplicationAdminApi |
+|   | hadoop.hbase.client.replication.TestReplicationAdmin |
+|   | hadoop.hbase.replication.TestReplicationEmptyWALRecovery |
+|   | hadoop.hbase.regionserver.TestRegionServerHostname |
+|   | hadoop.hbase.client.TestAdmin2 |
+|   | hadoop.hbase.master.TestMasterFailover |
+|   | hadoop.hbase.replication.multiwal.TestReplicationEndpointWithMultipleAsyncWAL |
+|   | hadoop.hbase.replication.TestReplicationProcedureRetry |
+|   | hadoop.hbase.master.TestMasterMetricsWrapper |
+|   | hadoop.hbase.security.visibility.TestVisibilityLabelsWithDefaultVisLabelService |
+|   | hadoop.hbase.master.TestMasterMetrics |
+|   | hadoop.hbase.regionserver.TestRegionServerReportForDuty |
+|   | hadoop.hbase.replication.TestReplicationKillSlaveRS |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hbase:eee3b01 |
+| JIRA Issue | HBASE-19598 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12912540/HBASE-19598.master.004.patch |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  shadedjars  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux 6a316e8a481e 3.13.0-133-generic #182-Ubuntu SMP Tue Sep 19 15:49:21 UTC 2017 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build/component/dev-support/hbase-personality.sh |
+| git revision | master / 372c88abd6 |
+| maven | version: Apache Maven 3.5.2 (138edd61fd100ec658bfa2d307c43b76940a5d7d; 2017-10-18T07:58:13Z) |
+| Default Java | 1.8.0_151 |
+| findbugs | v3.1.0-RC3 |
+| findbugs | https://builds.apache.org/job/PreCommit-HBASE-Build/11737/artifact/patchprocess/branch-findbugs-hbase-zookeeper-warnings.html |
+| checkstyle | https://builds.apache.org/job/PreCommit-HBASE-Build/11737/artifact/patchprocess/diff-checkstyle-hbase-server.txt |
+| unit | https://builds.apache.org/job/PreCommit-HBASE-Build/11737/artifact/patchprocess/patch-unit-hbase-server.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/11737/testReport/ |
+| Max. process+thread count | 4489 (vs. ulimit of 10000) |
+| modules | C: hbase-zookeeper hbase-server U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/11737/console |
+| Powered by | Apache Yetus 0.7.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+FAILURE: Integrated in Jenkins build HBase-Trunk_matrix #4670 (See [https://builds.apache.org/job/HBase-Trunk_matrix/4670/])
+HBASE-19598 Fix TestAssignmentManagerMetrics flaky test (stack: rev 016cf0c64ba867f740a19472f0fe716ee67306b1)
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/master/SplitLogManager.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/master/ServerManager.java
+* (edit) hbase-zookeeper/src/main/java/org/apache/hadoop/hbase/zookeeper/ZKUtil.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/TestClientClusterMetrics.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/RpcExecutor.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/BaseLoadBalancer.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestAssignmentManagerMetrics.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/AssignmentManager.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/TestClientClusterStatus.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/TestRegionsOnMasterOptions.java
+Revert "HBASE-19598 Fix TestAssignmentManagerMetrics flaky test" Pushed (stack: rev 0732ef5ebfea8e254d4a5dad6fe16ecccca3b799)
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/RpcExecutor.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/TestClientClusterMetrics.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/TestClientClusterStatus.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/master/ServerManager.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/AssignmentManager.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/BaseLoadBalancer.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/master/balancer/TestRegionsOnMasterOptions.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/master/SplitLogManager.java
+* (edit) hbase-zookeeper/src/main/java/org/apache/hadoop/hbase/zookeeper/ZKUtil.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestAssignmentManagerMetrics.java
+
+
+Seems a one line change can fix the test.
+
+In JVMClusterUtil.shutdown, change the 'activeMaster.master.shutdown();' to 'activeMaster.master.stopMaster();'.
+
+We are stuck in the HMaster.waitForMasterActive method when shutting down, and stopMaster will set stopped to true and free us. Still need to dig more to see why other tests do not have the same problem...
+
+[~stack] FYI.
+
+So after HBASE-20144, the test will not be stuck. Instead it fails with
+{noformat}
+java.lang.AssertionError: Metrics Should be equal expected:<1> but was:<0>
+	at org.apache.hadoop.hbase.master.TestAssignmentManagerMetrics.testRITAssignmentManagerMetrics(TestAssignmentManagerMetrics.java:143)
+{noformat}
+
+The problem maybe that we update the RIT metrics in a chore, the default update interval is 5 seconds. So if we are lucky that the chore update the metrics before we check then we are safe, otherwise we are dead.
+
+After I added this line in the setup method
+
+{code}
+conf.setInt(AssignmentManager.RIT_CHORE_INTERVAL_MSEC_CONF_KEY, 600000);
+{code}
+
+The test fails consistently for me.
+
+So I think we should set a small value (1000 maybe) for this value, and after returning from the modifyTable, we sleep 2 times of the interval, and then go to check the metrics.
+
+What do you think [~stack]?
+
+Mainly a one line change with some clean up. Set update interval to MSG_INTERVAL in the test.
+
+{code}
+    // set a small interval for updating rit metrics
+    conf.setInt(AssignmentManager.RIT_CHORE_INTERVAL_MSEC_CONF_KEY, MSG_INTERVAL);
+{code}
+
+It is in the flakey list so pre commit will not run it. Pushed to master first to see what the flakey tests find says. Will revert if not work.
+
++1 on trying against branch-2 and branch-2.0. I am watching those..   [~Apache9] thanks
+
+| (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 31s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green}  0m  0s{color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  8m 43s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m  0s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 21s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  7m 14s{color} | {color:green} branch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m  4s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 47s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  5m 29s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 50s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 50s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 10s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  5m 50s{color} | {color:green} patch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green} 22m 54s{color} | {color:green} Patch does not cause any errors with Hadoop 2.6.5 2.7.4 or 3.0.0. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 33s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 40s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}144m 47s{color} | {color:green} hbase-server in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 26s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}200m  3s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hbase:eee3b01 |
+| JIRA Issue | HBASE-19598 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12913697/HBASE-19598.patch |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  shadedjars  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux cdf895609954 3.13.0-135-generic #184-Ubuntu SMP Wed Oct 18 11:55:51 UTC 2017 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build/component/dev-support/hbase-personality.sh |
+| git revision | master / 4e821d4916 |
+| maven | version: Apache Maven 3.5.2 (138edd61fd100ec658bfa2d307c43b76940a5d7d; 2017-10-18T07:58:13Z) |
+| Default Java | 1.8.0_151 |
+| findbugs | v3.1.0-RC3 |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/11878/testReport/ |
+| Max. process+thread count | 4311 (vs. ulimit of 10000) |
+| modules | C: hbase-server U: hbase-server |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/11878/console |
+| Powered by | Apache Yetus 0.7.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+FAILURE: Integrated in Jenkins build HBase-Trunk_matrix #4716 (See [https://builds.apache.org/job/HBase-Trunk_matrix/4716/])
+HBASE-19598 Fix TestAssignmentManagerMetrics flaky test (zhangduo: rev 033485dff3998c72be6c4efd04ccf04355951db6)
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestAssignmentManagerMetrics.java
+
+
+A different error
+{noformat}
+org.apache.hadoop.hbase.exceptions.TimeoutIOException: java.util.concurrent.TimeoutException: The procedure 7 is still running
+	at org.apache.hadoop.hbase.master.TestAssignmentManagerMetrics.testRITAssignmentManagerMetrics(TestAssignmentManagerMetrics.java:107)
+Caused by: java.util.concurrent.TimeoutException: The procedure 7 is still running
+	at org.apache.hadoop.hbase.master.TestAssignmentManagerMetrics.testRITAssignmentManagerMetrics(TestAssignmentManagerMetrics.java:107)
+{noformat}
+
+A bit strange...
+
+Seems the problem is that we wait too short for creating table... 
+
+{noformat}
+conf.setInt("hbase.client.sync.wait.timeout.msec", 2500);
+{noformat}
+
+Increase to 10 seconds?
+
+The newest five runs are all passed. Pushed an addendum to increase the sync wait time to 5000. Let's see.
+
+If works well, will commit to branch-2 & branch-2.0. Thanks [~stack].
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m  0s{color} | {color:blue} Docker mode activated. {color} |
+| {color:red}-1{color} | {color:red} patch {color} | {color:red}  0m  3s{color} | {color:red} HBASE-19598 does not apply to master. Rebase required? Wrong Branch? See https://yetus.apache.org/documentation/0.7.0/precommit-patchnames for help. {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| JIRA Issue | HBASE-19598 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12913733/HBASE-19598-addendum.patch |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/11881/console |
+| Powered by | Apache Yetus 0.7.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+FAILURE: Integrated in Jenkins build HBase-Trunk_matrix #4717 (See [https://builds.apache.org/job/HBase-Trunk_matrix/4717/])
+HBASE-19598 Addendum increase sync wait time (zhangduo: rev 04798d6747ebc9ec91c82df2d9c084922c61da86)
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestAssignmentManagerMetrics.java
+HBASE-19598 Addendum fix typo (zhangduo: rev 756cccecffef3a64ae328022ae47fc1d1087dc6c)
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestAssignmentManagerMetrics.java
+
+
+Seems fine. Let me also commit to branch-2.0 & branch-2.
+
+Pushed to branch-2 & branch-2.0. Keep the issue open for a while to see if it works.
+
+Results for branch master
+	[build #256 on builds.a.o|https://builds.apache.org/job/HBase%20Nightly/job/master/256/]: (x) *{color:red}-1 overall{color}*
+----
+details (if available):
+
+(/) {color:green}+1 general checks{color}
+-- For more information [see general report|https://builds.apache.org/job/HBase%20Nightly/job/master/256//General_Nightly_Build_Report/]
+
+
+
+
+(/) {color:green}+1 jdk8 hadoop2 checks{color}
+-- For more information [see jdk8 (hadoop2) report|https://builds.apache.org/job/HBase%20Nightly/job/master/256//JDK8_Nightly_Build_Report_(Hadoop2)/]
+
+
+(x) {color:red}-1 jdk8 hadoop3 checks{color}
+-- For more information [see jdk8 (hadoop3) report|https://builds.apache.org/job/HBase%20Nightly/job/master/256//JDK8_Nightly_Build_Report_(Hadoop3)/]
+
+
+(/) {color:green}+1 source release artifact{color}
+-- See build output for details.
+
+
+Results for branch branch-2
+	[build #464 on builds.a.o|https://builds.apache.org/job/HBase%20Nightly/job/branch-2/464/]: (x) *{color:red}-1 overall{color}*
+----
+details (if available):
+
+(/) {color:green}+1 general checks{color}
+-- For more information [see general report|https://builds.apache.org/job/HBase%20Nightly/job/branch-2/464//General_Nightly_Build_Report/]
+
+
+
+
+(/) {color:green}+1 jdk8 hadoop2 checks{color}
+-- For more information [see jdk8 (hadoop2) report|https://builds.apache.org/job/HBase%20Nightly/job/branch-2/464//JDK8_Nightly_Build_Report_(Hadoop2)/]
+
+
+(x) {color:red}-1 jdk8 hadoop3 checks{color}
+-- For more information [see jdk8 (hadoop3) report|https://builds.apache.org/job/HBase%20Nightly/job/branch-2/464//JDK8_Nightly_Build_Report_(Hadoop3)/]
+
+
+(/) {color:green}+1 source release artifact{color}
+-- See build output for details.
+
+
+Thanks for backport [~Apache9]
+
+Results for branch branch-2.0
+	[build #10 on builds.a.o|https://builds.apache.org/job/HBase%20Nightly/job/branch-2.0/10/]: (x) *{color:red}-1 overall{color}*
+----
+details (if available):
+
+(/) {color:green}+1 general checks{color}
+-- For more information [see general report|https://builds.apache.org/job/HBase%20Nightly/job/branch-2.0/10//General_Nightly_Build_Report/]
+
+
+
+
+(x) {color:red}-1 jdk8 hadoop2 checks{color}
+-- For more information [see jdk8 (hadoop2) report|https://builds.apache.org/job/HBase%20Nightly/job/branch-2.0/10//JDK8_Nightly_Build_Report_(Hadoop2)/]
+
+
+(/) {color:green}+1 jdk8 hadoop3 checks{color}
+-- For more information [see jdk8 (hadoop3) report|https://builds.apache.org/job/HBase%20Nightly/job/branch-2.0/10//JDK8_Nightly_Build_Report_(Hadoop3)/]
+
+
+(/) {color:green}+1 source release artifact{color}
+-- See build output for details.
+
+
+{noformat}
+java.lang.NullPointerException
+	at org.apache.hadoop.hbase.master.TestAssignmentManagerMetrics.after(TestAssignmentManagerMetrics.java:100)
+{noformat}
+
+The stacktrace is a bit strange, I see this in log
+
+{noformat}
+2018-03-09 19:43:30,445 INFO  [Time-limited test] hbase.HBaseTestingUtility(1103): Shutting down minicluster
+{noformat}
+This means we have already entered the shutdownMiniCluster method in HBTU, so the NPE should be in the shutdownMiniCluster method. I've also saw this for TestRestartCluster once on the flakey test finder. Let me close this issue and open a new one.
+
+Almost disappear on the flakey list. Will open a new issue to address remaining problems(not only for TestAssignmentManager).
+
+Results for branch HBASE-19064
+	[build #77 on builds.a.o|https://builds.apache.org/job/HBase%20Nightly/job/HBASE-19064/77/]: (x) *{color:red}-1 overall{color}*
+----
+details (if available):
+
+(x) {color:red}-1 general checks{color}
+-- For more information [see general report|https://builds.apache.org/job/HBase%20Nightly/job/HBASE-19064/77//General_Nightly_Build_Report/]
+
+
+
+
+(x) {color:red}-1 jdk8 hadoop2 checks{color}
+-- For more information [see jdk8 (hadoop2) report|https://builds.apache.org/job/HBase%20Nightly/job/HBASE-19064/77//JDK8_Nightly_Build_Report_(Hadoop2)/]
+
+
+(x) {color:red}-1 jdk8 hadoop3 checks{color}
+-- For more information [see jdk8 (hadoop3) report|https://builds.apache.org/job/HBase%20Nightly/job/HBASE-19064/77//JDK8_Nightly_Build_Report_(Hadoop3)/]
+
+
+(/) {color:green}+1 source release artifact{color}
+-- See build output for details.
+
+

@@ -1,0 +1,2567 @@
+I'd imagine that it is related. I'll take a look.
+
+It looks like the reduced statestore frequency somehow resulted in the admission control queue filling up and rejecting queries when it previously didn't.
+
+I dug in further and I think the root cause of the bug may be the assumption that rejected + queued + admitted = num queries submitted. 
+
+The below code essentially assumes that all queries have been submitted once that sum reaches the total queries. However, that assumption is false if one of the previously-queued queries later gets admitted.
+{code}
+    LOG.debug("Wait for initial admission decisions")
+    (metric_deltas, curr_metrics) = self.wait_for_metric_changes(\
+        ['admitted', 'queued', 'rejected'], initial_metrics, num_queries)
+{code}
+
+We really need an additional metric - either the total number of queries that were admitted immediately, or the total number of queries that were submitted.
+
+This should reduce the flakiness a lot but i don't believe makes the tests completely solid.
+
+
+IMPALA-6227: deflake admission stress tests
+
+The problem was that, during the initial admission decision phase, some
+queries were initially queued then dequeued once memory came available.
+All of the accounting in the test implicitly relies on queries not being
+dequeued until queries are later explicitly ended, so if this happened,
+the test broke in multiple subtle ways.
+
+This happened because the query only scanned a small number of
+rows, which could be all buffered on the receiver side of the
+exchange even before the client fetched any rows from the coordinator.
+This means that the reserved memory on some backends could increase
+then decrease during the initial admission phase, resulting in a
+query being queued then dequeued.
+
+The fix is to increase the number of rows returned by the query so that
+all fragments remain active during the initial admission phase.
+This increased test execution time somewhat, so I also had to bump the
+queue wait timeout for the admission stress tests (they assume that
+queries don't time out in the queue).
+
+Testing:
+Ran the test under debug, release and ASAN builds, i.e.
+
+  impala-py.test tests/custom_cluster/test_admission_controller.py \
+    --workload_exploration_strategy="functional-query:exhaustive"
+
+I looped the mem_limit test for a while to confirm it didn't reproduce
+(it reproduced reliably every 2-3 iterations before this fix).
+
+It still reproduces every 5-10 runs with exhaustive+release, so I
+need to do further work to make it more robust.
+
+Change-Id: Iafb3af0ce68f96e5d713dbb3b37dd0b50ea66bb4
+Reviewed-on: http://gerrit.cloudera.org:8080/8631
+Reviewed-by: Tim Armstrong <tarmstrong@cloudera.com>
+Tested-by: Impala Public Jenkins
+
+
+Downgraded to reflect the flaky it's not recurring as frequently. Keeping as critical since I still think it's somewhat flaky and need to invest time in stabilising it further.
+
+Looks like a related problem, this time on asf-master-exhaustive - some queries still appear to be queued after 60 seconds.  Unless it recurs or the symptoms look new, I'm chalking this up to general flakiness for now.
+{noformat}
+Regression
+custom_cluster.test_admission_controller.TestAdmissionControllerStress.test_mem_limit[num_queries: 30 | submission_delay_ms: 0 | exec_option: {'batch_size': 0, 'num_nodes': 0, 'disable_codegen_rows_threshold': 5000, 'disable_codegen': False, 'abort_on_error': 1, 'exec_single_node_rows_threshold': 0} | table_format: text/none | round_robin_submission: True] (from pytest)
+
+Failing for the past 1 build (Since #278 )
+Took 2 min 2 sec.
+add description
+Error Message
+AssertionError: Timed out waiting 60 seconds for metrics admitted,timed-out delta 5 current {'dequeued': 10, 'rejected': 10, 'released': 18, 'admitted': 20, 'queued': 10, 'timed-out': 0} initial {'dequeued': 5, 'rejected': 10, 'released': 10, 'admitted': 18, 'queued': 10, 'timed-out': 0} assert (1518447795.0094669 - 1518447734.6988029) < 60  +  where 1518447795.0094669 = time()
+Stacktrace
+custom_cluster/test_admission_controller.py:943: in test_mem_limit
+    {'request_pool': self.pool_name, 'mem_limit': query_mem_limit})
+custom_cluster/test_admission_controller.py:844: in run_admission_test
+    ['admitted', 'timed-out'], curr_metrics, expected_admitted)
+custom_cluster/test_admission_controller.py:547: in wait_for_metric_changes
+    assert (time() - start_time < STRESS_TIMEOUT),\
+E   AssertionError: Timed out waiting 60 seconds for metrics admitted,timed-out delta 5 current {'dequeued': 10, 'rejected': 10, 'released': 18, 'admitted': 20, 'queued': 10, 'timed-out': 0} initial {'dequeued': 5, 'rejected': 10, 'released': 10, 'admitted': 18, 'queued': 10, 'timed-out': 0}
+E   assert (1518447795.0094669 - 1518447734.6988029) < 60
+E    +  where 1518447795.0094669 = time(){noformat}
+
+Saw this happen again.
+
+Saw this happen again.
+
+Ok, I should make time to look at this :)
+
+Looking at the output that Zach posted, it looks like dequeued increased by 5 (5-->10) but admitted only increased by 2 (18->20). I wonder if the initial metrics captured were inconsistent.
+
+I looped an ASAN build overnight and didn't see a failure. I'm pushing a change to increase logging so I can reconstruct what happens when the flaky failure happens: https://gerrit.cloudera.org/#/c/9555/
+
+Commit 35d459479edfda3601afa0ed2e9985de58bedbe5 in impala's branch refs/heads/master from [~tarmstrong@cloudera.com]
+[ https://git-wip-us.apache.org/repos/asf?p=impala.git;h=35d4594 ]
+
+IMPALA-6227: more logging in test_admission_controller
+
+To enable debugging the occasional flakiness, lets log what each query
+is doing by default.
+
+Change-Id: Icbb58a9be4a5d023c1ee3fd76e5992dfba03188c
+Reviewed-on: http://gerrit.cloudera.org:8080/9555
+Reviewed-by: Tim Armstrong <tarmstrong@cloudera.com>
+Tested-by: Impala Public Jenkins
+
+
+Commit 0fd962f8da40d4d3a8b32de20eae2782f2780bc5 in impala's branch refs/heads/2.x from [~tarmstrong@cloudera.com]
+[ https://git-wip-us.apache.org/repos/asf?p=impala.git;h=0fd962f ]
+
+IMPALA-6227: more logging in test_admission_controller
+
+To enable debugging the occasional flakiness, lets log what each query
+is doing by default.
+
+Change-Id: Icbb58a9be4a5d023c1ee3fd76e5992dfba03188c
+Reviewed-on: http://gerrit.cloudera.org:8080/9555
+Reviewed-by: Tim Armstrong <tarmstrong@cloudera.com>
+Tested-by: Impala Public Jenkins
+
+
+Saw this again. The symptom is the same as the one [~zamsden] posted.
+{noformat}
+14:00:59 =================================== FAILURES ===================================
+14:00:59  TestAdmissionControllerStress.test_mem_limit[num_queries: 30 | submission_delay_ms: 0 | exec_option: {'batch_size': 0, 'num_nodes': 0, 'disable_codegen_rows_threshold': 5000, 'disable_codegen': False, 'abort_on_error': 1, 'exec_single_node_rows_threshold': 0} | table_format: text/none | round_robin_submission: True] 
+14:00:59 custom_cluster/test_admission_controller.py:943: in test_mem_limit
+14:00:59     {'request_pool': self.pool_name, 'mem_limit': query_mem_limit})
+14:00:59 custom_cluster/test_admission_controller.py:844: in run_admission_test
+14:00:59     ['admitted', 'timed-out'], curr_metrics, expected_admitted)
+14:00:59 custom_cluster/test_admission_controller.py:547: in wait_for_metric_changes
+14:00:59     assert (time() - start_time < STRESS_TIMEOUT),\
+14:00:59 E   AssertionError: Timed out waiting 60 seconds for metrics admitted,timed-out delta 5 current {'dequeued': 15, 'rejected': 0, 'released': 25, 'admitted': 30, 'queued': 15, 'timed-out': 0} initial {'dequeued': 10, 'rejected': 0, 'released': 20, 'admitted': 30, 'queued': 15, 'timed-out': 0}
+14:00:59 E   assert (1522437821.207175 - 1522437760.4661441) < 60
+14:00:59 E    +  where 1522437821.207175 = time()
+14:00:59 ---------------------------- Captured stdo
+{noformat}
+
+
+This JIRA has a Target Version of Impala 3.0. Since we’re close to releasing Impala 3.0, please either update the version to a later release or speak up now (leave a comment stating so) if this change absolutely must go into Impala 3.0.
+
+Hit this again:
+
+
+{code:java}
+
+custom_cluster.test_admission_controller.TestAdmissionControllerStress.test_mem_limit[num_queries: 50 | submission_delay_ms: 50 | exec_option: {'batch_size': 0, 'num_nodes': 0, 'disable_codegen_rows_threshold': 5000, 'disable_codegen': False, 'abort_on_error': 1, 'exec_single_node_rows_threshold': 0} | table_format: text/none | round_robin_submission: True] (from pytest)
+
+Failing for the past 1 build (Since Failed#8 )
+Took 2 min 30 sec.
+Error Message
+AssertionError: Timed out waiting 60 seconds for metrics admitted,timed-out delta 5 current {'dequeued': 20, 'rejected': 20, 'released': 24, 'admitted': 30, 'queued': 20, 'timed-out': 0} initial {'dequeued': 14, 'rejected': 20, 'released': 18, 'admitted': 26, 'queued': 20, 'timed-out': 0} assert (1524822944.9910979 - 1524822883.858825) < 60  +  where 1524822944.9910979 = time()
+Stacktrace
+custom_cluster/test_admission_controller.py:943: in test_mem_limit
+    {'request_pool': self.pool_name, 'mem_limit': query_mem_limit})
+custom_cluster/test_admission_controller.py:844: in run_admission_test
+    ['admitted', 'timed-out'], curr_metrics, expected_admitted)
+custom_cluster/test_admission_controller.py:547: in wait_for_metric_changes
+    assert (time() - start_time < STRESS_TIMEOUT),\
+E   AssertionError: Timed out waiting 60 seconds for metrics admitted,timed-out delta 5 current {'dequeued': 20, 'rejected': 20, 'released': 24, 'admitted': 30, 'queued': 20, 'timed-out': 0} initial {'dequeued': 14, 'rejected': 20, 'released': 18, 'admitted': 26, 'queued': 20, 'timed-out': 0}
+E   assert (1524822944.9910979 - 1524822883.858825) < 60
+E    +  where 1524822944.9910979 = time()
+Standard Output
+Starting State Store logging to /data/jenkins/workspace/impala-cdh6.0.x-exhaustive/repos/Impala/logs/custom_cluster_tests/statestored.INFO
+Starting Catalog Service logging to /data/jenkins/workspace/impala-cdh6.0.x-exhaustive/repos/Impala/logs/custom_cluster_tests/catalogd.INFO
+Starting Impala Daemon logging to /data/jenkins/workspace/impala-cdh6.0.x-exhaustive/repos/Impala/logs/custom_cluster_tests/impalad.INFO
+Starting Impala Daemon logging to /data/jenkins/workspace/impala-cdh6.0.x-exhaustive/repos/Impala/logs/custom_cluster_tests/impalad_node1.INFO
+Starting Impala Daemon logging to /data/jenkins/workspace/impala-cdh6.0.x-exhaustive/repos/Impala/logs/custom_cluster_tests/impalad_node2.INFO
+Impala Cluster Running with 3 nodes (3 coordinators, 3 executors).
+Standard Error
+MainThread: Found 3 impalad/1 statestored/1 catalogd process(es)
+MainThread: Getting num_known_live_backends from ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:25000
+MainThread: Debug webpage not yet available.
+MainThread: Debug webpage not yet available.
+MainThread: Waiting for num_known_live_backends=3. Current value: 0
+MainThread: Getting num_known_live_backends from ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:25000
+MainThread: Waiting for num_known_live_backends=3. Current value: 0
+MainThread: Getting num_known_live_backends from ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:25000
+MainThread: Waiting for num_known_live_backends=3. Current value: 1
+MainThread: Getting num_known_live_backends from ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:25000
+MainThread: Waiting for num_known_live_backends=3. Current value: 2
+MainThread: Getting num_known_live_backends from ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:25000
+MainThread: num_known_live_backends has reached value: 3
+MainThread: Getting num_known_live_backends from ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:25001
+MainThread: num_known_live_backends has reached value: 3
+MainThread: Getting num_known_live_backends from ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:25002
+MainThread: num_known_live_backends has reached value: 3
+MainThread: Found 3 impalad/1 statestored/1 catalogd process(es)
+MainThread: Getting metric: statestore.live-backends from ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:25010
+MainThread: Metric 'statestore.live-backends' has reached desired value: 4
+MainThread: Getting num_known_live_backends from ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:25000
+MainThread: num_known_live_backends has reached value: 3
+MainThread: Getting num_known_live_backends from ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:25001
+MainThread: num_known_live_backends has reached value: 3
+MainThread: Getting num_known_live_backends from ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:25002
+MainThread: num_known_live_backends has reached value: 3
+-- connecting to: localhost:21000
+MainThread: Starting test case with parameters: num_queries: 50 | submission_delay_ms: 50 | exec_option: {'batch_size': 0, 'num_nodes': 0, 'disable_codegen_rows_threshold': 5000, 'disable_codegen': False, 'abort_on_error': 1, 'request_pool': 'default-pool', 'mem_limit': 858993458, 'exec_single_node_rows_threshold': 0} | table_format: text/none | round_robin_submission: True
+MainThread: Initial metrics: admitted=0, queued=0, dequeued=0, rejected=0, released=0, timed-out=0
+-- connecting to: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21000
+-- executing against ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21000
+use functional;
+
+-- connecting to: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21001
+-- executing against ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21001
+use functional;
+
+-- connecting to: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21002
+-- executing against ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21002
+use functional;
+
+-- connecting to: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21000
+-- executing against ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21000
+use functional;
+
+-- connecting to: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21001
+-- executing against ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21001
+use functional;
+
+-- connecting to: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21002
+-- executing against ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21002
+use functional;
+
+SET batch_size=0;
+SET batch_size=0;
+SET num_nodes=0;
+SET num_nodes=0;
+SET disable_codegen_rows_threshold=5000;
+SET disable_codegen_rows_threshold=5000;
+SET disable_codegen=False;
+SET disable_codegen=False;
+SET abort_on_error=1;
+SET abort_on_error=1;
+SET request_pool=default-pool;
+SET mem_limit=858993458;
+SET request_pool=default-pool;
+SET exec_single_node_rows_threshold=0;
+SET mem_limit=858993458;
+SET exec_single_node_rows_threshold=0;
+Thread-666: Submitting query 0
+-- executing async: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21000
+
+select * from alltypesagg where id != 0
+union all
+select * from alltypesagg where id != 0
+union all
+select * from alltypesagg where id != 0
+union all
+select * from alltypesagg where id != 0
+union all
+select * from alltypesagg where id != 0
+union all
+select * from alltypesagg where id != 0
+union all
+select * from alltypesagg where id != 0
+union all
+select * from alltypesagg where id != 0
+union all
+select * from alltypesagg where id != 0
+union all
+select * from alltypesagg where id != 0
+union all
+select * from alltypesagg where id != 0
+union all
+select * from alltypesagg where id != 0
+union all
+select * from alltypesagg where id != 0
+union all
+select * from alltypesagg where id != 0
+union all
+select * from alltypesagg where id != 0
+union all
+select * from alltypesagg where id != 0
+union all
+select * from alltypesagg where id != 0
+union all
+select * from alltypesagg where id != 0
+union all
+select * from alltypesagg where id != 0
+;
+
+Thread-669: Submitting query 3
+-- executing async: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21000
+
+select * from alltypesagg where id != 3
+union all
+select * from alltypesagg where id != 3
+union all
+select * from alltypesagg where id != 3
+union all
+select * from alltypesagg where id != 3
+union all
+select * from alltypesagg where id != 3
+union all
+select * from alltypesagg where id != 3
+union all
+select * from alltypesagg where id != 3
+union all
+select * from alltypesagg where id != 3
+union all
+select * from alltypesagg where id != 3
+union all
+select * from alltypesagg where id != 3
+union all
+select * from alltypesagg where id != 3
+union all
+select * from alltypesagg where id != 3
+union all
+select * from alltypesagg where id != 3
+union all
+select * from alltypesagg where id != 3
+union all
+select * from alltypesagg where id != 3
+union all
+select * from alltypesagg where id != 3
+union all
+select * from alltypesagg where id != 3
+union all
+select * from alltypesagg where id != 3
+union all
+select * from alltypesagg where id != 3
+;
+
+-- connecting to: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21000
+-- executing against ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21000
+use functional;
+
+SET batch_size=0;
+SET num_nodes=0;
+SET disable_codegen_rows_threshold=5000;
+SET disable_codegen=False;
+SET abort_on_error=1;
+SET request_pool=default-pool;
+SET mem_limit=858993458;
+SET exec_single_node_rows_threshold=0;
+Thread-670: Submitting query 4
+-- executing async: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21001
+
+select * from alltypesagg where id != 4
+union all
+select * from alltypesagg where id != 4
+union all
+select * from alltypesagg where id != 4
+union all
+select * from alltypesagg where id != 4
+union all
+select * from alltypesagg where id != 4
+union all
+select * from alltypesagg where id != 4
+union all
+select * from alltypesagg where id != 4
+union all
+select * from alltypesagg where id != 4
+union all
+select * from alltypesagg where id != 4
+union all
+select * from alltypesagg where id != 4
+union all
+select * from alltypesagg where id != 4
+union all
+select * from alltypesagg where id != 4
+union all
+select * from alltypesagg where id != 4
+union all
+select * from alltypesagg where id != 4
+union all
+select * from alltypesagg where id != 4
+union all
+select * from alltypesagg where id != 4
+union all
+select * from alltypesagg where id != 4
+union all
+select * from alltypesagg where id != 4
+union all
+select * from alltypesagg where id != 4
+;
+
+SET batch_size=0;
+SET num_nodes=0;
+SET disable_codegen_rows_threshold=5000;
+SET disable_codegen=False;
+SET abort_on_error=1;
+SET request_pool=default-pool;
+SET mem_limit=858993458;
+SET exec_single_node_rows_threshold=0;
+-- executing against ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21000
+SET QUERY_TIMEOUT_S=1;
+
+SET batch_size=0;
+SET num_nodes=0;
+SET disable_codegen_rows_threshold=5000;
+SET disable_codegen=False;
+SET abort_on_error=1;
+SET request_pool=default-pool;
+SET mem_limit=858993458;
+SET exec_single_node_rows_threshold=0;
+Thread-667: Submitting query 1
+-- executing async: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21001
+
+select * from alltypesagg where id != 1
+union all
+select * from alltypesagg where id != 1
+union all
+select * from alltypesagg where id != 1
+union all
+select * from alltypesagg where id != 1
+union all
+select * from alltypesagg where id != 1
+union all
+select * from alltypesagg where id != 1
+union all
+select * from alltypesagg where id != 1
+union all
+select * from alltypesagg where id != 1
+union all
+select * from alltypesagg where id != 1
+union all
+select * from alltypesagg where id != 1
+union all
+select * from alltypesagg where id != 1
+union all
+select * from alltypesagg where id != 1
+union all
+select * from alltypesagg where id != 1
+union all
+select * from alltypesagg where id != 1
+union all
+select * from alltypesagg where id != 1
+union all
+select * from alltypesagg where id != 1
+union all
+select * from alltypesagg where id != 1
+union all
+select * from alltypesagg where id != 1
+union all
+select * from alltypesagg where id != 1
+;
+
+-- connecting to: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21001
+-- executing against ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21001
+use functional;
+
+SET batch_size=0;
+SET num_nodes=0;
+SET disable_codegen_rows_threshold=5000;
+SET disable_codegen=False;
+SET abort_on_error=1;
+SET request_pool=default-pool;
+SET mem_limit=858993458;
+SET exec_single_node_rows_threshold=0;
+Thread-673: Submitting query 7
+-- executing async: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21001
+
+select * from alltypesagg where id != 7
+union all
+select * from alltypesagg where id != 7
+union all
+select * from alltypesagg where id != 7
+union all
+select * from alltypesagg where id != 7
+union all
+select * from alltypesagg where id != 7
+union all
+select * from alltypesagg where id != 7
+union all
+select * from alltypesagg where id != 7
+union all
+select * from alltypesagg where id != 7
+union all
+select * from alltypesagg where id != 7
+union all
+select * from alltypesagg where id != 7
+union all
+select * from alltypesagg where id != 7
+union all
+select * from alltypesagg where id != 7
+union all
+select * from alltypesagg where id != 7
+union all
+select * from alltypesagg where id != 7
+union all
+select * from alltypesagg where id != 7
+union all
+select * from alltypesagg where id != 7
+union all
+select * from alltypesagg where id != 7
+union all
+select * from alltypesagg where id != 7
+union all
+select * from alltypesagg where id != 7
+;
+
+Thread-672: Submitting query 6
+-- executing async: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21000
+
+select * from alltypesagg where id != 6
+union all
+select * from alltypesagg where id != 6
+union all
+select * from alltypesagg where id != 6
+union all
+select * from alltypesagg where id != 6
+union all
+select * from alltypesagg where id != 6
+union all
+select * from alltypesagg where id != 6
+union all
+select * from alltypesagg where id != 6
+union all
+select * from alltypesagg where id != 6
+union all
+select * from alltypesagg where id != 6
+union all
+select * from alltypesagg where id != 6
+union all
+select * from alltypesagg where id != 6
+union all
+select * from alltypesagg where id != 6
+union all
+select * from alltypesagg where id != 6
+union all
+select * from alltypesagg where id != 6
+union all
+select * from alltypesagg where id != 6
+union all
+select * from alltypesagg where id != 6
+union all
+select * from alltypesagg where id != 6
+union all
+select * from alltypesagg where id != 6
+union all
+select * from alltypesagg where id != 6
+;
+
+SET batch_size=0;
+SET num_nodes=0;
+SET disable_codegen_rows_threshold=5000;
+SET disable_codegen=False;
+SET abort_on_error=1;
+SET request_pool=default-pool;
+SET mem_limit=858993458;
+SET exec_single_node_rows_threshold=0;
+Thread-671: Submitting query 5
+-- executing async: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21002
+
+select * from alltypesagg where id != 5
+union all
+select * from alltypesagg where id != 5
+union all
+select * from alltypesagg where id != 5
+union all
+select * from alltypesagg where id != 5
+union all
+select * from alltypesagg where id != 5
+union all
+select * from alltypesagg where id != 5
+union all
+select * from alltypesagg where id != 5
+union all
+select * from alltypesagg where id != 5
+union all
+select * from alltypesagg where id != 5
+union all
+select * from alltypesagg where id != 5
+union all
+select * from alltypesagg where id != 5
+union all
+select * from alltypesagg where id != 5
+union all
+select * from alltypesagg where id != 5
+union all
+select * from alltypesagg where id != 5
+union all
+select * from alltypesagg where id != 5
+union all
+select * from alltypesagg where id != 5
+union all
+select * from alltypesagg where id != 5
+union all
+select * from alltypesagg where id != 5
+union all
+select * from alltypesagg where id != 5
+;
+
+-- connecting to: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21002
+-- executing against ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21002
+use functional;
+
+SET batch_size=0;
+SET num_nodes=0;
+SET disable_codegen_rows_threshold=5000;
+SET disable_codegen=False;
+SET abort_on_error=1;
+SET batch_size=0;
+SET request_pool=default-pool;
+SET mem_limit=858993458;
+SET num_nodes=0;
+SET exec_single_node_rows_threshold=0;
+Thread-674: Submitting query 8
+SET disable_codegen_rows_threshold=5000;
+-- executing async: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21002
+
+select * from alltypesagg where id != 8
+union all
+select * from alltypesagg where id != 8
+union all
+select * from alltypesagg where id != 8
+union all
+select * from alltypesagg where id != 8
+union all
+select * from alltypesagg where id != 8
+union all
+select * from alltypesagg where id != 8
+union all
+select * from alltypesagg where id != 8
+union all
+select * from alltypesagg where id != 8
+union all
+select * from alltypesagg where id != 8
+union all
+select * from alltypesagg where id != 8
+union all
+select * from alltypesagg where id != 8
+union all
+select * from alltypesagg where id != 8
+union all
+select * from alltypesagg where id != 8
+union all
+select * from alltypesagg where id != 8
+union all
+select * from alltypesagg where id != 8
+union all
+select * from alltypesagg where id != 8
+union all
+select * from alltypesagg where id != 8
+union all
+select * from alltypesagg where id != 8
+union all
+select * from alltypesagg where id != 8
+;
+
+SET disable_codegen=False;
+SET abort_on_error=1;
+SET request_pool=default-pool;
+SET mem_limit=858993458;
+SET exec_single_node_rows_threshold=0;
+-- executing against ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21002
+SET QUERY_TIMEOUT_S=1;
+
+-- connecting to: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21000
+-- executing against ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21000
+use functional;
+
+SET batch_size=0;
+SET num_nodes=0;
+SET disable_codegen_rows_threshold=5000;
+SET disable_codegen=False;
+SET abort_on_error=1;
+SET request_pool=default-pool;
+SET mem_limit=858993458;
+SET exec_single_node_rows_threshold=0;
+Thread-675: Submitting query 9
+-- executing async: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21000
+
+select * from alltypesagg where id != 9
+union all
+select * from alltypesagg where id != 9
+union all
+select * from alltypesagg where id != 9
+union all
+select * from alltypesagg where id != 9
+union all
+select * from alltypesagg where id != 9
+union all
+select * from alltypesagg where id != 9
+union all
+select * from alltypesagg where id != 9
+union all
+select * from alltypesagg where id != 9
+union all
+select * from alltypesagg where id != 9
+union all
+select * from alltypesagg where id != 9
+union all
+select * from alltypesagg where id != 9
+union all
+select * from alltypesagg where id != 9
+union all
+select * from alltypesagg where id != 9
+union all
+select * from alltypesagg where id != 9
+union all
+select * from alltypesagg where id != 9
+union all
+select * from alltypesagg where id != 9
+union all
+select * from alltypesagg where id != 9
+union all
+select * from alltypesagg where id != 9
+union all
+select * from alltypesagg where id != 9
+;
+
+Thread-668: Submitting query 2
+-- executing async: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21002
+
+select * from alltypesagg where id != 2
+union all
+select * from alltypesagg where id != 2
+union all
+select * from alltypesagg where id != 2
+union all
+select * from alltypesagg where id != 2
+union all
+select * from alltypesagg where id != 2
+union all
+select * from alltypesagg where id != 2
+union all
+select * from alltypesagg where id != 2
+union all
+select * from alltypesagg where id != 2
+union all
+select * from alltypesagg where id != 2
+union all
+select * from alltypesagg where id != 2
+union all
+select * from alltypesagg where id != 2
+union all
+select * from alltypesagg where id != 2
+union all
+select * from alltypesagg where id != 2
+union all
+select * from alltypesagg where id != 2
+union all
+select * from alltypesagg where id != 2
+union all
+select * from alltypesagg where id != 2
+union all
+select * from alltypesagg where id != 2
+union all
+select * from alltypesagg where id != 2
+union all
+select * from alltypesagg where id != 2
+;
+
+-- connecting to: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21001
+-- executing against ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21001
+use functional;
+
+SET batch_size=0;
+SET num_nodes=0;
+SET disable_codegen_rows_threshold=5000;
+SET disable_codegen=False;
+SET abort_on_error=1;
+SET request_pool=default-pool;
+SET mem_limit=858993458;
+SET exec_single_node_rows_threshold=0;
+-- executing against ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21001
+SET QUERY_TIMEOUT_S=1;
+
+-- connecting to: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21002
+-- executing against ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21002
+use functional;
+
+SET batch_size=0;
+SET num_nodes=0;
+SET disable_codegen_rows_threshold=5000;
+SET disable_codegen=False;
+SET abort_on_error=1;
+SET request_pool=default-pool;
+SET mem_limit=858993458;
+SET exec_single_node_rows_threshold=0;
+Thread-677: Submitting query 11
+-- executing async: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21002
+
+select * from alltypesagg where id != 11
+union all
+select * from alltypesagg where id != 11
+union all
+select * from alltypesagg where id != 11
+union all
+select * from alltypesagg where id != 11
+union all
+select * from alltypesagg where id != 11
+union all
+select * from alltypesagg where id != 11
+union all
+select * from alltypesagg where id != 11
+union all
+select * from alltypesagg where id != 11
+union all
+select * from alltypesagg where id != 11
+union all
+select * from alltypesagg where id != 11
+union all
+select * from alltypesagg where id != 11
+union all
+select * from alltypesagg where id != 11
+union all
+select * from alltypesagg where id != 11
+union all
+select * from alltypesagg where id != 11
+union all
+select * from alltypesagg where id != 11
+union all
+select * from alltypesagg where id != 11
+union all
+select * from alltypesagg where id != 11
+union all
+select * from alltypesagg where id != 11
+union all
+select * from alltypesagg where id != 11
+;
+
+Thread-676: Submitting query 10
+-- executing async: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21001
+
+select * from alltypesagg where id != 10
+union all
+select * from alltypesagg where id != 10
+union all
+select * from alltypesagg where id != 10
+union all
+select * from alltypesagg where id != 10
+union all
+select * from alltypesagg where id != 10
+union all
+select * from alltypesagg where id != 10
+union all
+select * from alltypesagg where id != 10
+union all
+select * from alltypesagg where id != 10
+union all
+select * from alltypesagg where id != 10
+union all
+select * from alltypesagg where id != 10
+union all
+select * from alltypesagg where id != 10
+union all
+select * from alltypesagg where id != 10
+union all
+select * from alltypesagg where id != 10
+union all
+select * from alltypesagg where id != 10
+union all
+select * from alltypesagg where id != 10
+union all
+select * from alltypesagg where id != 10
+union all
+select * from alltypesagg where id != 10
+union all
+select * from alltypesagg where id != 10
+union all
+select * from alltypesagg where id != 10
+;
+
+-- connecting to: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21000
+-- executing against ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21000
+use functional;
+
+SET batch_size=0;
+SET num_nodes=0;
+SET disable_codegen_rows_threshold=5000;
+SET disable_codegen=False;
+SET abort_on_error=1;
+SET request_pool=default-pool;
+SET mem_limit=858993458;
+SET exec_single_node_rows_threshold=0;
+Thread-678: Submitting query 12
+-- executing async: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21000
+
+select * from alltypesagg where id != 12
+union all
+select * from alltypesagg where id != 12
+union all
+select * from alltypesagg where id != 12
+union all
+select * from alltypesagg where id != 12
+union all
+select * from alltypesagg where id != 12
+union all
+select * from alltypesagg where id != 12
+union all
+select * from alltypesagg where id != 12
+union all
+select * from alltypesagg where id != 12
+union all
+select * from alltypesagg where id != 12
+union all
+select * from alltypesagg where id != 12
+union all
+select * from alltypesagg where id != 12
+union all
+select * from alltypesagg where id != 12
+union all
+select * from alltypesagg where id != 12
+union all
+select * from alltypesagg where id != 12
+union all
+select * from alltypesagg where id != 12
+union all
+select * from alltypesagg where id != 12
+union all
+select * from alltypesagg where id != 12
+union all
+select * from alltypesagg where id != 12
+union all
+select * from alltypesagg where id != 12
+;
+
+-- connecting to: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21001
+-- executing against ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21001
+use functional;
+
+SET batch_size=0;
+SET num_nodes=0;
+SET disable_codegen_rows_threshold=5000;
+SET disable_codegen=False;
+SET abort_on_error=1;
+SET request_pool=default-pool;
+SET mem_limit=858993458;
+SET exec_single_node_rows_threshold=0;
+Thread-679: Submitting query 13
+-- executing async: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21001
+
+select * from alltypesagg where id != 13
+union all
+select * from alltypesagg where id != 13
+union all
+select * from alltypesagg where id != 13
+union all
+select * from alltypesagg where id != 13
+union all
+select * from alltypesagg where id != 13
+union all
+select * from alltypesagg where id != 13
+union all
+select * from alltypesagg where id != 13
+union all
+select * from alltypesagg where id != 13
+union all
+select * from alltypesagg where id != 13
+union all
+select * from alltypesagg where id != 13
+union all
+select * from alltypesagg where id != 13
+union all
+select * from alltypesagg where id != 13
+union all
+select * from alltypesagg where id != 13
+union all
+select * from alltypesagg where id != 13
+union all
+select * from alltypesagg where id != 13
+union all
+select * from alltypesagg where id != 13
+union all
+select * from alltypesagg where id != 13
+union all
+select * from alltypesagg where id != 13
+union all
+select * from alltypesagg where id != 13
+;
+
+-- connecting to: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21002
+-- executing against ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21002
+use functional;
+
+SET batch_size=0;
+SET num_nodes=0;
+SET disable_codegen_rows_threshold=5000;
+SET disable_codegen=False;
+SET abort_on_error=1;
+SET request_pool=default-pool;
+SET mem_limit=858993458;
+SET exec_single_node_rows_threshold=0;
+-- executing against ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21002
+SET QUERY_TIMEOUT_S=1;
+
+Thread-680: Submitting query 14
+-- executing async: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21002
+
+select * from alltypesagg where id != 14
+union all
+select * from alltypesagg where id != 14
+union all
+select * from alltypesagg where id != 14
+union all
+select * from alltypesagg where id != 14
+union all
+select * from alltypesagg where id != 14
+union all
+select * from alltypesagg where id != 14
+union all
+select * from alltypesagg where id != 14
+union all
+select * from alltypesagg where id != 14
+union all
+select * from alltypesagg where id != 14
+union all
+select * from alltypesagg where id != 14
+union all
+select * from alltypesagg where id != 14
+union all
+select * from alltypesagg where id != 14
+union all
+select * from alltypesagg where id != 14
+union all
+select * from alltypesagg where id != 14
+union all
+select * from alltypesagg where id != 14
+union all
+select * from alltypesagg where id != 14
+union all
+select * from alltypesagg where id != 14
+union all
+select * from alltypesagg where id != 14
+union all
+select * from alltypesagg where id != 14
+;
+
+-- connecting to: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21000
+-- executing against ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21000
+use functional;
+
+SET batch_size=0;
+SET num_nodes=0;
+SET disable_codegen_rows_threshold=5000;
+SET disable_codegen=False;
+SET abort_on_error=1;
+SET request_pool=default-pool;
+SET mem_limit=858993458;
+SET exec_single_node_rows_threshold=0;
+Thread-681: Submitting query 15
+-- executing async: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21000
+
+select * from alltypesagg where id != 15
+union all
+select * from alltypesagg where id != 15
+union all
+select * from alltypesagg where id != 15
+union all
+select * from alltypesagg where id != 15
+union all
+select * from alltypesagg where id != 15
+union all
+select * from alltypesagg where id != 15
+union all
+select * from alltypesagg where id != 15
+union all
+select * from alltypesagg where id != 15
+union all
+select * from alltypesagg where id != 15
+union all
+select * from alltypesagg where id != 15
+union all
+select * from alltypesagg where id != 15
+union all
+select * from alltypesagg where id != 15
+union all
+select * from alltypesagg where id != 15
+union all
+select * from alltypesagg where id != 15
+union all
+select * from alltypesagg where id != 15
+union all
+select * from alltypesagg where id != 15
+union all
+select * from alltypesagg where id != 15
+union all
+select * from alltypesagg where id != 15
+union all
+select * from alltypesagg where id != 15
+;
+
+-- connecting to: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21001
+-- executing against ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21001
+use functional;
+
+SET batch_size=0;
+SET num_nodes=0;
+SET disable_codegen_rows_threshold=5000;
+SET disable_codegen=False;
+SET abort_on_error=1;
+SET request_pool=default-pool;
+SET mem_limit=858993458;
+SET exec_single_node_rows_threshold=0;
+Thread-682: Submitting query 16
+-- executing async: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21001
+
+select * from alltypesagg where id != 16
+union all
+select * from alltypesagg where id != 16
+union all
+select * from alltypesagg where id != 16
+union all
+select * from alltypesagg where id != 16
+union all
+select * from alltypesagg where id != 16
+union all
+select * from alltypesagg where id != 16
+union all
+select * from alltypesagg where id != 16
+union all
+select * from alltypesagg where id != 16
+union all
+select * from alltypesagg where id != 16
+union all
+select * from alltypesagg where id != 16
+union all
+select * from alltypesagg where id != 16
+union all
+select * from alltypesagg where id != 16
+union all
+select * from alltypesagg where id != 16
+union all
+select * from alltypesagg where id != 16
+union all
+select * from alltypesagg where id != 16
+union all
+select * from alltypesagg where id != 16
+union all
+select * from alltypesagg where id != 16
+union all
+select * from alltypesagg where id != 16
+union all
+select * from alltypesagg where id != 16
+;
+
+-- connecting to: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21002
+-- executing against ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21002
+use functional;
+
+SET batch_size=0;
+SET num_nodes=0;
+SET disable_codegen_rows_threshold=5000;
+SET disable_codegen=False;
+SET abort_on_error=1;
+SET request_pool=default-pool;
+SET mem_limit=858993458;
+SET exec_single_node_rows_threshold=0;
+Thread-683: Submitting query 17
+-- executing async: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21002
+
+select * from alltypesagg where id != 17
+union all
+select * from alltypesagg where id != 17
+union all
+select * from alltypesagg where id != 17
+union all
+select * from alltypesagg where id != 17
+union all
+select * from alltypesagg where id != 17
+union all
+select * from alltypesagg where id != 17
+union all
+select * from alltypesagg where id != 17
+union all
+select * from alltypesagg where id != 17
+union all
+select * from alltypesagg where id != 17
+union all
+select * from alltypesagg where id != 17
+union all
+select * from alltypesagg where id != 17
+union all
+select * from alltypesagg where id != 17
+union all
+select * from alltypesagg where id != 17
+union all
+select * from alltypesagg where id != 17
+union all
+select * from alltypesagg where id != 17
+union all
+select * from alltypesagg where id != 17
+union all
+select * from alltypesagg where id != 17
+union all
+select * from alltypesagg where id != 17
+union all
+select * from alltypesagg where id != 17
+;
+
+-- connecting to: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21000
+-- executing against ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21000
+use functional;
+
+SET batch_size=0;
+SET num_nodes=0;
+SET disable_codegen_rows_threshold=5000;
+SET disable_codegen=False;
+SET abort_on_error=1;
+SET request_pool=default-pool;
+SET mem_limit=858993458;
+SET exec_single_node_rows_threshold=0;
+-- executing against ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21000
+SET QUERY_TIMEOUT_S=1;
+
+Thread-684: Submitting query 18
+-- executing async: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21000
+
+select * from alltypesagg where id != 18
+union all
+select * from alltypesagg where id != 18
+union all
+select * from alltypesagg where id != 18
+union all
+select * from alltypesagg where id != 18
+union all
+select * from alltypesagg where id != 18
+union all
+select * from alltypesagg where id != 18
+union all
+select * from alltypesagg where id != 18
+union all
+select * from alltypesagg where id != 18
+union all
+select * from alltypesagg where id != 18
+union all
+select * from alltypesagg where id != 18
+union all
+select * from alltypesagg where id != 18
+union all
+select * from alltypesagg where id != 18
+union all
+select * from alltypesagg where id != 18
+union all
+select * from alltypesagg where id != 18
+union all
+select * from alltypesagg where id != 18
+union all
+select * from alltypesagg where id != 18
+union all
+select * from alltypesagg where id != 18
+union all
+select * from alltypesagg where id != 18
+union all
+select * from alltypesagg where id != 18
+;
+
+-- connecting to: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21001
+-- executing against ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21001
+use functional;
+
+SET batch_size=0;
+SET num_nodes=0;
+SET disable_codegen_rows_threshold=5000;
+SET disable_codegen=False;
+SET abort_on_error=1;
+SET request_pool=default-pool;
+SET mem_limit=858993458;
+SET exec_single_node_rows_threshold=0;
+Thread-685: Submitting query 19
+-- executing async: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21001
+
+select * from alltypesagg where id != 19
+union all
+select * from alltypesagg where id != 19
+union all
+select * from alltypesagg where id != 19
+union all
+select * from alltypesagg where id != 19
+union all
+select * from alltypesagg where id != 19
+union all
+select * from alltypesagg where id != 19
+union all
+select * from alltypesagg where id != 19
+union all
+select * from alltypesagg where id != 19
+union all
+select * from alltypesagg where id != 19
+union all
+select * from alltypesagg where id != 19
+union all
+select * from alltypesagg where id != 19
+union all
+select * from alltypesagg where id != 19
+union all
+select * from alltypesagg where id != 19
+union all
+select * from alltypesagg where id != 19
+union all
+select * from alltypesagg where id != 19
+union all
+select * from alltypesagg where id != 19
+union all
+select * from alltypesagg where id != 19
+union all
+select * from alltypesagg where id != 19
+union all
+select * from alltypesagg where id != 19
+;
+
+-- connecting to: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21002
+-- executing against ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21002
+use functional;
+
+SET batch_size=0;
+SET num_nodes=0;
+SET disable_codegen_rows_threshold=5000;
+SET disable_codegen=False;
+SET abort_on_error=1;
+SET request_pool=default-pool;
+SET mem_limit=858993458;
+SET exec_single_node_rows_threshold=0;
+Thread-686: Submitting query 20
+-- executing async: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21002
+
+select * from alltypesagg where id != 20
+union all
+select * from alltypesagg where id != 20
+union all
+select * from alltypesagg where id != 20
+union all
+select * from alltypesagg where id != 20
+union all
+select * from alltypesagg where id != 20
+union all
+select * from alltypesagg where id != 20
+union all
+select * from alltypesagg where id != 20
+union all
+select * from alltypesagg where id != 20
+union all
+select * from alltypesagg where id != 20
+union all
+select * from alltypesagg where id != 20
+union all
+select * from alltypesagg where id != 20
+union all
+select * from alltypesagg where id != 20
+union all
+select * from alltypesagg where id != 20
+union all
+select * from alltypesagg where id != 20
+union all
+select * from alltypesagg where id != 20
+union all
+select * from alltypesagg where id != 20
+union all
+select * from alltypesagg where id != 20
+union all
+select * from alltypesagg where id != 20
+union all
+select * from alltypesagg where id != 20
+;
+
+-- connecting to: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21000
+-- executing against ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21000
+use functional;
+
+SET batch_size=0;
+SET num_nodes=0;
+SET disable_codegen_rows_threshold=5000;
+SET disable_codegen=False;
+SET abort_on_error=1;
+SET request_pool=default-pool;
+SET mem_limit=858993458;
+SET exec_single_node_rows_threshold=0;
+Thread-687: Submitting query 21
+-- executing async: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21000
+
+select * from alltypesagg where id != 21
+union all
+select * from alltypesagg where id != 21
+union all
+select * from alltypesagg where id != 21
+union all
+select * from alltypesagg where id != 21
+union all
+select * from alltypesagg where id != 21
+union all
+select * from alltypesagg where id != 21
+union all
+select * from alltypesagg where id != 21
+union all
+select * from alltypesagg where id != 21
+union all
+select * from alltypesagg where id != 21
+union all
+select * from alltypesagg where id != 21
+union all
+select * from alltypesagg where id != 21
+union all
+select * from alltypesagg where id != 21
+union all
+select * from alltypesagg where id != 21
+union all
+select * from alltypesagg where id != 21
+union all
+select * from alltypesagg where id != 21
+union all
+select * from alltypesagg where id != 21
+union all
+select * from alltypesagg where id != 21
+union all
+select * from alltypesagg where id != 21
+union all
+select * from alltypesagg where id != 21
+;
+
+-- connecting to: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21001
+-- executing against ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21001
+use functional;
+
+SET batch_size=0;
+SET num_nodes=0;
+SET disable_codegen_rows_threshold=5000;
+SET disable_codegen=False;
+SET abort_on_error=1;
+SET request_pool=default-pool;
+SET mem_limit=858993458;
+SET exec_single_node_rows_threshold=0;
+-- executing against ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21001
+SET QUERY_TIMEOUT_S=1;
+
+Thread-688: Submitting query 22
+-- executing async: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21001
+
+select * from alltypesagg where id != 22
+union all
+select * from alltypesagg where id != 22
+union all
+select * from alltypesagg where id != 22
+union all
+select * from alltypesagg where id != 22
+union all
+select * from alltypesagg where id != 22
+union all
+select * from alltypesagg where id != 22
+union all
+select * from alltypesagg where id != 22
+union all
+select * from alltypesagg where id != 22
+union all
+select * from alltypesagg where id != 22
+union all
+select * from alltypesagg where id != 22
+union all
+select * from alltypesagg where id != 22
+union all
+select * from alltypesagg where id != 22
+union all
+select * from alltypesagg where id != 22
+union all
+select * from alltypesagg where id != 22
+union all
+select * from alltypesagg where id != 22
+union all
+select * from alltypesagg where id != 22
+union all
+select * from alltypesagg where id != 22
+union all
+select * from alltypesagg where id != 22
+union all
+select * from alltypesagg where id != 22
+;
+
+-- connecting to: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21002
+-- executing against ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21002
+use functional;
+
+SET batch_size=0;
+SET num_nodes=0;
+SET disable_codegen_rows_threshold=5000;
+SET disable_codegen=False;
+SET abort_on_error=1;
+SET request_pool=default-pool;
+SET mem_limit=858993458;
+SET exec_single_node_rows_threshold=0;
+Thread-689: Submitting query 23
+-- executing async: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21002
+
+select * from alltypesagg where id != 23
+union all
+select * from alltypesagg where id != 23
+union all
+select * from alltypesagg where id != 23
+union all
+select * from alltypesagg where id != 23
+union all
+select * from alltypesagg where id != 23
+union all
+select * from alltypesagg where id != 23
+union all
+select * from alltypesagg where id != 23
+union all
+select * from alltypesagg where id != 23
+union all
+select * from alltypesagg where id != 23
+union all
+select * from alltypesagg where id != 23
+union all
+select * from alltypesagg where id != 23
+union all
+select * from alltypesagg where id != 23
+union all
+select * from alltypesagg where id != 23
+union all
+select * from alltypesagg where id != 23
+union all
+select * from alltypesagg where id != 23
+union all
+select * from alltypesagg where id != 23
+union all
+select * from alltypesagg where id != 23
+union all
+select * from alltypesagg where id != 23
+union all
+select * from alltypesagg where id != 23
+;
+
+-- connecting to: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21000
+-- executing against ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21000
+use functional;
+
+SET batch_size=0;
+SET num_nodes=0;
+SET disable_codegen_rows_threshold=5000;
+SET disable_codegen=False;
+SET abort_on_error=1;
+SET request_pool=default-pool;
+SET mem_limit=858993458;
+SET exec_single_node_rows_threshold=0;
+Thread-690: Submitting query 24
+-- executing async: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21000
+
+select * from alltypesagg where id != 24
+union all
+select * from alltypesagg where id != 24
+union all
+select * from alltypesagg where id != 24
+union all
+select * from alltypesagg where id != 24
+union all
+select * from alltypesagg where id != 24
+union all
+select * from alltypesagg where id != 24
+union all
+select * from alltypesagg where id != 24
+union all
+select * from alltypesagg where id != 24
+union all
+select * from alltypesagg where id != 24
+union all
+select * from alltypesagg where id != 24
+union all
+select * from alltypesagg where id != 24
+union all
+select * from alltypesagg where id != 24
+union all
+select * from alltypesagg where id != 24
+union all
+select * from alltypesagg where id != 24
+union all
+select * from alltypesagg where id != 24
+union all
+select * from alltypesagg where id != 24
+union all
+select * from alltypesagg where id != 24
+union all
+select * from alltypesagg where id != 24
+union all
+select * from alltypesagg where id != 24
+;
+
+-- connecting to: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21001
+-- executing against ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21001
+use functional;
+
+SET batch_size=0;
+SET num_nodes=0;
+SET disable_codegen_rows_threshold=5000;
+SET disable_codegen=False;
+SET abort_on_error=1;
+SET request_pool=default-pool;
+SET mem_limit=858993458;
+SET exec_single_node_rows_threshold=0;
+Thread-691: Submitting query 25
+-- executing async: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21001
+
+select * from alltypesagg where id != 25
+union all
+select * from alltypesagg where id != 25
+union all
+select * from alltypesagg where id != 25
+union all
+select * from alltypesagg where id != 25
+union all
+select * from alltypesagg where id != 25
+union all
+select * from alltypesagg where id != 25
+union all
+select * from alltypesagg where id != 25
+union all
+select * from alltypesagg where id != 25
+union all
+select * from alltypesagg where id != 25
+union all
+select * from alltypesagg where id != 25
+union all
+select * from alltypesagg where id != 25
+union all
+select * from alltypesagg where id != 25
+union all
+select * from alltypesagg where id != 25
+union all
+select * from alltypesagg where id != 25
+union all
+select * from alltypesagg where id != 25
+union all
+select * from alltypesagg where id != 25
+union all
+select * from alltypesagg where id != 25
+union all
+select * from alltypesagg where id != 25
+union all
+select * from alltypesagg where id != 25
+;
+
+-- connecting to: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21002
+-- executing against ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21002
+use functional;
+
+SET batch_size=0;
+SET num_nodes=0;
+SET disable_codegen_rows_threshold=5000;
+SET disable_codegen=False;
+SET abort_on_error=1;
+SET request_pool=default-pool;
+SET mem_limit=858993458;
+SET exec_single_node_rows_threshold=0;
+-- executing against ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21002
+SET QUERY_TIMEOUT_S=1;
+
+Thread-692: Submitting query 26
+-- executing async: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21002
+
+select * from alltypesagg where id != 26
+union all
+select * from alltypesagg where id != 26
+union all
+select * from alltypesagg where id != 26
+union all
+select * from alltypesagg where id != 26
+union all
+select * from alltypesagg where id != 26
+union all
+select * from alltypesagg where id != 26
+union all
+select * from alltypesagg where id != 26
+union all
+select * from alltypesagg where id != 26
+union all
+select * from alltypesagg where id != 26
+union all
+select * from alltypesagg where id != 26
+union all
+select * from alltypesagg where id != 26
+union all
+select * from alltypesagg where id != 26
+union all
+select * from alltypesagg where id != 26
+union all
+select * from alltypesagg where id != 26
+union all
+select * from alltypesagg where id != 26
+union all
+select * from alltypesagg where id != 26
+union all
+select * from alltypesagg where id != 26
+union all
+select * from alltypesagg where id != 26
+union all
+select * from alltypesagg where id != 26
+;
+
+-- connecting to: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21000
+-- executing against ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21000
+use functional;
+
+SET batch_size=0;
+SET num_nodes=0;
+SET disable_codegen_rows_threshold=5000;
+SET disable_codegen=False;
+SET abort_on_error=1;
+SET request_pool=default-pool;
+SET mem_limit=858993458;
+SET exec_single_node_rows_threshold=0;
+Thread-693: Submitting query 27
+-- executing async: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21000
+
+select * from alltypesagg where id != 27
+union all
+select * from alltypesagg where id != 27
+union all
+select * from alltypesagg where id != 27
+union all
+select * from alltypesagg where id != 27
+union all
+select * from alltypesagg where id != 27
+union all
+select * from alltypesagg where id != 27
+union all
+select * from alltypesagg where id != 27
+union all
+select * from alltypesagg where id != 27
+union all
+select * from alltypesagg where id != 27
+union all
+select * from alltypesagg where id != 27
+union all
+select * from alltypesagg where id != 27
+union all
+select * from alltypesagg where id != 27
+union all
+select * from alltypesagg where id != 27
+union all
+select * from alltypesagg where id != 27
+union all
+select * from alltypesagg where id != 27
+union all
+select * from alltypesagg where id != 27
+union all
+select * from alltypesagg where id != 27
+union all
+select * from alltypesagg where id != 27
+union all
+select * from alltypesagg where id != 27
+;
+
+-- connecting to: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21001
+-- executing against ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21001
+use functional;
+
+SET batch_size=0;
+SET num_nodes=0;
+SET disable_codegen_rows_threshold=5000;
+SET disable_codegen=False;
+SET abort_on_error=1;
+SET request_pool=default-pool;
+SET mem_limit=858993458;
+SET exec_single_node_rows_threshold=0;
+Thread-694: Submitting query 28
+-- executing async: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21001
+
+select * from alltypesagg where id != 28
+union all
+select * from alltypesagg where id != 28
+union all
+select * from alltypesagg where id != 28
+union all
+select * from alltypesagg where id != 28
+union all
+select * from alltypesagg where id != 28
+union all
+select * from alltypesagg where id != 28
+union all
+select * from alltypesagg where id != 28
+union all
+select * from alltypesagg where id != 28
+union all
+select * from alltypesagg where id != 28
+union all
+select * from alltypesagg where id != 28
+union all
+select * from alltypesagg where id != 28
+union all
+select * from alltypesagg where id != 28
+union all
+select * from alltypesagg where id != 28
+union all
+select * from alltypesagg where id != 28
+union all
+select * from alltypesagg where id != 28
+union all
+select * from alltypesagg where id != 28
+union all
+select * from alltypesagg where id != 28
+union all
+select * from alltypesagg where id != 28
+union all
+select * from alltypesagg where id != 28
+;
+
+-- connecting to: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21002
+-- executing against ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21002
+use functional;
+
+SET batch_size=0;
+SET num_nodes=0;
+SET disable_codegen_rows_threshold=5000;
+SET disable_codegen=False;
+SET abort_on_error=1;
+SET request_pool=default-pool;
+SET mem_limit=858993458;
+SET exec_single_node_rows_threshold=0;
+Thread-695: Submitting query 29
+-- executing async: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21002
+
+select * from alltypesagg where id != 29
+union all
+select * from alltypesagg where id != 29
+union all
+select * from alltypesagg where id != 29
+union all
+select * from alltypesagg where id != 29
+union all
+select * from alltypesagg where id != 29
+union all
+select * from alltypesagg where id != 29
+union all
+select * from alltypesagg where id != 29
+union all
+select * from alltypesagg where id != 29
+union all
+select * from alltypesagg where id != 29
+union all
+select * from alltypesagg where id != 29
+union all
+select * from alltypesagg where id != 29
+union all
+select * from alltypesagg where id != 29
+union all
+select * from alltypesagg where id != 29
+union all
+select * from alltypesagg where id != 29
+union all
+select * from alltypesagg where id != 29
+union all
+select * from alltypesagg where id != 29
+union all
+select * from alltypesagg where id != 29
+union all
+select * from alltypesagg where id != 29
+union all
+select * from alltypesagg where id != 29
+;
+
+-- connecting to: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21000
+-- executing against ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21000
+use functional;
+
+SET batch_size=0;
+SET num_nodes=0;
+SET disable_codegen_rows_threshold=5000;
+SET disable_codegen=False;
+SET abort_on_error=1;
+SET request_pool=default-pool;
+SET mem_limit=858993458;
+SET exec_single_node_rows_threshold=0;
+-- executing against ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21000
+SET QUERY_TIMEOUT_S=1;
+
+Thread-696: Submitting query 30
+-- executing async: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21000
+
+select * from alltypesagg where id != 30
+union all
+select * from alltypesagg where id != 30
+union all
+select * from alltypesagg where id != 30
+union all
+select * from alltypesagg where id != 30
+union all
+select * from alltypesagg where id != 30
+union all
+select * from alltypesagg where id != 30
+union all
+select * from alltypesagg where id != 30
+union all
+select * from alltypesagg where id != 30
+union all
+select * from alltypesagg where id != 30
+union all
+select * from alltypesagg where id != 30
+union all
+select * from alltypesagg where id != 30
+union all
+select * from alltypesagg where id != 30
+union all
+select * from alltypesagg where id != 30
+union all
+select * from alltypesagg where id != 30
+union all
+select * from alltypesagg where id != 30
+union all
+select * from alltypesagg where id != 30
+union all
+select * from alltypesagg where id != 30
+union all
+select * from alltypesagg where id != 30
+union all
+select * from alltypesagg where id != 30
+;
+
+-- connecting to: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21001
+-- executing against ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21001
+use functional;
+
+SET batch_size=0;
+SET num_nodes=0;
+SET disable_codegen_rows_threshold=5000;
+SET disable_codegen=False;
+SET abort_on_error=1;
+SET request_pool=default-pool;
+SET mem_limit=858993458;
+SET exec_single_node_rows_threshold=0;
+Thread-697: Submitting query 31
+-- executing async: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21001
+
+select * from alltypesagg where id != 31
+union all
+select * from alltypesagg where id != 31
+union all
+select * from alltypesagg where id != 31
+union all
+select * from alltypesagg where id != 31
+union all
+select * from alltypesagg where id != 31
+union all
+select * from alltypesagg where id != 31
+union all
+select * from alltypesagg where id != 31
+union all
+select * from alltypesagg where id != 31
+union all
+select * from alltypesagg where id != 31
+union all
+select * from alltypesagg where id != 31
+union all
+select * from alltypesagg where id != 31
+union all
+select * from alltypesagg where id != 31
+union all
+select * from alltypesagg where id != 31
+union all
+select * from alltypesagg where id != 31
+union all
+select * from alltypesagg where id != 31
+union all
+select * from alltypesagg where id != 31
+union all
+select * from alltypesagg where id != 31
+union all
+select * from alltypesagg where id != 31
+union all
+select * from alltypesagg where id != 31
+;
+
+-- connecting to: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21002
+-- executing against ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21002
+use functional;
+
+-- connecting to: ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21000
+-- executing against ec2-m2-4xlarge-centos-6-4-07fb.vpc.cloudera.com:21000
+use functional;
+
+SET batch_size=0;
+SET n
+...[truncated 62619 chars]...
+x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+MainThread: wait_for_metric_changes, current=admitted=30, queued=20, dequeued=20, rejected=20, released=24, timed-out=0
+MainThread: DeltaSum=4 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=5 for metrics=['admitted', 'timed-out'])
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+MainThread: wait_for_metric_changes, current=admitted=30, queued=20, dequeued=20, rejected=20, released=24, timed-out=0
+MainThread: DeltaSum=4 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=5 for metrics=['admitted', 'timed-out'])
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+MainThread: wait_for_metric_changes, current=admitted=30, queued=20, dequeued=20, rejected=20, released=24, timed-out=0
+MainThread: DeltaSum=4 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=5 for metrics=['admitted', 'timed-out'])
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+MainThread: wait_for_metric_changes, current=admitted=30, queued=20, dequeued=20, rejected=20, released=24, timed-out=0
+MainThread: DeltaSum=4 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=5 for metrics=['admitted', 'timed-out'])
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+MainThread: wait_for_metric_changes, current=admitted=30, queued=20, dequeued=20, rejected=20, released=24, timed-out=0
+MainThread: DeltaSum=4 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=5 for metrics=['admitted', 'timed-out'])
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+MainThread: wait_for_metric_changes, current=admitted=30, queued=20, dequeued=20, rejected=20, released=24, timed-out=0
+MainThread: DeltaSum=4 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=5 for metrics=['admitted', 'timed-out'])
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+MainThread: wait_for_metric_changes, current=admitted=30, queued=20, dequeued=20, rejected=20, released=24, timed-out=0
+MainThread: DeltaSum=4 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=5 for metrics=['admitted', 'timed-out'])
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+MainThread: wait_for_metric_changes, current=admitted=30, queued=20, dequeued=20, rejected=20, released=24, timed-out=0
+MainThread: DeltaSum=4 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=5 for metrics=['admitted', 'timed-out'])
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+MainThread: wait_for_metric_changes, current=admitted=30, queued=20, dequeued=20, rejected=20, released=24, timed-out=0
+MainThread: DeltaSum=4 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=5 for metrics=['admitted', 'timed-out'])
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+MainThread: wait_for_metric_changes, current=admitted=30, queued=20, dequeued=20, rejected=20, released=24, timed-out=0
+MainThread: DeltaSum=4 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=5 for metrics=['admitted', 'timed-out'])
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+MainThread: wait_for_metric_changes, current=admitted=30, queued=20, dequeued=20, rejected=20, released=24, timed-out=0
+MainThread: DeltaSum=4 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=5 for metrics=['admitted', 'timed-out'])
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+MainThread: wait_for_metric_changes, current=admitted=30, queued=20, dequeued=20, rejected=20, released=24, timed-out=0
+MainThread: DeltaSum=4 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=5 for metrics=['admitted', 'timed-out'])
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+MainThread: wait_for_metric_changes, current=admitted=30, queued=20, dequeued=20, rejected=20, released=24, timed-out=0
+MainThread: DeltaSum=4 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=5 for metrics=['admitted', 'timed-out'])
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+MainThread: wait_for_metric_changes, current=admitted=30, queued=20, dequeued=20, rejected=20, released=24, timed-out=0
+MainThread: DeltaSum=4 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=5 for metrics=['admitted', 'timed-out'])
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+MainThread: wait_for_metric_changes, current=admitted=30, queued=20, dequeued=20, rejected=20, released=24, timed-out=0
+MainThread: DeltaSum=4 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=5 for metrics=['admitted', 'timed-out'])
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+MainThread: wait_for_metric_changes, current=admitted=30, queued=20, dequeued=20, rejected=20, released=24, timed-out=0
+MainThread: DeltaSum=4 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=5 for metrics=['admitted', 'timed-out'])
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+MainThread: wait_for_metric_changes, current=admitted=30, queued=20, dequeued=20, rejected=20, released=24, timed-out=0
+MainThread: DeltaSum=4 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=5 for metrics=['admitted', 'timed-out'])
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+MainThread: wait_for_metric_changes, current=admitted=30, queued=20, dequeued=20, rejected=20, released=24, timed-out=0
+MainThread: DeltaSum=4 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=5 for metrics=['admitted', 'timed-out'])
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+MainThread: wait_for_metric_changes, current=admitted=30, queued=20, dequeued=20, rejected=20, released=24, timed-out=0
+MainThread: DeltaSum=4 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=5 for metrics=['admitted', 'timed-out'])
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+MainThread: wait_for_metric_changes, current=admitted=30, queued=20, dequeued=20, rejected=20, released=24, timed-out=0
+MainThread: DeltaSum=4 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=5 for metrics=['admitted', 'timed-out'])
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+MainThread: wait_for_metric_changes, current=admitted=30, queued=20, dequeued=20, rejected=20, released=24, timed-out=0
+MainThread: DeltaSum=4 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=5 for metrics=['admitted', 'timed-out'])
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+MainThread: wait_for_metric_changes, current=admitted=30, queued=20, dequeued=20, rejected=20, released=24, timed-out=0
+MainThread: DeltaSum=4 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=5 for metrics=['admitted', 'timed-out'])
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+MainThread: wait_for_metric_changes, current=admitted=30, queued=20, dequeued=20, rejected=20, released=24, timed-out=0
+MainThread: DeltaSum=4 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=5 for metrics=['admitted', 'timed-out'])
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+MainThread: wait_for_metric_changes, current=admitted=30, queued=20, dequeued=20, rejected=20, released=24, timed-out=0
+MainThread: DeltaSum=4 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=5 for metrics=['admitted', 'timed-out'])
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+MainThread: wait_for_metric_changes, current=admitted=30, queued=20, dequeued=20, rejected=20, released=24, timed-out=0
+MainThread: DeltaSum=4 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=5 for metrics=['admitted', 'timed-out'])
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+MainThread: wait_for_metric_changes, current=admitted=30, queued=20, dequeued=20, rejected=20, released=24, timed-out=0
+MainThread: DeltaSum=4 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=5 for metrics=['admitted', 'timed-out'])
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+MainThread: wait_for_metric_changes, current=admitted=30, queued=20, dequeued=20, rejected=20, released=24, timed-out=0
+MainThread: DeltaSum=4 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=5 for metrics=['admitted', 'timed-out'])
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+MainThread: wait_for_metric_changes, current=admitted=30, queued=20, dequeued=20, rejected=20, released=24, timed-out=0
+MainThread: DeltaSum=4 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=5 for metrics=['admitted', 'timed-out'])
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+MainThread: wait_for_metric_changes, current=admitted=30, queued=20, dequeued=20, rejected=20, released=24, timed-out=0
+MainThread: DeltaSum=4 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=5 for metrics=['admitted', 'timed-out'])
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+MainThread: wait_for_metric_changes, current=admitted=30, queued=20, dequeued=20, rejected=20, released=24, timed-out=0
+MainThread: DeltaSum=4 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=5 for metrics=['admitted', 'timed-out'])
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+MainThread: wait_for_metric_changes, current=admitted=30, queued=20, dequeued=20, rejected=20, released=24, timed-out=0
+MainThread: DeltaSum=4 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=5 for metrics=['admitted', 'timed-out'])
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+MainThread: wait_for_metric_changes, current=admitted=30, queued=20, dequeued=20, rejected=20, released=24, timed-out=0
+MainThread: DeltaSum=4 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=5 for metrics=['admitted', 'timed-out'])
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+MainThread: wait_for_metric_changes, current=admitted=30, queued=20, dequeued=20, rejected=20, released=24, timed-out=0
+MainThread: DeltaSum=4 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=5 for metrics=['admitted', 'timed-out'])
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+MainThread: wait_for_metric_changes, current=admitted=30, queued=20, dequeued=20, rejected=20, released=24, timed-out=0
+MainThread: DeltaSum=4 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=5 for metrics=['admitted', 'timed-out'])
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+MainThread: wait_for_metric_changes, current=admitted=30, queued=20, dequeued=20, rejected=20, released=24, timed-out=0
+MainThread: DeltaSum=4 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=5 for metrics=['admitted', 'timed-out'])
+{code}
+
+Attached logs. I think this is the interesting part:
+{noformat}
+MainThread: Main loop, curr_metrics: admitted=26, queued=20, dequeued=14, rejected=20, released=18, timed-out=0
+MainThread: Main loop, will request 6 queries to end
+MainThread: Requesting 6 clients to end queries
+MainThread: Cancelling query 2
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+MainThread: Cancelling query 14
+MainThread: Cancelling query 1
+MainThread: Cancelling query 31
+MainThread: Cancelling query 19
+MainThread: Cancelling query 23
+Thread-689: Ending query QueryHandle(log_context='c04a7c92333c0646:63dfc09c00000000', id='c04a7c92333c0646:63dfc09c00000000') by CLIENT_CLOSE
+-- closing query for operation handle: <tests.common.impala_connection.OperationHandle object at 0x7f090c016850>
+Thread-697: Ending query QueryHandle(log_context='4f4ce9ddfea34b66:4788b64100000000', id='4f4ce9ddfea34b66:4788b64100000000') by CLIENT_CLOSE
+-- closing query for operation handle: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+Thread-667: Ending query QueryHandle(log_context='7e474d8a33622077:2e7aacc800000000', id='7e474d8a33622077:2e7aacc800000000') by CLIENT_CANCEL
+-- canceling operation: <tests.common.impala_connection.OperationHandle object at 0x44ccf90>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x44ccc10>
+Thread-680: Ending query QueryHandle(log_context='364771ca11f54d6f:d826796e00000000', id='364771ca11f54d6f:d826796e00000000') by QUERY_TIMEOUT
+-- getting state for operation: <tests.common.impala_connection.OperationHandle object at 0x44ccc10>
+Thread-685: Ending query QueryHandle(log_context='b84cd4660695d218:b2b187d600000000', id='b84cd4660695d218:b2b187d600000000') by CLIENT_CLOSE
+-- closing query for operation handle: <tests.common.impala_connection.OperationHandle object at 0x7f090c016690>
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+Thread-668: Ending query QueryHandle(log_context='f04dcf86fc9b574c:86fcff5700000000', id='f04dcf86fc9b574c:86fcff5700000000') by QUERY_TIMEOUT
+-- getting state for operation: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+Thread-677: Admitted query 11
+Thread-700: Admitted query 34
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016e50>
+Thread-695: Admitted query 29
+Thread-679: Admitted query 13
+-- getting state for operation: <tests.common.impala_connection.OperationHandle object at 0x44ccc10>
+-- getting state for operation: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- getting state for operation: <tests.common.impala_connection.OperationHandle object at 0x44ccc10>
+-- getting state for operation: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+-- getting state for operation: <tests.common.impala_connection.OperationHandle object at 0x44ccc10>
+-- getting state for operation: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+Thread-671: Admitted query 5
+Thread-676: Admitted query 10
+-- fetching results from: <tests.common.impala_connection.OperationHandle object at 0x7f090c016250>
+MainThread: wait_for_metric_changes, initial=admitted=26, queued=20, dequeued=14, rejected=20, released=18, timed-out=0
+MainThread: wait_for_metric_changes, current=admitted=30, queued=20, dequeued=20, rejected=20, released=24, timed-out=0
+MainThread: DeltaSum=6 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=6 for metrics=['released'])
+MainThread: Found all 6 metrics after 0.5 seconds
+MainThread: wait_for_metric_changes, initial=admitted=26, queued=20, dequeued=14, rejected=20, released=18, timed-out=0
+MainThread: wait_for_metric_changes, current=admitted=30, queued=20, dequeued=20, rejected=20, released=24, timed-out=0
+MainThread: DeltaSum=4 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=5 for metrics=['admitted', 'timed-out'])
+MainThread: wait_for_metric_changes, current=admitted=30, queued=20, dequeued=20, rejected=20, released=24, timed-out=0
+MainThread: DeltaSum=4 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=5 for metrics=['admitted', 'timed-out'])
+MainThread: wait_for_metric_changes, current=admitted=30, queued=20, dequeued=20, rejected=20, released=24, timed-out=0
+MainThread: DeltaSum=4 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=5 for metrics=['admitted', 'timed-out'])
+MainThread: wait_for_metric_changes, current=admitted=30, queued=20, dequeued=20, rejected=20, released=24, timed-out=0
+MainThread: DeltaSum=4 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=5 for metrics=['admitted', 'timed-out'])
+MainThread: wait_for_metric_changes, current=admitted=30, queued=20, dequeued=20, rejected=20, released=24, timed-out=0
+MainThread: DeltaSum=4 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=5 for metrics=['admitted', 'timed-out'])
+MainThread: wait_for_metric_changes, current=admitted=30, queued=20, dequeued=20, rejected=20, released=24, timed-out=0
+MainThread: DeltaSum=4 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=5 for metrics=['admitted', 'timed-out'])
+
+{noformat}
+
+It looks a bit like the "admitted" and "dequeued" metrics were temporarily out of sync when we took the snapshot of the metrics:
+{noformat}
+MainThread: wait_for_metric_changes, current=admitted=10, queued=20, dequeued=0, rejected=20, released=0, timed-out=0
+...
+MainThread: Main loop, curr_metrics: admitted=18, queued=20, dequeued=8, rejected=20, released=10, timed-out=0
+...
+MainThread: wait_for_metric_changes, current=admitted=24, queued=20, dequeued=14, rejected=20, released=18, timed-out=0
+...
+MainThread: wait_for_metric_changes, initial=admitted=26, queued=20, dequeued=14, rejected=20, released=18, timed-out=0
+...
+MainThread: DeltaSum=4 Deltas={'dequeued': 6, 'admitted': 4, 'released': 6, 'rejected': 0, 'queued': 0, 'timed-out': 0} (Expected=5 for metrics=['admitted', 'timed-out'])
+{noformat}
+
+-I looked at MetricsGroup and it looks like we iterate over the metrics map in sorted order of key, so we could have taken the snapshot of the "admitted" value before the "queued" value if we got unlucky.-
+{code}
+  /// Contains all Metric objects, indexed by key
+  typedef std::map<std::string, Metric*> MetricMap;
+  MetricMap metric_map_;
+...
+  for (const MetricMap::value_type& m: metric_map_) {
+    Value metric_value;
+    m.second->ToJson(document, &metric_value);
+    metric_list.PushBack(metric_value, document->GetAllocator());
+  }
+{code}
+
+We fetch the JSON separately for each metric and parse the whole thing, so there's a large window for getting inconsistent metrics.
+
+Commit ab2fc5c8b894ef7332d9e4307eacc7842d986aae in impala's branch refs/heads/master from [~tarmstrong@cloudera.com]
+[ https://git-wip-us.apache.org/repos/asf?p=impala.git;h=ab2fc5c ]
+
+IMPALA-6227: reduce window of metric inconsistency
+
+The admission controller test fetches multiple metrics relating to the
+admission controller. Before this patch it fetched the whole metrics
+list for each metric, meaning there was a substantial window for
+the metrics to be inconsistent for a single backend. Now the metrics are
+only fetched once. Metric updates are not transactional so there is
+still a small window for raciness if an admission decision is made
+exactly when the metrics are fetched.
+
+Also try to detect the specific race between updating "dequeued"
+and "admitted" that we saw in practice, since the race is still
+possible with a smaller window. In that case we retry getting
+the metrics.
+
+Change-Id: I2f16edbec53e49446c4c37ef5f926eedb5604319
+Reviewed-on: http://gerrit.cloudera.org:8080/10330
+Reviewed-by: Tim Armstrong <tarmstrong@cloudera.com>
+Tested-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+
+
+I'm going to close since I don't have any next steps and the last commit solved one of the root causes of the flakiness (inconsistent metrics).
+
+Commit 0a0a2da46d3c3b72a0c19a3099bd038906dbfbc7 in impala's branch refs/heads/2.x from [~tarmstrong@cloudera.com]
+[ https://git-wip-us.apache.org/repos/asf?p=impala.git;h=0a0a2da ]
+
+IMPALA-6227: reduce window of metric inconsistency
+
+The admission controller test fetches multiple metrics relating to the
+admission controller. Before this patch it fetched the whole metrics
+list for each metric, meaning there was a substantial window for
+the metrics to be inconsistent for a single backend. Now the metrics are
+only fetched once. Metric updates are not transactional so there is
+still a small window for raciness if an admission decision is made
+exactly when the metrics are fetched.
+
+Also try to detect the specific race between updating "dequeued"
+and "admitted" that we saw in practice, since the race is still
+possible with a smaller window. In that case we retry getting
+the metrics.
+
+Change-Id: I2f16edbec53e49446c4c37ef5f926eedb5604319
+Reviewed-on: http://gerrit.cloudera.org:8080/10330
+Reviewed-by: Tim Armstrong <tarmstrong@cloudera.com>
+Tested-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+
+

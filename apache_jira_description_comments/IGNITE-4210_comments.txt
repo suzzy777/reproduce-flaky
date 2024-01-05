@@ -1,0 +1,105 @@
+GitHub user voipp opened a pull request:
+
+    https://github.com/apache/ignite/pull/3898
+
+    IGNITE-4210 cache store loading test fixed
+
+    
+
+You can merge this pull request into a Git repository by running:
+
+    $ git pull https://github.com/voipp/ignite IGNITE-4210
+
+Alternatively you can review and apply these changes as the patch at:
+
+    https://github.com/apache/ignite/pull/3898.patch
+
+To close this pull request, make a commit to your master/trunk branch
+with (at least) the following in the commit message:
+
+    This closes #3898
+    
+----
+commit 6819c3474206652fb5e55c98f58ee45b6c42b8a2
+Author: voipp <alkuznetsov.sb@...>
+Date:   2018-04-23T08:27:05Z
+
+    IGNITE-4210 cache store loading test fixed
+
+----
+
+
+The root cause of the bug identified.
+grid.cache(DEFAULT_CACHE_NAME).loadCache(null) performs cache loading only on few nodes(ususally one) because other nodes are in the middle of process of joining cluster.
+
+In unstable topology(multiple nodes join cluster) some entries aren't get loaded into the cache , because partitions cannot be reserved. Partitons concurrently are evicted, moved to other nodes while PME.
+
+I put cache lock on topology before grid.cache(DEFAULT_CACHE_NAME).loadCache(null), and unlocked it after loading. Test passes.
+
+So, we should lock topology before cache loading, or retry loading after topology is settled down.
+
+[~dpavlov] hi. 
+Can you plz review the ticket?
+All failed tests doesn't correspond to the patch.
+
+[~agura], could you please take a look? 
+
+TC run seems to be good, license failure is not related to fix.
+
+I'll take a look.
+
+[~Alexey Kuznetsov] From my point of view it's a not good solution because it will block partition map exchange until loadCache finish data loading and then will lead to massive data rebalancing. Better way, I believe, it's passing exception to user code in case of topology changes and then user will have possibility to manage initial data loading from cache store (e.g. user can split whole data set on blocks and retry loading of block on which topology is changed).
+
+[~agura] 
+Am I understand you correctly ? :
+1) User starts 1 grid
+2) User initiates cache store loading
+3) Additional grids connect to cluster. During PME they observe cache store loading progress(certain future was created on initiator), 
+they cancel cache store loading, pass exception to user.
+4) User receives exception during mass node start. Cache contains some values, loaded from store.
+
+I have the only question left :
+Should we cancel cache store loading if PME was initiated due to node left, or new cache created etc.? I think yes. 
+
+[~Alexey Kuznetsov] I think we should cancel cache store loading in mentioned cases.
+
+[~sergey-chugunov] [~agura] Hi
+Andrey, you propose to cancel cache store loading if PME is started.
+But there is a drawback in this idea : user might prefer PME hang than canceling cache store loading(and he could be confused seeing cache store loading was canceled by ignite).
+
+I propose to block PME if cache store loading is in progress. We should warn user that cache store loading might cause massive data rebalancing.
+This solution looks more naturally for me.
+
+What do you think about it?
+
+[~Alexey Kuznetsov] I don't see any arguments for blocking PME. Any operations on the cluster are impossible during PME so, as I said early, we must not block PME.
+
+[~agura] [~andrey-kuznetsov] In case of topology changes during store loading I wanted to throw *ClusterTopologyCheckedException* with retry future, but it failed to be serialized.
+Imagine client calling store load, and loading failed on remote node, 
+
+In this case *ClusterTopologyCheckedException* would be returned back to client, but without retry future.
+
+Is it ok, if no retry future present inside exception ?
+
+[~agura] Hi
+Now, exception is thrown to user when topology changes during cache store loading.
+
+Could you review the pr ?
+
+[~Alexey Kuznetsov] 
+I've reviewed your solution and have several concerns about it's implementation and test.
+1) Current implentation of cache loading mechanism doesn't fit into requirement that there should be no ongoing update operations during PME.
+2) We're waiting for finishing that operations at org.apache.ignite.internal.processors.cache.distributed.dht.preloader.GridDhtPartitionsExchangeFuture#waitPartitionRelease method . Cache load operations are not covered in partitions release future and have their custom workflow which is big miss now and this should be fixed.
+3) GridDhtInvalidPartitionException is throwed only when affinity for that partition is changed. What will be happened when some partitions are moved to other nodes, some not? In that case some of the cache loads will be finished with exception, some of them not. This will cause of data inconsistency between nodes after PME is finished.
+4) For me test doesn't cover well case when cluster topology is changed. Future that starts new nodes can be completed before you run load to cache store. Moreover test don't check that event with ClusterTopologyCheckedException is fired always when topology is changed. It means that sometimes test checks negative (expected) scenario, sometimes positive scneario which leads to test flakiness. 
+
+From my side of view correct solution should be implemented as below:
+1) Introduce new cache future in org.apache.ignite.internal.processors.cache.GridCacheMvccManager (as welll as locks, transactions, atomic updates futures)  that will indicate that cache loading is in progress.
+2) Create and register this future at the beginning of org.apache.ignite.internal.processors.cache.store.CacheStoreManager#loadAll method.
+3) Future should have ability to cancel. Add this future as a part of partitionsRelease future and cancel it when waitPartitionsRelease event is happened.
+4) Divide whole keys set to micro-batches in loadAll. At the end of each of micro-batch, check that CacheLoadFuture is not cancelled by waitPartitionsRelease.
+5) If future was cancelled, immediately finish this future to unblock waitPartitionsRelease and throw appropriate exception to user, that topology is changed and operation should be retired.
+6) Fix test in a way to have 100% guarantees that it checks negative scenario with cluster topology changing.
+
+The issue has moved to the next release. Please, let me know if we still should include it to the 2.10
+

@@ -1,0 +1,769 @@
+[~xuzq_zander] This is an interesting find. I have seen this happen a couple of times when a disk was removed and then added to the cluster, but was never able to reproduce. It seemed to happen somewhat randomly and resulted in the DN reporting much fewer than expected blocks to the NN and hence causing missing blocks. A DN restarted fixed it.
+
+Are you able to reproduce this problem every time, or is it caused by some sort of race condition and only happens sometimes?
+
+Looking at the source just before the activeVolume call, the new temporary map should be populated with all the replicas on the volume before it is called by getVolumeMap():
+
+{code}
+    ReplicaMap tempVolumeMap = new ReplicaMap(datasetLock);
+    fsVolume.getVolumeMap(tempVolumeMap, ramDiskReplicaTracker);
+
+    activateVolume(tempVolumeMap, sd, storageLocation.getStorageType(), ref);
+{code}
+
+If the new map is populated correctly, do you know why the call to volumeMap.addAll() causes the issue? Is it possible the tempVolumeMap object is not populated fully somehow?
+
+[~sodonnell] Thanks for your replay.
+
+Reproduce step as blow:
+ # A machine has many disks, like /media/disk1, /media/disk2, /media/disk3
+ # Each disk has some BlockPool, like /media/disk*/dn/current/BP-1, /media/disk*/dn/current/BP-2, /media/disk*/dn/current/BP-3
+ # There's a lot of datas in every BP in every disk.
+ # Then we dropped the /media/disk1 through "reconfig datanode"
+ # Sleep some times
+ # Then we add the /media/disk1 to production through "reconfig datanode"
+
+The relevant part of the code  in 'addVolume()' from current trunk looks like:
+{code:java}
+final ReplicaMap tempVolumeMap = new ReplicaMap(new AutoCloseableLock());
+ArrayList<IOException> exceptions = Lists.newArrayList();
+
+for (final NamespaceInfo nsInfo : nsInfos) {
+  String bpid = nsInfo.getBlockPoolID();
+  try {
+    fsVolume.addBlockPool(bpid, this.conf, this.timer);
+    fsVolume.getVolumeMap(bpid, tempVolumeMap, ramDiskReplicaTracker);
+  } catch (IOException e) {
+    LOG.warn("Caught exception when adding " + fsVolume +
+        ". Will throw later.", e);
+    exceptions.add(e);
+  }
+}
+if (!exceptions.isEmpty()) {
+  try {
+    sd.unlock();
+  } catch (IOException e) {
+    exceptions.add(e);
+  }
+  throw MultipleIOException.createIOException(exceptions);
+}
+
+final FsVolumeReference ref = fsVolume.obtainReference();
+setupAsyncLazyPersistThread(fsVolume);
+
+builder.build();
+activateVolume(tempVolumeMap, sd, storageType, ref);
+LOG.info("Added volume - " + location + ", StorageType: " + storageType);
+{code}
+As we all known, the tempVolumeMap.map contains only blocks for each BP of the newly added Storage.
+
+In activateVolume() will add the tempVolumeMap.map into volumeMap like blow.
+{code:java}
+/**
+ * Add all entries from the given replica map into the local replica map.
+ */
+void addAll(ReplicaMap other) {
+  map.putAll(other.map);
+}
+{code}
+But map.putAll(otherMap) will use the new values in otherMap to replace the old value in map for the same key. 
+
+The document of HashMap.putAll() as blow. These mapping will replace any mapping that this hashtable had for any of keys currently in the specified map.
+{code:java}
+/**
+ * Copies all of the mappings from the specified map to this hashtable.
+ * These mappings will replace any mappings that this hashtable had for any
+ * of the keys currently in the specified map.
+ *
+ * @param t mappings to be stored in this map
+ * @throws NullPointerException if the specified map is null
+ * @since 1.2
+ */
+public synchronized void putAll(Map<? extends K, ? extends V> t) {
+    for (Map.Entry<? extends K, ? extends V> e : t.entrySet())
+        put(e.getKey(), e.getValue());
+}{code}
+ 
+
+ 
+
+Ah, I thought the variable VolumeMap was a per volume set, but its actually a map of BPID -> Replica Info.
+
+So when we build the new tempVolumeMap, as you said, it only contains blocks for the new storage and then when it gets merged into the master VolumeMap, it wipes out all other blocks in the map as it replaces the original BPID key in the map.
+
+If I am reading this correctly, does that mean the dynamic disk add feature basically doesn't work at all and this is reproducible easily, with a single block pool?
+
+If I get some time I will see if I can reproduce this on a test cluster.
+
+I tried to reproduce this with current trunk (namenode and one DN running locally) as I had it built already and the problem does not occur. If I:
+
+# Format the NN
+# Add 10 files giving me 10 blocks
+# Add a disk and reconfig - what I expected to happen due to this bug, is it will 'forget' the 10 blocks when it issues a FBR, but it does not
+
+{code}
+<startup DN>
+...
+2019-04-27 17:06:54,561 INFO datanode.DataNode: Successfully sent block report 0x6850d9b5dfeab332,  containing 1 storage report(s), of which we sent 1. The reports had 10 total blocks and used 1 RPC(s). This took 3 msec to generate and 20 msecs for RPC and NN processing. Got back one command: FinalizeCommand/5.
+<We can see it has only 10 blocks>
+...
+<Reconfigure here>
+2019-04-27 17:13:54,111 INFO datanode.DataNode: Reconfiguring dfs.datanode.data.dir to /tmp/hadoop-sodonnell/dfs/data,/tmp/hadoop-sodonnell/dfs/data2
+2019-04-27 17:13:54,122 INFO datanode.DataNode: Adding new volumes: [DISK]file:/tmp/hadoop-sodonnell/dfs/data2
+2019-04-27 17:13:54,123 INFO common.Storage: /private/tmp/hadoop-sodonnell/dfs/data2 does not exist. Creating ...
+2019-04-27 17:13:54,281 INFO common.Storage: Lock on /tmp/hadoop-sodonnell/dfs/data2/in_use.lock acquired by nodename 7155@SOdonnell-MBP15.local
+2019-04-27 17:13:54,281 INFO common.Storage: Storage directory with location [DISK]file:/tmp/hadoop-sodonnell/dfs/data2 is not formatted for namespace 79966483. Formatting...
+2019-04-27 17:13:54,282 INFO common.Storage: Generated new storageID DS-9449564c-f688-46b8-b88d-2aacd53810f4 for directory /tmp/hadoop-sodonnell/dfs/data2 
+2019-04-27 17:13:54,304 INFO common.Storage: Locking is disabled for /tmp/hadoop-sodonnell/dfs/data2/current/BP-615868015-192.168.0.24-1556381051528
+2019-04-27 17:13:54,304 INFO common.Storage: Block pool storage directory for location [DISK]file:/tmp/hadoop-sodonnell/dfs/data2 and block pool id BP-615868015-192.168.0.24-1556381051528 is not formatted. Formatting ...
+2019-04-27 17:13:54,304 INFO common.Storage: Formatting block pool BP-615868015-192.168.0.24-1556381051528 directory /tmp/hadoop-sodonnell/dfs/data2/current/BP-615868015-192.168.0.24-1556381051528/current
+2019-04-27 17:13:54,324 INFO impl.BlockPoolSlice: Replica Cache file: /tmp/hadoop-sodonnell/dfs/data2/current/BP-615868015-192.168.0.24-1556381051528/current/replicas doesn't exist 
+2019-04-27 17:13:54,325 INFO impl.FsDatasetImpl: Added new volume: DS-9449564c-f688-46b8-b88d-2aacd53810f4
+2019-04-27 17:13:54,325 INFO impl.FsDatasetImpl: Added volume - [DISK]file:/tmp/hadoop-sodonnell/dfs/data2, StorageType: DISK
+2019-04-27 17:13:54,325 INFO datanode.DataNode: Successfully added volume: [DISK]file:/tmp/hadoop-sodonnell/dfs/data2
+2019-04-27 17:13:54,326 INFO datanode.DataNode: Block pool BP-615868015-192.168.0.24-1556381051528 (Datanode Uuid 93ca3bd5-ee44-4506-b952-dc243eac4d18): scheduling a full block report.
+2019-04-27 17:13:54,326 INFO datanode.DataNode: Forcing a full block report to localhost/127.0.0.1:8020
+2019-04-27 17:13:54,326 INFO conf.ReconfigurableBase: Property rpc.engine.org.apache.hadoop.hdfs.protocolPB.DatanodeProtocolPB is not configurable: old value: org.apache.hadoop.ipc.ProtobufRpcEngine, new value: null
+2019-04-27 17:13:54,329 INFO datanode.DataNode: Successfully sent block report 0x6850d9b5dfeab333,  containing 2 storage report(s), of which we sent 2. The reports had 10 total blocks and used 1 RPC(s). This took 0 msec to generate and 3 msecs for RPC and NN processing. Got back no commands.
+< ^^^ Note still 10 blocks reported as expected >
+{code}
+
+
+The issue seems to happen when the new volume being added has some blocks in a block pool that exists in other volumes in the Datanode. As mentioned by [~xuzq_zander], the bug is due to the way {{ReplicaMap#addAll}} is implemented. I was able to reproduce this bug on trunk by modifying one of the unit tests in {{TestDataNodeHotSwapVolumes}}.
+
+[~arpitagarwal] - did you see this problem?
+
+Yes, I just thought that perhaps the reason the problem does not reproduce is because my new disk is empty. Re-adding a non-empty disk is what causes this problem to manifest. So steps to reproduce:
+
+1. Single node local cluster with 1 storage configured. Add 10 files or so, giving a known number of blocks.
+2. Reconfigure to add a new second storage. Add say 5 more files to put 2 or 3 blocks on the new disk.
+3. Reconfigure to remove the second storage, then add it again. Then the DN should generate a FBR with only 2 or 3 blocks (ie missing those from the original storage) due to this bug.
+
+{code}
+<DN with 1 volume and 10 blocks just restarted>
+2019-04-27 19:50:12,801 INFO datanode.DataNode: Successfully sent block report 0x230a1c633c634987,  containing 1 storage report(s), of which we sent 1. The reports had 10 total blocks and used 1 RPC(s). This took 3 msec to generate and 20 msecs for RPC and NN processing. Got back one command: FinalizeCommand/5.
+{code}
+
+Now I add an empty disk and we can no issues, still 10 blocks reported:
+
+{code}
+2019-04-27 19:52:18,085 INFO impl.FsDatasetImpl: Added volume - [DISK]file:/tmp/hadoop-sodonnell/dfs/data2, StorageType: DISK
+2019-04-27 19:52:18,085 INFO datanode.DataNode: Successfully added volume: [DISK]file:/tmp/hadoop-sodonnell/dfs/data2
+2019-04-27 19:52:18,086 INFO datanode.DataNode: Block pool BP-1999061334-192.168.0.24-1556390848658 (Datanode Uuid 242e590a-b1e3-4a1e-9b32-e67cc095bb0f): scheduling a full block report.
+2019-04-27 19:52:18,087 INFO datanode.DataNode: Forcing a full block report to localhost/127.0.0.1:8020
+2019-04-27 19:52:18,087 INFO conf.ReconfigurableBase: Property rpc.engine.org.apache.hadoop.hdfs.protocolPB.DatanodeProtocolPB is not configurable: old value: org.apache.hadoop.ipc.ProtobufRpcEngine, new value: null
+2019-04-27 19:52:18,089 INFO datanode.DataNode: Successfully sent block report 0x230a1c633c634988,  containing 2 storage report(s), of which we sent 2. The reports had 10 total blocks and used 1 RPC(s). This took 1 msec to generate and 2 msecs for RPC and NN processing. Got back no commands.
+{code}
+
+Now add 5 more files, giving 15 blocks total and then remove the second volume. We can see 13 blocks reported as 2 are on the removed disk, still as expected:
+
+{code}
+2019-04-27 19:54:19,740 INFO impl.FsDatasetImpl: Removed volume: /tmp/hadoop-sodonnell/dfs/data2
+2019-04-27 19:54:19,740 INFO impl.FsDatasetImpl: Volume reference is released.
+2019-04-27 19:54:19,741 INFO common.Storage: Removing block level storage: /tmp/hadoop-sodonnell/dfs/data2/current/BP-1999061334-192.168.0.24-1556390848658
+2019-04-27 19:54:19,743 INFO datanode.DataNode: Block pool BP-1999061334-192.168.0.24-1556390848658 (Datanode Uuid 242e590a-b1e3-4a1e-9b32-e67cc095bb0f): scheduling a full block report.
+2019-04-27 19:54:19,743 INFO datanode.DataNode: Forcing a full block report to localhost/127.0.0.1:8020
+2019-04-27 19:54:19,743 INFO conf.ReconfigurableBase: Property rpc.engine.org.apache.hadoop.hdfs.protocolPB.DatanodeProtocolPB is not configurable: old value: org.apache.hadoop.ipc.ProtobufRpcEngine, new value: null
+2019-04-27 19:54:19,746 INFO datanode.DataNode: Successfully sent block report 0x230a1c633c634989,  containing 1 storage report(s), of which we sent 1. The reports had 13 total blocks and used 1 RPC(s). This took 0 msec to generate and 2 msecs for RPC and NN processing. Got back no commands.
+{code}
+
+Finally add the disk back in and the problem appears, as its no longer an empty disk. The FBR reports only 2 blocks from the new disk instead of 15 as it should:
+
+{code}
+2019-04-27 19:57:24,710 INFO impl.FsDatasetImpl: Added volume - [DISK]file:/tmp/hadoop-sodonnell/dfs/data2, StorageType: DISK
+2019-04-27 19:57:24,710 INFO datanode.DataNode: Successfully added volume: [DISK]file:/tmp/hadoop-sodonnell/dfs/data2
+2019-04-27 19:57:24,711 INFO datanode.DataNode: Block pool BP-1999061334-192.168.0.24-1556390848658 (Datanode Uuid 242e590a-b1e3-4a1e-9b32-e67cc095bb0f): scheduling a full block report.
+2019-04-27 19:57:24,711 INFO datanode.DataNode: Forcing a full block report to localhost/127.0.0.1:8020
+2019-04-27 19:57:24,711 INFO conf.ReconfigurableBase: Property rpc.engine.org.apache.hadoop.hdfs.protocolPB.DatanodeProtocolPB is not configurable: old value: org.apache.hadoop.ipc.ProtobufRpcEngine, new value: null
+2019-04-27 19:57:24,713 INFO datanode.DataNode: Successfully sent block report 0x230a1c633c63498a,  containing 2 storage report(s), of which we sent 2. The reports had 2 total blocks and used 1 RPC(s). This took 0 msec to generate and 2 msecs for RPC and NN processing. Got back no commands.
+{code}
+
+Looking at the patch [~xuzq_zander] uploaded some time ago:
+
+1. I wonder if we should change the addAll method as other parts of the code may be using it and expecting it to simply replace the blockpool? It would be worth a look around to see if its being used in any other places. Perhaps we should add a new method "mergeAll" which does what we need here and better describes its purpose?
+
+2. Rather than the new method addAndNotReplace, we should just call the existing method add:
+
+{code}
+  ReplicaInfo add(String bpid, ReplicaInfo replicaInfo) {
+    checkBlockPool(bpid);
+    checkBlock(replicaInfo);
+    try (AutoCloseableLock l = lock.acquire()) {
+      FoldedTreeSet<ReplicaInfo> set = map.get(bpid);
+      if (set == null) {
+        // Add an entry for block pool if it does not exist already
+        set = new FoldedTreeSet<>();
+        map.put(bpid, set);
+      }
+      return set.addOrReplace(replicaInfo);
+    }
+  }
+{code}
+
+It handles adding the blockpool entry if it is needed and also puts the required locking around the calls to make it threadsafe.
+
+{quote}1. I wonder if we should change the addAll method as other parts of the code may be using it and expecting it to simply replace the blockpool? It would be worth a look around to see if its being used in any other places. Perhaps we should add a new method "mergeAll" which does what we need here and better describes its purpose?
+
+2. Rather than the new method addAndNotReplace, we should just call the existing method add:
+{quote}
+[~sodonnell] I think this is a good idea, and I will  upload a new version code based the current trunk.
+
+ 
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 14m 37s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 24m 23s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m  6s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 46s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m  9s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 14m 11s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m  7s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 51s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 58s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 53s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 53s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 38s{color} | {color:orange} hadoop-hdfs-project/hadoop-hdfs: The patch generated 1 new + 90 unchanged - 0 fixed = 91 total (was 90) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m  0s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 13m 14s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 13s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 48s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 80m  7s{color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 53s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}160m 38s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hdfs.server.datanode.TestBPOfferService |
+|   | hadoop.hdfs.server.blockmanagement.TestUnderReplicatedBlocks |
+|   | hadoop.hdfs.server.datanode.TestDirectoryScanner |
+|   | hadoop.hdfs.web.TestWebHdfsTimeouts |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce base: https://builds.apache.org/job/hadoop-multibranch/job/PR-780/2/artifact/out/Dockerfile |
+| GITHUB PR | https://github.com/apache/hadoop/pull/780 |
+| JIRA Issue | HDFS-13677 |
+| Optional Tests |  dupname  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  |
+| uname | Linux 6172042187a3 4.4.0-143-generic #169~14.04.2-Ubuntu SMP Wed Feb 13 15:00:41 UTC 2019 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | personality/hadoop.sh |
+| git revision | trunk / 43b2a4b |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_191 |
+| findbugs | v3.1.0-RC1 |
+| checkstyle | https://builds.apache.org/job/hadoop-multibranch/job/PR-780/2/artifact/out/diff-checkstyle-hadoop-hdfs-project_hadoop-hdfs.txt |
+| unit | https://builds.apache.org/job/hadoop-multibranch/job/PR-780/2/artifact/out/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+|  Test Results | https://builds.apache.org/job/hadoop-multibranch/job/PR-780/2/testReport/ |
+| Max. process+thread count | 3912 (vs. ulimit of 5500) |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs U: hadoop-hdfs-project/hadoop-hdfs |
+| Console output | https://builds.apache.org/job/hadoop-multibranch/job/PR-780/2/console |
+| Powered by | Apache Yetus 0.9.0 http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 13m 34s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 19m  0s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m  1s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 44s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m  5s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 13m 56s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m  5s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 51s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 58s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 55s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 55s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 41s{color} | {color:orange} hadoop-hdfs-project/hadoop-hdfs: The patch generated 1 new + 90 unchanged - 0 fixed = 91 total (was 90) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m  2s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 13m 24s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 11s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 48s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 95m 14s{color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 33s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}168m 41s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hdfs.TestReconstructStripedFile |
+|   | hadoop.hdfs.server.namenode.ha.TestHASafeMode |
+|   | hadoop.hdfs.web.TestWebHdfsTimeouts |
+|   | hadoop.hdfs.tools.TestDFSZKFailoverController |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce base: https://builds.apache.org/job/hadoop-multibranch/job/PR-780/1/artifact/out/Dockerfile |
+| GITHUB PR | https://github.com/apache/hadoop/pull/780 |
+| JIRA Issue | HDFS-13677 |
+| Optional Tests |  dupname  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  |
+| uname | Linux b0370166451e 4.4.0-141-generic #167~14.04.1-Ubuntu SMP Mon Dec 10 13:20:24 UTC 2018 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | personality/hadoop.sh |
+| git revision | trunk / 43b2a4b |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_191 |
+| findbugs | v3.1.0-RC1 |
+| checkstyle | https://builds.apache.org/job/hadoop-multibranch/job/PR-780/1/artifact/out/diff-checkstyle-hadoop-hdfs-project_hadoop-hdfs.txt |
+| unit | https://builds.apache.org/job/hadoop-multibranch/job/PR-780/1/artifact/out/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+|  Test Results | https://builds.apache.org/job/hadoop-multibranch/job/PR-780/1/testReport/ |
+| Max. process+thread count | 2810 (vs. ulimit of 5500) |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs U: hadoop-hdfs-project/hadoop-hdfs |
+| Console output | https://builds.apache.org/job/hadoop-multibranch/job/PR-780/1/console |
+| Powered by | Apache Yetus 0.9.0 http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 22s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 22m 28s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 25s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 50s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 22s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 14m 14s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 13s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 52s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 59s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 55s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 55s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 37s{color} | {color:orange} hadoop-hdfs-project/hadoop-hdfs: The patch generated 1 new + 90 unchanged - 0 fixed = 91 total (was 90) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 13s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 13m 20s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m  8s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 47s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}100m 25s{color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 35s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}164m 16s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hdfs.server.namenode.TestNameNodeMXBean |
+|   | hadoop.hdfs.server.datanode.TestDataNodeHotSwapVolumes |
+|   | hadoop.hdfs.qjournal.server.TestJournalNodeSync |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:bdbca0e |
+| JIRA Issue | HDFS-13677 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12967305/HDFS-13677-001.patch |
+| Optional Tests |  dupname  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  |
+| uname | Linux dab98239121c 3.13.0-153-generic #203-Ubuntu SMP Thu Jun 14 08:52:28 UTC 2018 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 43b2a4b |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_191 |
+| findbugs | v3.1.0-RC1 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HDFS-Build/26720/artifact/out/diff-checkstyle-hadoop-hdfs-project_hadoop-hdfs.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/26720/artifact/out/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/26720/testReport/ |
+| Max. process+thread count | 3271 (vs. ulimit of 10000) |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs U: hadoop-hdfs-project/hadoop-hdfs |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/26720/console |
+| Powered by | Apache Yetus 0.8.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Hi [~xuzq_zander] - The new patch looks better. A couple of comments:
+
+1. I don't think we need the lock in mergeAll method, as there is a lock in the add method it calls which protects the structures. With a lock in mergeAll, if the disk being added has a lot of blocks, it could block the DN adding anything else to the volumeMap (eg new blocks being created) for a bit of time while all the volumes blocks are loaded.
+
+2. Do you think we could add a test in TestDataNodeHotSwapVolumes that reproduces the issue? Eg Have a DN with 1 volume and 5 blocks and then add another volume with 2 blocks and ensure it reports 7 blocks rather than 2.
+
+3. One test has failed in TestDataNodeHotSwapVolumes. Not sure if its related to this change or not, so we will need to dig into it and see.
+
+That failing test seems to be flaky. It failed sometimes and passed sometimes when I ran it locally even without the patch in place.
+
+Borrowing a lot from the existing tests in TestDataNodeHotSwapVolumes, here is a test that reproduces the issue without the patch and passes with the patch in place:
+
+{code}
+  /**
+   * Test re-adding one volume with some blocks on a running MiniDFSCluster
+   * with only one NameNode to reproduce HDFS-13677.
+   */
+  @Test(timeout=60000)
+  public void testReAddVolumeWithBlocks()
+      throws IOException, ReconfigurationException,
+      InterruptedException, TimeoutException {
+    startDFSCluster(1, 1);
+    String bpid = cluster.getNamesystem().getBlockPoolId();
+    final int numBlocks = 10;
+
+    Path testFile = new Path("/test");
+    createFile(testFile, numBlocks);
+
+    List<Map<DatanodeStorage, BlockListAsLongs>> blockReports =
+        cluster.getAllBlockReports(bpid);
+    assertEquals(1, blockReports.size());  // 1 DataNode
+    assertEquals(2, blockReports.get(0).size());  // 2 volumes
+
+    // Now remove the second volume
+    DataNode dn = cluster.getDataNodes().get(0);
+    Collection<String> oldDirs = getDataDirs(dn);
+    String newDirs = oldDirs.iterator().next();  // Keep the first volume.
+    assertThat(
+        "DN did not update its own config",
+        dn.reconfigurePropertyImpl(
+            DFSConfigKeys.DFS_DATANODE_DATA_DIR_KEY, newDirs),
+        is(dn.getConf().get(DFS_DATANODE_DATA_DIR_KEY)));
+    assertFileLocksReleased(
+      new ArrayList<String>(oldDirs).subList(1, oldDirs.size()));
+
+    // Now create another file - the first volume should have 15 blocks
+    // and 5 blocks on the previously removed volume
+    createFile(new Path("/test2"), numBlocks);
+    dn.scheduleAllBlockReport(0);
+    blockReports = cluster.getAllBlockReports(bpid);
+
+    assertEquals(1, blockReports.size());  // 1 DataNode
+    assertEquals(1, blockReports.get(0).size());  // 1 volume
+    for (BlockListAsLongs blockList : blockReports.get(0).values()) {
+      assertEquals(15, blockList.getNumberOfBlocks());
+    }
+
+    // Now add the original volume back again and ensure 15 blocks are reported
+    assertThat(
+        "DN did not update its own config",
+        dn.reconfigurePropertyImpl(
+            DFSConfigKeys.DFS_DATANODE_DATA_DIR_KEY, String.join(",", oldDirs)),
+        is(dn.getConf().get(DFS_DATANODE_DATA_DIR_KEY)));
+    dn.scheduleAllBlockReport(0);
+    blockReports = cluster.getAllBlockReports(bpid);
+
+    assertEquals(1, blockReports.size());  // 1 DataNode
+    assertEquals(2, blockReports.get(0).size());  // 2 volumes
+
+    // The order of the block reports is not guaranteed. As we expect 2, get the
+    // max block count and the min block count and then assert on that.
+    int minNumBlocks = Integer.MAX_VALUE;
+    int maxNumBlocks = Integer.MIN_VALUE;
+    for (BlockListAsLongs blockList : blockReports.get(0).values()) {
+      minNumBlocks = Math.min(minNumBlocks, blockList.getNumberOfBlocks());
+      maxNumBlocks = Math.max(maxNumBlocks, blockList.getNumberOfBlocks());
+    }
+    assertEquals(5, minNumBlocks);
+    assertEquals(15, maxNumBlocks);
+  }
+{code}
+
+Without the patch, the second last assertEquals will fail as zero blocks will be reported from the volume that was not removed instead of 15.
+
+Feel free to use the above test in the patch or refactor it as needed.
+
+Hi [~sodonnell] - I will drop the lock in  mergeAll(). 
+
+The testReAddVolumeWithBlocks() is very good. I need to add the code into the patch?
+
+This is my first MR, so there is somethings I don't understand.  
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 23s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 17m 28s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 56s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 41s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m  4s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 12m  3s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m  0s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 55s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m  1s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 51s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 51s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 38s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 58s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 11m 49s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m  7s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 48s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 76m 38s{color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 37s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}131m 54s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hdfs.server.blockmanagement.TestUnderReplicatedBlocks |
+|   | hadoop.hdfs.web.TestWebHdfsTimeouts |
+|   | hadoop.hdfs.TestRollingUpgrade |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce base: https://builds.apache.org/job/hadoop-multibranch/job/PR-780/3/artifact/out/Dockerfile |
+| GITHUB PR | https://github.com/apache/hadoop/pull/780 |
+| JIRA Issue | HDFS-13677 |
+| Optional Tests |  dupname  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  |
+| uname | Linux 3140035b8a9a 4.4.0-138-generic #164-Ubuntu SMP Tue Oct 2 17:16:02 UTC 2018 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | personality/hadoop.sh |
+| git revision | trunk / 43b2a4b |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_191 |
+| findbugs | v3.1.0-RC1 |
+| unit | https://builds.apache.org/job/hadoop-multibranch/job/PR-780/3/artifact/out/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+|  Test Results | https://builds.apache.org/job/hadoop-multibranch/job/PR-780/3/testReport/ |
+| Max. process+thread count | 3989 (vs. ulimit of 5500) |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs U: hadoop-hdfs-project/hadoop-hdfs |
+| Console output | https://builds.apache.org/job/hadoop-multibranch/job/PR-780/3/console |
+| Powered by | Apache Yetus 0.9.0 http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 16s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 20m 50s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m  4s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 45s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 11s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 13m 17s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m  8s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 50s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 58s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 55s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 55s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 38s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m  1s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 12m 28s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 13s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 47s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 80m  7s{color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 31s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}139m 40s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hdfs.TestMultipleNNPortQOP |
+|   | hadoop.hdfs.web.TestWebHdfsTimeouts |
+|   | hadoop.fs.viewfs.TestViewFileSystemHdfs |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:bdbca0e |
+| JIRA Issue | HDFS-13677 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12967322/HDFS-13677-002.patch |
+| Optional Tests |  dupname  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  |
+| uname | Linux f12a0f1c7d76 4.4.0-143-generic #169~14.04.2-Ubuntu SMP Wed Feb 13 15:00:41 UTC 2019 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 43b2a4b |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_191 |
+| findbugs | v3.1.0-RC1 |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/26722/artifact/out/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/26722/testReport/ |
+| Max. process+thread count | 3744 (vs. ulimit of 10000) |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs U: hadoop-hdfs-project/hadoop-hdfs |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/26722/console |
+| Powered by | Apache Yetus 0.8.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+HI [~xuzq_zander] - Thanks for the additional revision. I see you have added the test I gave above into the patch - that is the correct thing to do as if the test is in the patch it will get executed by the automated build run.
+
+The 002 patch looks good to me and the tests which failed seem unrelated to the change (there are often some tests that fail intermittently due to to load on the build server etc).
+
+Thanks [~sodonnell] !
+
+Thank you for reporting and fixing this [~xuzq_zander]. Also thanks [~sodonnell]!
+
+I am +1 on the latest patch, I especially like the targeted unit test for mergeAll.
+
+Will hold off committing for a day or two in case someone else has comments.
+
+[~xuzq_zander] Nice work. lgtm on patch rev 002. Ran unit test locally w/ and w/o the fix.
+
+FsDatasetImpl#activateVolume() is introduced in HDFS-9715, so I believe we need to backport this to 2.8.x and 2.9.x.
+
+I am going to commit this shortly.
+
+SUCCESS: Integrated in Jenkins build Hadoop-trunk-Commit #16478 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/16478/])
+HDFS-13677. Dynamic refresh Disk configuration results in overwriting (arp: rev 4b4200f1f87ad40d9c19ba160f706ffd0470a8d4)
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestReplicaMap.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/ReplicaMap.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDataNodeHotSwapVolumes.java
+
+
+Committed this to trunk and the 3.x branches.
+
+2.x needs a different patch since we cannot use lambdas there.
+
+I will resolve this for now, if someone wants to post a branch-2 patch I would be happy to review and commit it.
+
+[~arpitagarwal] I have uploaded a patch based on the 2.9 branch. Two changes were needed:
+
+1. Remove Lamdas and replace with nested for loops.
+
+2. Replace String.join with StringUtils.join as String.join does not exist in Java 7.
+
+I ran both the changed test classes locally and they all passed and the code compiles under Java 7.
+
+Thanks for the branch-2 patch [~sodonnell].
+
++1, I have committed after compiling and running affected unit tests locally.
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m  0s{color} | {color:blue} Docker mode activated. {color} |
+| {color:red}-1{color} | {color:red} patch {color} | {color:red}  0m 12s{color} | {color:red} https://github.com/apache/hadoop/pull/780 does not apply to trunk. Rebase required? Wrong Branch? See https://wiki.apache.org/hadoop/HowToContribute for help. {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| GITHUB PR | https://github.com/apache/hadoop/pull/780 |
+| JIRA Issue | HDFS-13677 |
+| Console output | https://builds.apache.org/job/hadoop-multibranch/job/PR-780/4/console |
+| versions | git=2.7.4 |
+| Powered by | Apache Yetus 0.10.0 http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m  0s{color} | {color:blue} Docker mode activated. {color} |
+| {color:red}-1{color} | {color:red} patch {color} | {color:red}  0m 11s{color} | {color:red} https://github.com/apache/hadoop/pull/780 does not apply to trunk. Rebase required? Wrong Branch? See https://wiki.apache.org/hadoop/HowToContribute for help. {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| GITHUB PR | https://github.com/apache/hadoop/pull/780 |
+| JIRA Issue | HDFS-13677 |
+| Console output | https://builds.apache.org/job/hadoop-multibranch/job/PR-780/5/console |
+| versions | git=2.17.1 |
+| Powered by | Apache Yetus 0.10.0 http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m  0s{color} | {color:blue} Docker mode activated. {color} |
+| {color:red}-1{color} | {color:red} patch {color} | {color:red}  0m 12s{color} | {color:red} https://github.com/apache/hadoop/pull/780 does not apply to trunk. Rebase required? Wrong Branch? See https://wiki.apache.org/hadoop/HowToContribute for help. {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| GITHUB PR | https://github.com/apache/hadoop/pull/780 |
+| JIRA Issue | HDFS-13677 |
+| Console output | https://builds.apache.org/job/hadoop-multibranch/job/PR-780/6/console |
+| versions | git=2.7.4 |
+| Powered by | Apache Yetus 0.10.0 http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m  0s{color} | {color:blue} Docker mode activated. {color} |
+| {color:red}-1{color} | {color:red} patch {color} | {color:red}  0m 11s{color} | {color:red} https://github.com/apache/hadoop/pull/780 does not apply to trunk. Rebase required? Wrong Branch? See https://wiki.apache.org/hadoop/HowToContribute for help. {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| GITHUB PR | https://github.com/apache/hadoop/pull/780 |
+| JIRA Issue | HDFS-13677 |
+| Console output | https://builds.apache.org/job/hadoop-multibranch/job/PR-780/7/console |
+| versions | git=2.7.4 |
+| Powered by | Apache Yetus 0.10.0 http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m  0s{color} | {color:blue} Docker mode activated. {color} |
+| {color:red}-1{color} | {color:red} patch {color} | {color:red}  0m 17s{color} | {color:red} https://github.com/apache/hadoop/pull/780 does not apply to trunk. Rebase required? Wrong Branch? See https://wiki.apache.org/hadoop/HowToContribute for help. {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| GITHUB PR | https://github.com/apache/hadoop/pull/780 |
+| JIRA Issue | HDFS-13677 |
+| Console output | https://builds.apache.org/job/hadoop-multibranch/job/PR-780/8/console |
+| versions | git=2.7.4 |
+| Powered by | Apache Yetus 0.10.0 http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Hi all, we just encountered this bug or one exactly like it in 2.10.1 .  Maybe the patch missed being merged for 2.10.0 .  Not a big deal for us we will simply stop/start the DN daemon.
+
+Huum, this change is in branch 2.8, 2.9, 3.1, 3.2 and 3.3. It has somehow missed out on branch 2.10. I will see if I can cherry-pick it over to the 2.10 release line later.
+
+I pushed this change to branch 2.10, so it will be in 2.10.2 when it is released. Thanks for letting us know about this [~seys]
+

@@ -1,0 +1,185 @@
+Steps to reproduce:
+ 1. Add `::sleep(1)` before [sending http response|https://github.com/apache/mesos/blob/95bbe784da51b3a7eaeb9127e2541ea0b2af07b5/3rdparty/libprocess/src/http.cpp#L1741] to a socket.
+ 2. Recompile and run: `make check GTEST_FILTER=ContentType/AgentAPIStreamingTest.AttachInputToNestedContainerSession/0`
+
+https://reviews.apache.org/r/66147/
+
+{noformat}
+commit 02ebf9986ab5ce883a71df72e9e3392a3e37e40e
+Author:     Andrei Budnik <abudnik@mesosphere.com>
+AuthorDate: Mon Mar 19 22:48:31 2018 +0100
+Commit:     Alexander Rukletsov <alexr@apache.org>
+CommitDate: Mon Mar 19 22:48:31 2018 +0100
+
+    Fixed disconnection for ATTACH_CONTAINER_INPUT call in IOSwitchboard.
+    
+    Previously, an http response for the `ATTACH_CONTAINER_INPUT` call
+    could be lost due to immediate termination of the IOSwitchboard
+    process after the termination of the IOSwitchboard actor. Since the
+    IOSwitchboard process didn't wait for completion of sending all
+    responses back to the agent, the agent received disconnection error.
+    To fix the issue, this patch adds explicit finalization of libprocess
+    before returning from the IOSwitchboard's main function.
+    
+    Review: https://reviews.apache.org/r/66147/
+{noformat}
+{noformat}
+commit 1ed3eae3ca09c8fdeac349d78e568d2a91be306b
+Author:     Andrei Budnik <abudnik@mesosphere.com>
+AuthorDate: Mon Mar 26 15:03:30 2018 +0200
+Commit:     Alexander Rukletsov <alexr@apache.org>
+CommitDate: Mon Mar 26 15:03:30 2018 +0200
+
+    Ensured correct termination order in IOSwitchboard's main function.
+    
+    This patch terminates `IOSwitchboardServer` actor before calling
+    `process::finalize()`. This patch is an addition to commit 02ebf9986a.
+    
+    Review: https://reviews.apache.org/r/66278/
+{noformat}
+
+I've reverted the {{finalize()}} patch for now. We should commit it after MESOS-8729 is fixed.
+{noformat}
+commit 5984cb72589415402f769190b124e172f72cfb39
+Author:     Alexander Rukletsov <alexr@apache.org>
+AuthorDate: Thu Mar 29 13:10:35 2018 +0200
+Commit:     Alexander Rukletsov <alexr@apache.org>
+CommitDate: Thu Mar 29 13:11:11 2018 +0200
+
+    Revert "Fixed disconnection for ATTACH_CONTAINER_INPUT call...".
+    
+    This reverts commit 02ebf9986ab5ce883a71df72e9e3392a3e37e40e.
+    
+    Though this patch does fix the intended issue, it apparently surfaces
+    a bug in libprocess, which leads to a deadlock during IOSwitchBoard
+    finalization. Until the libprocess bug is fixed, it is better to
+    drop a single message and have one flaky tests than have a process
+    stuck during the cleanup and have multiple flaky tests and likely
+    issues in production.
+{noformat}
+
+Once this is fixed, {{ROOT_CGROUPS_LaunchNestedContainerSessionsInParallel}} should be enabled.
+
+When the agent handles {{ATTACH_CONTAINER_INPUT}} call, it creates an HTTP [streaming connection|https://github.com/apache/mesos/blob/12636838f78ad06b66466b3d2fa9c9db94ac70b2/src/slave/http.cpp#L3104] to IOSwitchboard.
+ After the agent [sends|https://github.com/apache/mesos/blob/12636838f78ad06b66466b3d2fa9c9db94ac70b2/src/slave/http.cpp#L3141] a request to IOSwitchboard, a new instance of {{ConnectionProcess}} is created, which calls [{{ConnectionProcess::read()}}|https://github.com/apache/mesos/blob/12636838f78ad06b66466b3d2fa9c9db94ac70b2/3rdparty/libprocess/src/http.cpp#L1220] to read an HTTP response from IOSwitchboard.
+ If the socket is closed before a `\r\n\r\n` response is received, the {{ConnectionProcess}} calls `[disconnect()|https://github.com/apache/mesos/blob/12636838f78ad06b66466b3d2fa9c9db94ac70b2/3rdparty/libprocess/src/http.cpp#L1326]`, which in turn [flushes `pipeline`|https://github.com/apache/mesos/blob/12636838f78ad06b66466b3d2fa9c9db94ac70b2/3rdparty/libprocess/src/http.cpp#L1197-L1201] containing a {{Response}} promise. This leads to responding back (to the {{AttachInputToNestedContainerSession}} [test|https://github.com/apache/mesos/blob/12636838f78ad06b66466b3d2fa9c9db94ac70b2/src/tests/api_tests.cpp#L7942-L7943]) an {{HTTP 500}} error with body "Disconnected".
+
+When io redirect finishes, IOSwitchboardServerProcess calls {{terminate(self(), false)}} (here [\[1\]|https://github.com/apache/mesos/blob/12636838f78ad06b66466b3d2fa9c9db94ac70b2/src/slave/containerizer/mesos/io/switchboard.cpp#L1262] or there [\[2\]|https://github.com/apache/mesos/blob/12636838f78ad06b66466b3d2fa9c9db94ac70b2/src/slave/containerizer/mesos/io/switchboard.cpp#L1713]). Then, {{IOSwitchboardServerProcess::finalize()}} sets a value to the [`promise`|https://github.com/apache/mesos/blob/12636838f78ad06b66466b3d2fa9c9db94ac70b2/src/slave/containerizer/mesos/io/switchboard.cpp#L1304-L1308], which [unblocks {{main()}}|https://github.com/apache/mesos/blob/12636838f78ad06b66466b3d2fa9c9db94ac70b2/src/slave/containerizer/mesos/io/switchboard_main.cpp#L149-L150] function. As a result, IOSwitchboard process terminates immediately.
+
+When IOSwitchboard terminates, there could be not yet [written|https://github.com/apache/mesos/blob/12636838f78ad06b66466b3d2fa9c9db94ac70b2/3rdparty/libprocess/src/http.cpp#L1699] response messages to the socket. So, if any delay occurs before [sending|https://github.com/apache/mesos/blob/95bbe784da51b3a7eaeb9127e2541ea0b2af07b5/3rdparty/libprocess/src/http.cpp#L1742-L1748] the response back to the agent, the socket will be closed due to IOSwitchboard process termination. That leads to the aforementioned premature socket close in the agent.
+
+See my previous comment which includes steps to reproduce the bug.
+
+https://reviews.apache.org/r/65168/
+https://reviews.apache.org/r/62187/
+
+*{{master}} aka {{1.8-dev}}*:
+{noformat}
+commit 5b95bb0f21852058d22703385f2c8e139881bf1a
+Author:     Andrei Budnik <abudnik@mesosphere.com>
+AuthorDate: Tue Sep 18 19:10:14 2018 +0200
+Commit:     Alexander Rukletsov <alexr@apache.org>
+CommitDate: Tue Sep 18 19:10:14 2018 +0200
+
+    Fixed HTTP errors caused by dropped HTTP responses by IOSwitchboard.
+    
+    Previously, IOSwitchboard process could terminate before all HTTP
+    responses had been sent to the agent. In the case of
+    `ATTACH_CONTAINER_INPUT` call, we could drop a final HTTP `200 OK`
+    response, so the agent got broken HTTP connection for the call.
+    This patch introduces an acknowledgment for the received response
+    for the `ATTACH_CONTAINER_INPUT` call. This acknowledgment is a new
+    type of control messages for the `ATTACH_CONTAINER_INPUT` call. When
+    IOSwitchboard receives an acknowledgment, and io redirects are
+    finished, it terminates itself. That guarantees that the agent always
+    receives a response for the `ATTACH_CONTAINER_INPUT` call.
+    
+    Review: https://reviews.apache.org/r/65168/
+{noformat}
+{noformat}
+commit 5b95bb0f21852058d22703385f2c8e139881bf1a
+Author:     Andrei Budnik <abudnik@mesosphere.com>
+AuthorDate: Tue Sep 18 19:10:14 2018 +0200
+Commit:     Alexander Rukletsov <alexr@apache.org>
+CommitDate: Tue Sep 18 19:10:14 2018 +0200
+
+    Fixed HTTP errors caused by dropped HTTP responses by IOSwitchboard.
+    
+    Previously, IOSwitchboard process could terminate before all HTTP
+    responses had been sent to the agent. In the case of
+    `ATTACH_CONTAINER_INPUT` call, we could drop a final HTTP `200 OK`
+    response, so the agent got broken HTTP connection for the call.
+    This patch introduces an acknowledgment for the received response
+    for the `ATTACH_CONTAINER_INPUT` call. This acknowledgment is a new
+    type of control messages for the `ATTACH_CONTAINER_INPUT` call. When
+    IOSwitchboard receives an acknowledgment, and io redirects are
+    finished, it terminates itself. That guarantees that the agent always
+    receives a response for the `ATTACH_CONTAINER_INPUT` call.
+    
+    Review: https://reviews.apache.org/r/65168/
+{noformat}
+{noformat}
+commit bfa2bd24780b5c49467b3c23260855e3d8b4c948
+Author:     Andrei Budnik <abudnik@mesosphere.com>
+AuthorDate: Fri Sep 21 14:51:24 2018 +0200
+Commit:     Alexander Rukletsov <alexr@apache.org>
+CommitDate: Fri Sep 21 14:51:24 2018 +0200
+
+    Fixed disconnection while sending acknowledgment to IOSwitchboard.
+    
+    Previously, an HTTP connection to the IOSwitchboard could be garbage
+    collected before the agent sent an acknowledgment to the IOSwitchboard
+    via this connection. This patch fixes the issue by keeping a reference
+    count to the connection in a lambda callback until disconnection
+    occurs.
+    
+    Review: https://reviews.apache.org/r/68768/
+{noformat}
+{noformat}
+commit c3c77cbef818d497d8bd5e67fa72e55a7190e27a
+Author:     Andrei Budnik <abudnik@mesosphere.com>
+AuthorDate: Fri Sep 21 14:51:59 2018 +0200
+Commit:     Alexander Rukletsov <alexr@apache.org>
+CommitDate: Fri Sep 21 14:51:59 2018 +0200
+
+    Fixed broken pipe error in IOSwitchboard.
+    
+    Previous attempt to fix `HTTP 500` "broken pipe" in review /r/62187/
+    was not correct: after IOSwitchboard sends a response to the agent for
+    the `ATTACH_CONTAINER_INPUT` call, the socket is closed immediately,
+    thus causing the error on the agent. This patch adds a delay after
+    IO redirects are finished and before IOSwitchboard forcibly send a
+    response.
+    
+    Review: https://reviews.apache.org/r/68784/
+{noformat}
+*{{1.7.1}}*:
+{noformat}
+commit 1672941630960cccf66ed81b11811d84e8a4e3f0
+commit 600b388e25c49f4fac4d39bc07bcf6ffce42c679
+commit 021a8f4de1ad65167946548e3ecfa74d8e41e9c5
+commit 38a914398b6f1aaf08db4f62f4e42cdb80127eb5
+{noformat}
+*{{1.6.2}}*:
+{noformat}
+commit 2ddd6f07bebbe91e1e0d5165c4a5ae552b836303
+commit c1448f36d4c2c2c8345e7e8d1bf1f206dba18dac
+commit 55b0e94f0c8a1896ca079361d89527123faf22c6
+commit c40c92b7710b5b238b13ce6f1bacd3d75e04283b
+{noformat}
+*{{1.5.2}}*:
+{noformat}
+commit 3bf4fe22e0ed828a36d5b2ea652d07c6eef4b578
+commit 33a6bec95b44592d626874ae8deaa3e2a3bbc120
+commit 7b8195680104c2c5f61073a956f60ac961c37f45
+commit 0216002744517a6053fd782b6b4dc3d6cf77dd5e
+{noformat}
+
+commit a296b820d4d4a25f47caaa3870bc56c6437dd63e
+Author: Andrei Budnik <abudnik@mesosphere.com>
+Date:   Wed Oct 31 11:37:07 2018 -0700
+
+    Fixed compile errors on clang 3.5.
+    
+    Review: https://reviews.apache.org/r/69217/
+

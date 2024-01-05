@@ -1,0 +1,89 @@
+Profiling...2GB memory usage for single test function TestMultiRespectsLimits#testMultiLimits. Is that normal?? Need to figure out more.
+!screenshot-2.png|width=800px!
+
+Ran some other tests to get a sense of memory usage in general. Here's data from two other tests:
+- TestAssignmentManager: Size: 321M; Used: 142M; Max: 4G
+- TestStochasticLoadBalancer2: Size: 520M; Used: 181M; Max: 4G
+- TestMultiRespectsLimits#testMultiLimits : Size: 3G; Used: 2G; Max: 4G *<-- clearly way off!*
+
+Trying to learn visualVM-foo.
+Seem to be creating too many Object array, and other arrays. Trying to find out the source of their creation. As soon as i enable profiling, i stop seeing crazy memory usage problem, so it's turning out a bit non-trivial to pinpoint the sources.
+!screenshot-3.png|width=500px!
+
+It's just crazy how we have ~6 million Object[] instances. 
+And lots of instances are of size 32 containing just AsyncReqestFutureImpl.class (yes, the Class object, see the common #1297 object id). It feels like it's some java internal array, but i am sure there's something wrong going by my observation of browsing around heap dump and seeing that repeat over and over.
+!screenshot-4.png|width=800px!
+
+Time to ping recent authors of that file, [~chenheng].
+Ping [~stack] for recommendations in case he has suggestion on how to dig deeper.
+In meantime, learning OQL to better analyze java heap dump.
+
+[~appy] You want to be able to track the objects back to the reference holder. Might take a while with OQL. Commercial profilers allow you do this.
+
+The creation of AsyncReqestFutureImpl instances happens in one place only. Our AsyncProcess is awful in the number of threads it creates especially when blocked (another reason to more to async client basis).
+
+Seems the cost of retry is prohibitive. I run the TestMultiRespectsLimits#testMultiLimits with jmc. The observation, which is different from yours, is that building the exception create lots of char arrays. The {{sizeIOE}} won't be changed after initializing so we can cache the {{pair}} in order to avoid building the proto exception repeatedly.
+{code:title=RsRpcService#doNonAtomicRegionMutation}
+          // We're storing the exception since the exception and reason string won't
+          // change after the response size limit is reached.
+          if (sizeIOE == null ) {
+            // We don't need the stack un-winding do don't throw the exception.
+            // Throwing will kill the JVM's JIT.
+            //
+            // Instead just create the exception and then store it.
+            sizeIOE = new MultiActionResultTooLarge("Max size exceeded"
+                + " CellSize: " + context.getResponseCellSize()
+                + " BlockSize: " + context.getResponseBlockSize());
+
+            // Only report the exception once since there's only one request that
+            // caused the exception. Otherwise this number will dominate the exceptions count.
+            rpcServer.getMetrics().exception(sizeIOE);
+          }
+
+          // Now that there's an exception is known to be created
+          // use it for the response.
+          //
+          // This will create a copy in the builder.
+          hasResultOrException = true;
+          NameBytesPair pair = ResponseConverter.buildException(sizeIOE);
+{code}
+
+[~chia7712] can you please provide me a quick patch with what you thinking? I can profile it for memory just like above analysis.
+
+The statistic is shown below. The patch add the loop to the #testMultiLimits for more statistic.
+
+|| ||master||patch||
+|elapsed time|81s|75s|
+|total memory allocation|16.33GB|9.19GB|
+|char array|7.29GB|1.08GB|
+
+
+Here's the visualVM profile with the change (but no for-loop, to keep things same as previous graphs). Not much difference in heap usage (I think the 100mb diff is just variance since i have seen that number change more than that between runs).
+!screenshot-5.png|width=800px!
+
+!screenshot-6.png|width=800px!
+
+Client need to instantiate the exception for each row action (Get) so many objects will be created in the test case. The async client also encounter this trouble. We can do a small change to avoid creating the MultiActionResultTooLarge repeatedly on client-side since all MultiActionResultTooLarges from the same region are always the same. see the test.v2.patch. 
+
+run time: 78s -> 42s
+
+Ahh, why are we using exception here. Use of an optional boolean flag would have been better. But anyways, can't change now.
+If we are really using a free-form byte array to convey the state back, and given that in this situation it can really blow out of proportion i.e say a batch of 1000 requests reaches response limit at 100th, then we'll repeat the state (exception) for rest of 900, the best we can do now is, reduce its size. Let's not hack our system more.
+
+Here's proposed solution, including some from the changes by [~chia7712] above.
+- Cache NameBytePair for the exception
+- Pass empty string to constructor (exception class comments are good and clearly state what it means): The choice is between no exception message vs RS dying because of long GC pause since it had to build NameBytePair for 100s of requests. I saw it in tests.
+- no need of including stack trace in NameBytePair
+
+It just feels like it was bad design to use an exception object (with class name, message, stack trace, and so much byte/char copying) to return all kinds of non-Result status of the request. A simple boolean flag would have been better.
+
+bq.  It just feels like it was bad design to use an exception object (with class name, message, stack trace, and so much byte/char copying) to return all kinds of non-Result status of the request. A simple boolean flag would have been better.
+The class name of exception is necessary since the client may take different follow-up for different exception. For example, DoNotRetryIOException. The message and stack trace are useful information to debug. Hence, I'm having doubts about whether we can replace the exception object by a simple boolean flag.
+
+Would making our batches smaller help?
+
+bq. Would making our batches smaller help?
+The story is about the cost of handling the exception is directly proportional to the batch size. Ya, we can add some suggestion to user about the side effect of large batch. But I think what [~appy] are trying is to reduce the cost - make it not proportional to the batch size at least.
+
+Not on flaky lists.
+

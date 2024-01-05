@@ -1,0 +1,113 @@
+Patch which deals with this in the case of Strings, with a test case. This is a POC example; if people are happy with the approach I'll implement for the other types (float, int, etc) as I think it makes sense there also.
+
+Hey Paul,
+
+I agree that your patch is more intuitive than the current behavior, but I don't know how intuitive that is - if the sort worked on multiple tokens, you would expect it to sort lexicographically across each word, and even with your patch it won't, it will just use the first word rather than the last, right? In other words, I see it as a half fix.
+
+So while its low overhead, I wonder if any overhead is worth not getting the full fix? Currently the solution has been that you should only be sorting on single token fields - in fact, there is a check for this (that just isnt very good at checking <g>) that will possibly throw an exception if you sort on a field with multiple tokens - its just not safe unless that check is taken out (FieldCacheImpl string sorting).
+
+It appears that to do this right, we need to pay a cost in the general case and sorting across multiple tokens may not be worth that, as you can get around the limitation by using multiple fields etc now. Personally though, if a patch were to be accepted, I think it would have to fully support the correct sorting and disable that check I mentioned (again, i doubt people want to pay that perf cost though). Finally, even if the committers decide this is a good way to go, the check needs to come out at a minimum.
+
+
+
+
+Having a Document sorted last because it has "zebra", even though it has "apple" seems way incorrect.  Yes it would be ideal if Lucene _could_ perform the multi-term sort properly, but in the absence of an effective fix in the short term, having the lexographically earlier term 'picked' as the primary sort candidate is likely to generate results that match what users would expect (even if it's not quite perfect).
+
+Right now it looks blatantly silly at the presentation layer when one presents the search results with their data, and show that "apple,zebra" appears last in the list..
+
+Ah, but right now, the documentation will tell you its not supported, and possibly even that you can't do it (though you can because the check that would stop you is basically a guess). So it looks funny when presenting data because you are violating the rules<g> You are not just proposing making it work more unintuitive, but by necessity, you are also proposing Lucene support sorting on a field with multiple tokens in the first place, because the stance right now is that it does not - hence the weak guard around it in the code.
+
+
+bq. Right now it looks blatantly silly at the presentation layer when one presents the search results with their data, and show that "apple,zebra" appears last in the list.
+
+I'm not following this argument.  Will it be less silly when {zebra,apple} sorts before {banana} ?
+
+If we're going to break backwards compatibility for FieldCache users, let's break it completely and make the code throw a RuntimeException when it sees that retArray[termDocs.doc()] is non-null ... that way we are quickly alerting the client code that they are doing something very, very wrong.
+
+bq. I'm not following this argument. Will it be less silly when {zebra,apple} sorts before {banana} ?
+
+Well, at the presentation layer I don't think you'd present it like that (we don't).  We'd sort the list of attributes so that it would appear as "apple,zebra".
+
+bq. We'd sort the list of attributes so that it would appear as "apple,zebra".
+
+Again i'm missing something in your argument ... you'll put code in your application which will change the order of stored fields when displaying them so it looks better, but you won't put code in your application to ensure that multiple values aren't indexed in the first place?
+
+The application using Lucene is in the best position to decide "this is the value i want to sort on." FieldCache shouldn't guess which value to use if the application breaks the rules and indexes more then one.  the fact that FieldCache currently picks the last one is just an artifact of how it was implemented ... it is "consistent" but "undefined" behavior.
+
+if we are going to change the behavior we should change it should be an error.
+
+TrieRange has a similar problem with that (see LUCENE-1470, SOLR-940). Currently the highest precision trie field is indexed per default in a separate field to enable sorting. If there would be a possibility to only sort on the *first term of the field in the document* (not the first term in the complete TermEnum!), TrieRange would be simplier to use and Solr would support sorting on trie fields (Solr currently does not support indexing one value into two different fields without a CopyField).
+If this could be fixed before 2.9, I can simplify the API of TrieRange and may not need to deprecate unneeded helper constructs later.
+
+I think we're after somewhat different things here Uwe, but still pulling generally in the same direction.
+
+For your case, I personally am in favour of:
+1) replacing (as I did in my original patch) the loops in FieldCacheImpl that look like this:
+{code}while (termDocs.next()) {
+   retArray[termDocs.doc()] = termval;
+}{code}
+with ones that look like this:
+{code}while (termDocs.next()) {
+   if (retArray[termDocs.doc() == null) {
+     retArray[termDocs.doc()] = termval;
+   }
+}{code}
+(or == 0 for the int case, == 0.0 for the float case, whatever). This, I think, meets your sorting goal (order by lexicographically first term using simple binary ordering of the term text). You then just need either:
+a) a code path that uses FieldCacheImpl.getStrings() rather than than .getStringIndex() (the former doesn't care about the more-terms-than-documents case), but this is obviously not optimally performant
+b) a change to .getStringIndex which doesn't assume that there are fewer terms than documents. Not sure if this is harder or not.... don't know if there is an easy way to find the number of terms for a field in advance to size the array?
+I think 'multi-value fields order by the first term in binary string order' is a valid behaviour, doesn't 'dirty' the codebase, is easy to document + explain, and suits cases like Uwe's where the fact that it's stored as a String is kind of irrelevant (for TrieRange, you'd be just as happy with a byte[] as a String, right?) So that, I think, would suit you fine.
+
+2) For OUR case, we might have docs indicated above:
+doc 1: {"apple"}
+doc 2: {"banana"}
+doc 3: {"apple", "banana"}
+doc 4: {"apple", "zebra"}
+and we'd like them sorted lexicographically in what most english speakers would call the 'expected' order (1, 3, 4, 2) this won't really help (the case above was really just a half-hearted compromise). You might ask why we don't just index a single term for each ("apple", "banana", "apple/banana", "apple/zebra" and sort by that, but as well as being flaky if the separator character is used in an actual term, this breaks for multi-language sorting; 'banana' might sort before 'apple' in another locale. Imagine if these were people's surnames, we need to follow expected order. If you have 1000 values in random combinations of 10 this also makes the index terms eat up serious memory)
+
+For this case, I have attached a patch which may or may not be a useful basis for doing this behaviour 'correctly'. It's implemented as a static factory class for producing SortComparatorSources which have the correct behaviour. There's little javadoc for now, but a test case which should explain relatively easily how it works. This is very low-impact on Lucene; if people want it in Lucene-core, great; if it can go in contrib, great; if not, we can keep it separate, though for it to work there is a minor change required to [Extended]FieldCacheImpl to expose the default parsers. We could remove that, but it would be good to up those default parsers to default access.
+
+Please let me know what you think of this patch; it's not overly performance (rather than a String[] or a float[] for the terms, it uses a ArrayList<String>[] or ArrayList<Float>[], which is more overhead (especially in the latter case; 4 bytes per doc for a primitive float explodes a bit for an ArrayList of Float objects) but I suspect this will be acceptable for certain cases and can be appropriately documented.
+
+For TrieRange the proposed variant to sort by the lowest term in TermEnum is absolutely fine.
+
+Sorting against the first term in the document is simply impossible (maybe working if you use the term positions during array creation, but this will slow down and it only works with real tokenized fields, not fields like TrieRange).
+TrieRange does not use String/StringIndex sorting, the ordering is done using the raw long/int values. The arrays are filled and SortFields are instantiated using a custom FieldCache.Parser (see LUCENE-1478). So if it is ordered by the lowest term (which is always the highest precision one in TrieRange), the order would be correct.
+
+In the current version, the results would be sorted using the last term in TermEnum, which is the lowest precision. The order is then simply to unprecise (because the documents indexed with TrieRange have the lower int/long bits stripped away).
+
+The "simple" proposal is enough for trie range. Maybe we can add a option to switch between first/last term (and make this option also available to SortFields and other parts where the FieldCache is used).
+
+Yes, sorry, I might have been unclear. When I referred to 'first term' I meant 'the first term lexicographically' -- at least as far as binary order is 'lexicographically' -- i.e. the 'lowest' term.
+
+I like the idea of the pluggable behaviour, even if it's a simple boolean:
+
+{code}
+boolean sortByLowestTerm = ...
+
+if (retArray[termDocs.doc() == null || !sortByLowestTerm) {
+   retArray[termDocs.doc()] = termval;
+}
+{code}
+
+We could replace this with a pluggable 'TermSelectionPolicy' or somesuch (as suggested by Earwin on java-dev@).... perhaps something like
+
+{code}
+interface SortTermCollector {
+  void addTermText(String text);
+  Comparable toSortValue();
+}
+{code}
+
+and then use a SortTermCollector[maxDoc] in the field cache, then iterate over the array at the end to convert the SortTermCollectors into Comparables (or make them directly comparable). Implementation of addTermText would be trivial for the first and last behaviour ("if (sortValue != null) sortValue = text" and "sortValue = text") respectively but we could use it for our 'full alphabetical ordering', it could perform functions on the terms as Earwin mentions, etc. This may or may not be overkill.
+
+I'm happy to try and get the changes you'd like for TrieRange, because they're an almost-but-not-quite-acceptable compromise for us (we're using a patched version of Lucene that does this now), but I'm content to use our own class internally, happy if we can expose the DEFAULT_PARSER implementations (and anything else -- my class sits in the same package so rebasing it may expose other things that need to be made protected etc) -- and anything beyond that (landing it in contrib or core) would be brilliant.
+
+My two proposals certainly aren't mutually exclusive, they don't really touch each other.
+
+
+The goals being discussed under LUCENE-831 should match the first proposed solution, by giving you custom control over how the FieldCache array is computed from the un-inverted terms.
+
+SPRING_CLEANING_2013 JIRAS Defining the sort order on MV fields has always seemed like one of those features that is more trouble than it's worth. One can define a predictable order, but the use to the user is questionable.
+
+This issue was moved to GitHub issue: [#2446|https://github.com/apache/lucene/issues/2446].
+

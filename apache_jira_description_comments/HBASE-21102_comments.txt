@@ -1,0 +1,750 @@
+Found the reason for this and the fix seems to be simple. 
+When the processAssignQueue() happens for the regions on the crashed server
+{code}
+    for (RegionStateNode regionStateNode: regions.values()) {
+      boolean sysTable = regionStateNode.isSystemTable();
+      final List<RegionInfo> hris = sysTable? systemHRIs: userHRIs;
+      if (regionStateNode.getRegionLocation() != null) {
+        retainMap.put(regionStateNode.getRegionInfo(), regionStateNode.getRegionLocation());
+      } else {
+        hris.add(regionStateNode.getRegionInfo());
+      }
+    }
+{code}
+We will endup in creating the regionMap because all the regions have a location (that is the crashed server).
+Since we now have a retainMap we will try to go with the retainAssignment() flow in the LB.
+{code}
+    if (retainMap != null && !retainMap.isEmpty()) {
+      if (isTraceEnabled) {
+        LOG.trace("retain assign regions=" + retainMap);
+      }
+      try {
+        acceptPlan(regions, balancer.retainAssignment(retainMap, servers));
+      } catch (HBaseIOException e) {
+        LOG.warn("unable to retain assignment", e);
+        addToPendingAssignment(regions, retainMap.keySet());
+      }
+    }
+{code}
+The 'servers' passed here is the list of online servers at that point of time.
+Inside retainAssignment() generally where we don have same host hosting multiservers, we end up here
+{code}
+    // If servers from prior assignment aren't present, then lets do randomAssignment on regions.
+    if (randomAssignRegions.size() > 0) {
+      Cluster cluster = createCluster(servers, regions.keySet());
+      for (Map.Entry<ServerName, List<RegionInfo>> entry : assignments.entrySet()) {
+        ServerName sn = entry.getKey();
+        for (RegionInfo region : entry.getValue()) {
+          cluster.doAssignRegion(region, sn);
+        }
+      }
+      for (RegionInfo region : randomAssignRegions) {
+        ServerName target = randomAssignment(cluster, region, servers);
+        assignments.get(target).add(region);
+        cluster.doAssignRegion(region, target);
+        numRandomAssignments++;
+      }
+    }
+{code}
+Note the createcluster() call where we pass the current set of regions to be assigned.
+Inside createCluster()
+{code}
+  protected Cluster createCluster(List<ServerName> servers, Collection<RegionInfo> regions) {
+    // Get the snapshot of the current assignments for the regions in question, and then create
+    // a cluster out of it. Note that we might have replicas already assigned to some servers
+    // earlier. So we want to get the snapshot to see those assignments, but this will only contain
+    // replicas of the regions that are passed (for performance).
+    Map<ServerName, List<RegionInfo>> clusterState = getRegionAssignmentsByServer(regions);
+
+    for (ServerName server : servers) {
+      if (!clusterState.containsKey(server)) {
+        clusterState.put(server, EMPTY_REGION_LIST);
+      }
+    }
+    return new Cluster(regions, clusterState, null, this.regionFinder,
+        rackManager);
+  }
+{code}
+So the Cluster that we create has the regions to be assigned and the cluster state is again formed with same set of regions to be assigned and for the actual live servers we create an empty list. In a case where there are no region replicas probably this is enough as we have the servers to be assigned and the region's list but in case of replicas this cluster state does not give an indication as to where the replica regions are located. So we end up in randomly assigning these regions (including replicas) to the available live servers without minding the replica colocation.
+
+The fix here seems to be simple when we createCluster() - create the cllusterState Map with all the existing regions and its servers and then pass on the current set of regions as 'unassignedRegions' to the Cluster constructor
+{code}
+protected Cluster(
+        Collection<RegionInfo> unassignedRegions,
+        Map<ServerName, List<RegionInfo>> clusterState,
+        Map<String, Deque<BalancerRegionLoad>> loads,
+        RegionLocationFinder regionFinder,
+        RackManager rackManager) {
+{code}
+that solves the problem because when there is a region replica we get a wholistic picture of the cluster and then we do check internally if we can assign based on the replica region location. 
+
+
+Attaching an initial patch to show the fix. 
+[~huaxiang]
+Pls have a look at this. 
+
+Ok  I read this comment which says 
+{code}
+So we want to get the snapshot to see those assignments, but this will only contain
+    // replicas of the regions that are passed (for performance).
+{code}
+So for performance reasons they were doing this. So we should stick on to this and only if we see regions with replicas we try to get the snapshot of the current assignment state. 
+
+A more formal patch. Running the test cases to see if there are any missing cases. By the time, any reviews/feedback appreciated.
+
+Though the patch _1 was solving the real problem at times the test case was failing. After spending some time in debugging found that, though we do retainAssignment at the balancer level, since this is a ServerCrash case, the regions in that crashed server are randomly assigned to the existing servers. 
+So 
+{code}
+ do {
+      int i = RANDOM.nextInt(numServers);
+      sn = servers.get(i);
+    } while (cluster.wouldLowerAvailability(regionInfo, sn)
+        && iterations++ < maxIterations);
+{code}
+in test cases since we have only 4 RS and on is killed among the remaining 3 what happens is till the maxIterations we keep getting the 2 RS only where already replicas are present. So this makes the test case flaky. So in _2 patch added some little intelligence like if we reach the maxIterations before doing assigning just check if we have really used the complete list of servers. If not try to make use of all the servers and then decide the server to be assigned. In a big cluster may be this is not bound to happen but it is better to have and also ensure that the test case is not flaky.
+
+I ran the test cases in this patch around 20 times and did not get a failure .
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 12s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green}  0m  0s{color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 3 new or modified test files. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  3m 45s{color} | {color:green} master passed {color} |
+| {color:red}-1{color} | {color:red} compile {color} | {color:red}  1m 24s{color} | {color:red} hbase-server in master failed. {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 19s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  4m 36s{color} | {color:green} branch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m  2s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 29s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  3m 35s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} compile {color} | {color:red}  1m 15s{color} | {color:red} hbase-server in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} javac {color} | {color:red}  1m 15s{color} | {color:red} hbase-server in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red}  1m 14s{color} | {color:red} hbase-server: The patch generated 8 new + 302 unchanged - 2 fixed = 310 total (was 304) {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  4m  8s{color} | {color:green} patch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green}  7m 24s{color} | {color:green} Patch does not cause any errors with Hadoop 2.7.4 or 3.0.0. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m  2s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 29s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}117m 45s{color} | {color:red} hbase-server in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 20s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}152m 28s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hbase.master.procedure.TestCloneSnapshotProcedure |
+|   | hadoop.hbase.client.TestCloneSnapshotFromClient |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hbase:b002b0b |
+| JIRA Issue | HBASE-21102 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12937913/HBASE-21102_2.patch |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  shadedjars  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux d3816d97e1b9 3.13.0-139-generic #188-Ubuntu SMP Tue Jan 9 14:43:09 UTC 2018 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build/component/dev-support/hbase-personality.sh |
+| git revision | master / 7c1fad4992 |
+| maven | version: Apache Maven 3.5.4 (1edded0938998edf8bf061f1ceb3cfdeccf443fe; 2018-06-17T18:33:14Z) |
+| Default Java | 1.8.0_181 |
+| compile | https://builds.apache.org/job/PreCommit-HBASE-Build/14268/artifact/patchprocess/branch-compile-hbase-server.txt |
+| findbugs | v3.1.0-RC3 |
+| compile | https://builds.apache.org/job/PreCommit-HBASE-Build/14268/artifact/patchprocess/patch-compile-hbase-server.txt |
+| javac | https://builds.apache.org/job/PreCommit-HBASE-Build/14268/artifact/patchprocess/patch-compile-hbase-server.txt |
+| checkstyle | https://builds.apache.org/job/PreCommit-HBASE-Build/14268/artifact/patchprocess/diff-checkstyle-hbase-server.txt |
+| unit | https://builds.apache.org/job/PreCommit-HBASE-Build/14268/artifact/patchprocess/patch-unit-hbase-server.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/14268/testReport/ |
+| Max. process+thread count | 5032 (vs. ulimit of 10000) |
+| modules | C: hbase-server U: hbase-server |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/14268/console |
+| Powered by | Apache Yetus 0.7.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+[~huaxiang]
+Pls take a look at the patch. It now reliably assigns the replica regions in the right way in cases where we have servers >= num of replicas.
+
+All failed test cases seems to pass. The failure is due to some env issue. Fixed checkstyle issues. Will put this in QA.
+
+[~ram_krish], I was out this weekend, will take a look tomorrow morning PST, thanks.
+
+Ping [~huaxiang].
+
+Sorry, [~ram_krish]. Somehow, I thought this review as the other read replica review(which was committed) and totally ignored this one. I am reviewing now, sorry for the delay!
+
+No problem. Appreciate your time.
+Here is the RB link - https://reviews.apache.org/r/68605/.
+
++1, a nit, the following else branch does not seem necessary. I did a test to verify that.
+
+{code}
++    List<ServerName> usedSNs = new ArrayList<ServerName>(servers.size());
+     do {
+       int i = RANDOM.nextInt(numServers);
+       sn = servers.get(i);
++      if (!usedSNs.contains(sn)) {
++        usedSNs.add(sn);
++      } else {
++        continue;
++      }
+// Huaxiang: the else branch does not seem necessary. I did a test, with continue, it still // goes through the while conditions.
+     } while (cluster.wouldLowerAvailability(regionInfo, sn)
+         && iterations++ < maxIterations);
++    if (iterations >= maxIterations) {
++      // We have reached the max. Means the servers that we collected is still lowering the
++      // availability
++      for (ServerName unusedServer : servers) {
++        if (!usedSNs.contains(unusedServer)) {
++          // check if any other unused server is there for us to use.
++          // If so use it. Else we have not other go but to go with one of them
++          if (!cluster.wouldLowerAvailability(regionInfo, unusedServer)) {
++            sn = unusedServer;
++            break;
++          }
++        }
++      }
++    }
+{code}
+
+[~ram_krish] +1 It looks good to me overall. I commented very small things in the RB.
+
+[~huaxiang] and [~brfrn169]
+Thanks for the reviews and your time. Looking at them now. Will update patch shortly and commit it to respective branches. 
+
+Pushed to master and branch-2. Thanks for the reviews. 
+[~Apache9]
+Let me know if you want this fix in 2.1. This is a bug fix only. 
+
+Yes I think this is a bug fix. +1 on committing to branch-2.1.
+
+Results for branch branch-2
+	[build #1229 on builds.a.o|https://builds.apache.org/job/HBase%20Nightly/job/branch-2/1229/]: (x) *{color:red}-1 overall{color}*
+----
+details (if available):
+
+(/) {color:green}+1 general checks{color}
+-- For more information [see general report|https://builds.apache.org/job/HBase%20Nightly/job/branch-2/1229//General_Nightly_Build_Report/]
+
+
+
+
+(x) {color:red}-1 jdk8 hadoop2 checks{color}
+-- For more information [see jdk8 (hadoop2) report|https://builds.apache.org/job/HBase%20Nightly/job/branch-2/1229//JDK8_Nightly_Build_Report_(Hadoop2)/]
+
+
+(x) {color:red}-1 jdk8 hadoop3 checks{color}
+-- For more information [see jdk8 (hadoop3) report|https://builds.apache.org/job/HBase%20Nightly/job/branch-2/1229//JDK8_Nightly_Build_Report_(Hadoop3)/]
+
+
+(/) {color:green}+1 source release artifact{color}
+-- See build output for details.
+
+
+(/) {color:green}+1 client integration test{color}
+
+
+There are some failed tests and one of them is the test attached in this patch. Will check it and be back here.
+
+I ran the test 25 times against branch-2 and not able to reproduce the failure. 
+
+Try pre commit again?
+
+bq.Try pre commit again?
+So you mean revert and try again?
+
+Oh you have already commited to master and branch-2? There is no green pre commit result yet so I thought we haven't committed it yet.
+
+Then let's try the patch for branch-2.1?
+
+In precommit I got a clear run
+bq.https://builds.apache.org/job/PreCommit-HBASE-Build/14268/testReport/org.apache.hadoop.hbase.master.procedure/TestServerCrashProcedureWithReplicas/
+
+Infact I ran the failing test cases in that report and they were not related to this. Hence I went ahead with the commit. 
+One fact is that I think after the commit I have not seen the master branch 'Test Report'. I can try for branch-2.1. I am working on it to prepare a patch. 
+
+This one showed up on the flaky list. You could see the logs to find out what's wrong. [~ram_krish]
+
+[~Apache9]
+I already downloaded the artificats from the build and verified the logs. The existing logs does not give much info. When I wanted to fix the flakiness before I committed the patch I added intermediatory logs and only then found that the randomAssignment() was having some issues. Since in my local cluster the test passes consistently I would like to push in some Logs and then rerun the tests. Probably in precommits. If pre-commit does not fail then let me push those logs and then generate a build. But one question I have is will the flakey test re run after the commit with Log msgs added is done?
+
+HBASE-21197 is for this problem? I think we can resolve this issue first and start working on fixing the UT there. After that we can open backport issues.
+
+Oh I see. Some one has raised an issue for the failures. I am just seeing it. 
+
+Fixed the reason for the UT failure. It was because in the LB code I was trying to see if the list of regions had atleast one replica. It was so happening that in my test env (even today I ran it 25 times) every time I was getting more than 5 regions to the retain Assignment API. So  one of them turned out to be a replica region always. But in the jenkins build it was so happening that the list of regions had only one region and that one region was a primary region. So when it was the case we were not taking the entire snapshot of assignment so we were doing its assignment to the server where there was another replica. 
+It would be better if we can centrally know some where that for a given region are there any replicas without iterating through the AM's region states. Other way is to get the details from the TableDescriptor of Master but I fear it is not using the cache in the master side and we may end up doing a FS read there.  
+
+Let me make the method that says whether replica or not - better. The current one in the addendum patch is not that great.
+
+This new addendum is better since we get the regions list from the tail map of the RegionState's regionMap. And if we move to the next region we immediately break the loop. 
+
+Addendum looks good.
+{code}
+  public boolean isReplicaAvailbleForRegion(final RegionInfo info) {
+{code}
+Missing 'a' in 'Availble'
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 12s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green}  0m  0s{color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:orange}-0{color} | {color:orange} test4tests {color} | {color:orange}  0m  0s{color} | {color:orange} The patch doesn't appear to include any new or modified tests. Please justify why no new tests are needed for this patch. Also please list what manual steps were performed to verify this patch. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  6m  3s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  2m  4s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 18s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  4m 28s{color} | {color:green} branch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 18s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 32s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  5m 14s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  2m  0s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  2m  0s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red}  1m 18s{color} | {color:red} hbase-server: The patch generated 2 new + 74 unchanged - 0 fixed = 76 total (was 74) {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  4m 39s{color} | {color:green} patch has no errors when building our shaded downstream artifacts. {color} |
+| {color:red}-1{color} | {color:red} hadoopcheck {color} | {color:red}  6m 23s{color} | {color:red} The patch causes 10 errors with Hadoop v3.0.0. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 20s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 33s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}138m 16s{color} | {color:red} hbase-server in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 27s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}178m 31s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hbase.master.assignment.TestAssignmentManager |
+|   | hadoop.hbase.master.balancer.TestBaseLoadBalancer |
+|   | hadoop.hbase.master.assignment.TestAMAssignWithRandExec |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hbase:b002b0b |
+| JIRA Issue | HBASE-21102 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12939671/HBASE-21102_addendum.patch |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  shadedjars  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux 44883cbfad62 4.4.0-134-generic #160~14.04.1-Ubuntu SMP Fri Aug 17 11:07:07 UTC 2018 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build/component/dev-support/hbase-personality.sh |
+| git revision | master / 5d14c1af65 |
+| maven | version: Apache Maven 3.5.4 (1edded0938998edf8bf061f1ceb3cfdeccf443fe; 2018-06-17T18:33:14Z) |
+| Default Java | 1.8.0_181 |
+| findbugs | v3.1.0-RC3 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HBASE-Build/14416/artifact/patchprocess/diff-checkstyle-hbase-server.txt |
+| hadoopcheck | https://builds.apache.org/job/PreCommit-HBASE-Build/14416/artifact/patchprocess/patch-javac-3.0.0.txt |
+| unit | https://builds.apache.org/job/PreCommit-HBASE-Build/14416/artifact/patchprocess/patch-unit-hbase-server.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/14416/testReport/ |
+| Max. process+thread count | 4904 (vs. ulimit of 10000) |
+| modules | C: hbase-server U: hbase-server |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/14416/console |
+| Powered by | Apache Yetus 0.7.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Solved the test case issue. The services could be null in test cases where cluster is not spawned. 
+[~Apache9]
+Still I cannot see the failed test case running after the addendum. It is not in the list of tests. Is it because it is flaky test?
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 14s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green}  0m  0s{color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:orange}-0{color} | {color:orange} test4tests {color} | {color:orange}  0m  0s{color} | {color:orange} The patch doesn't appear to include any new or modified tests. Please justify why no new tests are needed for this patch. Also please list what manual steps were performed to verify this patch. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  6m 17s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 58s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 17s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  4m 45s{color} | {color:green} branch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 18s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 40s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  5m 26s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 48s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  1m 48s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red}  1m 18s{color} | {color:red} hbase-server: The patch generated 1 new + 74 unchanged - 0 fixed = 75 total (was 74) {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  4m 23s{color} | {color:green} patch has no errors when building our shaded downstream artifacts. {color} |
+| {color:red}-1{color} | {color:red} hadoopcheck {color} | {color:red}  5m 56s{color} | {color:red} The patch causes 10 errors with Hadoop v3.0.0. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 18s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 31s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}130m 40s{color} | {color:red} hbase-server in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 20s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}170m 36s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hbase.master.balancer.TestBaseLoadBalancer |
+|   | hadoop.hbase.master.assignment.TestAMAssignWithRandExec |
+|   | hadoop.hbase.master.assignment.TestAssignmentManager |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hbase:b002b0b |
+| JIRA Issue | HBASE-21102 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12939683/HBASE-21102_addendum.patch |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  shadedjars  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux 12a4cae49838 3.13.0-143-generic #192-Ubuntu SMP Tue Feb 27 10:45:36 UTC 2018 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build/component/dev-support/hbase-personality.sh |
+| git revision | master / 5d14c1af65 |
+| maven | version: Apache Maven 3.5.4 (1edded0938998edf8bf061f1ceb3cfdeccf443fe; 2018-06-17T18:33:14Z) |
+| Default Java | 1.8.0_181 |
+| findbugs | v3.1.0-RC3 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HBASE-Build/14417/artifact/patchprocess/diff-checkstyle-hbase-server.txt |
+| hadoopcheck | https://builds.apache.org/job/PreCommit-HBASE-Build/14417/artifact/patchprocess/patch-javac-3.0.0.txt |
+| unit | https://builds.apache.org/job/PreCommit-HBASE-Build/14417/artifact/patchprocess/patch-unit-hbase-server.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/14417/testReport/ |
+| Max. process+thread count | 5373 (vs. ulimit of 10000) |
+| modules | C: hbase-server U: hbase-server |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/14417/console |
+| Powered by | Apache Yetus 0.7.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 13s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green}  0m  0s{color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:orange}-0{color} | {color:orange} test4tests {color} | {color:orange}  0m  0s{color} | {color:orange} The patch doesn't appear to include any new or modified tests. Please justify why no new tests are needed for this patch. Also please list what manual steps were performed to verify this patch. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  5m  4s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 44s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 13s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  4m 29s{color} | {color:green} branch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 19s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 35s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  5m 12s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 46s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  1m 46s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red}  1m 14s{color} | {color:red} hbase-server: The patch generated 1 new + 74 unchanged - 0 fixed = 75 total (was 74) {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  4m  9s{color} | {color:green} patch has no errors when building our shaded downstream artifacts. {color} |
+| {color:red}-1{color} | {color:red} hadoopcheck {color} | {color:red}  5m 43s{color} | {color:red} The patch causes 10 errors with Hadoop v3.0.0. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m  3s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 29s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}123m  4s{color} | {color:green} hbase-server in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 20s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}160m  5s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hbase:b002b0b |
+| JIRA Issue | HBASE-21102 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12939712/HBASE-21102_addendum.patch |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  shadedjars  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux 4d5c3a52de96 3.13.0-139-generic #188-Ubuntu SMP Tue Jan 9 14:43:09 UTC 2018 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build/component/dev-support/hbase-personality.sh |
+| git revision | master / 5d14c1af65 |
+| maven | version: Apache Maven 3.5.4 (1edded0938998edf8bf061f1ceb3cfdeccf443fe; 2018-06-17T18:33:14Z) |
+| Default Java | 1.8.0_181 |
+| findbugs | v3.1.0-RC3 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HBASE-Build/14418/artifact/patchprocess/diff-checkstyle-hbase-server.txt |
+| hadoopcheck | https://builds.apache.org/job/PreCommit-HBASE-Build/14418/artifact/patchprocess/patch-javac-3.0.0.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/14418/testReport/ |
+| Max. process+thread count | 4929 (vs. ulimit of 10000) |
+| modules | C: hbase-server U: hbase-server |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/14418/console |
+| Powered by | Apache Yetus 0.7.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+[~Apache9]
+After the patch still the TestServerCrashProcedureWithReplicas does not run in the pre-commit. Is it because it is already marked flakey?
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m  0s{color} | {color:blue} Docker mode activated. {color} |
+| {color:red}-1{color} | {color:red} patch {color} | {color:red}  0m  4s{color} | {color:red} HBASE-21102 does not apply to master. Rebase required? Wrong Branch? See https://yetus.apache.org/documentation/0.7.0/precommit-patchnames for help. {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| JIRA Issue | HBASE-21102 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12939923/HBASE-21102_branch-2.1.patch |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/14430/console |
+| Powered by | Apache Yetus 0.7.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Patch that was pushed to branch-2.1. This is along with the addendum fix. 
+I am trying to figure if there is a way to remove the excluded flakey tests during pre-commit and build time and I am finding a way to do it. 
+The pre-commit has this
+ DOCKER_EXTRAARGS=--env=EXCLUDE_TESTS_URL=https://builds.apache.org/job/HBase-Find-Flaky-Tests/job/master/lastSuccessfulBuild/artifact/excludes/
+
+from the personality.sh file and that 'excludes' file has the failing test TestServerCrashProcedureWithReplicas and hence it is not getting picked up at all. How should we make that test to be included again? 
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m  0s{color} | {color:blue} Docker mode activated. {color} |
+| {color:red}-1{color} | {color:red} patch {color} | {color:red}  0m  4s{color} | {color:red} HBASE-21102 does not apply to master. Rebase required? Wrong Branch? See https://yetus.apache.org/documentation/0.7.0/precommit-patchnames for help. {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| JIRA Issue | HBASE-21102 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12940021/HBASE-21102_branch-2.1.patch |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/14433/console |
+| Powered by | Apache Yetus 0.7.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Results for branch branch-2.1
+	[build #340 on builds.a.o|https://builds.apache.org/job/HBase%20Nightly/job/branch-2.1/340/]: (x) *{color:red}-1 overall{color}*
+----
+details (if available):
+
+(/) {color:green}+1 general checks{color}
+-- For more information [see general report|https://builds.apache.org/job/HBase%20Nightly/job/branch-2.1/340//General_Nightly_Build_Report/]
+
+
+
+
+(x) {color:red}-1 jdk8 hadoop2 checks{color}
+-- For more information [see jdk8 (hadoop2) report|https://builds.apache.org/job/HBase%20Nightly/job/branch-2.1/340//JDK8_Nightly_Build_Report_(Hadoop2)/]
+
+
+(x) {color:red}-1 jdk8 hadoop3 checks{color}
+-- For more information [see jdk8 (hadoop3) report|https://builds.apache.org/job/HBase%20Nightly/job/branch-2.1/340//JDK8_Nightly_Build_Report_(Hadoop3)/]
+
+
+(/) {color:green}+1 source release artifact{color}
+-- See build output for details.
+
+
+(/) {color:green}+1 client integration test{color}
+
+
+The build for branch-2.1 was successful for the flaky test. 
+As per the discussion on mail list- I have pushed the addendum to master and branch-2. Will see for one or two builds and then mark this JIRA as resolved.
+Thanks for the reviews [~yuzhihong@gmail.com] and [~Apache9].
+
+
+Results for branch branch-2
+	[build #1266 on builds.a.o|https://builds.apache.org/job/HBase%20Nightly/job/branch-2/1266/]: (x) *{color:red}-1 overall{color}*
+----
+details (if available):
+
+(/) {color:green}+1 general checks{color}
+-- For more information [see general report|https://builds.apache.org/job/HBase%20Nightly/job/branch-2/1266//General_Nightly_Build_Report/]
+
+
+
+
+(x) {color:red}-1 jdk8 hadoop2 checks{color}
+-- For more information [see jdk8 (hadoop2) report|https://builds.apache.org/job/HBase%20Nightly/job/branch-2/1266//JDK8_Nightly_Build_Report_(Hadoop2)/]
+
+
+(x) {color:red}-1 jdk8 hadoop3 checks{color}
+-- For more information [see jdk8 (hadoop3) report|https://builds.apache.org/job/HBase%20Nightly/job/branch-2/1266//JDK8_Nightly_Build_Report_(Hadoop3)/]
+
+
+(/) {color:green}+1 source release artifact{color}
+-- See build output for details.
+
+
+(/) {color:green}+1 client integration test{color}
+
+
+Results for branch master
+	[build #498 on builds.a.o|https://builds.apache.org/job/HBase%20Nightly/job/master/498/]: (x) *{color:red}-1 overall{color}*
+----
+details (if available):
+
+(/) {color:green}+1 general checks{color}
+-- For more information [see general report|https://builds.apache.org/job/HBase%20Nightly/job/master/498//General_Nightly_Build_Report/]
+
+
+
+
+(x) {color:red}-1 jdk8 hadoop2 checks{color}
+-- For more information [see jdk8 (hadoop2) report|https://builds.apache.org/job/HBase%20Nightly/job/master/498//JDK8_Nightly_Build_Report_(Hadoop2)/]
+
+
+(x) {color:red}-1 jdk8 hadoop3 checks{color}
+-- For more information [see jdk8 (hadoop3) report|https://builds.apache.org/job/HBase%20Nightly/job/master/498//JDK8_Nightly_Build_Report_(Hadoop3)/]
+
+
+(/) {color:green}+1 source release artifact{color}
+-- See build output for details.
+
+
+(/) {color:green}+1 client integration test{color}
+
+
+From https://builds.apache.org/job/HBase%20Nightly/job/branch-2/1267/testReport/junit/org.apache.hadoop.hbase.master.balancer/TestRSGroupBasedLoadBalancer/health_checks___yetus_jdk8_hadoop3_checks___testRetainAssignment/ :
+{code}
+java.lang.NullPointerException
+	at org.apache.hadoop.hbase.master.balancer.TestRSGroupBasedLoadBalancer.testRetainAssignment(TestRSGroupBasedLoadBalancer.java:166)
+{code}
+It was due to this code:
+{code}
+      if (this.services != null && this.services.getAssignmentManager() != null) { // for tests
+        if (!hasRegionReplica && this.services.getAssignmentManager().getRegionStates()
+            .isReplicaAvailableForRegion(region)) {
+{code}
+this.services.getAssignmentManager().getRegionStates() may return null.
+Ram:
+Can you take a look at 21102.addendum2.txt ?
+
+The above test passes with the additional check.
+
+| (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 12s{color} | {color:blue} Docker mode activated. {color} |
+| {color:blue}0{color} | {color:blue} patch {color} | {color:blue}  0m  1s{color} | {color:blue} The patch file was not named according to hbase's naming conventions. Please see https://yetus.apache.org/documentation/0.7.0/precommit-patchnames for instructions. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green}  0m  0s{color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:orange}-0{color} | {color:orange} test4tests {color} | {color:orange}  0m  0s{color} | {color:orange} The patch doesn't appear to include any new or modified tests. Please justify why no new tests are needed for this patch. Also please list what manual steps were performed to verify this patch. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  5m  5s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 44s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 11s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  4m 11s{color} | {color:green} branch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m  6s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 37s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  5m 19s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 50s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  1m 50s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 12s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  4m 14s{color} | {color:green} patch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green} 10m 40s{color} | {color:green} Patch does not cause any errors with Hadoop 2.7.4 or 3.0.0. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m  9s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 31s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}123m 37s{color} | {color:green} hbase-server in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 22s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}165m 26s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hbase:b002b0b |
+| JIRA Issue | HBASE-21102 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12940320/21102.addendum2.txt |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  shadedjars  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux f8632bd77be4 3.13.0-143-generic #192-Ubuntu SMP Tue Feb 27 10:45:36 UTC 2018 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build/component/dev-support/hbase-personality.sh |
+| git revision | master / cebb725a9f |
+| maven | version: Apache Maven 3.5.4 (1edded0938998edf8bf061f1ceb3cfdeccf443fe; 2018-06-17T18:33:14Z) |
+| Default Java | 1.8.0_181 |
+| findbugs | v3.1.0-RC3 |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/14449/testReport/ |
+| Max. process+thread count | 5039 (vs. ulimit of 10000) |
+| modules | C: hbase-server U: hbase-server |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/14449/console |
+| Powered by | Apache Yetus 0.7.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Thanks Ted. +1 for the addendum. Seems it is a 'SmallTest' and hence the RegionStates is null. But why is that the pre-commit did not indicate the test failure? And I can see it is not even there in the test report. 
+Will you be committing the addendum?
+
+I will commit tomorrow. 
+
+The failing test is in hbase-rsgroups, a different module. So qa didn't run that test.
+
+Results for branch branch-2
+	[build #1273 on builds.a.o|https://builds.apache.org/job/HBase%20Nightly/job/branch-2/1273/]: (x) *{color:red}-1 overall{color}*
+----
+details (if available):
+
+(/) {color:green}+1 general checks{color}
+-- For more information [see general report|https://builds.apache.org/job/HBase%20Nightly/job/branch-2/1273//General_Nightly_Build_Report/]
+
+
+
+
+(x) {color:red}-1 jdk8 hadoop2 checks{color}
+-- For more information [see jdk8 (hadoop2) report|https://builds.apache.org/job/HBase%20Nightly/job/branch-2/1273//JDK8_Nightly_Build_Report_(Hadoop2)/]
+
+
+(x) {color:red}-1 jdk8 hadoop3 checks{color}
+-- For more information [see jdk8 (hadoop3) report|https://builds.apache.org/job/HBase%20Nightly/job/branch-2/1273//JDK8_Nightly_Build_Report_(Hadoop3)/]
+
+
+(/) {color:green}+1 source release artifact{color}
+-- See build output for details.
+
+
+(/) {color:green}+1 client integration test{color}
+
+
+Results for branch master
+	[build #501 on builds.a.o|https://builds.apache.org/job/HBase%20Nightly/job/master/501/]: (x) *{color:red}-1 overall{color}*
+----
+details (if available):
+
+(/) {color:green}+1 general checks{color}
+-- For more information [see general report|https://builds.apache.org/job/HBase%20Nightly/job/master/501//General_Nightly_Build_Report/]
+
+
+
+
+(x) {color:red}-1 jdk8 hadoop2 checks{color}
+-- For more information [see jdk8 (hadoop2) report|https://builds.apache.org/job/HBase%20Nightly/job/master/501//JDK8_Nightly_Build_Report_(Hadoop2)/]
+
+
+(x) {color:red}-1 jdk8 hadoop3 checks{color}
+-- For more information [see jdk8 (hadoop3) report|https://builds.apache.org/job/HBase%20Nightly/job/master/501//JDK8_Nightly_Build_Report_(Hadoop3)/]
+
+
+(/) {color:green}+1 source release artifact{color}
+-- See build output for details.
+
+
+(/) {color:green}+1 client integration test{color}
+
+
+Resolving as the test is no more flaky. It is there in the flaky dashboard and it has failed 1 among the 40 times it has run and that failure is when the entire set of flaky tests had not run. 
+Thanks every one.
+

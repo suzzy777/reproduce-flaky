@@ -1,0 +1,4076 @@
+kirklund opened a new pull request #5728:
+URL: https://github.com/apache/geode/pull/5728
+
+
+   
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+demery-pivotal commented on a change in pull request #5728:
+URL: https://github.com/apache/geode/pull/5728#discussion_r535522701
+
+
+
+##########
+File path: geode-core/src/distributedTest/java/org/apache/geode/management/JMXMBeanLocatorRestartTest.java
+##########
+@@ -0,0 +1,317 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more contributor license
++ * agreements. See the NOTICE file distributed with this work for additional information regarding
++ * copyright ownership. The ASF licenses this file to You under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance with the License. You may obtain a
++ * copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software distributed under the License
++ * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
++ * or implied. See the License for the specific language governing permissions and limitations under
++ * the License.
++ */
++package org.apache.geode.management;
++
++import static java.lang.management.ManagementFactory.getPlatformMBeanServer;
++import static java.util.Arrays.asList;
++import static java.util.concurrent.TimeUnit.MINUTES;
++import static javax.management.ObjectName.getInstance;
++import static org.apache.geode.cache.Region.SEPARATOR;
++import static org.apache.geode.distributed.ConfigurationProperties.HTTP_SERVICE_PORT;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER_PORT;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER_START;
++import static org.apache.geode.distributed.ConfigurationProperties.LOCATORS;
++import static org.apache.geode.distributed.ConfigurationProperties.LOG_FILE;
++import static org.apache.geode.distributed.ConfigurationProperties.MAX_WAIT_TIME_RECONNECT;
++import static org.apache.geode.distributed.ConfigurationProperties.MEMBER_TIMEOUT;
++import static org.apache.geode.distributed.internal.membership.api.MembershipManagerHelper.crashDistributedSystem;
++import static org.apache.geode.internal.AvailablePortHelper.getRandomAvailableTCPPorts;
++import static org.apache.geode.test.awaitility.GeodeAwaitility.getTimeout;
++import static org.apache.geode.test.dunit.Disconnect.disconnectAllFromDS;
++import static org.apache.geode.test.dunit.IgnoredException.addIgnoredException;
++import static org.apache.geode.test.dunit.Invoke.invokeInEveryVM;
++import static org.apache.geode.test.dunit.VM.getVM;
++import static org.apache.geode.test.dunit.VM.getVMId;
++import static org.apache.geode.util.internal.GeodeGlossary.GEMFIRE_PREFIX;
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.mockito.Mockito.mock;
++
++import java.io.File;
++import java.io.Serializable;
++import java.util.HashSet;
++import java.util.Set;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.atomic.AtomicReference;
++
++import javax.management.MalformedObjectNameException;
++import javax.management.ObjectName;
++
++import org.awaitility.core.ConditionFactory;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++
++import org.apache.geode.CancelException;
++import org.apache.geode.ForcedDisconnectException;
++import org.apache.geode.alerting.internal.spi.AlertingIOException;
++import org.apache.geode.cache.CacheClosedException;
++import org.apache.geode.distributed.DistributedSystemDisconnectedException;
++import org.apache.geode.distributed.LocatorLauncher;
++import org.apache.geode.distributed.ServerLauncher;
++import org.apache.geode.distributed.internal.InternalLocator;
++import org.apache.geode.distributed.internal.membership.api.MemberDisconnectedException;
++import org.apache.geode.test.awaitility.GeodeAwaitility;
++import org.apache.geode.test.dunit.VM;
++import org.apache.geode.test.dunit.rules.DistributedErrorCollector;
++import org.apache.geode.test.dunit.rules.DistributedRestoreSystemProperties;
++import org.apache.geode.test.dunit.rules.DistributedRule;
++import org.apache.geode.test.junit.rules.GfshCommandRule;
++import org.apache.geode.test.junit.rules.serializable.SerializableTemporaryFolder;
++
++public class JMXMBeanLocatorRestartTest implements Serializable {
++
++  private static final long TIMEOUT_MILLIS = getTimeout().toMillis();
++  private static final LocatorLauncher DUMMY_LOCATOR = mock(LocatorLauncher.class);
++  private static final ServerLauncher DUMMY_SERVER = mock(ServerLauncher.class);
++
++  private static final AtomicReference<CountDownLatch> BEFORE =
++      new AtomicReference<>(new CountDownLatch(0));
++  private static final AtomicReference<CountDownLatch> AFTER =
++      new AtomicReference<>(new CountDownLatch(0));
++
++  private static final AtomicReference<LocatorLauncher> LOCATOR =
++      new AtomicReference<>(DUMMY_LOCATOR);
++  private static final AtomicReference<ServerLauncher> SERVER =
++      new AtomicReference<>(DUMMY_SERVER);
++
++  private VM locatorVM;
++  private VM serverVM;
++
++  private String locatorName;
++  private String serverName;
++  private String locators;
++  private int locatorPort;
++  private int locatorJmxPort;
++  private String regionName;
++  private Set<ObjectName> mxbeansOnServer;
++  private Set<ObjectName> mxbeansOnLocator;
++
++  @Rule
++  public DistributedRule distributedRule = new DistributedRule();
++  @Rule
++  public SerializableTemporaryFolder temporaryFolder = new SerializableTemporaryFolder();
++  @Rule
++  public DistributedErrorCollector errorCollector = new DistributedErrorCollector();
++  @Rule
++  public transient GfshCommandRule gfsh = new GfshCommandRule();
++  @Rule
++  public DistributedRestoreSystemProperties restoreProps = new DistributedRestoreSystemProperties();
++
++  @Before
++  public void setUp() throws Exception {
++    locatorVM = getVM(1);
++    serverVM = getVM(0);
++
++    for (VM vm : asList(locatorVM, serverVM)) {
++      vm.invoke(() -> System.setProperty(GEMFIRE_PREFIX + "standard-output-always-on", "true"));
++    }
++
++    locatorName = "locator1";
++    serverName = "server1";
++    File locator1Dir = temporaryFolder.newFolder(locatorName);
++    File serverDir = temporaryFolder.newFolder(serverName);
++
++    int[] port = getRandomAvailableTCPPorts(4);
++    locatorPort = port[0];
++    locatorJmxPort = port[2];
++    locators = "localhost[" + locatorPort + "]";
++
++    locatorVM.invoke(() -> {
++      startLocator(locatorName, locator1Dir, locatorPort, locatorJmxPort, locators);
++    });
++
++    serverVM.invoke(() -> startServer(serverName, serverDir, locators));
++
++    gfsh.connectAndVerify(locatorJmxPort, GfshCommandRule.PortType.jmxManager);
++
++    regionName = "region1";
++    String createRegionCommand = "create region --type=REPLICATE --name=" + SEPARATOR + regionName;
++    gfsh.executeAndAssertThat(createRegionCommand).statusIsSuccess();
++
++    addIgnoredException(AlertingIOException.class);
++    addIgnoredException(CacheClosedException.class);
++    addIgnoredException(CancelException.class);
++    addIgnoredException(DistributedSystemDisconnectedException.class);
++    addIgnoredException(ForcedDisconnectException.class);
++    addIgnoredException(MemberDisconnectedException.class);
++    addIgnoredException("Possible loss of quorum");
++
++    mxbeansOnServer = serverVM.invoke(() -> {
++      await().untilAsserted(() -> {
++        assertThat(getPlatformMBeanServer().queryNames(getInstance("GemFire:*"), null))
++            .as("GemFire mbeans on server1")
++            .containsAll(expectedServerMXBeans(serverName, regionName));
+
+Review comment:
+       Can the result of `expectedServerMXBeans(…)` change each time through the loop? If not, is it worth it to call it before the loop, rather than inside?
+   
+   Similar for other inside-the-loop calls to get lists of expected beans.
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+kirklund commented on a change in pull request #5728:
+URL: https://github.com/apache/geode/pull/5728#discussion_r535530422
+
+
+
+##########
+File path: geode-core/src/distributedTest/java/org/apache/geode/management/JMXMBeanLocatorRestartTest.java
+##########
+@@ -0,0 +1,317 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more contributor license
++ * agreements. See the NOTICE file distributed with this work for additional information regarding
++ * copyright ownership. The ASF licenses this file to You under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance with the License. You may obtain a
++ * copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software distributed under the License
++ * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
++ * or implied. See the License for the specific language governing permissions and limitations under
++ * the License.
++ */
++package org.apache.geode.management;
++
++import static java.lang.management.ManagementFactory.getPlatformMBeanServer;
++import static java.util.Arrays.asList;
++import static java.util.concurrent.TimeUnit.MINUTES;
++import static javax.management.ObjectName.getInstance;
++import static org.apache.geode.cache.Region.SEPARATOR;
++import static org.apache.geode.distributed.ConfigurationProperties.HTTP_SERVICE_PORT;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER_PORT;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER_START;
++import static org.apache.geode.distributed.ConfigurationProperties.LOCATORS;
++import static org.apache.geode.distributed.ConfigurationProperties.LOG_FILE;
++import static org.apache.geode.distributed.ConfigurationProperties.MAX_WAIT_TIME_RECONNECT;
++import static org.apache.geode.distributed.ConfigurationProperties.MEMBER_TIMEOUT;
++import static org.apache.geode.distributed.internal.membership.api.MembershipManagerHelper.crashDistributedSystem;
++import static org.apache.geode.internal.AvailablePortHelper.getRandomAvailableTCPPorts;
++import static org.apache.geode.test.awaitility.GeodeAwaitility.getTimeout;
++import static org.apache.geode.test.dunit.Disconnect.disconnectAllFromDS;
++import static org.apache.geode.test.dunit.IgnoredException.addIgnoredException;
++import static org.apache.geode.test.dunit.Invoke.invokeInEveryVM;
++import static org.apache.geode.test.dunit.VM.getVM;
++import static org.apache.geode.test.dunit.VM.getVMId;
++import static org.apache.geode.util.internal.GeodeGlossary.GEMFIRE_PREFIX;
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.mockito.Mockito.mock;
++
++import java.io.File;
++import java.io.Serializable;
++import java.util.HashSet;
++import java.util.Set;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.atomic.AtomicReference;
++
++import javax.management.MalformedObjectNameException;
++import javax.management.ObjectName;
++
++import org.awaitility.core.ConditionFactory;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++
++import org.apache.geode.CancelException;
++import org.apache.geode.ForcedDisconnectException;
++import org.apache.geode.alerting.internal.spi.AlertingIOException;
++import org.apache.geode.cache.CacheClosedException;
++import org.apache.geode.distributed.DistributedSystemDisconnectedException;
++import org.apache.geode.distributed.LocatorLauncher;
++import org.apache.geode.distributed.ServerLauncher;
++import org.apache.geode.distributed.internal.InternalLocator;
++import org.apache.geode.distributed.internal.membership.api.MemberDisconnectedException;
++import org.apache.geode.test.awaitility.GeodeAwaitility;
++import org.apache.geode.test.dunit.VM;
++import org.apache.geode.test.dunit.rules.DistributedErrorCollector;
++import org.apache.geode.test.dunit.rules.DistributedRestoreSystemProperties;
++import org.apache.geode.test.dunit.rules.DistributedRule;
++import org.apache.geode.test.junit.rules.GfshCommandRule;
++import org.apache.geode.test.junit.rules.serializable.SerializableTemporaryFolder;
++
++public class JMXMBeanLocatorRestartTest implements Serializable {
++
++  private static final long TIMEOUT_MILLIS = getTimeout().toMillis();
++  private static final LocatorLauncher DUMMY_LOCATOR = mock(LocatorLauncher.class);
++  private static final ServerLauncher DUMMY_SERVER = mock(ServerLauncher.class);
++
++  private static final AtomicReference<CountDownLatch> BEFORE =
++      new AtomicReference<>(new CountDownLatch(0));
++  private static final AtomicReference<CountDownLatch> AFTER =
++      new AtomicReference<>(new CountDownLatch(0));
++
++  private static final AtomicReference<LocatorLauncher> LOCATOR =
++      new AtomicReference<>(DUMMY_LOCATOR);
++  private static final AtomicReference<ServerLauncher> SERVER =
++      new AtomicReference<>(DUMMY_SERVER);
++
++  private VM locatorVM;
++  private VM serverVM;
++
++  private String locatorName;
++  private String serverName;
++  private String locators;
++  private int locatorPort;
++  private int locatorJmxPort;
++  private String regionName;
++  private Set<ObjectName> mxbeansOnServer;
++  private Set<ObjectName> mxbeansOnLocator;
++
++  @Rule
++  public DistributedRule distributedRule = new DistributedRule();
++  @Rule
++  public SerializableTemporaryFolder temporaryFolder = new SerializableTemporaryFolder();
++  @Rule
++  public DistributedErrorCollector errorCollector = new DistributedErrorCollector();
++  @Rule
++  public transient GfshCommandRule gfsh = new GfshCommandRule();
++  @Rule
++  public DistributedRestoreSystemProperties restoreProps = new DistributedRestoreSystemProperties();
++
++  @Before
++  public void setUp() throws Exception {
++    locatorVM = getVM(1);
++    serverVM = getVM(0);
++
++    for (VM vm : asList(locatorVM, serverVM)) {
++      vm.invoke(() -> System.setProperty(GEMFIRE_PREFIX + "standard-output-always-on", "true"));
++    }
++
++    locatorName = "locator1";
++    serverName = "server1";
++    File locator1Dir = temporaryFolder.newFolder(locatorName);
++    File serverDir = temporaryFolder.newFolder(serverName);
++
++    int[] port = getRandomAvailableTCPPorts(4);
++    locatorPort = port[0];
++    locatorJmxPort = port[2];
++    locators = "localhost[" + locatorPort + "]";
++
++    locatorVM.invoke(() -> {
++      startLocator(locatorName, locator1Dir, locatorPort, locatorJmxPort, locators);
++    });
++
++    serverVM.invoke(() -> startServer(serverName, serverDir, locators));
++
++    gfsh.connectAndVerify(locatorJmxPort, GfshCommandRule.PortType.jmxManager);
++
++    regionName = "region1";
++    String createRegionCommand = "create region --type=REPLICATE --name=" + SEPARATOR + regionName;
++    gfsh.executeAndAssertThat(createRegionCommand).statusIsSuccess();
++
++    addIgnoredException(AlertingIOException.class);
++    addIgnoredException(CacheClosedException.class);
++    addIgnoredException(CancelException.class);
++    addIgnoredException(DistributedSystemDisconnectedException.class);
++    addIgnoredException(ForcedDisconnectException.class);
++    addIgnoredException(MemberDisconnectedException.class);
++    addIgnoredException("Possible loss of quorum");
++
++    mxbeansOnServer = serverVM.invoke(() -> {
++      await().untilAsserted(() -> {
++        assertThat(getPlatformMBeanServer().queryNames(getInstance("GemFire:*"), null))
++            .as("GemFire mbeans on server1")
++            .containsAll(expectedServerMXBeans(serverName, regionName));
+
+Review comment:
+       Yeah I should probably change those to be invoked within the await loop. They end up creating new instances of ObjectName every time they're called.
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+kirklund commented on a change in pull request #5728:
+URL: https://github.com/apache/geode/pull/5728#discussion_r535530422
+
+
+
+##########
+File path: geode-core/src/distributedTest/java/org/apache/geode/management/JMXMBeanLocatorRestartTest.java
+##########
+@@ -0,0 +1,317 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more contributor license
++ * agreements. See the NOTICE file distributed with this work for additional information regarding
++ * copyright ownership. The ASF licenses this file to You under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance with the License. You may obtain a
++ * copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software distributed under the License
++ * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
++ * or implied. See the License for the specific language governing permissions and limitations under
++ * the License.
++ */
++package org.apache.geode.management;
++
++import static java.lang.management.ManagementFactory.getPlatformMBeanServer;
++import static java.util.Arrays.asList;
++import static java.util.concurrent.TimeUnit.MINUTES;
++import static javax.management.ObjectName.getInstance;
++import static org.apache.geode.cache.Region.SEPARATOR;
++import static org.apache.geode.distributed.ConfigurationProperties.HTTP_SERVICE_PORT;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER_PORT;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER_START;
++import static org.apache.geode.distributed.ConfigurationProperties.LOCATORS;
++import static org.apache.geode.distributed.ConfigurationProperties.LOG_FILE;
++import static org.apache.geode.distributed.ConfigurationProperties.MAX_WAIT_TIME_RECONNECT;
++import static org.apache.geode.distributed.ConfigurationProperties.MEMBER_TIMEOUT;
++import static org.apache.geode.distributed.internal.membership.api.MembershipManagerHelper.crashDistributedSystem;
++import static org.apache.geode.internal.AvailablePortHelper.getRandomAvailableTCPPorts;
++import static org.apache.geode.test.awaitility.GeodeAwaitility.getTimeout;
++import static org.apache.geode.test.dunit.Disconnect.disconnectAllFromDS;
++import static org.apache.geode.test.dunit.IgnoredException.addIgnoredException;
++import static org.apache.geode.test.dunit.Invoke.invokeInEveryVM;
++import static org.apache.geode.test.dunit.VM.getVM;
++import static org.apache.geode.test.dunit.VM.getVMId;
++import static org.apache.geode.util.internal.GeodeGlossary.GEMFIRE_PREFIX;
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.mockito.Mockito.mock;
++
++import java.io.File;
++import java.io.Serializable;
++import java.util.HashSet;
++import java.util.Set;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.atomic.AtomicReference;
++
++import javax.management.MalformedObjectNameException;
++import javax.management.ObjectName;
++
++import org.awaitility.core.ConditionFactory;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++
++import org.apache.geode.CancelException;
++import org.apache.geode.ForcedDisconnectException;
++import org.apache.geode.alerting.internal.spi.AlertingIOException;
++import org.apache.geode.cache.CacheClosedException;
++import org.apache.geode.distributed.DistributedSystemDisconnectedException;
++import org.apache.geode.distributed.LocatorLauncher;
++import org.apache.geode.distributed.ServerLauncher;
++import org.apache.geode.distributed.internal.InternalLocator;
++import org.apache.geode.distributed.internal.membership.api.MemberDisconnectedException;
++import org.apache.geode.test.awaitility.GeodeAwaitility;
++import org.apache.geode.test.dunit.VM;
++import org.apache.geode.test.dunit.rules.DistributedErrorCollector;
++import org.apache.geode.test.dunit.rules.DistributedRestoreSystemProperties;
++import org.apache.geode.test.dunit.rules.DistributedRule;
++import org.apache.geode.test.junit.rules.GfshCommandRule;
++import org.apache.geode.test.junit.rules.serializable.SerializableTemporaryFolder;
++
++public class JMXMBeanLocatorRestartTest implements Serializable {
++
++  private static final long TIMEOUT_MILLIS = getTimeout().toMillis();
++  private static final LocatorLauncher DUMMY_LOCATOR = mock(LocatorLauncher.class);
++  private static final ServerLauncher DUMMY_SERVER = mock(ServerLauncher.class);
++
++  private static final AtomicReference<CountDownLatch> BEFORE =
++      new AtomicReference<>(new CountDownLatch(0));
++  private static final AtomicReference<CountDownLatch> AFTER =
++      new AtomicReference<>(new CountDownLatch(0));
++
++  private static final AtomicReference<LocatorLauncher> LOCATOR =
++      new AtomicReference<>(DUMMY_LOCATOR);
++  private static final AtomicReference<ServerLauncher> SERVER =
++      new AtomicReference<>(DUMMY_SERVER);
++
++  private VM locatorVM;
++  private VM serverVM;
++
++  private String locatorName;
++  private String serverName;
++  private String locators;
++  private int locatorPort;
++  private int locatorJmxPort;
++  private String regionName;
++  private Set<ObjectName> mxbeansOnServer;
++  private Set<ObjectName> mxbeansOnLocator;
++
++  @Rule
++  public DistributedRule distributedRule = new DistributedRule();
++  @Rule
++  public SerializableTemporaryFolder temporaryFolder = new SerializableTemporaryFolder();
++  @Rule
++  public DistributedErrorCollector errorCollector = new DistributedErrorCollector();
++  @Rule
++  public transient GfshCommandRule gfsh = new GfshCommandRule();
++  @Rule
++  public DistributedRestoreSystemProperties restoreProps = new DistributedRestoreSystemProperties();
++
++  @Before
++  public void setUp() throws Exception {
++    locatorVM = getVM(1);
++    serverVM = getVM(0);
++
++    for (VM vm : asList(locatorVM, serverVM)) {
++      vm.invoke(() -> System.setProperty(GEMFIRE_PREFIX + "standard-output-always-on", "true"));
++    }
++
++    locatorName = "locator1";
++    serverName = "server1";
++    File locator1Dir = temporaryFolder.newFolder(locatorName);
++    File serverDir = temporaryFolder.newFolder(serverName);
++
++    int[] port = getRandomAvailableTCPPorts(4);
++    locatorPort = port[0];
++    locatorJmxPort = port[2];
++    locators = "localhost[" + locatorPort + "]";
++
++    locatorVM.invoke(() -> {
++      startLocator(locatorName, locator1Dir, locatorPort, locatorJmxPort, locators);
++    });
++
++    serverVM.invoke(() -> startServer(serverName, serverDir, locators));
++
++    gfsh.connectAndVerify(locatorJmxPort, GfshCommandRule.PortType.jmxManager);
++
++    regionName = "region1";
++    String createRegionCommand = "create region --type=REPLICATE --name=" + SEPARATOR + regionName;
++    gfsh.executeAndAssertThat(createRegionCommand).statusIsSuccess();
++
++    addIgnoredException(AlertingIOException.class);
++    addIgnoredException(CacheClosedException.class);
++    addIgnoredException(CancelException.class);
++    addIgnoredException(DistributedSystemDisconnectedException.class);
++    addIgnoredException(ForcedDisconnectException.class);
++    addIgnoredException(MemberDisconnectedException.class);
++    addIgnoredException("Possible loss of quorum");
++
++    mxbeansOnServer = serverVM.invoke(() -> {
++      await().untilAsserted(() -> {
++        assertThat(getPlatformMBeanServer().queryNames(getInstance("GemFire:*"), null))
++            .as("GemFire mbeans on server1")
++            .containsAll(expectedServerMXBeans(serverName, regionName));
+
+Review comment:
+       Yeah I should probably change those to be invoked outside the await loop. They end up creating new instances of ObjectName every time they're called.
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+demery-pivotal commented on a change in pull request #5728:
+URL: https://github.com/apache/geode/pull/5728#discussion_r535534864
+
+
+
+##########
+File path: geode-core/src/test/java/org/apache/geode/management/internal/FederatingManagerTest.java
+##########
+@@ -437,14 +474,79 @@ public void removeMemberArtifactsDoesNotRemoveAllProxiesIfMonitoringRegionIsNull
+         .thenReturn(mock(Region.class));
+     when(system.getDistributedMember())
+         .thenReturn(member);
+-    FederatingManager federatingManager = new FederatingManager(repo, system, service, cache,
+-        statisticsFactory, statisticsClock, proxyFactory, messenger, executorService);
++    FederatingManager federatingManager =
++        new FederatingManager(repo, system, service, cache, statisticsFactory,
++            statisticsClock, proxyFactory, messenger, cancelCriterion, executorService);
+ 
+     federatingManager.removeMemberArtifacts(member, false);
+ 
+     verifyNoMoreInteractions(proxyFactory);
+   }
+ 
++  @Test
++  public void removeMemberWaitsForStartManager() throws Exception {
++    CountDownLatch latch = new CountDownLatch(1);
++    CyclicBarrier barrier = new CyclicBarrier(2);
++    ExecutorService executorService = mock(ExecutorService.class);
++    List<Future<InternalDistributedMember>> futureTaskList = Collections.emptyList();
++
++    when(executorService.invokeAll(any())).thenAnswer(invocation -> {
++      awaitCyclicBarrier(barrier);
++      awaitCountDownLatch(latch);
++      return futureTaskList;
++    });
++
++    FederatingManager federatingManager =
++        spy(new FederatingManager(repo, system, service, cache, statisticsFactory, statisticsClock,
+
+Review comment:
+       Does this need to be a spy? I don't see any uses of the spyness (spyity?) in this test.
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+dschneider-pivotal commented on a change in pull request #5728:
+URL: https://github.com/apache/geode/pull/5728#discussion_r535537581
+
+
+
+##########
+File path: geode-core/src/main/java/org/apache/geode/management/internal/FederatingManager.java
+##########
+@@ -79,26 +82,39 @@
+    * unbounded in practical situation as number of members will be a finite set at any given point
+    * of time
+    */
+-  private ExecutorService executorService;
++  private final AtomicReference<ExecutorService> executorService = new AtomicReference<>();
++  private boolean pendingStartup = true;
+
+Review comment:
+       The concern I have with pendingStartup being set to true when FederatingManager is created is that removeMember could build up a big list of pending tasks if the call of startManager is delayed.
+   In some cases we are careful to call start right after create. But in others, based on how the gemfire properties configure jmx, it can be delayed. If you look in ManagementAdapter this code:`      if (cache.getInternalDistributedSystem().getConfig().getJmxManager()) {
+           service.createManager();
+           if (cache.getInternalDistributedSystem().getConfig().getJmxManagerStart()) {
+             service.startManager();
+           }
+         }
+   `
+   will not always call startManager. 
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+jchen21 commented on a change in pull request #5728:
+URL: https://github.com/apache/geode/pull/5728#discussion_r535539542
+
+
+
+##########
+File path: geode-core/src/distributedTest/java/org/apache/geode/management/JMXMBeanLocatorRestartTest.java
+##########
+@@ -0,0 +1,317 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more contributor license
++ * agreements. See the NOTICE file distributed with this work for additional information regarding
++ * copyright ownership. The ASF licenses this file to You under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance with the License. You may obtain a
++ * copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software distributed under the License
++ * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
++ * or implied. See the License for the specific language governing permissions and limitations under
++ * the License.
++ */
++package org.apache.geode.management;
++
++import static java.lang.management.ManagementFactory.getPlatformMBeanServer;
++import static java.util.Arrays.asList;
++import static java.util.concurrent.TimeUnit.MINUTES;
++import static javax.management.ObjectName.getInstance;
++import static org.apache.geode.cache.Region.SEPARATOR;
++import static org.apache.geode.distributed.ConfigurationProperties.HTTP_SERVICE_PORT;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER_PORT;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER_START;
++import static org.apache.geode.distributed.ConfigurationProperties.LOCATORS;
++import static org.apache.geode.distributed.ConfigurationProperties.LOG_FILE;
++import static org.apache.geode.distributed.ConfigurationProperties.MAX_WAIT_TIME_RECONNECT;
++import static org.apache.geode.distributed.ConfigurationProperties.MEMBER_TIMEOUT;
++import static org.apache.geode.distributed.internal.membership.api.MembershipManagerHelper.crashDistributedSystem;
++import static org.apache.geode.internal.AvailablePortHelper.getRandomAvailableTCPPorts;
++import static org.apache.geode.test.awaitility.GeodeAwaitility.getTimeout;
++import static org.apache.geode.test.dunit.Disconnect.disconnectAllFromDS;
++import static org.apache.geode.test.dunit.IgnoredException.addIgnoredException;
++import static org.apache.geode.test.dunit.Invoke.invokeInEveryVM;
++import static org.apache.geode.test.dunit.VM.getVM;
++import static org.apache.geode.test.dunit.VM.getVMId;
++import static org.apache.geode.util.internal.GeodeGlossary.GEMFIRE_PREFIX;
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.mockito.Mockito.mock;
++
++import java.io.File;
++import java.io.Serializable;
++import java.util.HashSet;
++import java.util.Set;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.atomic.AtomicReference;
++
++import javax.management.MalformedObjectNameException;
++import javax.management.ObjectName;
++
++import org.awaitility.core.ConditionFactory;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++
++import org.apache.geode.CancelException;
++import org.apache.geode.ForcedDisconnectException;
++import org.apache.geode.alerting.internal.spi.AlertingIOException;
++import org.apache.geode.cache.CacheClosedException;
++import org.apache.geode.distributed.DistributedSystemDisconnectedException;
++import org.apache.geode.distributed.LocatorLauncher;
++import org.apache.geode.distributed.ServerLauncher;
++import org.apache.geode.distributed.internal.InternalLocator;
++import org.apache.geode.distributed.internal.membership.api.MemberDisconnectedException;
++import org.apache.geode.test.awaitility.GeodeAwaitility;
++import org.apache.geode.test.dunit.VM;
++import org.apache.geode.test.dunit.rules.DistributedErrorCollector;
++import org.apache.geode.test.dunit.rules.DistributedRestoreSystemProperties;
++import org.apache.geode.test.dunit.rules.DistributedRule;
++import org.apache.geode.test.junit.rules.GfshCommandRule;
++import org.apache.geode.test.junit.rules.serializable.SerializableTemporaryFolder;
++
++public class JMXMBeanLocatorRestartTest implements Serializable {
++
++  private static final long TIMEOUT_MILLIS = getTimeout().toMillis();
++  private static final LocatorLauncher DUMMY_LOCATOR = mock(LocatorLauncher.class);
++  private static final ServerLauncher DUMMY_SERVER = mock(ServerLauncher.class);
++
++  private static final AtomicReference<CountDownLatch> BEFORE =
++      new AtomicReference<>(new CountDownLatch(0));
++  private static final AtomicReference<CountDownLatch> AFTER =
++      new AtomicReference<>(new CountDownLatch(0));
++
++  private static final AtomicReference<LocatorLauncher> LOCATOR =
++      new AtomicReference<>(DUMMY_LOCATOR);
++  private static final AtomicReference<ServerLauncher> SERVER =
++      new AtomicReference<>(DUMMY_SERVER);
++
++  private VM locatorVM;
++  private VM serverVM;
++
++  private String locatorName;
++  private String serverName;
++  private String locators;
++  private int locatorPort;
++  private int locatorJmxPort;
++  private String regionName;
++  private Set<ObjectName> mxbeansOnServer;
++  private Set<ObjectName> mxbeansOnLocator;
++
++  @Rule
++  public DistributedRule distributedRule = new DistributedRule();
++  @Rule
++  public SerializableTemporaryFolder temporaryFolder = new SerializableTemporaryFolder();
++  @Rule
++  public DistributedErrorCollector errorCollector = new DistributedErrorCollector();
++  @Rule
++  public transient GfshCommandRule gfsh = new GfshCommandRule();
++  @Rule
++  public DistributedRestoreSystemProperties restoreProps = new DistributedRestoreSystemProperties();
++
++  @Before
++  public void setUp() throws Exception {
++    locatorVM = getVM(1);
++    serverVM = getVM(0);
++
++    for (VM vm : asList(locatorVM, serverVM)) {
++      vm.invoke(() -> System.setProperty(GEMFIRE_PREFIX + "standard-output-always-on", "true"));
++    }
++
++    locatorName = "locator1";
++    serverName = "server1";
++    File locator1Dir = temporaryFolder.newFolder(locatorName);
++    File serverDir = temporaryFolder.newFolder(serverName);
++
++    int[] port = getRandomAvailableTCPPorts(4);
+
+Review comment:
+       I don't see port[1] and port[3] being used. Is it on purpose?
+
+##########
+File path: geode-core/src/distributedTest/java/org/apache/geode/management/JMXMBeanLocatorRestartTest.java
+##########
+@@ -0,0 +1,317 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more contributor license
++ * agreements. See the NOTICE file distributed with this work for additional information regarding
++ * copyright ownership. The ASF licenses this file to You under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance with the License. You may obtain a
++ * copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software distributed under the License
++ * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
++ * or implied. See the License for the specific language governing permissions and limitations under
++ * the License.
++ */
++package org.apache.geode.management;
++
++import static java.lang.management.ManagementFactory.getPlatformMBeanServer;
++import static java.util.Arrays.asList;
++import static java.util.concurrent.TimeUnit.MINUTES;
++import static javax.management.ObjectName.getInstance;
++import static org.apache.geode.cache.Region.SEPARATOR;
++import static org.apache.geode.distributed.ConfigurationProperties.HTTP_SERVICE_PORT;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER_PORT;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER_START;
++import static org.apache.geode.distributed.ConfigurationProperties.LOCATORS;
++import static org.apache.geode.distributed.ConfigurationProperties.LOG_FILE;
++import static org.apache.geode.distributed.ConfigurationProperties.MAX_WAIT_TIME_RECONNECT;
++import static org.apache.geode.distributed.ConfigurationProperties.MEMBER_TIMEOUT;
++import static org.apache.geode.distributed.internal.membership.api.MembershipManagerHelper.crashDistributedSystem;
++import static org.apache.geode.internal.AvailablePortHelper.getRandomAvailableTCPPorts;
++import static org.apache.geode.test.awaitility.GeodeAwaitility.getTimeout;
++import static org.apache.geode.test.dunit.Disconnect.disconnectAllFromDS;
++import static org.apache.geode.test.dunit.IgnoredException.addIgnoredException;
++import static org.apache.geode.test.dunit.Invoke.invokeInEveryVM;
++import static org.apache.geode.test.dunit.VM.getVM;
++import static org.apache.geode.test.dunit.VM.getVMId;
++import static org.apache.geode.util.internal.GeodeGlossary.GEMFIRE_PREFIX;
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.mockito.Mockito.mock;
++
++import java.io.File;
++import java.io.Serializable;
++import java.util.HashSet;
++import java.util.Set;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.atomic.AtomicReference;
++
++import javax.management.MalformedObjectNameException;
++import javax.management.ObjectName;
++
++import org.awaitility.core.ConditionFactory;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++
++import org.apache.geode.CancelException;
++import org.apache.geode.ForcedDisconnectException;
++import org.apache.geode.alerting.internal.spi.AlertingIOException;
++import org.apache.geode.cache.CacheClosedException;
++import org.apache.geode.distributed.DistributedSystemDisconnectedException;
++import org.apache.geode.distributed.LocatorLauncher;
++import org.apache.geode.distributed.ServerLauncher;
++import org.apache.geode.distributed.internal.InternalLocator;
++import org.apache.geode.distributed.internal.membership.api.MemberDisconnectedException;
++import org.apache.geode.test.awaitility.GeodeAwaitility;
++import org.apache.geode.test.dunit.VM;
++import org.apache.geode.test.dunit.rules.DistributedErrorCollector;
++import org.apache.geode.test.dunit.rules.DistributedRestoreSystemProperties;
++import org.apache.geode.test.dunit.rules.DistributedRule;
++import org.apache.geode.test.junit.rules.GfshCommandRule;
++import org.apache.geode.test.junit.rules.serializable.SerializableTemporaryFolder;
++
++public class JMXMBeanLocatorRestartTest implements Serializable {
++
++  private static final long TIMEOUT_MILLIS = getTimeout().toMillis();
++  private static final LocatorLauncher DUMMY_LOCATOR = mock(LocatorLauncher.class);
++  private static final ServerLauncher DUMMY_SERVER = mock(ServerLauncher.class);
++
++  private static final AtomicReference<CountDownLatch> BEFORE =
++      new AtomicReference<>(new CountDownLatch(0));
++  private static final AtomicReference<CountDownLatch> AFTER =
++      new AtomicReference<>(new CountDownLatch(0));
++
++  private static final AtomicReference<LocatorLauncher> LOCATOR =
++      new AtomicReference<>(DUMMY_LOCATOR);
++  private static final AtomicReference<ServerLauncher> SERVER =
++      new AtomicReference<>(DUMMY_SERVER);
++
++  private VM locatorVM;
++  private VM serverVM;
++
++  private String locatorName;
++  private String serverName;
++  private String locators;
++  private int locatorPort;
++  private int locatorJmxPort;
++  private String regionName;
++  private Set<ObjectName> mxbeansOnServer;
++  private Set<ObjectName> mxbeansOnLocator;
++
++  @Rule
++  public DistributedRule distributedRule = new DistributedRule();
++  @Rule
++  public SerializableTemporaryFolder temporaryFolder = new SerializableTemporaryFolder();
++  @Rule
++  public DistributedErrorCollector errorCollector = new DistributedErrorCollector();
++  @Rule
++  public transient GfshCommandRule gfsh = new GfshCommandRule();
++  @Rule
++  public DistributedRestoreSystemProperties restoreProps = new DistributedRestoreSystemProperties();
++
++  @Before
++  public void setUp() throws Exception {
++    locatorVM = getVM(1);
++    serverVM = getVM(0);
++
++    for (VM vm : asList(locatorVM, serverVM)) {
++      vm.invoke(() -> System.setProperty(GEMFIRE_PREFIX + "standard-output-always-on", "true"));
++    }
++
++    locatorName = "locator1";
++    serverName = "server1";
++    File locator1Dir = temporaryFolder.newFolder(locatorName);
++    File serverDir = temporaryFolder.newFolder(serverName);
++
++    int[] port = getRandomAvailableTCPPorts(4);
++    locatorPort = port[0];
++    locatorJmxPort = port[2];
++    locators = "localhost[" + locatorPort + "]";
++
++    locatorVM.invoke(() -> {
++      startLocator(locatorName, locator1Dir, locatorPort, locatorJmxPort, locators);
++    });
++
++    serverVM.invoke(() -> startServer(serverName, serverDir, locators));
++
++    gfsh.connectAndVerify(locatorJmxPort, GfshCommandRule.PortType.jmxManager);
++
++    regionName = "region1";
++    String createRegionCommand = "create region --type=REPLICATE --name=" + SEPARATOR + regionName;
++    gfsh.executeAndAssertThat(createRegionCommand).statusIsSuccess();
++
++    addIgnoredException(AlertingIOException.class);
++    addIgnoredException(CacheClosedException.class);
++    addIgnoredException(CancelException.class);
++    addIgnoredException(DistributedSystemDisconnectedException.class);
++    addIgnoredException(ForcedDisconnectException.class);
++    addIgnoredException(MemberDisconnectedException.class);
++    addIgnoredException("Possible loss of quorum");
++
++    mxbeansOnServer = serverVM.invoke(() -> {
++      await().untilAsserted(() -> {
++        assertThat(getPlatformMBeanServer().queryNames(getInstance("GemFire:*"), null))
++            .as("GemFire mbeans on server1")
++            .containsAll(expectedServerMXBeans(serverName, regionName));
++      });
++      return getPlatformMBeanServer().queryNames(getInstance("GemFire:*"), null);
++    });
++
++    mxbeansOnLocator = locatorVM.invoke(() -> {
++      await().untilAsserted(() -> {
++        assertThat(getPlatformMBeanServer().queryNames(getInstance("GemFire:*"), null))
++            .as("GemFire mbeans on locator1")
++            .containsAll(expectedServerMXBeans(serverName, regionName))
++            .containsAll(expectedLocatorMXBeans(locatorName))
++            .containsAll(expectedDistributedMXBeans(regionName));
++      });
++
++      return getPlatformMBeanServer().queryNames(getInstance("GemFire:*"), null);
++    });
++  }
++
++  @After
++  public void tearDown() {
++    invokeInEveryVM(() -> {
++      BEFORE.get().countDown();
+
+Review comment:
+       The latches `BEFORE` and `AFTER` are initialized as `0`. But I don't see them being used anywhere else.
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+kirklund commented on a change in pull request #5728:
+URL: https://github.com/apache/geode/pull/5728#discussion_r535680626
+
+
+
+##########
+File path: geode-core/src/test/java/org/apache/geode/management/internal/FederatingManagerTest.java
+##########
+@@ -437,14 +474,79 @@ public void removeMemberArtifactsDoesNotRemoveAllProxiesIfMonitoringRegionIsNull
+         .thenReturn(mock(Region.class));
+     when(system.getDistributedMember())
+         .thenReturn(member);
+-    FederatingManager federatingManager = new FederatingManager(repo, system, service, cache,
+-        statisticsFactory, statisticsClock, proxyFactory, messenger, executorService);
++    FederatingManager federatingManager =
++        new FederatingManager(repo, system, service, cache, statisticsFactory,
++            statisticsClock, proxyFactory, messenger, cancelCriterion, executorService);
+ 
+     federatingManager.removeMemberArtifacts(member, false);
+ 
+     verifyNoMoreInteractions(proxyFactory);
+   }
+ 
++  @Test
++  public void removeMemberWaitsForStartManager() throws Exception {
++    CountDownLatch latch = new CountDownLatch(1);
++    CyclicBarrier barrier = new CyclicBarrier(2);
++    ExecutorService executorService = mock(ExecutorService.class);
++    List<Future<InternalDistributedMember>> futureTaskList = Collections.emptyList();
++
++    when(executorService.invokeAll(any())).thenAnswer(invocation -> {
++      awaitCyclicBarrier(barrier);
++      awaitCountDownLatch(latch);
++      return futureTaskList;
++    });
++
++    FederatingManager federatingManager =
++        spy(new FederatingManager(repo, system, service, cache, statisticsFactory, statisticsClock,
+
+Review comment:
+       Removing use of spy. The test no longer does any spying.
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+kirklund commented on a change in pull request #5728:
+URL: https://github.com/apache/geode/pull/5728#discussion_r535682503
+
+
+
+##########
+File path: geode-core/src/distributedTest/java/org/apache/geode/management/JMXMBeanLocatorRestartTest.java
+##########
+@@ -0,0 +1,317 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more contributor license
++ * agreements. See the NOTICE file distributed with this work for additional information regarding
++ * copyright ownership. The ASF licenses this file to You under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance with the License. You may obtain a
++ * copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software distributed under the License
++ * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
++ * or implied. See the License for the specific language governing permissions and limitations under
++ * the License.
++ */
++package org.apache.geode.management;
++
++import static java.lang.management.ManagementFactory.getPlatformMBeanServer;
++import static java.util.Arrays.asList;
++import static java.util.concurrent.TimeUnit.MINUTES;
++import static javax.management.ObjectName.getInstance;
++import static org.apache.geode.cache.Region.SEPARATOR;
++import static org.apache.geode.distributed.ConfigurationProperties.HTTP_SERVICE_PORT;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER_PORT;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER_START;
++import static org.apache.geode.distributed.ConfigurationProperties.LOCATORS;
++import static org.apache.geode.distributed.ConfigurationProperties.LOG_FILE;
++import static org.apache.geode.distributed.ConfigurationProperties.MAX_WAIT_TIME_RECONNECT;
++import static org.apache.geode.distributed.ConfigurationProperties.MEMBER_TIMEOUT;
++import static org.apache.geode.distributed.internal.membership.api.MembershipManagerHelper.crashDistributedSystem;
++import static org.apache.geode.internal.AvailablePortHelper.getRandomAvailableTCPPorts;
++import static org.apache.geode.test.awaitility.GeodeAwaitility.getTimeout;
++import static org.apache.geode.test.dunit.Disconnect.disconnectAllFromDS;
++import static org.apache.geode.test.dunit.IgnoredException.addIgnoredException;
++import static org.apache.geode.test.dunit.Invoke.invokeInEveryVM;
++import static org.apache.geode.test.dunit.VM.getVM;
++import static org.apache.geode.test.dunit.VM.getVMId;
++import static org.apache.geode.util.internal.GeodeGlossary.GEMFIRE_PREFIX;
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.mockito.Mockito.mock;
++
++import java.io.File;
++import java.io.Serializable;
++import java.util.HashSet;
++import java.util.Set;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.atomic.AtomicReference;
++
++import javax.management.MalformedObjectNameException;
++import javax.management.ObjectName;
++
++import org.awaitility.core.ConditionFactory;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++
++import org.apache.geode.CancelException;
++import org.apache.geode.ForcedDisconnectException;
++import org.apache.geode.alerting.internal.spi.AlertingIOException;
++import org.apache.geode.cache.CacheClosedException;
++import org.apache.geode.distributed.DistributedSystemDisconnectedException;
++import org.apache.geode.distributed.LocatorLauncher;
++import org.apache.geode.distributed.ServerLauncher;
++import org.apache.geode.distributed.internal.InternalLocator;
++import org.apache.geode.distributed.internal.membership.api.MemberDisconnectedException;
++import org.apache.geode.test.awaitility.GeodeAwaitility;
++import org.apache.geode.test.dunit.VM;
++import org.apache.geode.test.dunit.rules.DistributedErrorCollector;
++import org.apache.geode.test.dunit.rules.DistributedRestoreSystemProperties;
++import org.apache.geode.test.dunit.rules.DistributedRule;
++import org.apache.geode.test.junit.rules.GfshCommandRule;
++import org.apache.geode.test.junit.rules.serializable.SerializableTemporaryFolder;
++
++public class JMXMBeanLocatorRestartTest implements Serializable {
++
++  private static final long TIMEOUT_MILLIS = getTimeout().toMillis();
++  private static final LocatorLauncher DUMMY_LOCATOR = mock(LocatorLauncher.class);
++  private static final ServerLauncher DUMMY_SERVER = mock(ServerLauncher.class);
++
++  private static final AtomicReference<CountDownLatch> BEFORE =
++      new AtomicReference<>(new CountDownLatch(0));
++  private static final AtomicReference<CountDownLatch> AFTER =
++      new AtomicReference<>(new CountDownLatch(0));
++
++  private static final AtomicReference<LocatorLauncher> LOCATOR =
++      new AtomicReference<>(DUMMY_LOCATOR);
++  private static final AtomicReference<ServerLauncher> SERVER =
++      new AtomicReference<>(DUMMY_SERVER);
++
++  private VM locatorVM;
++  private VM serverVM;
++
++  private String locatorName;
++  private String serverName;
++  private String locators;
++  private int locatorPort;
++  private int locatorJmxPort;
++  private String regionName;
++  private Set<ObjectName> mxbeansOnServer;
++  private Set<ObjectName> mxbeansOnLocator;
++
++  @Rule
++  public DistributedRule distributedRule = new DistributedRule();
++  @Rule
++  public SerializableTemporaryFolder temporaryFolder = new SerializableTemporaryFolder();
++  @Rule
++  public DistributedErrorCollector errorCollector = new DistributedErrorCollector();
++  @Rule
++  public transient GfshCommandRule gfsh = new GfshCommandRule();
++  @Rule
++  public DistributedRestoreSystemProperties restoreProps = new DistributedRestoreSystemProperties();
++
++  @Before
++  public void setUp() throws Exception {
++    locatorVM = getVM(1);
++    serverVM = getVM(0);
++
++    for (VM vm : asList(locatorVM, serverVM)) {
++      vm.invoke(() -> System.setProperty(GEMFIRE_PREFIX + "standard-output-always-on", "true"));
++    }
++
++    locatorName = "locator1";
++    serverName = "server1";
++    File locator1Dir = temporaryFolder.newFolder(locatorName);
++    File serverDir = temporaryFolder.newFolder(serverName);
++
++    int[] port = getRandomAvailableTCPPorts(4);
+
+Review comment:
+       Thanks for catching that! I originally had the test using 4 ports. I'll change it to 2 ports.
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+kirklund commented on a change in pull request #5728:
+URL: https://github.com/apache/geode/pull/5728#discussion_r535683589
+
+
+
+##########
+File path: geode-core/src/distributedTest/java/org/apache/geode/management/JMXMBeanLocatorRestartTest.java
+##########
+@@ -0,0 +1,317 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more contributor license
++ * agreements. See the NOTICE file distributed with this work for additional information regarding
++ * copyright ownership. The ASF licenses this file to You under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance with the License. You may obtain a
++ * copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software distributed under the License
++ * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
++ * or implied. See the License for the specific language governing permissions and limitations under
++ * the License.
++ */
++package org.apache.geode.management;
++
++import static java.lang.management.ManagementFactory.getPlatformMBeanServer;
++import static java.util.Arrays.asList;
++import static java.util.concurrent.TimeUnit.MINUTES;
++import static javax.management.ObjectName.getInstance;
++import static org.apache.geode.cache.Region.SEPARATOR;
++import static org.apache.geode.distributed.ConfigurationProperties.HTTP_SERVICE_PORT;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER_PORT;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER_START;
++import static org.apache.geode.distributed.ConfigurationProperties.LOCATORS;
++import static org.apache.geode.distributed.ConfigurationProperties.LOG_FILE;
++import static org.apache.geode.distributed.ConfigurationProperties.MAX_WAIT_TIME_RECONNECT;
++import static org.apache.geode.distributed.ConfigurationProperties.MEMBER_TIMEOUT;
++import static org.apache.geode.distributed.internal.membership.api.MembershipManagerHelper.crashDistributedSystem;
++import static org.apache.geode.internal.AvailablePortHelper.getRandomAvailableTCPPorts;
++import static org.apache.geode.test.awaitility.GeodeAwaitility.getTimeout;
++import static org.apache.geode.test.dunit.Disconnect.disconnectAllFromDS;
++import static org.apache.geode.test.dunit.IgnoredException.addIgnoredException;
++import static org.apache.geode.test.dunit.Invoke.invokeInEveryVM;
++import static org.apache.geode.test.dunit.VM.getVM;
++import static org.apache.geode.test.dunit.VM.getVMId;
++import static org.apache.geode.util.internal.GeodeGlossary.GEMFIRE_PREFIX;
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.mockito.Mockito.mock;
++
++import java.io.File;
++import java.io.Serializable;
++import java.util.HashSet;
++import java.util.Set;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.atomic.AtomicReference;
++
++import javax.management.MalformedObjectNameException;
++import javax.management.ObjectName;
++
++import org.awaitility.core.ConditionFactory;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++
++import org.apache.geode.CancelException;
++import org.apache.geode.ForcedDisconnectException;
++import org.apache.geode.alerting.internal.spi.AlertingIOException;
++import org.apache.geode.cache.CacheClosedException;
++import org.apache.geode.distributed.DistributedSystemDisconnectedException;
++import org.apache.geode.distributed.LocatorLauncher;
++import org.apache.geode.distributed.ServerLauncher;
++import org.apache.geode.distributed.internal.InternalLocator;
++import org.apache.geode.distributed.internal.membership.api.MemberDisconnectedException;
++import org.apache.geode.test.awaitility.GeodeAwaitility;
++import org.apache.geode.test.dunit.VM;
++import org.apache.geode.test.dunit.rules.DistributedErrorCollector;
++import org.apache.geode.test.dunit.rules.DistributedRestoreSystemProperties;
++import org.apache.geode.test.dunit.rules.DistributedRule;
++import org.apache.geode.test.junit.rules.GfshCommandRule;
++import org.apache.geode.test.junit.rules.serializable.SerializableTemporaryFolder;
++
++public class JMXMBeanLocatorRestartTest implements Serializable {
++
++  private static final long TIMEOUT_MILLIS = getTimeout().toMillis();
++  private static final LocatorLauncher DUMMY_LOCATOR = mock(LocatorLauncher.class);
++  private static final ServerLauncher DUMMY_SERVER = mock(ServerLauncher.class);
++
++  private static final AtomicReference<CountDownLatch> BEFORE =
++      new AtomicReference<>(new CountDownLatch(0));
++  private static final AtomicReference<CountDownLatch> AFTER =
++      new AtomicReference<>(new CountDownLatch(0));
++
++  private static final AtomicReference<LocatorLauncher> LOCATOR =
++      new AtomicReference<>(DUMMY_LOCATOR);
++  private static final AtomicReference<ServerLauncher> SERVER =
++      new AtomicReference<>(DUMMY_SERVER);
++
++  private VM locatorVM;
++  private VM serverVM;
++
++  private String locatorName;
++  private String serverName;
++  private String locators;
++  private int locatorPort;
++  private int locatorJmxPort;
++  private String regionName;
++  private Set<ObjectName> mxbeansOnServer;
++  private Set<ObjectName> mxbeansOnLocator;
++
++  @Rule
++  public DistributedRule distributedRule = new DistributedRule();
++  @Rule
++  public SerializableTemporaryFolder temporaryFolder = new SerializableTemporaryFolder();
++  @Rule
++  public DistributedErrorCollector errorCollector = new DistributedErrorCollector();
++  @Rule
++  public transient GfshCommandRule gfsh = new GfshCommandRule();
++  @Rule
++  public DistributedRestoreSystemProperties restoreProps = new DistributedRestoreSystemProperties();
++
++  @Before
++  public void setUp() throws Exception {
++    locatorVM = getVM(1);
++    serverVM = getVM(0);
++
++    for (VM vm : asList(locatorVM, serverVM)) {
++      vm.invoke(() -> System.setProperty(GEMFIRE_PREFIX + "standard-output-always-on", "true"));
++    }
++
++    locatorName = "locator1";
++    serverName = "server1";
++    File locator1Dir = temporaryFolder.newFolder(locatorName);
++    File serverDir = temporaryFolder.newFolder(serverName);
++
++    int[] port = getRandomAvailableTCPPorts(4);
++    locatorPort = port[0];
++    locatorJmxPort = port[2];
++    locators = "localhost[" + locatorPort + "]";
++
++    locatorVM.invoke(() -> {
++      startLocator(locatorName, locator1Dir, locatorPort, locatorJmxPort, locators);
++    });
++
++    serverVM.invoke(() -> startServer(serverName, serverDir, locators));
++
++    gfsh.connectAndVerify(locatorJmxPort, GfshCommandRule.PortType.jmxManager);
++
++    regionName = "region1";
++    String createRegionCommand = "create region --type=REPLICATE --name=" + SEPARATOR + regionName;
++    gfsh.executeAndAssertThat(createRegionCommand).statusIsSuccess();
++
++    addIgnoredException(AlertingIOException.class);
++    addIgnoredException(CacheClosedException.class);
++    addIgnoredException(CancelException.class);
++    addIgnoredException(DistributedSystemDisconnectedException.class);
++    addIgnoredException(ForcedDisconnectException.class);
++    addIgnoredException(MemberDisconnectedException.class);
++    addIgnoredException("Possible loss of quorum");
++
++    mxbeansOnServer = serverVM.invoke(() -> {
++      await().untilAsserted(() -> {
++        assertThat(getPlatformMBeanServer().queryNames(getInstance("GemFire:*"), null))
++            .as("GemFire mbeans on server1")
++            .containsAll(expectedServerMXBeans(serverName, regionName));
++      });
++      return getPlatformMBeanServer().queryNames(getInstance("GemFire:*"), null);
++    });
++
++    mxbeansOnLocator = locatorVM.invoke(() -> {
++      await().untilAsserted(() -> {
++        assertThat(getPlatformMBeanServer().queryNames(getInstance("GemFire:*"), null))
++            .as("GemFire mbeans on locator1")
++            .containsAll(expectedServerMXBeans(serverName, regionName))
++            .containsAll(expectedLocatorMXBeans(locatorName))
++            .containsAll(expectedDistributedMXBeans(regionName));
++      });
++
++      return getPlatformMBeanServer().queryNames(getInstance("GemFire:*"), null);
++    });
++  }
++
++  @After
++  public void tearDown() {
++    invokeInEveryVM(() -> {
++      BEFORE.get().countDown();
+
+Review comment:
+       I copied too much code from JMXMBeanReconnectDUnitTest which focuses on restart of servers. JMXMBeanLocatorRestartTest 
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+kirklund commented on a change in pull request #5728:
+URL: https://github.com/apache/geode/pull/5728#discussion_r535683589
+
+
+
+##########
+File path: geode-core/src/distributedTest/java/org/apache/geode/management/JMXMBeanLocatorRestartTest.java
+##########
+@@ -0,0 +1,317 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more contributor license
++ * agreements. See the NOTICE file distributed with this work for additional information regarding
++ * copyright ownership. The ASF licenses this file to You under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance with the License. You may obtain a
++ * copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software distributed under the License
++ * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
++ * or implied. See the License for the specific language governing permissions and limitations under
++ * the License.
++ */
++package org.apache.geode.management;
++
++import static java.lang.management.ManagementFactory.getPlatformMBeanServer;
++import static java.util.Arrays.asList;
++import static java.util.concurrent.TimeUnit.MINUTES;
++import static javax.management.ObjectName.getInstance;
++import static org.apache.geode.cache.Region.SEPARATOR;
++import static org.apache.geode.distributed.ConfigurationProperties.HTTP_SERVICE_PORT;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER_PORT;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER_START;
++import static org.apache.geode.distributed.ConfigurationProperties.LOCATORS;
++import static org.apache.geode.distributed.ConfigurationProperties.LOG_FILE;
++import static org.apache.geode.distributed.ConfigurationProperties.MAX_WAIT_TIME_RECONNECT;
++import static org.apache.geode.distributed.ConfigurationProperties.MEMBER_TIMEOUT;
++import static org.apache.geode.distributed.internal.membership.api.MembershipManagerHelper.crashDistributedSystem;
++import static org.apache.geode.internal.AvailablePortHelper.getRandomAvailableTCPPorts;
++import static org.apache.geode.test.awaitility.GeodeAwaitility.getTimeout;
++import static org.apache.geode.test.dunit.Disconnect.disconnectAllFromDS;
++import static org.apache.geode.test.dunit.IgnoredException.addIgnoredException;
++import static org.apache.geode.test.dunit.Invoke.invokeInEveryVM;
++import static org.apache.geode.test.dunit.VM.getVM;
++import static org.apache.geode.test.dunit.VM.getVMId;
++import static org.apache.geode.util.internal.GeodeGlossary.GEMFIRE_PREFIX;
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.mockito.Mockito.mock;
++
++import java.io.File;
++import java.io.Serializable;
++import java.util.HashSet;
++import java.util.Set;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.atomic.AtomicReference;
++
++import javax.management.MalformedObjectNameException;
++import javax.management.ObjectName;
++
++import org.awaitility.core.ConditionFactory;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++
++import org.apache.geode.CancelException;
++import org.apache.geode.ForcedDisconnectException;
++import org.apache.geode.alerting.internal.spi.AlertingIOException;
++import org.apache.geode.cache.CacheClosedException;
++import org.apache.geode.distributed.DistributedSystemDisconnectedException;
++import org.apache.geode.distributed.LocatorLauncher;
++import org.apache.geode.distributed.ServerLauncher;
++import org.apache.geode.distributed.internal.InternalLocator;
++import org.apache.geode.distributed.internal.membership.api.MemberDisconnectedException;
++import org.apache.geode.test.awaitility.GeodeAwaitility;
++import org.apache.geode.test.dunit.VM;
++import org.apache.geode.test.dunit.rules.DistributedErrorCollector;
++import org.apache.geode.test.dunit.rules.DistributedRestoreSystemProperties;
++import org.apache.geode.test.dunit.rules.DistributedRule;
++import org.apache.geode.test.junit.rules.GfshCommandRule;
++import org.apache.geode.test.junit.rules.serializable.SerializableTemporaryFolder;
++
++public class JMXMBeanLocatorRestartTest implements Serializable {
++
++  private static final long TIMEOUT_MILLIS = getTimeout().toMillis();
++  private static final LocatorLauncher DUMMY_LOCATOR = mock(LocatorLauncher.class);
++  private static final ServerLauncher DUMMY_SERVER = mock(ServerLauncher.class);
++
++  private static final AtomicReference<CountDownLatch> BEFORE =
++      new AtomicReference<>(new CountDownLatch(0));
++  private static final AtomicReference<CountDownLatch> AFTER =
++      new AtomicReference<>(new CountDownLatch(0));
++
++  private static final AtomicReference<LocatorLauncher> LOCATOR =
++      new AtomicReference<>(DUMMY_LOCATOR);
++  private static final AtomicReference<ServerLauncher> SERVER =
++      new AtomicReference<>(DUMMY_SERVER);
++
++  private VM locatorVM;
++  private VM serverVM;
++
++  private String locatorName;
++  private String serverName;
++  private String locators;
++  private int locatorPort;
++  private int locatorJmxPort;
++  private String regionName;
++  private Set<ObjectName> mxbeansOnServer;
++  private Set<ObjectName> mxbeansOnLocator;
++
++  @Rule
++  public DistributedRule distributedRule = new DistributedRule();
++  @Rule
++  public SerializableTemporaryFolder temporaryFolder = new SerializableTemporaryFolder();
++  @Rule
++  public DistributedErrorCollector errorCollector = new DistributedErrorCollector();
++  @Rule
++  public transient GfshCommandRule gfsh = new GfshCommandRule();
++  @Rule
++  public DistributedRestoreSystemProperties restoreProps = new DistributedRestoreSystemProperties();
++
++  @Before
++  public void setUp() throws Exception {
++    locatorVM = getVM(1);
++    serverVM = getVM(0);
++
++    for (VM vm : asList(locatorVM, serverVM)) {
++      vm.invoke(() -> System.setProperty(GEMFIRE_PREFIX + "standard-output-always-on", "true"));
++    }
++
++    locatorName = "locator1";
++    serverName = "server1";
++    File locator1Dir = temporaryFolder.newFolder(locatorName);
++    File serverDir = temporaryFolder.newFolder(serverName);
++
++    int[] port = getRandomAvailableTCPPorts(4);
++    locatorPort = port[0];
++    locatorJmxPort = port[2];
++    locators = "localhost[" + locatorPort + "]";
++
++    locatorVM.invoke(() -> {
++      startLocator(locatorName, locator1Dir, locatorPort, locatorJmxPort, locators);
++    });
++
++    serverVM.invoke(() -> startServer(serverName, serverDir, locators));
++
++    gfsh.connectAndVerify(locatorJmxPort, GfshCommandRule.PortType.jmxManager);
++
++    regionName = "region1";
++    String createRegionCommand = "create region --type=REPLICATE --name=" + SEPARATOR + regionName;
++    gfsh.executeAndAssertThat(createRegionCommand).statusIsSuccess();
++
++    addIgnoredException(AlertingIOException.class);
++    addIgnoredException(CacheClosedException.class);
++    addIgnoredException(CancelException.class);
++    addIgnoredException(DistributedSystemDisconnectedException.class);
++    addIgnoredException(ForcedDisconnectException.class);
++    addIgnoredException(MemberDisconnectedException.class);
++    addIgnoredException("Possible loss of quorum");
++
++    mxbeansOnServer = serverVM.invoke(() -> {
++      await().untilAsserted(() -> {
++        assertThat(getPlatformMBeanServer().queryNames(getInstance("GemFire:*"), null))
++            .as("GemFire mbeans on server1")
++            .containsAll(expectedServerMXBeans(serverName, regionName));
++      });
++      return getPlatformMBeanServer().queryNames(getInstance("GemFire:*"), null);
++    });
++
++    mxbeansOnLocator = locatorVM.invoke(() -> {
++      await().untilAsserted(() -> {
++        assertThat(getPlatformMBeanServer().queryNames(getInstance("GemFire:*"), null))
++            .as("GemFire mbeans on locator1")
++            .containsAll(expectedServerMXBeans(serverName, regionName))
++            .containsAll(expectedLocatorMXBeans(locatorName))
++            .containsAll(expectedDistributedMXBeans(regionName));
++      });
++
++      return getPlatformMBeanServer().queryNames(getInstance("GemFire:*"), null);
++    });
++  }
++
++  @After
++  public void tearDown() {
++    invokeInEveryVM(() -> {
++      BEFORE.get().countDown();
+
+Review comment:
+       I copied too much code from JMXMBeanReconnectDUnitTest which focuses on restart of servers. 
+   
+   JMXMBeanLocatorRestartTest is new and focuses on restart of locator. I need to do more cleanup. Thanks!
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+kirklund commented on a change in pull request #5728:
+URL: https://github.com/apache/geode/pull/5728#discussion_r535686179
+
+
+
+##########
+File path: geode-core/src/main/java/org/apache/geode/management/internal/FederatingManager.java
+##########
+@@ -79,26 +82,39 @@
+    * unbounded in practical situation as number of members will be a finite set at any given point
+    * of time
+    */
+-  private ExecutorService executorService;
++  private final AtomicReference<ExecutorService> executorService = new AtomicReference<>();
++  private boolean pendingStartup = true;
+
+Review comment:
+       Do you have any suggestions how to fix FederatingManager without this problem? The membership listener callbacks need to never block on synchronization but they cannot add or remove until after the manager is started.
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+kirklund commented on a change in pull request #5728:
+URL: https://github.com/apache/geode/pull/5728#discussion_r535690932
+
+
+
+##########
+File path: geode-core/src/distributedTest/java/org/apache/geode/management/JMXMBeanLocatorRestartTest.java
+##########
+@@ -0,0 +1,317 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more contributor license
++ * agreements. See the NOTICE file distributed with this work for additional information regarding
++ * copyright ownership. The ASF licenses this file to You under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance with the License. You may obtain a
++ * copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software distributed under the License
++ * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
++ * or implied. See the License for the specific language governing permissions and limitations under
++ * the License.
++ */
++package org.apache.geode.management;
++
++import static java.lang.management.ManagementFactory.getPlatformMBeanServer;
++import static java.util.Arrays.asList;
++import static java.util.concurrent.TimeUnit.MINUTES;
++import static javax.management.ObjectName.getInstance;
++import static org.apache.geode.cache.Region.SEPARATOR;
++import static org.apache.geode.distributed.ConfigurationProperties.HTTP_SERVICE_PORT;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER_PORT;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER_START;
++import static org.apache.geode.distributed.ConfigurationProperties.LOCATORS;
++import static org.apache.geode.distributed.ConfigurationProperties.LOG_FILE;
++import static org.apache.geode.distributed.ConfigurationProperties.MAX_WAIT_TIME_RECONNECT;
++import static org.apache.geode.distributed.ConfigurationProperties.MEMBER_TIMEOUT;
++import static org.apache.geode.distributed.internal.membership.api.MembershipManagerHelper.crashDistributedSystem;
++import static org.apache.geode.internal.AvailablePortHelper.getRandomAvailableTCPPorts;
++import static org.apache.geode.test.awaitility.GeodeAwaitility.getTimeout;
++import static org.apache.geode.test.dunit.Disconnect.disconnectAllFromDS;
++import static org.apache.geode.test.dunit.IgnoredException.addIgnoredException;
++import static org.apache.geode.test.dunit.Invoke.invokeInEveryVM;
++import static org.apache.geode.test.dunit.VM.getVM;
++import static org.apache.geode.test.dunit.VM.getVMId;
++import static org.apache.geode.util.internal.GeodeGlossary.GEMFIRE_PREFIX;
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.mockito.Mockito.mock;
++
++import java.io.File;
++import java.io.Serializable;
++import java.util.HashSet;
++import java.util.Set;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.atomic.AtomicReference;
++
++import javax.management.MalformedObjectNameException;
++import javax.management.ObjectName;
++
++import org.awaitility.core.ConditionFactory;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++
++import org.apache.geode.CancelException;
++import org.apache.geode.ForcedDisconnectException;
++import org.apache.geode.alerting.internal.spi.AlertingIOException;
++import org.apache.geode.cache.CacheClosedException;
++import org.apache.geode.distributed.DistributedSystemDisconnectedException;
++import org.apache.geode.distributed.LocatorLauncher;
++import org.apache.geode.distributed.ServerLauncher;
++import org.apache.geode.distributed.internal.InternalLocator;
++import org.apache.geode.distributed.internal.membership.api.MemberDisconnectedException;
++import org.apache.geode.test.awaitility.GeodeAwaitility;
++import org.apache.geode.test.dunit.VM;
++import org.apache.geode.test.dunit.rules.DistributedErrorCollector;
++import org.apache.geode.test.dunit.rules.DistributedRestoreSystemProperties;
++import org.apache.geode.test.dunit.rules.DistributedRule;
++import org.apache.geode.test.junit.rules.GfshCommandRule;
++import org.apache.geode.test.junit.rules.serializable.SerializableTemporaryFolder;
++
++public class JMXMBeanLocatorRestartTest implements Serializable {
++
++  private static final long TIMEOUT_MILLIS = getTimeout().toMillis();
++  private static final LocatorLauncher DUMMY_LOCATOR = mock(LocatorLauncher.class);
++  private static final ServerLauncher DUMMY_SERVER = mock(ServerLauncher.class);
++
++  private static final AtomicReference<CountDownLatch> BEFORE =
++      new AtomicReference<>(new CountDownLatch(0));
++  private static final AtomicReference<CountDownLatch> AFTER =
++      new AtomicReference<>(new CountDownLatch(0));
++
++  private static final AtomicReference<LocatorLauncher> LOCATOR =
++      new AtomicReference<>(DUMMY_LOCATOR);
++  private static final AtomicReference<ServerLauncher> SERVER =
++      new AtomicReference<>(DUMMY_SERVER);
++
++  private VM locatorVM;
++  private VM serverVM;
++
++  private String locatorName;
++  private String serverName;
++  private String locators;
++  private int locatorPort;
++  private int locatorJmxPort;
++  private String regionName;
++  private Set<ObjectName> mxbeansOnServer;
++  private Set<ObjectName> mxbeansOnLocator;
++
++  @Rule
++  public DistributedRule distributedRule = new DistributedRule();
++  @Rule
++  public SerializableTemporaryFolder temporaryFolder = new SerializableTemporaryFolder();
++  @Rule
++  public DistributedErrorCollector errorCollector = new DistributedErrorCollector();
++  @Rule
++  public transient GfshCommandRule gfsh = new GfshCommandRule();
++  @Rule
++  public DistributedRestoreSystemProperties restoreProps = new DistributedRestoreSystemProperties();
++
++  @Before
++  public void setUp() throws Exception {
++    locatorVM = getVM(1);
++    serverVM = getVM(0);
++
++    for (VM vm : asList(locatorVM, serverVM)) {
++      vm.invoke(() -> System.setProperty(GEMFIRE_PREFIX + "standard-output-always-on", "true"));
++    }
++
++    locatorName = "locator1";
++    serverName = "server1";
++    File locator1Dir = temporaryFolder.newFolder(locatorName);
++    File serverDir = temporaryFolder.newFolder(serverName);
++
++    int[] port = getRandomAvailableTCPPorts(4);
++    locatorPort = port[0];
++    locatorJmxPort = port[2];
++    locators = "localhost[" + locatorPort + "]";
++
++    locatorVM.invoke(() -> {
++      startLocator(locatorName, locator1Dir, locatorPort, locatorJmxPort, locators);
++    });
++
++    serverVM.invoke(() -> startServer(serverName, serverDir, locators));
++
++    gfsh.connectAndVerify(locatorJmxPort, GfshCommandRule.PortType.jmxManager);
++
++    regionName = "region1";
++    String createRegionCommand = "create region --type=REPLICATE --name=" + SEPARATOR + regionName;
++    gfsh.executeAndAssertThat(createRegionCommand).statusIsSuccess();
++
++    addIgnoredException(AlertingIOException.class);
++    addIgnoredException(CacheClosedException.class);
++    addIgnoredException(CancelException.class);
++    addIgnoredException(DistributedSystemDisconnectedException.class);
++    addIgnoredException(ForcedDisconnectException.class);
++    addIgnoredException(MemberDisconnectedException.class);
++    addIgnoredException("Possible loss of quorum");
++
++    mxbeansOnServer = serverVM.invoke(() -> {
++      await().untilAsserted(() -> {
++        assertThat(getPlatformMBeanServer().queryNames(getInstance("GemFire:*"), null))
++            .as("GemFire mbeans on server1")
++            .containsAll(expectedServerMXBeans(serverName, regionName));
+
+Review comment:
+       I just remembered why I have it like this: for easier reading. I'm converting them all to variables and one field, but it's not as readable.
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+demery-pivotal commented on a change in pull request #5728:
+URL: https://github.com/apache/geode/pull/5728#discussion_r535693444
+
+
+
+##########
+File path: geode-core/src/distributedTest/java/org/apache/geode/management/JMXMBeanLocatorRestartTest.java
+##########
+@@ -0,0 +1,317 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more contributor license
++ * agreements. See the NOTICE file distributed with this work for additional information regarding
++ * copyright ownership. The ASF licenses this file to You under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance with the License. You may obtain a
++ * copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software distributed under the License
++ * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
++ * or implied. See the License for the specific language governing permissions and limitations under
++ * the License.
++ */
++package org.apache.geode.management;
++
++import static java.lang.management.ManagementFactory.getPlatformMBeanServer;
++import static java.util.Arrays.asList;
++import static java.util.concurrent.TimeUnit.MINUTES;
++import static javax.management.ObjectName.getInstance;
++import static org.apache.geode.cache.Region.SEPARATOR;
++import static org.apache.geode.distributed.ConfigurationProperties.HTTP_SERVICE_PORT;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER_PORT;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER_START;
++import static org.apache.geode.distributed.ConfigurationProperties.LOCATORS;
++import static org.apache.geode.distributed.ConfigurationProperties.LOG_FILE;
++import static org.apache.geode.distributed.ConfigurationProperties.MAX_WAIT_TIME_RECONNECT;
++import static org.apache.geode.distributed.ConfigurationProperties.MEMBER_TIMEOUT;
++import static org.apache.geode.distributed.internal.membership.api.MembershipManagerHelper.crashDistributedSystem;
++import static org.apache.geode.internal.AvailablePortHelper.getRandomAvailableTCPPorts;
++import static org.apache.geode.test.awaitility.GeodeAwaitility.getTimeout;
++import static org.apache.geode.test.dunit.Disconnect.disconnectAllFromDS;
++import static org.apache.geode.test.dunit.IgnoredException.addIgnoredException;
++import static org.apache.geode.test.dunit.Invoke.invokeInEveryVM;
++import static org.apache.geode.test.dunit.VM.getVM;
++import static org.apache.geode.test.dunit.VM.getVMId;
++import static org.apache.geode.util.internal.GeodeGlossary.GEMFIRE_PREFIX;
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.mockito.Mockito.mock;
++
++import java.io.File;
++import java.io.Serializable;
++import java.util.HashSet;
++import java.util.Set;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.atomic.AtomicReference;
++
++import javax.management.MalformedObjectNameException;
++import javax.management.ObjectName;
++
++import org.awaitility.core.ConditionFactory;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++
++import org.apache.geode.CancelException;
++import org.apache.geode.ForcedDisconnectException;
++import org.apache.geode.alerting.internal.spi.AlertingIOException;
++import org.apache.geode.cache.CacheClosedException;
++import org.apache.geode.distributed.DistributedSystemDisconnectedException;
++import org.apache.geode.distributed.LocatorLauncher;
++import org.apache.geode.distributed.ServerLauncher;
++import org.apache.geode.distributed.internal.InternalLocator;
++import org.apache.geode.distributed.internal.membership.api.MemberDisconnectedException;
++import org.apache.geode.test.awaitility.GeodeAwaitility;
++import org.apache.geode.test.dunit.VM;
++import org.apache.geode.test.dunit.rules.DistributedErrorCollector;
++import org.apache.geode.test.dunit.rules.DistributedRestoreSystemProperties;
++import org.apache.geode.test.dunit.rules.DistributedRule;
++import org.apache.geode.test.junit.rules.GfshCommandRule;
++import org.apache.geode.test.junit.rules.serializable.SerializableTemporaryFolder;
++
++public class JMXMBeanLocatorRestartTest implements Serializable {
++
++  private static final long TIMEOUT_MILLIS = getTimeout().toMillis();
++  private static final LocatorLauncher DUMMY_LOCATOR = mock(LocatorLauncher.class);
++  private static final ServerLauncher DUMMY_SERVER = mock(ServerLauncher.class);
++
++  private static final AtomicReference<CountDownLatch> BEFORE =
++      new AtomicReference<>(new CountDownLatch(0));
++  private static final AtomicReference<CountDownLatch> AFTER =
++      new AtomicReference<>(new CountDownLatch(0));
++
++  private static final AtomicReference<LocatorLauncher> LOCATOR =
++      new AtomicReference<>(DUMMY_LOCATOR);
++  private static final AtomicReference<ServerLauncher> SERVER =
++      new AtomicReference<>(DUMMY_SERVER);
++
++  private VM locatorVM;
++  private VM serverVM;
++
++  private String locatorName;
++  private String serverName;
++  private String locators;
++  private int locatorPort;
++  private int locatorJmxPort;
++  private String regionName;
++  private Set<ObjectName> mxbeansOnServer;
++  private Set<ObjectName> mxbeansOnLocator;
++
++  @Rule
++  public DistributedRule distributedRule = new DistributedRule();
++  @Rule
++  public SerializableTemporaryFolder temporaryFolder = new SerializableTemporaryFolder();
++  @Rule
++  public DistributedErrorCollector errorCollector = new DistributedErrorCollector();
++  @Rule
++  public transient GfshCommandRule gfsh = new GfshCommandRule();
++  @Rule
++  public DistributedRestoreSystemProperties restoreProps = new DistributedRestoreSystemProperties();
++
++  @Before
++  public void setUp() throws Exception {
++    locatorVM = getVM(1);
++    serverVM = getVM(0);
++
++    for (VM vm : asList(locatorVM, serverVM)) {
++      vm.invoke(() -> System.setProperty(GEMFIRE_PREFIX + "standard-output-always-on", "true"));
++    }
++
++    locatorName = "locator1";
++    serverName = "server1";
++    File locator1Dir = temporaryFolder.newFolder(locatorName);
++    File serverDir = temporaryFolder.newFolder(serverName);
++
++    int[] port = getRandomAvailableTCPPorts(4);
++    locatorPort = port[0];
++    locatorJmxPort = port[2];
++    locators = "localhost[" + locatorPort + "]";
++
++    locatorVM.invoke(() -> {
++      startLocator(locatorName, locator1Dir, locatorPort, locatorJmxPort, locators);
++    });
++
++    serverVM.invoke(() -> startServer(serverName, serverDir, locators));
++
++    gfsh.connectAndVerify(locatorJmxPort, GfshCommandRule.PortType.jmxManager);
++
++    regionName = "region1";
++    String createRegionCommand = "create region --type=REPLICATE --name=" + SEPARATOR + regionName;
++    gfsh.executeAndAssertThat(createRegionCommand).statusIsSuccess();
++
++    addIgnoredException(AlertingIOException.class);
++    addIgnoredException(CacheClosedException.class);
++    addIgnoredException(CancelException.class);
++    addIgnoredException(DistributedSystemDisconnectedException.class);
++    addIgnoredException(ForcedDisconnectException.class);
++    addIgnoredException(MemberDisconnectedException.class);
++    addIgnoredException("Possible loss of quorum");
++
++    mxbeansOnServer = serverVM.invoke(() -> {
++      await().untilAsserted(() -> {
++        assertThat(getPlatformMBeanServer().queryNames(getInstance("GemFire:*"), null))
++            .as("GemFire mbeans on server1")
++            .containsAll(expectedServerMXBeans(serverName, regionName));
+
+Review comment:
+       Yeah, that's part of why I was wondering whether my suggestion was worth the effort.
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+kirklund commented on a change in pull request #5728:
+URL: https://github.com/apache/geode/pull/5728#discussion_r536295508
+
+
+
+##########
+File path: geode-core/src/distributedTest/java/org/apache/geode/management/JMXMBeanLocatorRestartTest.java
+##########
+@@ -0,0 +1,317 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more contributor license
++ * agreements. See the NOTICE file distributed with this work for additional information regarding
++ * copyright ownership. The ASF licenses this file to You under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance with the License. You may obtain a
++ * copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software distributed under the License
++ * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
++ * or implied. See the License for the specific language governing permissions and limitations under
++ * the License.
++ */
++package org.apache.geode.management;
++
++import static java.lang.management.ManagementFactory.getPlatformMBeanServer;
++import static java.util.Arrays.asList;
++import static java.util.concurrent.TimeUnit.MINUTES;
++import static javax.management.ObjectName.getInstance;
++import static org.apache.geode.cache.Region.SEPARATOR;
++import static org.apache.geode.distributed.ConfigurationProperties.HTTP_SERVICE_PORT;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER_PORT;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER_START;
++import static org.apache.geode.distributed.ConfigurationProperties.LOCATORS;
++import static org.apache.geode.distributed.ConfigurationProperties.LOG_FILE;
++import static org.apache.geode.distributed.ConfigurationProperties.MAX_WAIT_TIME_RECONNECT;
++import static org.apache.geode.distributed.ConfigurationProperties.MEMBER_TIMEOUT;
++import static org.apache.geode.distributed.internal.membership.api.MembershipManagerHelper.crashDistributedSystem;
++import static org.apache.geode.internal.AvailablePortHelper.getRandomAvailableTCPPorts;
++import static org.apache.geode.test.awaitility.GeodeAwaitility.getTimeout;
++import static org.apache.geode.test.dunit.Disconnect.disconnectAllFromDS;
++import static org.apache.geode.test.dunit.IgnoredException.addIgnoredException;
++import static org.apache.geode.test.dunit.Invoke.invokeInEveryVM;
++import static org.apache.geode.test.dunit.VM.getVM;
++import static org.apache.geode.test.dunit.VM.getVMId;
++import static org.apache.geode.util.internal.GeodeGlossary.GEMFIRE_PREFIX;
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.mockito.Mockito.mock;
++
++import java.io.File;
++import java.io.Serializable;
++import java.util.HashSet;
++import java.util.Set;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.atomic.AtomicReference;
++
++import javax.management.MalformedObjectNameException;
++import javax.management.ObjectName;
++
++import org.awaitility.core.ConditionFactory;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++
++import org.apache.geode.CancelException;
++import org.apache.geode.ForcedDisconnectException;
++import org.apache.geode.alerting.internal.spi.AlertingIOException;
++import org.apache.geode.cache.CacheClosedException;
++import org.apache.geode.distributed.DistributedSystemDisconnectedException;
++import org.apache.geode.distributed.LocatorLauncher;
++import org.apache.geode.distributed.ServerLauncher;
++import org.apache.geode.distributed.internal.InternalLocator;
++import org.apache.geode.distributed.internal.membership.api.MemberDisconnectedException;
++import org.apache.geode.test.awaitility.GeodeAwaitility;
++import org.apache.geode.test.dunit.VM;
++import org.apache.geode.test.dunit.rules.DistributedErrorCollector;
++import org.apache.geode.test.dunit.rules.DistributedRestoreSystemProperties;
++import org.apache.geode.test.dunit.rules.DistributedRule;
++import org.apache.geode.test.junit.rules.GfshCommandRule;
++import org.apache.geode.test.junit.rules.serializable.SerializableTemporaryFolder;
++
++public class JMXMBeanLocatorRestartTest implements Serializable {
++
++  private static final long TIMEOUT_MILLIS = getTimeout().toMillis();
++  private static final LocatorLauncher DUMMY_LOCATOR = mock(LocatorLauncher.class);
++  private static final ServerLauncher DUMMY_SERVER = mock(ServerLauncher.class);
++
++  private static final AtomicReference<CountDownLatch> BEFORE =
++      new AtomicReference<>(new CountDownLatch(0));
++  private static final AtomicReference<CountDownLatch> AFTER =
++      new AtomicReference<>(new CountDownLatch(0));
++
++  private static final AtomicReference<LocatorLauncher> LOCATOR =
++      new AtomicReference<>(DUMMY_LOCATOR);
++  private static final AtomicReference<ServerLauncher> SERVER =
++      new AtomicReference<>(DUMMY_SERVER);
++
++  private VM locatorVM;
++  private VM serverVM;
++
++  private String locatorName;
++  private String serverName;
++  private String locators;
++  private int locatorPort;
++  private int locatorJmxPort;
++  private String regionName;
++  private Set<ObjectName> mxbeansOnServer;
++  private Set<ObjectName> mxbeansOnLocator;
++
++  @Rule
++  public DistributedRule distributedRule = new DistributedRule();
++  @Rule
++  public SerializableTemporaryFolder temporaryFolder = new SerializableTemporaryFolder();
++  @Rule
++  public DistributedErrorCollector errorCollector = new DistributedErrorCollector();
++  @Rule
++  public transient GfshCommandRule gfsh = new GfshCommandRule();
++  @Rule
++  public DistributedRestoreSystemProperties restoreProps = new DistributedRestoreSystemProperties();
++
++  @Before
++  public void setUp() throws Exception {
++    locatorVM = getVM(1);
++    serverVM = getVM(0);
++
++    for (VM vm : asList(locatorVM, serverVM)) {
++      vm.invoke(() -> System.setProperty(GEMFIRE_PREFIX + "standard-output-always-on", "true"));
++    }
++
++    locatorName = "locator1";
++    serverName = "server1";
++    File locator1Dir = temporaryFolder.newFolder(locatorName);
++    File serverDir = temporaryFolder.newFolder(serverName);
++
++    int[] port = getRandomAvailableTCPPorts(4);
++    locatorPort = port[0];
++    locatorJmxPort = port[2];
++    locators = "localhost[" + locatorPort + "]";
++
++    locatorVM.invoke(() -> {
++      startLocator(locatorName, locator1Dir, locatorPort, locatorJmxPort, locators);
++    });
++
++    serverVM.invoke(() -> startServer(serverName, serverDir, locators));
++
++    gfsh.connectAndVerify(locatorJmxPort, GfshCommandRule.PortType.jmxManager);
++
++    regionName = "region1";
++    String createRegionCommand = "create region --type=REPLICATE --name=" + SEPARATOR + regionName;
++    gfsh.executeAndAssertThat(createRegionCommand).statusIsSuccess();
++
++    addIgnoredException(AlertingIOException.class);
++    addIgnoredException(CacheClosedException.class);
++    addIgnoredException(CancelException.class);
++    addIgnoredException(DistributedSystemDisconnectedException.class);
++    addIgnoredException(ForcedDisconnectException.class);
++    addIgnoredException(MemberDisconnectedException.class);
++    addIgnoredException("Possible loss of quorum");
++
++    mxbeansOnServer = serverVM.invoke(() -> {
++      await().untilAsserted(() -> {
++        assertThat(getPlatformMBeanServer().queryNames(getInstance("GemFire:*"), null))
++            .as("GemFire mbeans on server1")
++            .containsAll(expectedServerMXBeans(serverName, regionName));
+
+Review comment:
+       I think I found a good way to improve readability along with make things more efficient. Please take a look at both JmxLocatorReconnectDistributedTest (my new test) and JmxServerReconnectDistributedTest (overhauled for consistency). Thanks!
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+kirklund commented on a change in pull request #5728:
+URL: https://github.com/apache/geode/pull/5728#discussion_r536295622
+
+
+
+##########
+File path: geode-core/src/test/java/org/apache/geode/management/internal/FederatingManagerTest.java
+##########
+@@ -437,14 +474,79 @@ public void removeMemberArtifactsDoesNotRemoveAllProxiesIfMonitoringRegionIsNull
+         .thenReturn(mock(Region.class));
+     when(system.getDistributedMember())
+         .thenReturn(member);
+-    FederatingManager federatingManager = new FederatingManager(repo, system, service, cache,
+-        statisticsFactory, statisticsClock, proxyFactory, messenger, executorService);
++    FederatingManager federatingManager =
++        new FederatingManager(repo, system, service, cache, statisticsFactory,
++            statisticsClock, proxyFactory, messenger, cancelCriterion, executorService);
+ 
+     federatingManager.removeMemberArtifacts(member, false);
+ 
+     verifyNoMoreInteractions(proxyFactory);
+   }
+ 
++  @Test
++  public void removeMemberWaitsForStartManager() throws Exception {
++    CountDownLatch latch = new CountDownLatch(1);
++    CyclicBarrier barrier = new CyclicBarrier(2);
++    ExecutorService executorService = mock(ExecutorService.class);
++    List<Future<InternalDistributedMember>> futureTaskList = Collections.emptyList();
++
++    when(executorService.invokeAll(any())).thenAnswer(invocation -> {
++      awaitCyclicBarrier(barrier);
++      awaitCountDownLatch(latch);
++      return futureTaskList;
++    });
++
++    FederatingManager federatingManager =
++        spy(new FederatingManager(repo, system, service, cache, statisticsFactory, statisticsClock,
+
+Review comment:
+       Spy is gone!
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+kirklund commented on a change in pull request #5728:
+URL: https://github.com/apache/geode/pull/5728#discussion_r536296251
+
+
+
+##########
+File path: geode-core/src/main/java/org/apache/geode/management/internal/FederatingManager.java
+##########
+@@ -79,26 +82,39 @@
+    * unbounded in practical situation as number of members will be a finite set at any given point
+    * of time
+    */
+-  private ExecutorService executorService;
++  private final AtomicReference<ExecutorService> executorService = new AtomicReference<>();
++  private boolean pendingStartup = true;
+
+Review comment:
+       I believe I can fix this concern by overhauling SystemManagementService and ManagementMembershipListener to avoid adding a membership listener until the manager is started.
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+kirklund commented on a change in pull request #5728:
+URL: https://github.com/apache/geode/pull/5728#discussion_r536297096
+
+
+
+##########
+File path: geode-core/src/distributedTest/java/org/apache/geode/management/JMXMBeanLocatorRestartTest.java
+##########
+@@ -0,0 +1,317 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more contributor license
++ * agreements. See the NOTICE file distributed with this work for additional information regarding
++ * copyright ownership. The ASF licenses this file to You under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance with the License. You may obtain a
++ * copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software distributed under the License
++ * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
++ * or implied. See the License for the specific language governing permissions and limitations under
++ * the License.
++ */
++package org.apache.geode.management;
++
++import static java.lang.management.ManagementFactory.getPlatformMBeanServer;
++import static java.util.Arrays.asList;
++import static java.util.concurrent.TimeUnit.MINUTES;
++import static javax.management.ObjectName.getInstance;
++import static org.apache.geode.cache.Region.SEPARATOR;
++import static org.apache.geode.distributed.ConfigurationProperties.HTTP_SERVICE_PORT;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER_PORT;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER_START;
++import static org.apache.geode.distributed.ConfigurationProperties.LOCATORS;
++import static org.apache.geode.distributed.ConfigurationProperties.LOG_FILE;
++import static org.apache.geode.distributed.ConfigurationProperties.MAX_WAIT_TIME_RECONNECT;
++import static org.apache.geode.distributed.ConfigurationProperties.MEMBER_TIMEOUT;
++import static org.apache.geode.distributed.internal.membership.api.MembershipManagerHelper.crashDistributedSystem;
++import static org.apache.geode.internal.AvailablePortHelper.getRandomAvailableTCPPorts;
++import static org.apache.geode.test.awaitility.GeodeAwaitility.getTimeout;
++import static org.apache.geode.test.dunit.Disconnect.disconnectAllFromDS;
++import static org.apache.geode.test.dunit.IgnoredException.addIgnoredException;
++import static org.apache.geode.test.dunit.Invoke.invokeInEveryVM;
++import static org.apache.geode.test.dunit.VM.getVM;
++import static org.apache.geode.test.dunit.VM.getVMId;
++import static org.apache.geode.util.internal.GeodeGlossary.GEMFIRE_PREFIX;
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.mockito.Mockito.mock;
++
++import java.io.File;
++import java.io.Serializable;
++import java.util.HashSet;
++import java.util.Set;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.atomic.AtomicReference;
++
++import javax.management.MalformedObjectNameException;
++import javax.management.ObjectName;
++
++import org.awaitility.core.ConditionFactory;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++
++import org.apache.geode.CancelException;
++import org.apache.geode.ForcedDisconnectException;
++import org.apache.geode.alerting.internal.spi.AlertingIOException;
++import org.apache.geode.cache.CacheClosedException;
++import org.apache.geode.distributed.DistributedSystemDisconnectedException;
++import org.apache.geode.distributed.LocatorLauncher;
++import org.apache.geode.distributed.ServerLauncher;
++import org.apache.geode.distributed.internal.InternalLocator;
++import org.apache.geode.distributed.internal.membership.api.MemberDisconnectedException;
++import org.apache.geode.test.awaitility.GeodeAwaitility;
++import org.apache.geode.test.dunit.VM;
++import org.apache.geode.test.dunit.rules.DistributedErrorCollector;
++import org.apache.geode.test.dunit.rules.DistributedRestoreSystemProperties;
++import org.apache.geode.test.dunit.rules.DistributedRule;
++import org.apache.geode.test.junit.rules.GfshCommandRule;
++import org.apache.geode.test.junit.rules.serializable.SerializableTemporaryFolder;
++
++public class JMXMBeanLocatorRestartTest implements Serializable {
++
++  private static final long TIMEOUT_MILLIS = getTimeout().toMillis();
++  private static final LocatorLauncher DUMMY_LOCATOR = mock(LocatorLauncher.class);
++  private static final ServerLauncher DUMMY_SERVER = mock(ServerLauncher.class);
++
++  private static final AtomicReference<CountDownLatch> BEFORE =
++      new AtomicReference<>(new CountDownLatch(0));
++  private static final AtomicReference<CountDownLatch> AFTER =
++      new AtomicReference<>(new CountDownLatch(0));
++
++  private static final AtomicReference<LocatorLauncher> LOCATOR =
++      new AtomicReference<>(DUMMY_LOCATOR);
++  private static final AtomicReference<ServerLauncher> SERVER =
++      new AtomicReference<>(DUMMY_SERVER);
++
++  private VM locatorVM;
++  private VM serverVM;
++
++  private String locatorName;
++  private String serverName;
++  private String locators;
++  private int locatorPort;
++  private int locatorJmxPort;
++  private String regionName;
++  private Set<ObjectName> mxbeansOnServer;
++  private Set<ObjectName> mxbeansOnLocator;
++
++  @Rule
++  public DistributedRule distributedRule = new DistributedRule();
++  @Rule
++  public SerializableTemporaryFolder temporaryFolder = new SerializableTemporaryFolder();
++  @Rule
++  public DistributedErrorCollector errorCollector = new DistributedErrorCollector();
++  @Rule
++  public transient GfshCommandRule gfsh = new GfshCommandRule();
++  @Rule
++  public DistributedRestoreSystemProperties restoreProps = new DistributedRestoreSystemProperties();
++
++  @Before
++  public void setUp() throws Exception {
++    locatorVM = getVM(1);
++    serverVM = getVM(0);
++
++    for (VM vm : asList(locatorVM, serverVM)) {
++      vm.invoke(() -> System.setProperty(GEMFIRE_PREFIX + "standard-output-always-on", "true"));
++    }
++
++    locatorName = "locator1";
++    serverName = "server1";
++    File locator1Dir = temporaryFolder.newFolder(locatorName);
++    File serverDir = temporaryFolder.newFolder(serverName);
++
++    int[] port = getRandomAvailableTCPPorts(4);
+
+Review comment:
+       Fixed! I've renamed the test to JmxLocatorReconnectDistributedTest and also renamed/overhauled JmxServerReconnectDistributedTest for consistency. I also updated them to use DistributedReference to make the launcher handling of easier. Please take a look when you have a chance. Thanks!
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+kirklund commented on a change in pull request #5728:
+URL: https://github.com/apache/geode/pull/5728#discussion_r536297223
+
+
+
+##########
+File path: geode-core/src/distributedTest/java/org/apache/geode/management/JMXMBeanLocatorRestartTest.java
+##########
+@@ -0,0 +1,317 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more contributor license
++ * agreements. See the NOTICE file distributed with this work for additional information regarding
++ * copyright ownership. The ASF licenses this file to You under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance with the License. You may obtain a
++ * copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software distributed under the License
++ * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
++ * or implied. See the License for the specific language governing permissions and limitations under
++ * the License.
++ */
++package org.apache.geode.management;
++
++import static java.lang.management.ManagementFactory.getPlatformMBeanServer;
++import static java.util.Arrays.asList;
++import static java.util.concurrent.TimeUnit.MINUTES;
++import static javax.management.ObjectName.getInstance;
++import static org.apache.geode.cache.Region.SEPARATOR;
++import static org.apache.geode.distributed.ConfigurationProperties.HTTP_SERVICE_PORT;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER_PORT;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER_START;
++import static org.apache.geode.distributed.ConfigurationProperties.LOCATORS;
++import static org.apache.geode.distributed.ConfigurationProperties.LOG_FILE;
++import static org.apache.geode.distributed.ConfigurationProperties.MAX_WAIT_TIME_RECONNECT;
++import static org.apache.geode.distributed.ConfigurationProperties.MEMBER_TIMEOUT;
++import static org.apache.geode.distributed.internal.membership.api.MembershipManagerHelper.crashDistributedSystem;
++import static org.apache.geode.internal.AvailablePortHelper.getRandomAvailableTCPPorts;
++import static org.apache.geode.test.awaitility.GeodeAwaitility.getTimeout;
++import static org.apache.geode.test.dunit.Disconnect.disconnectAllFromDS;
++import static org.apache.geode.test.dunit.IgnoredException.addIgnoredException;
++import static org.apache.geode.test.dunit.Invoke.invokeInEveryVM;
++import static org.apache.geode.test.dunit.VM.getVM;
++import static org.apache.geode.test.dunit.VM.getVMId;
++import static org.apache.geode.util.internal.GeodeGlossary.GEMFIRE_PREFIX;
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.mockito.Mockito.mock;
++
++import java.io.File;
++import java.io.Serializable;
++import java.util.HashSet;
++import java.util.Set;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.atomic.AtomicReference;
++
++import javax.management.MalformedObjectNameException;
++import javax.management.ObjectName;
++
++import org.awaitility.core.ConditionFactory;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++
++import org.apache.geode.CancelException;
++import org.apache.geode.ForcedDisconnectException;
++import org.apache.geode.alerting.internal.spi.AlertingIOException;
++import org.apache.geode.cache.CacheClosedException;
++import org.apache.geode.distributed.DistributedSystemDisconnectedException;
++import org.apache.geode.distributed.LocatorLauncher;
++import org.apache.geode.distributed.ServerLauncher;
++import org.apache.geode.distributed.internal.InternalLocator;
++import org.apache.geode.distributed.internal.membership.api.MemberDisconnectedException;
++import org.apache.geode.test.awaitility.GeodeAwaitility;
++import org.apache.geode.test.dunit.VM;
++import org.apache.geode.test.dunit.rules.DistributedErrorCollector;
++import org.apache.geode.test.dunit.rules.DistributedRestoreSystemProperties;
++import org.apache.geode.test.dunit.rules.DistributedRule;
++import org.apache.geode.test.junit.rules.GfshCommandRule;
++import org.apache.geode.test.junit.rules.serializable.SerializableTemporaryFolder;
++
++public class JMXMBeanLocatorRestartTest implements Serializable {
++
++  private static final long TIMEOUT_MILLIS = getTimeout().toMillis();
++  private static final LocatorLauncher DUMMY_LOCATOR = mock(LocatorLauncher.class);
++  private static final ServerLauncher DUMMY_SERVER = mock(ServerLauncher.class);
++
++  private static final AtomicReference<CountDownLatch> BEFORE =
++      new AtomicReference<>(new CountDownLatch(0));
++  private static final AtomicReference<CountDownLatch> AFTER =
++      new AtomicReference<>(new CountDownLatch(0));
++
++  private static final AtomicReference<LocatorLauncher> LOCATOR =
++      new AtomicReference<>(DUMMY_LOCATOR);
++  private static final AtomicReference<ServerLauncher> SERVER =
++      new AtomicReference<>(DUMMY_SERVER);
++
++  private VM locatorVM;
++  private VM serverVM;
++
++  private String locatorName;
++  private String serverName;
++  private String locators;
++  private int locatorPort;
++  private int locatorJmxPort;
++  private String regionName;
++  private Set<ObjectName> mxbeansOnServer;
++  private Set<ObjectName> mxbeansOnLocator;
++
++  @Rule
++  public DistributedRule distributedRule = new DistributedRule();
++  @Rule
++  public SerializableTemporaryFolder temporaryFolder = new SerializableTemporaryFolder();
++  @Rule
++  public DistributedErrorCollector errorCollector = new DistributedErrorCollector();
++  @Rule
++  public transient GfshCommandRule gfsh = new GfshCommandRule();
++  @Rule
++  public DistributedRestoreSystemProperties restoreProps = new DistributedRestoreSystemProperties();
++
++  @Before
++  public void setUp() throws Exception {
++    locatorVM = getVM(1);
++    serverVM = getVM(0);
++
++    for (VM vm : asList(locatorVM, serverVM)) {
++      vm.invoke(() -> System.setProperty(GEMFIRE_PREFIX + "standard-output-always-on", "true"));
++    }
++
++    locatorName = "locator1";
++    serverName = "server1";
++    File locator1Dir = temporaryFolder.newFolder(locatorName);
++    File serverDir = temporaryFolder.newFolder(serverName);
++
++    int[] port = getRandomAvailableTCPPorts(4);
++    locatorPort = port[0];
++    locatorJmxPort = port[2];
++    locators = "localhost[" + locatorPort + "]";
++
++    locatorVM.invoke(() -> {
++      startLocator(locatorName, locator1Dir, locatorPort, locatorJmxPort, locators);
++    });
++
++    serverVM.invoke(() -> startServer(serverName, serverDir, locators));
++
++    gfsh.connectAndVerify(locatorJmxPort, GfshCommandRule.PortType.jmxManager);
++
++    regionName = "region1";
++    String createRegionCommand = "create region --type=REPLICATE --name=" + SEPARATOR + regionName;
++    gfsh.executeAndAssertThat(createRegionCommand).statusIsSuccess();
++
++    addIgnoredException(AlertingIOException.class);
++    addIgnoredException(CacheClosedException.class);
++    addIgnoredException(CancelException.class);
++    addIgnoredException(DistributedSystemDisconnectedException.class);
++    addIgnoredException(ForcedDisconnectException.class);
++    addIgnoredException(MemberDisconnectedException.class);
++    addIgnoredException("Possible loss of quorum");
++
++    mxbeansOnServer = serverVM.invoke(() -> {
++      await().untilAsserted(() -> {
++        assertThat(getPlatformMBeanServer().queryNames(getInstance("GemFire:*"), null))
++            .as("GemFire mbeans on server1")
++            .containsAll(expectedServerMXBeans(serverName, regionName));
++      });
++      return getPlatformMBeanServer().queryNames(getInstance("GemFire:*"), null);
++    });
++
++    mxbeansOnLocator = locatorVM.invoke(() -> {
++      await().untilAsserted(() -> {
++        assertThat(getPlatformMBeanServer().queryNames(getInstance("GemFire:*"), null))
++            .as("GemFire mbeans on locator1")
++            .containsAll(expectedServerMXBeans(serverName, regionName))
++            .containsAll(expectedLocatorMXBeans(locatorName))
++            .containsAll(expectedDistributedMXBeans(regionName));
++      });
++
++      return getPlatformMBeanServer().queryNames(getInstance("GemFire:*"), null);
++    });
++  }
++
++  @After
++  public void tearDown() {
++    invokeInEveryVM(() -> {
++      BEFORE.get().countDown();
+
+Review comment:
+       Fixed!
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+kirklund commented on a change in pull request #5728:
+URL: https://github.com/apache/geode/pull/5728#discussion_r536295508
+
+
+
+##########
+File path: geode-core/src/distributedTest/java/org/apache/geode/management/JMXMBeanLocatorRestartTest.java
+##########
+@@ -0,0 +1,317 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more contributor license
++ * agreements. See the NOTICE file distributed with this work for additional information regarding
++ * copyright ownership. The ASF licenses this file to You under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance with the License. You may obtain a
++ * copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software distributed under the License
++ * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
++ * or implied. See the License for the specific language governing permissions and limitations under
++ * the License.
++ */
++package org.apache.geode.management;
++
++import static java.lang.management.ManagementFactory.getPlatformMBeanServer;
++import static java.util.Arrays.asList;
++import static java.util.concurrent.TimeUnit.MINUTES;
++import static javax.management.ObjectName.getInstance;
++import static org.apache.geode.cache.Region.SEPARATOR;
++import static org.apache.geode.distributed.ConfigurationProperties.HTTP_SERVICE_PORT;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER_PORT;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER_START;
++import static org.apache.geode.distributed.ConfigurationProperties.LOCATORS;
++import static org.apache.geode.distributed.ConfigurationProperties.LOG_FILE;
++import static org.apache.geode.distributed.ConfigurationProperties.MAX_WAIT_TIME_RECONNECT;
++import static org.apache.geode.distributed.ConfigurationProperties.MEMBER_TIMEOUT;
++import static org.apache.geode.distributed.internal.membership.api.MembershipManagerHelper.crashDistributedSystem;
++import static org.apache.geode.internal.AvailablePortHelper.getRandomAvailableTCPPorts;
++import static org.apache.geode.test.awaitility.GeodeAwaitility.getTimeout;
++import static org.apache.geode.test.dunit.Disconnect.disconnectAllFromDS;
++import static org.apache.geode.test.dunit.IgnoredException.addIgnoredException;
++import static org.apache.geode.test.dunit.Invoke.invokeInEveryVM;
++import static org.apache.geode.test.dunit.VM.getVM;
++import static org.apache.geode.test.dunit.VM.getVMId;
++import static org.apache.geode.util.internal.GeodeGlossary.GEMFIRE_PREFIX;
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.mockito.Mockito.mock;
++
++import java.io.File;
++import java.io.Serializable;
++import java.util.HashSet;
++import java.util.Set;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.atomic.AtomicReference;
++
++import javax.management.MalformedObjectNameException;
++import javax.management.ObjectName;
++
++import org.awaitility.core.ConditionFactory;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++
++import org.apache.geode.CancelException;
++import org.apache.geode.ForcedDisconnectException;
++import org.apache.geode.alerting.internal.spi.AlertingIOException;
++import org.apache.geode.cache.CacheClosedException;
++import org.apache.geode.distributed.DistributedSystemDisconnectedException;
++import org.apache.geode.distributed.LocatorLauncher;
++import org.apache.geode.distributed.ServerLauncher;
++import org.apache.geode.distributed.internal.InternalLocator;
++import org.apache.geode.distributed.internal.membership.api.MemberDisconnectedException;
++import org.apache.geode.test.awaitility.GeodeAwaitility;
++import org.apache.geode.test.dunit.VM;
++import org.apache.geode.test.dunit.rules.DistributedErrorCollector;
++import org.apache.geode.test.dunit.rules.DistributedRestoreSystemProperties;
++import org.apache.geode.test.dunit.rules.DistributedRule;
++import org.apache.geode.test.junit.rules.GfshCommandRule;
++import org.apache.geode.test.junit.rules.serializable.SerializableTemporaryFolder;
++
++public class JMXMBeanLocatorRestartTest implements Serializable {
++
++  private static final long TIMEOUT_MILLIS = getTimeout().toMillis();
++  private static final LocatorLauncher DUMMY_LOCATOR = mock(LocatorLauncher.class);
++  private static final ServerLauncher DUMMY_SERVER = mock(ServerLauncher.class);
++
++  private static final AtomicReference<CountDownLatch> BEFORE =
++      new AtomicReference<>(new CountDownLatch(0));
++  private static final AtomicReference<CountDownLatch> AFTER =
++      new AtomicReference<>(new CountDownLatch(0));
++
++  private static final AtomicReference<LocatorLauncher> LOCATOR =
++      new AtomicReference<>(DUMMY_LOCATOR);
++  private static final AtomicReference<ServerLauncher> SERVER =
++      new AtomicReference<>(DUMMY_SERVER);
++
++  private VM locatorVM;
++  private VM serverVM;
++
++  private String locatorName;
++  private String serverName;
++  private String locators;
++  private int locatorPort;
++  private int locatorJmxPort;
++  private String regionName;
++  private Set<ObjectName> mxbeansOnServer;
++  private Set<ObjectName> mxbeansOnLocator;
++
++  @Rule
++  public DistributedRule distributedRule = new DistributedRule();
++  @Rule
++  public SerializableTemporaryFolder temporaryFolder = new SerializableTemporaryFolder();
++  @Rule
++  public DistributedErrorCollector errorCollector = new DistributedErrorCollector();
++  @Rule
++  public transient GfshCommandRule gfsh = new GfshCommandRule();
++  @Rule
++  public DistributedRestoreSystemProperties restoreProps = new DistributedRestoreSystemProperties();
++
++  @Before
++  public void setUp() throws Exception {
++    locatorVM = getVM(1);
++    serverVM = getVM(0);
++
++    for (VM vm : asList(locatorVM, serverVM)) {
++      vm.invoke(() -> System.setProperty(GEMFIRE_PREFIX + "standard-output-always-on", "true"));
++    }
++
++    locatorName = "locator1";
++    serverName = "server1";
++    File locator1Dir = temporaryFolder.newFolder(locatorName);
++    File serverDir = temporaryFolder.newFolder(serverName);
++
++    int[] port = getRandomAvailableTCPPorts(4);
++    locatorPort = port[0];
++    locatorJmxPort = port[2];
++    locators = "localhost[" + locatorPort + "]";
++
++    locatorVM.invoke(() -> {
++      startLocator(locatorName, locator1Dir, locatorPort, locatorJmxPort, locators);
++    });
++
++    serverVM.invoke(() -> startServer(serverName, serverDir, locators));
++
++    gfsh.connectAndVerify(locatorJmxPort, GfshCommandRule.PortType.jmxManager);
++
++    regionName = "region1";
++    String createRegionCommand = "create region --type=REPLICATE --name=" + SEPARATOR + regionName;
++    gfsh.executeAndAssertThat(createRegionCommand).statusIsSuccess();
++
++    addIgnoredException(AlertingIOException.class);
++    addIgnoredException(CacheClosedException.class);
++    addIgnoredException(CancelException.class);
++    addIgnoredException(DistributedSystemDisconnectedException.class);
++    addIgnoredException(ForcedDisconnectException.class);
++    addIgnoredException(MemberDisconnectedException.class);
++    addIgnoredException("Possible loss of quorum");
++
++    mxbeansOnServer = serverVM.invoke(() -> {
++      await().untilAsserted(() -> {
++        assertThat(getPlatformMBeanServer().queryNames(getInstance("GemFire:*"), null))
++            .as("GemFire mbeans on server1")
++            .containsAll(expectedServerMXBeans(serverName, regionName));
+
+Review comment:
+       I think I found a good way to improve readability along with making things more efficient. Please take a look at both JmxLocatorReconnectDistributedTest (my new test) and JmxServerReconnectDistributedTest (overhauled for consistency). Thanks!
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+kirklund commented on a change in pull request #5728:
+URL: https://github.com/apache/geode/pull/5728#discussion_r536332513
+
+
+
+##########
+File path: geode-core/src/distributedTest/java/org/apache/geode/management/JMXMBeanLocatorRestartTest.java
+##########
+@@ -0,0 +1,317 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more contributor license
++ * agreements. See the NOTICE file distributed with this work for additional information regarding
++ * copyright ownership. The ASF licenses this file to You under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance with the License. You may obtain a
++ * copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software distributed under the License
++ * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
++ * or implied. See the License for the specific language governing permissions and limitations under
++ * the License.
++ */
++package org.apache.geode.management;
++
++import static java.lang.management.ManagementFactory.getPlatformMBeanServer;
++import static java.util.Arrays.asList;
++import static java.util.concurrent.TimeUnit.MINUTES;
++import static javax.management.ObjectName.getInstance;
++import static org.apache.geode.cache.Region.SEPARATOR;
++import static org.apache.geode.distributed.ConfigurationProperties.HTTP_SERVICE_PORT;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER_PORT;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER_START;
++import static org.apache.geode.distributed.ConfigurationProperties.LOCATORS;
++import static org.apache.geode.distributed.ConfigurationProperties.LOG_FILE;
++import static org.apache.geode.distributed.ConfigurationProperties.MAX_WAIT_TIME_RECONNECT;
++import static org.apache.geode.distributed.ConfigurationProperties.MEMBER_TIMEOUT;
++import static org.apache.geode.distributed.internal.membership.api.MembershipManagerHelper.crashDistributedSystem;
++import static org.apache.geode.internal.AvailablePortHelper.getRandomAvailableTCPPorts;
++import static org.apache.geode.test.awaitility.GeodeAwaitility.getTimeout;
++import static org.apache.geode.test.dunit.Disconnect.disconnectAllFromDS;
++import static org.apache.geode.test.dunit.IgnoredException.addIgnoredException;
++import static org.apache.geode.test.dunit.Invoke.invokeInEveryVM;
++import static org.apache.geode.test.dunit.VM.getVM;
++import static org.apache.geode.test.dunit.VM.getVMId;
++import static org.apache.geode.util.internal.GeodeGlossary.GEMFIRE_PREFIX;
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.mockito.Mockito.mock;
++
++import java.io.File;
++import java.io.Serializable;
++import java.util.HashSet;
++import java.util.Set;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.atomic.AtomicReference;
++
++import javax.management.MalformedObjectNameException;
++import javax.management.ObjectName;
++
++import org.awaitility.core.ConditionFactory;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++
++import org.apache.geode.CancelException;
++import org.apache.geode.ForcedDisconnectException;
++import org.apache.geode.alerting.internal.spi.AlertingIOException;
++import org.apache.geode.cache.CacheClosedException;
++import org.apache.geode.distributed.DistributedSystemDisconnectedException;
++import org.apache.geode.distributed.LocatorLauncher;
++import org.apache.geode.distributed.ServerLauncher;
++import org.apache.geode.distributed.internal.InternalLocator;
++import org.apache.geode.distributed.internal.membership.api.MemberDisconnectedException;
++import org.apache.geode.test.awaitility.GeodeAwaitility;
++import org.apache.geode.test.dunit.VM;
++import org.apache.geode.test.dunit.rules.DistributedErrorCollector;
++import org.apache.geode.test.dunit.rules.DistributedRestoreSystemProperties;
++import org.apache.geode.test.dunit.rules.DistributedRule;
++import org.apache.geode.test.junit.rules.GfshCommandRule;
++import org.apache.geode.test.junit.rules.serializable.SerializableTemporaryFolder;
++
++public class JMXMBeanLocatorRestartTest implements Serializable {
++
++  private static final long TIMEOUT_MILLIS = getTimeout().toMillis();
++  private static final LocatorLauncher DUMMY_LOCATOR = mock(LocatorLauncher.class);
++  private static final ServerLauncher DUMMY_SERVER = mock(ServerLauncher.class);
++
++  private static final AtomicReference<CountDownLatch> BEFORE =
++      new AtomicReference<>(new CountDownLatch(0));
++  private static final AtomicReference<CountDownLatch> AFTER =
++      new AtomicReference<>(new CountDownLatch(0));
++
++  private static final AtomicReference<LocatorLauncher> LOCATOR =
++      new AtomicReference<>(DUMMY_LOCATOR);
++  private static final AtomicReference<ServerLauncher> SERVER =
++      new AtomicReference<>(DUMMY_SERVER);
++
++  private VM locatorVM;
++  private VM serverVM;
++
++  private String locatorName;
++  private String serverName;
++  private String locators;
++  private int locatorPort;
++  private int locatorJmxPort;
++  private String regionName;
++  private Set<ObjectName> mxbeansOnServer;
++  private Set<ObjectName> mxbeansOnLocator;
++
++  @Rule
++  public DistributedRule distributedRule = new DistributedRule();
++  @Rule
++  public SerializableTemporaryFolder temporaryFolder = new SerializableTemporaryFolder();
++  @Rule
++  public DistributedErrorCollector errorCollector = new DistributedErrorCollector();
++  @Rule
++  public transient GfshCommandRule gfsh = new GfshCommandRule();
++  @Rule
++  public DistributedRestoreSystemProperties restoreProps = new DistributedRestoreSystemProperties();
++
++  @Before
++  public void setUp() throws Exception {
++    locatorVM = getVM(1);
++    serverVM = getVM(0);
++
++    for (VM vm : asList(locatorVM, serverVM)) {
++      vm.invoke(() -> System.setProperty(GEMFIRE_PREFIX + "standard-output-always-on", "true"));
++    }
++
++    locatorName = "locator1";
++    serverName = "server1";
++    File locator1Dir = temporaryFolder.newFolder(locatorName);
++    File serverDir = temporaryFolder.newFolder(serverName);
++
++    int[] port = getRandomAvailableTCPPorts(4);
++    locatorPort = port[0];
++    locatorJmxPort = port[2];
++    locators = "localhost[" + locatorPort + "]";
++
++    locatorVM.invoke(() -> {
++      startLocator(locatorName, locator1Dir, locatorPort, locatorJmxPort, locators);
++    });
++
++    serverVM.invoke(() -> startServer(serverName, serverDir, locators));
++
++    gfsh.connectAndVerify(locatorJmxPort, GfshCommandRule.PortType.jmxManager);
++
++    regionName = "region1";
++    String createRegionCommand = "create region --type=REPLICATE --name=" + SEPARATOR + regionName;
++    gfsh.executeAndAssertThat(createRegionCommand).statusIsSuccess();
++
++    addIgnoredException(AlertingIOException.class);
++    addIgnoredException(CacheClosedException.class);
++    addIgnoredException(CancelException.class);
++    addIgnoredException(DistributedSystemDisconnectedException.class);
++    addIgnoredException(ForcedDisconnectException.class);
++    addIgnoredException(MemberDisconnectedException.class);
++    addIgnoredException("Possible loss of quorum");
++
++    mxbeansOnServer = serverVM.invoke(() -> {
++      await().untilAsserted(() -> {
++        assertThat(getPlatformMBeanServer().queryNames(getInstance("GemFire:*"), null))
++            .as("GemFire mbeans on server1")
++            .containsAll(expectedServerMXBeans(serverName, regionName));
+
+Review comment:
+       Oops, I forgot to push earlier. The updated distributed tests are pushed now.
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+kirklund commented on a change in pull request #5728:
+URL: https://github.com/apache/geode/pull/5728#discussion_r536296251
+
+
+
+##########
+File path: geode-core/src/main/java/org/apache/geode/management/internal/FederatingManager.java
+##########
+@@ -79,26 +82,39 @@
+    * unbounded in practical situation as number of members will be a finite set at any given point
+    * of time
+    */
+-  private ExecutorService executorService;
++  private final AtomicReference<ExecutorService> executorService = new AtomicReference<>();
++  private boolean pendingStartup = true;
+
+Review comment:
+       I believe I can prevent building up an unused collection of membership tasks by overhauling SystemManagementService and ManagementMembershipListener to avoid adding a membership listener until the manager actually starts.
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+kirklund commented on a change in pull request #5728:
+URL: https://github.com/apache/geode/pull/5728#discussion_r536333793
+
+
+
+##########
+File path: geode-core/src/distributedTest/java/org/apache/geode/management/JMXMBeanLocatorRestartTest.java
+##########
+@@ -0,0 +1,317 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more contributor license
++ * agreements. See the NOTICE file distributed with this work for additional information regarding
++ * copyright ownership. The ASF licenses this file to You under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance with the License. You may obtain a
++ * copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software distributed under the License
++ * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
++ * or implied. See the License for the specific language governing permissions and limitations under
++ * the License.
++ */
++package org.apache.geode.management;
++
++import static java.lang.management.ManagementFactory.getPlatformMBeanServer;
++import static java.util.Arrays.asList;
++import static java.util.concurrent.TimeUnit.MINUTES;
++import static javax.management.ObjectName.getInstance;
++import static org.apache.geode.cache.Region.SEPARATOR;
++import static org.apache.geode.distributed.ConfigurationProperties.HTTP_SERVICE_PORT;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER_PORT;
++import static org.apache.geode.distributed.ConfigurationProperties.JMX_MANAGER_START;
++import static org.apache.geode.distributed.ConfigurationProperties.LOCATORS;
++import static org.apache.geode.distributed.ConfigurationProperties.LOG_FILE;
++import static org.apache.geode.distributed.ConfigurationProperties.MAX_WAIT_TIME_RECONNECT;
++import static org.apache.geode.distributed.ConfigurationProperties.MEMBER_TIMEOUT;
++import static org.apache.geode.distributed.internal.membership.api.MembershipManagerHelper.crashDistributedSystem;
++import static org.apache.geode.internal.AvailablePortHelper.getRandomAvailableTCPPorts;
++import static org.apache.geode.test.awaitility.GeodeAwaitility.getTimeout;
++import static org.apache.geode.test.dunit.Disconnect.disconnectAllFromDS;
++import static org.apache.geode.test.dunit.IgnoredException.addIgnoredException;
++import static org.apache.geode.test.dunit.Invoke.invokeInEveryVM;
++import static org.apache.geode.test.dunit.VM.getVM;
++import static org.apache.geode.test.dunit.VM.getVMId;
++import static org.apache.geode.util.internal.GeodeGlossary.GEMFIRE_PREFIX;
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.mockito.Mockito.mock;
++
++import java.io.File;
++import java.io.Serializable;
++import java.util.HashSet;
++import java.util.Set;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.atomic.AtomicReference;
++
++import javax.management.MalformedObjectNameException;
++import javax.management.ObjectName;
++
++import org.awaitility.core.ConditionFactory;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++
++import org.apache.geode.CancelException;
++import org.apache.geode.ForcedDisconnectException;
++import org.apache.geode.alerting.internal.spi.AlertingIOException;
++import org.apache.geode.cache.CacheClosedException;
++import org.apache.geode.distributed.DistributedSystemDisconnectedException;
++import org.apache.geode.distributed.LocatorLauncher;
++import org.apache.geode.distributed.ServerLauncher;
++import org.apache.geode.distributed.internal.InternalLocator;
++import org.apache.geode.distributed.internal.membership.api.MemberDisconnectedException;
++import org.apache.geode.test.awaitility.GeodeAwaitility;
++import org.apache.geode.test.dunit.VM;
++import org.apache.geode.test.dunit.rules.DistributedErrorCollector;
++import org.apache.geode.test.dunit.rules.DistributedRestoreSystemProperties;
++import org.apache.geode.test.dunit.rules.DistributedRule;
++import org.apache.geode.test.junit.rules.GfshCommandRule;
++import org.apache.geode.test.junit.rules.serializable.SerializableTemporaryFolder;
++
++public class JMXMBeanLocatorRestartTest implements Serializable {
++
++  private static final long TIMEOUT_MILLIS = getTimeout().toMillis();
++  private static final LocatorLauncher DUMMY_LOCATOR = mock(LocatorLauncher.class);
++  private static final ServerLauncher DUMMY_SERVER = mock(ServerLauncher.class);
++
++  private static final AtomicReference<CountDownLatch> BEFORE =
++      new AtomicReference<>(new CountDownLatch(0));
++  private static final AtomicReference<CountDownLatch> AFTER =
++      new AtomicReference<>(new CountDownLatch(0));
++
++  private static final AtomicReference<LocatorLauncher> LOCATOR =
++      new AtomicReference<>(DUMMY_LOCATOR);
++  private static final AtomicReference<ServerLauncher> SERVER =
++      new AtomicReference<>(DUMMY_SERVER);
++
++  private VM locatorVM;
++  private VM serverVM;
++
++  private String locatorName;
++  private String serverName;
++  private String locators;
++  private int locatorPort;
++  private int locatorJmxPort;
++  private String regionName;
++  private Set<ObjectName> mxbeansOnServer;
++  private Set<ObjectName> mxbeansOnLocator;
++
++  @Rule
++  public DistributedRule distributedRule = new DistributedRule();
++  @Rule
++  public SerializableTemporaryFolder temporaryFolder = new SerializableTemporaryFolder();
++  @Rule
++  public DistributedErrorCollector errorCollector = new DistributedErrorCollector();
++  @Rule
++  public transient GfshCommandRule gfsh = new GfshCommandRule();
++  @Rule
++  public DistributedRestoreSystemProperties restoreProps = new DistributedRestoreSystemProperties();
++
++  @Before
++  public void setUp() throws Exception {
++    locatorVM = getVM(1);
++    serverVM = getVM(0);
++
++    for (VM vm : asList(locatorVM, serverVM)) {
++      vm.invoke(() -> System.setProperty(GEMFIRE_PREFIX + "standard-output-always-on", "true"));
++    }
++
++    locatorName = "locator1";
++    serverName = "server1";
++    File locator1Dir = temporaryFolder.newFolder(locatorName);
++    File serverDir = temporaryFolder.newFolder(serverName);
++
++    int[] port = getRandomAvailableTCPPorts(4);
+
+Review comment:
+       The changes have been pushed now.
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+kirklund opened a new pull request #5834:
+URL: https://github.com/apache/geode/pull/5834
+
+
+   DO NOT MERGE
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+kirklund commented on pull request #5834:
+URL: https://github.com/apache/geode/pull/5834#issuecomment-745595097
+
+
+   AcceptanceTest failure is unrelated (Redis):
+   ```
+   org.apache.geode.redis.internal.executor.pubsub.PubSubNativeRedisAcceptanceTest > ensureOrderingOfPublishedMessages FAILED
+       java.util.concurrent.ExecutionException: java.lang.RuntimeException: Tried 10 times, but could not get a good connection.
+   
+           Caused by:
+           java.lang.RuntimeException: Tried 10 times, but could not get a good connection.
+   
+               Caused by:
+               redis.clients.jedis.exceptions.JedisConnectionException: java.net.SocketException: Connection reset
+   
+                   Caused by:
+                   java.net.SocketException: Connection reset
+   ```
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+kirklund commented on pull request #5728:
+URL: https://github.com/apache/geode/pull/5728#issuecomment-754230887
+
+
+   JmxServerReconnectDistributedTest hit a java-level deadlock which also shows that DUnit RMI calls don't have a timeout. It hangs forever until the DistributedTest job times out.
+   ```
+   Found one Java-level deadlock:
+   =============================
+   "Management Task1":
+     waiting to lock monitor 0x00007fa59ba23f28 (object 0x00000007a10a3b98, a org.apache.geode.management.internal.FederatingManager),
+     which is held by "RMI TCP Connection(8)-169.254.70.169"
+   "RMI TCP Connection(8)-169.254.70.169":
+     waiting to lock monitor 0x00007fa52eefecb8 (object 0x00000007a1077650, a java.lang.Object),
+     which is held by "Management Task1"
+   
+   Java stack information for the threads listed above:
+   ===================================================
+   "Management Task1":
+           at org.apache.geode.management.internal.FederatingManager.isRunning(FederatingManager.java:186)
+           - waiting to lock <0x00000007a10a3b98> (a org.apache.geode.management.internal.FederatingManager)
+           at org.apache.geode.management.internal.SystemManagementService.isManager(SystemManagementService.java:348)
+           at org.apache.geode.management.internal.LocalManager.doManagementTask(LocalManager.java:310)
+           - locked <0x00000007a1077650> (a java.lang.Object)
+           at org.apache.geode.management.internal.LocalManager.access$100(LocalManager.java:60)
+           at org.apache.geode.management.internal.LocalManager$ManagementTask.run(LocalManager.java:373)
+           at java.util.concurrent.Executors$RunnableAdapter.call(Executors.java:511)
+           at java.util.concurrent.FutureTask.runAndReset(FutureTask.java:308)
+           at java.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask.access$301(ScheduledThreadPoolExecutor.java:180)
+           at java.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask.run(ScheduledThreadPoolExecutor.java:294)
+           at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1149)
+           at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:624)
+           at java.lang.Thread.run(Thread.java:748)
+   "RMI TCP Connection(8)-169.254.70.169":
+           at org.apache.geode.management.internal.LocalManager.unMarkForFederation(LocalManager.java:194)
+           - waiting to lock <0x00000007a1077650> (a java.lang.Object)
+           at org.apache.geode.management.internal.SystemManagementService.unregisterMBean(SystemManagementService.java:343)
+           at org.apache.geode.management.internal.beans.DistributedSystemBridge.removeRegion(DistributedSystemBridge.java:1508)
+           - locked <0x00000007a1045360> (a java.util.concurrent.ConcurrentHashMap)
+           at org.apache.geode.management.internal.beans.MBeanAggregator$RegionHandler.handleProxyRemoval(MBeanAggregator.java:324)
+           at org.apache.geode.management.internal.beans.MBeanAggregator.afterRemoveProxy(MBeanAggregator.java:168)
+           at org.apache.geode.management.internal.SystemManagementService.afterRemoveProxy(SystemManagementService.java:615)
+           at org.apache.geode.management.internal.MBeanProxyFactory.removeProxy(MBeanProxyFactory.java:169)
+           at org.apache.geode.management.internal.MBeanProxyFactory.removeAllProxies(MBeanProxyFactory.java:144)
+           at org.apache.geode.management.internal.FederatingManager.removeMemberArtifacts(FederatingManager.java:516)
+           at org.apache.geode.management.internal.FederatingManager.stopManagingActivity(FederatingManager.java:349)
+           at org.apache.geode.management.internal.FederatingManager.stopManager(FederatingManager.java:181)
+           - locked <0x00000007a10a3b98> (a org.apache.geode.management.internal.FederatingManager)
+           at org.apache.geode.management.internal.SystemManagementService.close(SystemManagementService.java:206)
+           - locked <0x00000007a0ad18b0> (a java.util.HashMap)
+           at org.apache.geode.management.internal.beans.ManagementAdapter.handleCacheRemoval(ManagementAdapter.java:717)
+           at org.apache.geode.management.internal.beans.ManagementListener.handleEvent(ManagementListener.java:131)
+           at org.apache.geode.distributed.internal.InternalDistributedSystem.notifyResourceEventListeners(InternalDistributedSystem.java:2086)
+           at org.apache.geode.distributed.internal.InternalDistributedSystem.handleResourceEvent(InternalDistributedSystem.java:643)
+           at org.apache.geode.internal.cache.GemFireCacheImpl.doClose(GemFireCacheImpl.java:2192)
+           - locked <0x00000007a07d27f0> (a java.lang.Class for org.apache.geode.internal.cache.GemFireCacheImpl)
+           at org.apache.geode.internal.cache.GemFireCacheImpl.close(GemFireCacheImpl.java:2151)
+           at org.apache.geode.distributed.internal.InternalDistributedSystem.disconnect(InternalDistributedSystem.java:1559)
+           - locked <0x00000007a07d27f0> (a java.lang.Class for org.apache.geode.internal.cache.GemFireCacheImpl)
+           at org.apache.geode.distributed.internal.InternalDistributedSystem.disconnect(InternalDistributedSystem.java:1257)
+           at org.apache.geode.test.dunit.Disconnect.disconnectFromDS(Disconnect.java:44)
+           at org.apache.geode.test.dunit.rules.DistributedRule$TearDown.tearDownInVM(DistributedRule.java:237)
+           at org.apache.geode.test.dunit.rules.DistributedRule$TearDown.lambda$doTearDown$bb17a952$1(DistributedRule.java:224)
+           at org.apache.geode.test.dunit.rules.DistributedRule$TearDown$$Lambda$361/1785950851.run(Unknown Source)
+           at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+           at sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:62)
+           at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+           at java.lang.reflect.Method.invoke(Method.java:498)
+           at org.apache.geode.test.dunit.internal.MethodInvoker.executeObject(MethodInvoker.java:123)
+           at org.apache.geode.test.dunit.internal.RemoteDUnitVM.executeMethodOnObject(RemoteDUnitVM.java:78)
+           at sun.reflect.GeneratedMethodAccessor28.invoke(Unknown Source)
+           at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+           at java.lang.reflect.Method.invoke(Method.java:498)
+           at sun.rmi.server.UnicastServerRef.dispatch(UnicastServerRef.java:357)
+           at sun.rmi.transport.Transport$1.run(Transport.java:200)
+           at sun.rmi.transport.Transport$1.run(Transport.java:197)
+           at java.security.AccessController.doPrivileged(Native Method)
+           at sun.rmi.transport.Transport.serviceCall(Transport.java:196)
+           at sun.rmi.transport.tcp.TCPTransport.handleMessages(TCPTransport.java:573)
+           at sun.rmi.transport.tcp.TCPTransport$ConnectionHandler.run0(TCPTransport.java:834)
+           at sun.rmi.transport.tcp.TCPTransport$ConnectionHandler.lambda$run$0(TCPTransport.java:688)
+           at sun.rmi.transport.tcp.TCPTransport$ConnectionHandler$$Lambda$24/803288407.run(Unknown Source)
+           at java.security.AccessController.doPrivileged(Native Method)
+           at sun.rmi.transport.tcp.TCPTransport$ConnectionHandler.run(TCPTransport.java:687)
+           at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1149)
+           at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:624)
+           at java.lang.Thread.run(Thread.java:748)
+   ```
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+kirklund commented on pull request #5728:
+URL: https://github.com/apache/geode/pull/5728#issuecomment-755415589
+
+
+   Random flaky test failed: GEODE-8528
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+kirklund closed pull request #5834:
+URL: https://github.com/apache/geode/pull/5834
+
+
+   
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+dschneider-pivotal commented on a change in pull request #5728:
+URL: https://github.com/apache/geode/pull/5728#discussion_r554117743
+
+
+
+##########
+File path: geode-core/src/main/java/org/apache/geode/management/internal/FederatingManager.java
+##########
+@@ -108,31 +114,60 @@
+   @Override
+   public synchronized void startManager() {
+     try {
+-      if (logger.isDebugEnabled()) {
+-        logger.debug("Starting the Federating Manager.... ");
++      lifecycleLock.lock();
++      try {
++        if (starting || running) {
++          return;
++        }
++        if (logger.isDebugEnabled()) {
++          logger.debug("Starting the Federating Manager.... ");
++        }
++        starting = true;
++        executorService.set(executorServiceSupplier.get());
++        running = true;
++      } finally {
++        lifecycleLock.unlock();
+       }
+ 
+-      executorService = executorServiceSupplier.get();
+-
+-      running = true;
+       startManagingActivity();
++
++      lifecycleLock.lock();
++      try {
++        for (Runnable task : pendingTasks) {
++          executeTask(task);
++        }
++      } finally {
++        pendingTasks.clear();
++        starting = false;
++        lifecycleLock.unlock();
++      }
++
+       messenger.broadcastManagerInfo();
++
+     } catch (Exception e) {
++      pendingTasks.clear();
+
+Review comment:
+       Should this clear and setting running and starting also be protected by a lifecycleLock.lock/unlock?
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+kirklund commented on a change in pull request #5728:
+URL: https://github.com/apache/geode/pull/5728#discussion_r554126172
+
+
+
+##########
+File path: geode-core/src/main/java/org/apache/geode/management/internal/FederatingManager.java
+##########
+@@ -108,31 +114,60 @@
+   @Override
+   public synchronized void startManager() {
+     try {
+-      if (logger.isDebugEnabled()) {
+-        logger.debug("Starting the Federating Manager.... ");
++      lifecycleLock.lock();
++      try {
++        if (starting || running) {
++          return;
++        }
++        if (logger.isDebugEnabled()) {
++          logger.debug("Starting the Federating Manager.... ");
++        }
++        starting = true;
++        executorService.set(executorServiceSupplier.get());
++        running = true;
++      } finally {
++        lifecycleLock.unlock();
+       }
+ 
+-      executorService = executorServiceSupplier.get();
+-
+-      running = true;
+       startManagingActivity();
++
++      lifecycleLock.lock();
++      try {
++        for (Runnable task : pendingTasks) {
++          executeTask(task);
++        }
++      } finally {
++        pendingTasks.clear();
++        starting = false;
++        lifecycleLock.unlock();
++      }
++
+       messenger.broadcastManagerInfo();
++
+     } catch (Exception e) {
++      pendingTasks.clear();
+
+Review comment:
+       Yeah, I'm not sure if it's necessary but it would be more consistent. I'll try making that change and try to write a new test or two in which startup fails.
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+kirklund merged pull request #5728:
+URL: https://github.com/apache/geode/pull/5728
+
+
+   
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+Commit 42726bd99c9ebb57ec5d3e987d47ecae9f4ea3a7 in geode's branch refs/heads/develop from Kirk Lund
+[ https://gitbox.apache.org/repos/asf?p=geode.git;h=42726bd ]
+
+GEODE-8696: Fix synchronization in FederatingManager (#5728)
+
+Prevent hang while protecting against removal of member artifacts
+during startup of manager.
+
+
+Fix was merged to develop in PR #5728.
+
+kirklund commented on a change in pull request #5728:
+URL: https://github.com/apache/geode/pull/5728#discussion_r554126172
+
+
+
+##########
+File path: geode-core/src/main/java/org/apache/geode/management/internal/FederatingManager.java
+##########
+@@ -108,31 +114,60 @@
+   @Override
+   public synchronized void startManager() {
+     try {
+-      if (logger.isDebugEnabled()) {
+-        logger.debug("Starting the Federating Manager.... ");
++      lifecycleLock.lock();
++      try {
++        if (starting || running) {
++          return;
++        }
++        if (logger.isDebugEnabled()) {
++          logger.debug("Starting the Federating Manager.... ");
++        }
++        starting = true;
++        executorService.set(executorServiceSupplier.get());
++        running = true;
++      } finally {
++        lifecycleLock.unlock();
+       }
+ 
+-      executorService = executorServiceSupplier.get();
+-
+-      running = true;
+       startManagingActivity();
++
++      lifecycleLock.lock();
++      try {
++        for (Runnable task : pendingTasks) {
++          executeTask(task);
++        }
++      } finally {
++        pendingTasks.clear();
++        starting = false;
++        lifecycleLock.unlock();
++      }
++
+       messenger.broadcastManagerInfo();
++
+     } catch (Exception e) {
++      pendingTasks.clear();
+
+Review comment:
+       Yeah, I'm not sure if it's necessary but it would be more consistent. I'll try making that change and try to write a new test or two in which startup fails.
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+kirklund merged pull request #5728:
+URL: https://github.com/apache/geode/pull/5728
+
+
+   
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+dschneider-pivotal commented on a change in pull request #5728:
+URL: https://github.com/apache/geode/pull/5728#discussion_r554117743
+
+
+
+##########
+File path: geode-core/src/main/java/org/apache/geode/management/internal/FederatingManager.java
+##########
+@@ -108,31 +114,60 @@
+   @Override
+   public synchronized void startManager() {
+     try {
+-      if (logger.isDebugEnabled()) {
+-        logger.debug("Starting the Federating Manager.... ");
++      lifecycleLock.lock();
++      try {
++        if (starting || running) {
++          return;
++        }
++        if (logger.isDebugEnabled()) {
++          logger.debug("Starting the Federating Manager.... ");
++        }
++        starting = true;
++        executorService.set(executorServiceSupplier.get());
++        running = true;
++      } finally {
++        lifecycleLock.unlock();
+       }
+ 
+-      executorService = executorServiceSupplier.get();
+-
+-      running = true;
+       startManagingActivity();
++
++      lifecycleLock.lock();
++      try {
++        for (Runnable task : pendingTasks) {
++          executeTask(task);
++        }
++      } finally {
++        pendingTasks.clear();
++        starting = false;
++        lifecycleLock.unlock();
++      }
++
+       messenger.broadcastManagerInfo();
++
+     } catch (Exception e) {
++      pendingTasks.clear();
+
+Review comment:
+       Should this clear and setting running and starting also be protected by a lifecycleLock.lock/unlock?
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+I'm reverting and reopening GEODE-8696 because the fix causes a new 3-way java-level deadlock:
+{noformat}
+Found one Java-level deadlock:
+=============================
+"Pooled High Priority Message Processor 5":
+  waiting to lock monitor 0x00007f3ac400d558 (object 0x00000000fd486c20, a java.util.HashMap),
+  which is held by "vm_0_thr_0_locator_managing1_host1_13259"
+"vm_0_thr_0_locator_managing1_host1_13259":
+  waiting for ownable synchronizer 0x00000000fd2f3fb0, (a java.util.concurrent.locks.ReentrantLock$NonfairSync),
+  which is held by "DM-MemberEventInvoker"
+"DM-MemberEventInvoker":
+  waiting to lock monitor 0x00007f3af8002d28 (object 0x00000000fd3d12a8, a org.apache.geode.management.internal.FederatingManager),
+  which is held by "vm_0_thr_0_locator_managing1_host1_13259"
+{noformat}{noformat}
+Java stack information for the threads listed above:
+===================================================
+{noformat}{noformat}
+"Pooled High Priority Message Processor 5":
+  at org.apache.geode.management.internal.BaseManagementService.getExistingManagementService(BaseManagementService.java:106)
+  - waiting to lock <0x00000000fd486c20> (a java.util.HashMap)
+  at org.apache.geode.management.ManagementService.getExistingManagementService(ManagementService.java:52)
+  at org.apache.geode.management.internal.JmxManagerAdvisee.fillInProfile(JmxManagerAdvisee.java:99)
+  at org.apache.geode.distributed.internal.DistributionAdvisor.createProfile(DistributionAdvisor.java:1033)
+  at org.apache.geode.management.internal.JmxManagerAdvisee.getProfile(JmxManagerAdvisee.java:65)
+  at org.apache.geode.distributed.internal.DistributionAdvisor$Profile.handleDistributionAdvisee(DistributionAdvisor.java:1541)
+  at org.apache.geode.management.internal.JmxManagerAdvisor$JmxManagerProfile.processIncoming(JmxManagerAdvisor.java:332)
+  at org.apache.geode.internal.cache.UpdateAttributesProcessor$UpdateAttributesMessage.process(UpdateAttributesProcessor.java:291)
+  at org.apache.geode.distributed.internal.DistributionMessage.scheduleAction(DistributionMessage.java:376)
+  at org.apache.geode.distributed.internal.DistributionMessage$1.run(DistributionMessage.java:441)
+  at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1149)
+  at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:624)
+  at org.apache.geode.distributed.internal.ClusterOperationExecutors.runUntilShutdown(ClusterOperationExecutors.java:446)
+  at org.apache.geode.distributed.internal.ClusterOperationExecutors.doHighPriorityThread(ClusterOperationExecutors.java:404)
+  at org.apache.geode.distributed.internal.ClusterOperationExecutors$$Lambda$136/1646252585.invoke(Unknown Source)
+  at org.apache.geode.logging.internal.executors.LoggingThreadFactory.lambda$newThread$0(LoggingThreadFactory.java:120)
+  at org.apache.geode.logging.internal.executors.LoggingThreadFactory$$Lambda$134/1613570844.run(Unknown Source)
+  at java.lang.Thread.run(Thread.java:748)
+{noformat}{noformat}
+"vm_0_thr_0_locator_managing1_host1_13259":
+  at sun.misc.Unsafe.park(Native Method)
+  - parking to wait for  <0x00000000fd2f3fb0> (a java.util.concurrent.locks.ReentrantLock$NonfairSync)
+  at java.util.concurrent.locks.LockSupport.park(LockSupport.java:175)
+  at java.util.concurrent.locks.AbstractQueuedSynchronizer.parkAndCheckInterrupt(AbstractQueuedSynchronizer.java:836)
+  at java.util.concurrent.locks.AbstractQueuedSynchronizer.acquireQueued(AbstractQueuedSynchronizer.java:870)
+  at java.util.concurrent.locks.AbstractQueuedSynchronizer.acquire(AbstractQueuedSynchronizer.java:1199)
+  at java.util.concurrent.locks.ReentrantLock$NonfairSync.lock(ReentrantLock.java:209)
+  at java.util.concurrent.locks.ReentrantLock.lock(ReentrantLock.java:285)
+  at org.apache.geode.management.internal.FederatingManager.startManager(FederatingManager.java:134)
+  - locked <0x00000000fd3d12a8> (a org.apache.geode.management.internal.FederatingManager)
+  at org.apache.geode.management.internal.SystemManagementService.startManager(SystemManagementService.java:373)
+  - locked <0x00000000fd486c20> (a java.util.HashMap)
+  at org.apache.geode.management.internal.beans.ManagementAdapter.handleCacheCreation(ManagementAdapter.java:199)
+  at org.apache.geode.management.internal.beans.ManagementListener.handleEvent(ManagementListener.java:127)
+  at org.apache.geode.distributed.internal.InternalDistributedSystem.notifyResourceEventListeners(InternalDistributedSystem.java:2086)
+  at org.apache.geode.distributed.internal.InternalDistributedSystem.handleResourceEvent(InternalDistributedSystem.java:643)
+  at org.apache.geode.internal.cache.GemFireCacheImpl.initialize(GemFireCacheImpl.java:1437)
+  at org.apache.geode.internal.cache.InternalCacheBuilder.create(InternalCacheBuilder.java:191)
+  - locked <0x00000000f0a15060> (a java.lang.Class for org.apache.geode.internal.cache.GemFireCacheImpl)
+  - locked <0x00000000f0a29790> (a java.lang.Class for org.apache.geode.internal.cache.InternalCacheBuilder)
+  at org.apache.geode.internal.cache.InternalCacheBuilder.create(InternalCacheBuilder.java:158)
+  - locked <0x00000000f0a29790> (a java.lang.Class for org.apache.geode.internal.cache.InternalCacheBuilder)
+  at org.apache.geode.cache.CacheFactory.create(CacheFactory.java:142)
+  at hydra.CacheVersionHelper.configureAndCreateCache(CacheVersionHelper.java:51)
+  at hydra.CacheHelper.createCacheWithHttpService(CacheHelper.java:127)
+  - locked <0x00000000fd1f1070> (a java.lang.Class for hydra.CacheHelper)
+  at hydra.CacheHelper.createCache(CacheHelper.java:87)
+  at management.test.federation.FederationTest.createCache(FederationTest.java:234)
+  at management.test.federation.FederationTest.initialize(FederationTest.java:225)
+  at management.test.federation.FederationTest.HydraInitTask_initialize(FederationTest.java:130)
+  - locked <0x00000000fd1f1308> (a java.lang.Class for management.test.federation.FederationTest)
+  at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+  at sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:62)
+  at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+  at java.lang.reflect.Method.invoke(Method.java:498)
+  at hydra.MethExecutor.execute(MethExecutor.java:173)
+  at hydra.MethExecutor.execute(MethExecutor.java:141)
+  at hydra.TestTask.execute(TestTask.java:197)
+  at hydra.RemoteTestModule$1.run(RemoteTestModule.java:213)
+{noformat}{noformat}
+"DM-MemberEventInvoker":
+  at org.apache.geode.management.internal.FederatingManager.executeTask(FederatingManager.java:357)
+  - waiting to lock <0x00000000fd3d12a8> (a org.apache.geode.management.internal.FederatingManager)
+  at org.apache.geode.management.internal.FederatingManager.addMember(FederatingManager.java:199)
+  at org.apache.geode.management.internal.ManagementMembershipListener.memberJoined(ManagementMembershipListener.java:73)
+  at org.apache.geode.distributed.internal.ClusterDistributionManager$MemberJoinedEvent.handleEvent(ClusterDistributionManager.java:2478)
+  at org.apache.geode.distributed.internal.ClusterDistributionManager$MemberEvent.handleEvent(ClusterDistributionManager.java:2431)
+  at org.apache.geode.distributed.internal.ClusterDistributionManager$MemberEvent.handleEvent(ClusterDistributionManager.java:2420)
+  at org.apache.geode.distributed.internal.ClusterDistributionManager.handleMemberEvent(ClusterDistributionManager.java:1404)
+  at org.apache.geode.distributed.internal.ClusterDistributionManager.access$200(ClusterDistributionManager.java:108)
+  at org.apache.geode.distributed.internal.ClusterDistributionManager$MemberEventInvoker.run(ClusterDistributionManager.java:1436)
+  at java.lang.Thread.run(Thread.java:748)
+{noformat}
+
+kirklund opened a new pull request #5892:
+URL: https://github.com/apache/geode/pull/5892
+
+
+   This reverts commit 42726bd99c9ebb57ec5d3e987d47ecae9f4ea3a7.
+   
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+kirklund opened a new pull request #5893:
+URL: https://github.com/apache/geode/pull/5893
+
+
+   
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+kirklund commented on pull request #5892:
+URL: https://github.com/apache/geode/pull/5892#issuecomment-758275805
+
+
+   JMXMBeanReconnectDUnitTest keeps failing StressNewTest.
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+kirklund edited a comment on pull request #5892:
+URL: https://github.com/apache/geode/pull/5892#issuecomment-758275805
+
+
+   JMXMBeanReconnectDUnitTest (GEODE-7710) keeps failing StressNewTest, blocking the merge of this revert.
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+kirklund opened a new pull request #5894:
+URL: https://github.com/apache/geode/pull/5894
+
+
+   FederatingManager now uses a ReentrantLock instead of synchronization.
+   Leave the redundant syncs in results in a java-level deadlock.
+   
+   Thank you for submitting a contribution to Apache Geode.
+   
+   In order to streamline the review of the contribution we ask you
+   to ensure the following steps have been taken:
+   
+   ### For all changes:
+   - [ ] Is there a JIRA ticket associated with this PR? Is it referenced in the commit message?
+   
+   - [ ] Has your PR been rebased against the latest commit within the target branch (typically `develop`)?
+   
+   - [ ] Is your initial contribution a single, squashed commit?
+   
+   - [ ] Does `gradlew build` run cleanly?
+   
+   - [ ] Have you written or updated unit tests to verify your changes?
+   
+   - [ ] If adding new dependencies to the code, are these dependencies licensed in a way that is compatible for inclusion under [ASF 2.0](http://www.apache.org/legal/resolved.html#category-a)?
+   
+   ### Note:
+   Please ensure that once the PR is submitted, check Concourse for build issues and
+   submit an update to your PR as soon as possible. If you need help, please send an
+   email to dev@geode.apache.org.
+   
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+kirklund commented on pull request #5892:
+URL: https://github.com/apache/geode/pull/5892#issuecomment-758817683
+
+
+   Closing because StressNewTest never passes. Please see #5894 instead.
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+kirklund closed pull request #5892:
+URL: https://github.com/apache/geode/pull/5892
+
+
+   
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+kirklund merged pull request #5894:
+URL: https://github.com/apache/geode/pull/5894
+
+
+   
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+Commit 0e3ade53f724990a0932151a6fb6e90fe510758f in geode's branch refs/heads/develop from Kirk Lund
+[ https://gitbox.apache.org/repos/asf?p=geode.git;h=0e3ade5 ]
+
+GEODE-8696: Remove redundant syncs to prevent deadlock (#5894)
+
+FederatingManager now uses a ReentrantLock instead of synchronization.
+
+kirklund closed pull request #5893:
+URL: https://github.com/apache/geode/pull/5893
+
+
+   
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+kirklund opened a new pull request #5963:
+URL: https://github.com/apache/geode/pull/5963
+
+
+   Fix synchronization issues in FederatingManager and back-port required background commits.
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+lgtm-com[bot] commented on pull request #5963:
+URL: https://github.com/apache/geode/pull/5963#issuecomment-768642405
+
+
+   This pull request **fixes 13 alerts** when merging 7ffc93e096cb63c765ac083cdf0cc50dee870571 into 90ec4d3d8caf59a8818bf2de6dcab9da614e0996 - [view on LGTM.com](https://lgtm.com/projects/g/apache/geode/rev/pr-e92d878a11f709f4ebd8db1270eefc0f417f5480)
+   
+   **fixed alerts:**
+   
+   * 13 for Useless null check
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+kirklund opened a new pull request #5966:
+URL: https://github.com/apache/geode/pull/5966
+
+
+   Back port commits needed to fix GEODE-8696 on support/1.13.
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+kirklund commented on pull request #5963:
+URL: https://github.com/apache/geode/pull/5963#issuecomment-768658233
+
+
+   Looks like we need to back-port another commit which has conflicts with PutAllClientServerDistributedTest.java because the order of cherry-picks is wrong:
+   ```
+   commit cceaa66d3d4403b59b83a6f8f46f7a8389b6c64e
+   Author: Kirk Lund <klund@apache.org>
+   Date:   Mon Mar 2 12:51:14 2020 -0800
+   
+       Revert fluent style API fix in ClientRegionFactory (#4748)
+       
+       Revert fluent style usage of ClientRegionFactory in:
+       * DeltaPropagationDUnitTest
+       * PutAllClientServerDistributedTest
+   ```
+   I'm going to have to repeat the cherry-picks again tomorrow in the proper order with the above included.
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+kirklund closed pull request #5963:
+URL: https://github.com/apache/geode/pull/5963
+
+
+   
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+kirklund merged pull request #5966:
+URL: https://github.com/apache/geode/pull/5966
+
+
+   
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+Commit 8ae401e4c526a36b022bd0de708a9f2437cdde54 in geode's branch refs/heads/support/1.13 from Kirk Lund
+[ https://gitbox.apache.org/repos/asf?p=geode.git;h=8ae401e ]
+
+GEODE-8696: Fix synchronization in FederatingManager (#5728)
+
+Prevent hang while protecting against removal of member artifacts
+during startup of manager.
+
+(cherry picked from commit 42726bd99c9ebb57ec5d3e987d47ecae9f4ea3a7)
+
+
+Commit fd664de8a00dfc9b61bf54d869129a227889dcdd in geode's branch refs/heads/support/1.13 from Kirk Lund
+[ https://gitbox.apache.org/repos/asf?p=geode.git;h=fd664de ]
+
+GEODE-8696: Remove redundant syncs to prevent deadlock (#5894)
+
+FederatingManager now uses a ReentrantLock instead of synchronization.
+
+(cherry picked from commit 0e3ade53f724990a0932151a6fb6e90fe510758f)
+
+
+Back-ported to support/1.13. Back-porting to support/1.12 is problematic... I think it might not be worth going that far back.
+
+kirklund merged pull request #5966:
+URL: https://github.com/apache/geode/pull/5966
+
+
+   
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+

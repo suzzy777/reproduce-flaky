@@ -1,0 +1,139 @@
+I think the only feasible solution to this would be to make UnregisterQuery() partially asynchronous, e.g. move the archiving to a thread pool. The other alternative is to start the serialization *before* unregister is called then block in unregister. But that only works if there's a significant delay between the two things.
+
+One thing I noticed that's weird is that we remove the ClientRequestState from the map before we archive the query, so there's a gap where the profile is probably not available. This glitch might be masked because clients block in UnregisterQuery().
+
+I'm investigating this now. It looks feasible to me.
+
+Commit 748e41ab41a839be38d0865ff0e1bd3e9de8d157 in impala's branch refs/heads/master from Tim Armstrong
+[ https://gitbox.apache.org/repos/asf?p=impala.git;h=748e41a ]
+
+IMPALA-9380: async query unregistration
+
+This change improves query latency by doing much
+of the heavyweight work of unregistering a query
+asynchronously, instead of synchronously on the
+RPC thread. The biggest win is to move the
+profile serialization off the RPC thread.
+
+Unregistration processing is done by a thread pool
+with 4 threads by default. This is configurable by
+--unregistration_thread_pool_size and
+--unregistration_thread_pool_queue_depth.
+
+This fixes a pre-existing bug where a
+query was temporarily neither in the in-flight
+queries nor the completed queries. It would be
+much easier to hit this with async unregistration
+because there is less synchronisation on the client
+side. Now the query is briefly in both maps, but
+this is handled as follows:
+* All places that look up both the maps will check
+  the in-flight map first, and return a reference to
+  the ClientRequestState, i.e. ignoring the entry in
+  the query log.
+* The /queries page does not return completed queries
+  if they were found in the in-flight queries map, so
+  avoids duplicate results.
+
+The thread safety story changes slightly.
+Before this change, only one thread could
+remove the query from the map and close it,
+with only one thread "winning" the race to remove
+the ClientRequestState from the map. Since we leave
+the query in the map while being finalized, we
+instead use an atomic in ClientRequestState to ensure
+that only one thread does the finalization.
+
+Some misc cleanup was done as a result of these changes:
+* Fix a pre-existing TSAN race in RuntimeProfile that
+  was revealed by the new concurrent unregister test.
+* Consolidate the various unknown query handle errors into
+  an error code so that we consistently return the same
+  string.
+* "Unregister query" should include flushing audit events.
+
+Testing:
+* Add a test that unregisters a query concurrent with other
+  operations.
+* Ran exhaustive tests
+
+Perf:
+Ran TPC-H 30 with mt_dop=4. No regressions and some improvements:
++----------+-----------------------+---------+------------+------------+----------------+
+| Workload | File Format           | Avg (s) | Delta(Avg) | GeoMean(s) | Delta(GeoMean) |
++----------+-----------------------+---------+------------+------------+----------------+
+| TPCH(30) | parquet / none / none | 5.38    | -2.67%     | 4.02       | -2.01%         |
++----------+-----------------------+---------+------------+------------+----------------+
+
++----------+----------+-----------------------+--------+-------------+------------+-----------+----------------+-------+----------------+---------+--------+
+| Workload | Query    | File Format           | Avg(s) | Base Avg(s) | Delta(Avg) | StdDev(%) | Base StdDev(%) | Iters | Median Diff(%) | MW Zval | Tval   |
++----------+----------+-----------------------+--------+-------------+------------+-----------+----------------+-------+----------------+---------+--------+
+| TPCH(30) | TPCH-Q1  | parquet / none / none | 5.36   | 5.17        |   +3.61%   |   1.82%   |   1.17%        | 5     |   +3.73%       | 1.73    | 3.65   |
+| TPCH(30) | TPCH-Q6  | parquet / none / none | 1.77   | 1.74        |   +1.48%   |   2.00%   |   2.50%        | 5     |   +2.89%       | 0.87    | 1.03   |
+| TPCH(30) | TPCH-Q12 | parquet / none / none | 3.02   | 3.00        |   +0.79%   |   2.18%   |   2.21%        | 5     |   +1.55%       | 0.00    | 0.57   |
+| TPCH(30) | TPCH-Q16 | parquet / none / none | 1.65   | 1.64        |   +0.81%   |   1.35%   |   0.03%        | 5     |   +0.07%       | 1.15    | 1.34   |
+| TPCH(30) | TPCH-Q2  | parquet / none / none | 1.21   | 1.21        |   -0.07%   |   2.11%   |   2.14%        | 5     |   -0.04%       | -0.29   | -0.05  |
+| TPCH(30) | TPCH-Q4  | parquet / none / none | 2.50   | 2.52        |   -0.49%   |   2.43%   |   3.34%        | 5     |   -0.09%       | -0.29   | -0.27  |
+| TPCH(30) | TPCH-Q20 | parquet / none / none | 2.86   | 2.90        |   -1.28%   |   2.30%   |   1.24%        | 5     |   -0.02%       | -0.58   | -1.11  |
+| TPCH(30) | TPCH-Q3  | parquet / none / none | 4.35   | 4.40        |   -1.15%   |   1.76%   |   1.78%        | 5     |   -1.12%       | -0.87   | -1.03  |
+| TPCH(30) | TPCH-Q19 | parquet / none / none | 4.10   | 4.17        |   -1.80%   |   1.05%   |   1.31%        | 5     |   -1.25%       | -1.73   | -2.40  |
+| TPCH(30) | TPCH-Q14 | parquet / none / none | 3.20   | 3.25        |   -1.52%   |   0.79%   |   2.56%        | 5     |   -1.56%       | -0.58   | -1.26  |
+| TPCH(30) | TPCH-Q18 | parquet / none / none | 10.81  | 11.07       |   -2.34%   |   5.00%   |   7.01%        | 5     |   -1.40%       | -0.58   | -0.61  |
+| TPCH(30) | TPCH-Q7  | parquet / none / none | 11.19  | 11.56       |   -3.18%   |   3.47%   |   6.02%        | 5     |   -0.90%       | -0.87   | -1.03  |
+| TPCH(30) | TPCH-Q21 | parquet / none / none | 19.91  | 20.32       |   -2.02%   |   0.66%   |   0.47%        | 5     |   -2.18%       | -2.31   | -5.64  |
+| TPCH(30) | TPCH-Q17 | parquet / none / none | 5.63   | 5.77        |   -2.40%   |   1.71%   |   2.01%        | 5     |   -1.84%       | -1.73   | -2.05  |
+| TPCH(30) | TPCH-Q5  | parquet / none / none | 3.91   | 4.03        |   -2.74%   |   1.08%   |   1.86%        | 5     |   -2.45%       | -1.44   | -2.88  |
+| TPCH(30) | TPCH-Q8  | parquet / none / none | 4.55   | 4.71        |   -3.48%   |   1.90%   |   3.53%        | 5     |   -2.35%       | -1.44   | -1.96  |
+| TPCH(30) | TPCH-Q22 | parquet / none / none | 1.93   | 2.01        |   -3.96%   |   0.05%   |   4.05%        | 5     |   -2.59%       | -2.31   | -2.19  |
+| TPCH(30) | TPCH-Q10 | parquet / none / none | 4.52   | 4.73        |   -4.26%   |   1.26%   |   2.43%        | 5     |   -3.40%       | -2.02   | -3.51  |
+| TPCH(30) | TPCH-Q11 | parquet / none / none | 1.02   | 1.05        |   -3.58%   |   3.94%   |   2.36%        | 5     |   -4.56%       | -1.44   | -1.79  |
+| TPCH(30) | TPCH-Q13 | parquet / none / none | 9.52   | 10.04       | I -5.24%   |   2.14%   |   0.56%        | 5     | I -4.67%       | -2.31   | -5.57  |
+| TPCH(30) | TPCH-Q15 | parquet / none / none | 3.49   | 3.68        | I -5.08%   |   0.07%   |   0.56%        | 5     | I -5.66%       | -2.31   | -20.08 |
+| TPCH(30) | TPCH-Q9  | parquet / none / none | 11.92  | 12.71       | I -6.19%   |   0.57%   |   3.15%        | 5     | I -4.99%       | -2.31   | -4.33  |
++----------+----------+-----------------------+--------+-------------+------------+-----------+----------------+-------+----------------+---------+--------+
+
+Change-Id: I80027b1baeb4ab453938c0f6357b120f4035ba08
+Reviewed-on: http://gerrit.cloudera.org:8080/15821
+Reviewed-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+Tested-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+
+
+Commit f4f7fb53a48f114f520737af7be2433a5afd03d4 in impala's branch refs/heads/master from Tim Armstrong
+[ https://gitbox.apache.org/repos/asf?p=impala.git;h=f4f7fb5 ]
+
+IMPALA-9729: consistent GetExecSummary() behaviour
+
+Before IMPALA-9380, GetExecSummary() for archived
+queries without a coordinator returned a blank TExecSummary,
+but for in-flight queries it returned a "not found" error.
+
+This was masked by the synchronous query unregistration,
+but now has made an impala-shell test flaky, because the
+close() RPC returns to the shell before the query is archived,
+so the following GetExecSummary() call may go down either
+code path.
+
+This change makes the behaviour consistent for both code
+paths and preserves impala-shell behaviour.
+
+Testing:
+Looped TestImpalaShell.test_summary to make sure flakiness was
+fixed.
+
+Change-Id: If2b2ab118c4769e80284b2a3390577dd5f5e888b
+Reviewed-on: http://gerrit.cloudera.org:8080/15868
+Reviewed-by: Thomas Tauber-Marshall <tmarshall@cloudera.com>
+Tested-by: Tim Armstrong <tarmstrong@cloudera.com>
+
+
+Commit b3af05f43d7420c76367c31f7b870e9d04bac0bb in impala's branch refs/heads/master from Tim Armstrong
+[ https://gitbox.apache.org/repos/asf?p=impala.git;h=b3af05f ]
+
+IMPALA-9380: addendum - remove redundant assert
+
+Change-Id: I4ff4ff0a92f928314064b492c13904bec5ec6d5e
+Reviewed-on: http://gerrit.cloudera.org:8080/15876
+Reviewed-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+Tested-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+
+

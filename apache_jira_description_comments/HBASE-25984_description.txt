@@ -1,0 +1,48 @@
+We use FSHLog as the WAL implementation (branch-1 based) and under heavy load we noticed the WAL system gets locked up due to a subtle bug involving racy code with sync future reuse. This bug applies to all FSHLog implementations across branches.
+
+Symptoms:
+
+On heavily loaded clusters with large write load we noticed that the region servers are hanging abruptly with filled up handler queues and stuck MVCC indicating appends/syncs not making any progress.
+
+{noformat}
+ WARN  [8,queue=9,port=60020] regionserver.MultiVersionConcurrencyControl - STUCK for : 296000 millis. MultiVersionConcurrencyControl{readPoint=172383686, writePoint=172383690, regionName=1ce4003ab60120057734ffe367667dca}
+ WARN  [6,queue=2,port=60020] regionserver.MultiVersionConcurrencyControl - STUCK for : 296000 millis. MultiVersionConcurrencyControl{readPoint=171504376, writePoint=171504381, regionName=7c441d7243f9f504194dae6bf2622631}
+{noformat}
+
+All the handlers are stuck waiting for the sync futures and timing out.
+
+{noformat}
+ java.lang.Object.wait(Native Method)
+    org.apache.hadoop.hbase.regionserver.wal.SyncFuture.get(SyncFuture.java:183)
+    org.apache.hadoop.hbase.regionserver.wal.FSHLog.blockOnSync(FSHLog.java:1509)
+    .....
+{noformat}
+
+Log rolling is stuck because it was unable to attain a safe point
+
+{noformat}
+   java.util.concurrent.CountDownLatch.await(CountDownLatch.java:277) 
+org.apache.hadoop.hbase.regionserver.wal.FSHLog$SafePointZigZagLatch.waitSafePoint(FSHLog.java:1799)
+ org.apache.hadoop.hbase.regionserver.wal.FSHLog.replaceWriter(FSHLog.java:900)
+{noformat}
+
+and the Ring buffer consumer thinks that there are some outstanding syncs that need to finish..
+
+{noformat}
+  org.apache.hadoop.hbase.regionserver.wal.FSHLog$RingBufferEventHandler.attainSafePoint(FSHLog.java:2031)
+    org.apache.hadoop.hbase.regionserver.wal.FSHLog$RingBufferEventHandler.onEvent(FSHLog.java:1999)
+    org.apache.hadoop.hbase.regionserver.wal.FSHLog$RingBufferEventHandler.onEvent(FSHLog.java:1857)
+{noformat}
+
+On the other hand, SyncRunner threads are idle and just waiting for work implying that there are no pending SyncFutures that need to be run
+
+{noformat}
+   sun.misc.Unsafe.park(Native Method)
+    java.util.concurrent.locks.LockSupport.park(LockSupport.java:175)
+    java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject.await(AbstractQueuedSynchronizer.java:2039)
+    java.util.concurrent.LinkedBlockingQueue.take(LinkedBlockingQueue.java:442)
+    org.apache.hadoop.hbase.regionserver.wal.FSHLog$SyncRunner.run(FSHLog.java:1297)
+    java.lang.Thread.run(Thread.java:748)
+{noformat}
+
+Overall the WAL system is dead locked and could make no progress until it was aborted. I got to the bottom of this issue and have a patch that can fix it (more details in the comments due to word limit in the description).

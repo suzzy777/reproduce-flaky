@@ -1,0 +1,264 @@
+Thanks for the report. Is {{enable_legacy_ssl_storage_port}} the only thing you're changing in yaml? 
+
+I'm not sure it will matter, but which Java runtime are you running?
+
+This scenario is supported and should be covered in {{[test_rolling_upgrade_with_internode_ssl|https://github.com/apache/cassandra-dtest/blob/trunk/upgrade_tests/upgrade_through_versions_test.py#L328-L333]}}.
+
+I tried reproducing locally in ccm with these exact versions:
+
+{noformat}
+keytool -genkeypair -alias ccm_node -keyalg RSA -validity 365 -keystore keystore.jks -storepass cassandra -dname "cn=Cassandra Node,ou=CCMnode,o=DataStax,c=US" -keypass cassandra
+keytool -export -rfc -alias ccm_node -keystore keystore.jks -file ccm_node.cer -storepass cassandra
+ccm create -n 3 -v 3.11.10 --node-ssl `pwd` c16258 -s
+ccm node1 cqlsh -e 'select release_version from system.local'
+ccm node1 showlog | grep -i exception
+ccm node1 stop
+ccm node1 setdir -v 4.0-beta4
+ccm node1 updateconf 'server_encryption_options.enable_legacy_ssl_storage_port: true'
+ccm node1 start
+ccm node1 nodetool status
+ccm node2 nodetool status
+ccm node1 cqlsh -e 'select release_version from system.local'
+ccm node1 showlog | grep -i exception
+{noformat}
+
+I did not reproduce the error with either 4.0-beta4 or trunk. 
+
+We may need more information from troubleshooting your deployment, although I don't have anything more specific to ask for at this point.
+
+We added only {{enable_legacy_ssl_storage_port}} parameter in cassandra.yaml file while upgrading to Cassandra 4.
+
+Below is our Java version:
+
+{noformat}
+[abaroch@cass-521828978-1-1189299202 ~]$ java -version
+openjdk version "1.8.0_241"
+OpenJDK Runtime Environment (Zulu 8.43.0.6-SA-linux64) (build 1.8.0_241-b08)
+OpenJDK 64-Bit Server VM (Zulu 8.43.0.6-SA-linux64) (build 25.241-b08, mixed mode)
+{noformat}
+
+
+Do you have larger than usual key sizes or perhaps an openssl configuration that's being picked up on the host? It seems to be failing when adding the key material.
+
+How can we check the key sizes? 
+
+You may be able to get the info using
+
+
+{code}
+ keytool -list -v -keystore keystore.jks
+ keytool -list -v -keystore truststore.jks
+{code}
+
+Look for anything containing "bit", for example
+
+{code}
+Subject Public Key Algorithm: 2048-bit RSA key
+{code}
+
+I can programmatically reproduce the exception reported in this ticket with the following piece of code:
+
+{code}
+	public static void main(String[] args) throws CertificateEncodingException
+    	{
+		X509Certificate[] chain = new X509Certificate[5];
+		Random rand = new Random();
+		DatabaseDescriptor.clientInitialization();
+		for (int i = 0; i < chain.length; i++) {
+		    byte[] bytes = new byte[i % 2 == 0 ? 1024 : 4096];
+		    rand.nextBytes(bytes);
+		    OpenSslX509Certificate certificate = new OpenSslX509Certificate(bytes);
+		    chain[i] = certificate;
+		}
+		PemX509Certificate.toPEM(GlobalBufferPoolAllocator.instance, true, chain);
+	}
+ {code}
+
+Note: this test code has to live in io.netty.hadler.ssl because `toPEM` is package-protected.
+What it does is creating a chain of certificates (just random bytes for testing purposes) with different sizes (1024 and 4096 bits).
+
+The issue is that netty allocates a buffer that's proportional in size to the size of the first certificate in the chain, so if the certificates vary in length and the first one is shorter than the rest, the buffer size estimate will be off:
+
+https://github.com/netty/netty/blob/netty-4.1.58.Final/handler/src/main/java/io/netty/handler/ssl/PemX509Certificate.java#L135
+
+In general, that shouldn't be a problem because netty's default allocator, ByteBufAllocator.DEFAULT, will increase the max buffer capacity. But in C* 4.0, we can see from the attached stacktrace that it's using BufferPoolAllocator, which does not increase:
+
+https://github.com/apache/cassandra/blob/cassandra-4.0-beta4/src/java/org/apache/cassandra/net/BufferPoolAllocator.java#L59
+
+In the sample code above, if I switch from {{GlobalBufferPoolAllocator.instance}} to {{ByteBufAllocator.DEFAULT}}, it throws no exception.
+In C* 3.11.10 as far as I can tell it's using netty's default implementation.
+
+As I hinted above, this seems to be more of a general buffer allocation problem than SSL specific.
+In C* 4.0, a buffer is initialized with its max capacity equal to its initial capacity, for example, the following piece of code fails in C* 4.0:
+
+{code}
+ByteBuf myBuffer = GlobalBufferPoolAllocator.instance.buffer(100);
+byte[] toWrite = new byte[2000];
+myBuffer.writeBytes(toWrite);
+{code}
+
+So when netty tries to read a PEM certificate chain larger than what it originally estimated, it will fail.
+If we want to restore a similar behavior of 3.11.10 and allow for increasing the max buffer capacity up to Integer.MAX_VALUE (netty's [default value|https://github.com/netty/netty/blob/netty-4.1.58.Final/buffer/src/main/java/io/netty/buffer/AbstractByteBufAllocator.java#L31]), I have the following patch:
+
+https://github.com/grighetto/cassandra/pull/5
+
+CI build still pending, but I wanted to raise this for an early review/discussion. [~jasonstack] Would you mind taking a look?
+
+[~gianluca] thanks for the reproduction test. the fix looks good to me, left some minor nits.  [~aleksey] do you mind having a look as well?
+
+[~jasonstack] Thanks for the review. PR comments addressed.
+Left a follow-up question: https://github.com/grighetto/cassandra/pull/5/files#r607168291
+
+[~gianluca] can you please run the j11 tests under the j8 link? I can't trigger them for you unfortunately.
+
+Pushed new change as the result of the follow-up question above.
+Running new builds in CI.
+
+[~jasonstack] [~bereng] Latest change looks good on CI.
+Test result links updated in the ticket.
+
+I suspect there may be a bug if you don't at least look at overriding {{capacity(int)}}
+
+{{BufferPoolAllocator.Wrapped#capacity(int)}} is now overridden to ensure the original ByteBuffer will be returned to the pool when the buffer is resized.
+I also added unit tests for {{adopt()}} and various other scenarios of resizing.
+
+Tests passed in CircleCI and result links have been updated in the issue description.
+
+[~benedict] Would you mind taking another look?
+
+[~gianluca] I think we are just waiting for another +1 from either [~benedict], [~jasonstack] or some other committer right?
+
+[~bereng] Right, I'm not anticipating additional changes, just waiting for the final review.
+
+bq. BufferPoolAllocator.Wrapped#capacity(int) is now overridden to ensure the original ByteBuffer will be returned to the pool when the buffer is resized.
+
+Left a comment on whether to get rid of `super.capacity(int)` which allocated outside of pool.. https://github.com/grighetto/cassandra/pull/5/files#r614524653  [~e.dimitrova][~bereng][~gianluca] wdyt?
+
+[~jasonstack] I went that route initially, but there's a problem with that approach, we pass the initial buffer to the constructor of UnpooledUnsafeDirectByteBuf and it keeps a reference to that internally:
+
+https://github.com/netty/netty/blob/netty-4.1.58.Final/buffer/src/main/java/io/netty/buffer/UnpooledDirectByteBuf.java#L42
+
+We would have to call setByteBuffer to replace that object, but it is not public:
+
+https://github.com/netty/netty/blob/netty-4.1.58.Final/buffer/src/main/java/io/netty/buffer/UnpooledDirectByteBuf.java#L114
+
+If we don't replace that internal buffer, there will be mismatches because some internal functions use it.
+{{super.capacity(newCapacity)}} already does the right things, creates a new buffer, copies over the bytes, releases the old one and replaces that reference.
+
+{quote}
+So we don't have to keep track of returnToPool which defeats the purpose of reducing fragmented buffer allocation
+{quote}
+
+Right, I thought about that too and I agree, but for most cases it will behave as before (it has been working with fixed-length buffers up until now). Increasing the buffer capacity should be an edge case as the one reported in the ticket.
+
+Thanks [~gianluca] for all the work and bearing with me in Slack to confirm details. 
+
+I just submitted my pass of review with just small comments. I have only two questions. 
+ - Do we really need to use the new capacity function for max ?
+
+I want to align this with 3.11 and have the least hurdle. Does 3.11 always use the Netty [DEFAULT_MAX_CAPACITY|https://github.com/netty/netty/blob/netty-4.1.58.Final/buffer/src/main/java/io/netty/buffer/AbstractByteBufAllocator.java#L31]? 
+
+ - resizing happens in the same way it happens in 3.11 now?
+
+Also, [~aholmber], as you were working on the upgrade tests, do you think there is another one we can add to cover this case and show the smooth upgrade after this patch or it is overkill? 
+
+I understand that this was found during upgrade, but imo an upgrade test is fairly abstract characterization of this fix. [~gianluca] said creating the cert chain was fairly involved. Do you think it's worth codifying that in an integration test?  I had been thinking that the new unit tests were sufficient.
+
+The root cause has nothing to do with an upgrade or SSL. But it's just a generic BB resizing problem we have. So the unit tests should suffice and are the right fix imo if I am not missing anything.
+
+bq. The root cause has nothing to do with an upgrade or SSL. But it's just a generic BB resizing problem we have.
+I didn't say anything different I think? As I mentioned "to simulate the smooth upgrade" but probably only the unit tests are enough here. Ignore me :-) 
+
+I am hesitant whether we want to keep the current behavior during resizing or get back to using DEFAULT_MAX_CAPACITY, similar to what we do in 3.11. (I asked Gianluca on Friday and he verified it is  DEFAULT_MAX_CAPACITY in 3.11)
+
+
+
+
+bq. I didn't say anything different I think?
+
+Ah no, I was just thinking loud about the update thing.
+
+Jenkins is running [here|https://jenkins-cm4.apache.org/job/Cassandra-devbranch/690/] for the latest version of the patch.
+
+
+Jenkins finished with three failures which seem to me unrelated to the patch:
+
+[https://jenkins-cm4.apache.org/job/Cassandra-devbranch/690/testReport/]
+
+Two of the tests seem flaky and have failed with the same issue before:
+
+[https://ci-cassandra.apache.org/job/Cassandra-trunk/446/testReport/junit/org.apache.cassandra.net/AsyncPromiseTest/testFailure_cdc/]
+
+[https://ci-cassandra.apache.org/job/Cassandra-trunk/447/testReport/junit/org.apache.cass[…]ctionStrategyCQLTest/stressTestCompactionStrategyManager/|https://ci-cassandra.apache.org/job/Cassandra-trunk/447/testReport/junit/org.apache.cassandra.db.compaction/LongLeveledCompactionStrategyCQLTest/stressTestCompactionStrategyManager/]
+
+ 
+
+The third one looks to me as a CI env issue, WDYT?:
+
+[https://jenkins-cm4.apache.org/job/Cassandra-devbranch/690/testReport/junit.framework/Te[…]sandra_distributed_test_PreviewRepairCoordinatorFastTest/|https://jenkins-cm4.apache.org/job/Cassandra-devbranch/690/testReport/junit.framework/TestSuite/org_apache_cassandra_distributed_test_PreviewRepairCoordinatorFastTest/]
+
+ 
+{code:java}
+ERROR 20:56:36 Repair e500b3d0-a21a-11eb-882f-cd9857e77aff failed:
+java.lang.IllegalArgumentException: Unknown host specified thisreally.should.not.exist.apache.org
+ at org.apache.cassandra.service.ActiveRepairService.getNeighbors(ActiveRepairService.java:478)
+ at org.apache.cassandra.repair.RepairRunnable.getNeighborsAndRanges(RepairRunnable.java:326)
+ at org.apache.cassandra.repair.RepairRunnable.runMayThrow(RepairRunnable.java:265)
+ at org.apache.cassandra.repair.RepairRunnable.run(RepairRunnable.java:241)
+ at java.util.concurrent.Executors$RunnableAdapter.call(Executors.java:511)
+ at java.util.concurrent.FutureTask.run(FutureTask.java:266)
+ at java.util.concurrent.Executors$RunnableAdapter.call(Executors.java:511)
+ at java.util.concurrent.FutureTask.run(FutureTask.java:266)
+ at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1149)
+ at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:624)
+ at io.netty.util.concurrent.FastThreadLocalRunnable.run(FastThreadLocalRunnable.java:30)
+ at java.lang.Thread.run(Thread.java:748)
+Caused by: java.net.UnknownHostException: thisreally.should.not.exist.apache.org: Name or service not known
+ at java.net.Inet4AddressImpl.lookupAllHostAddr(Native Method)
+ at java.net.InetAddress$2.lookupAllHostAddr(InetAddress.java:929)
+ at java.net.InetAddress.getAddressesFromNameService(InetAddress.java:1324)
+ at java.net.InetAddress.getAllByName0(InetAddress.java:1277)
+ at java.net.InetAddress.getAllByName(InetAddress.java:1193)
+ at java.net.InetAddress.getAllByName(InetAddress.java:1127)
+ at java.net.InetAddress.getByName(InetAddress.java:1077)
+ at org.apache.cassandra.locator.InetAddressAndPort.getByNameOverrideDefaults(InetAddressAndPort.java:228)
+ at org.apache.cassandra.locator.InetAddressAndPort.getByName(InetAddressAndPort.java:213)
+ at org.apache.cassandra.service.ActiveRepairService.getNeighbors(ActiveRepairService.java:472)
+ ... 11 common frames omitted{code}
+ 
+
+[~e.dimitrova] The third test recently failed on trunk too: [https://jenkins-cm4.apache.org/job/Cassandra-trunk/451/]
+
+I agree they look unrelated to the patch.
+
+[~gianluca] just shared with me that the same test just failed again in the latest trunk build actually:
+
+https://jenkins-cm4.apache.org/job/Cassandra-trunk/451/testReport/junit/junit.framework/TestSuite/org_apache_cassandra_distributed_test_PreviewRepairCoordinatorFastTest/
+
+I think our messages crashed :D 
+
+I am +1 on the latest version of the patch.
+
+We were brainstorming with [~gianluca] around the usage of  DEFAULT_MAX_CAPACITY, and after looking at the whole testing done around that part of the code in 4.0 (with huge clusters and a lot of data), I think it sounds probably reasonable to keep the current limit/behavior.
+
+[~jasonstack] already approved the latest [PR|https://github.com/grighetto/cassandra/pull/6/files] in GitHub. I will leave the patch not committed until tomorrow morning if [~jasonstack] or [~bereng](or anyone else) has something to add, based on CI or some of my statements or anything and I think tomorrow morning I can commit it (if they don't do it and there is nothing else to be added here)
+
+ 
+
+If I followed the code correctly I _think_ we're not checking, neither is Netty, for {{BuffePool.memoryUsageThreshold}}. In this case that'd be {{NETWORKING_MEMORY_USAGE_THRESHOLD}} coming from [here|https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/utils/memory/BufferPools.java#L45]. That is being honored in reads i.e. but I think it'd be nice to do the same on resizing. At least I would add a unit test that tries to violate the buffer pool's memory threshold as future proofing. 
+
+The patch has been approved by [~e.dimitrova] and [~jasonstack]. CI looks good.
+I will fix 1 formatting issue and rename the test class as suggested by [~e.dimitrova] and commit.
+
+Sorry, [~bereng], I missed your comment.
+When {{Wrapped.capacity(int newCapacity)}} is called it calls {{super.capacity(int newCapacity)}} that call back {{Wrapped.allocateDirect}} that take care of using the BufferPool instead of allocating the buffer itself.
+I checked the test and they trigger that path before checking that the changes have updated correctly the {{BufferPool}}.
+
+So we cleared these doubts with [~blerer] on Slack. {{allocateDirect()}} being overridden is the key here. Upon resizing it gets called by Netty and that will prevent going over the threshold. That also makes current tests already have that check implicit.
+
++1
+
+A big thank you to [~gianluca], [~bereng], [~e.dimitrova] and [~jasonstack] for the patch and the reviews. Great job!
+
+Committed into trunk at 27cc2fc3e275f56f1fa1df7285c389d5491acc8c
+

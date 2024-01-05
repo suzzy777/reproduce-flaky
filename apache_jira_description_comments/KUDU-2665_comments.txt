@@ -1,0 +1,32 @@
+Fixed in commit 04bfc8c.
+
+Reopening because another major source of flakiness has emerged. The test is now failing with error:
+{noformat}
+block_manager-stress-test.cc:399] Check failed: _s.ok() Bad status: Not found: Can't find block: 18425938387067637933
+    @       0x3987e32625 __GI_raise at ??:0
+    @       0x3987e33e05 __GI_abort at ??:0
+    @           0x528b60 kudu::fs::BlockManagerStressTest<>::ReaderThread() at /data/somelongdirectorytoavoidrpathissues/src/kudu/thirdparty/installed/uninstrumented/include/glog/logging.h:717
+    @           0x680f01 kudu::Thread::SuperviseThread() at /usr/include/pthread.h:545
+    @       0x39882079d1 start_thread at ??:0
+    @       0x3987ee88fd clone at ??:0
+{noformat}
+
+I think I've identified the root cause.
+
+The new runtime container deletion code works as follows:
+# When a deletion transaction goes out of scope, we check all containers that participated. If any are both full and have no live blocks _right now_, we declare them to be dead, mark them as such, and remove their refs from global log block manager state.
+# The dead containers continue to live in memory because they have other referrents. These referrents are ongoing {{WritableBlock}} instances (shouldn't be any because the container is dead) and opened {{ReadableBlock}} instances (may exist).
+# When the last referrent is closed, the container's destructor runs. Because the container was marked as dead, its on disk files are now removed.
+
+To make all this work, it is assumed that when a container is both full and has no live blocks anymore, it is going to remain in that state in perpetuity. That's logically true: a full container with no live blocks isn't going to be used for any new blocks. However, due to the nature of {{WritableBlock}} finalization/closing, it's possible for a container with outstanding {{WritableBlock}} instances to briefly appear as dead. That's because:
+# The container's next block offset (responsible for determining fullness) is incrmented when the {{WritableBlock}} is finalized, but
+# The container's live block count is incremented when the {{WritableBlock}} is _closed_.
+
+Thus, if the "last" block in a container is deleted after a {{WritableBlock}} was finalized but before it has been closed, the container will be erroneously marked as dead. What's the effect? When the container's last referrent disappears (i.e. last outstanding {{ReadableBlock}} is closed), it will be deleted from disk _despite having live blocks in it_. Because block_manager-stress-test restarts from time to time, the block manager thus loses blocks that the test still expects to find.
+
+I'm attaching the test's output with a lot more instrumentation showing the bug.
+
+We absolutely need to fix this before releasing 1.9, or to at least disable the runtime container deletion code.
+
+[~helifu] fixed the second source of flakiness in commit 2107f23.
+

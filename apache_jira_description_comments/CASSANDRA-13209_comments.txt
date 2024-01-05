@@ -1,0 +1,90 @@
+although timeouts do appear in the failures, most of them seem to be occurring because the CSV's don't have the expected number of lines. sometimes it's more, sometimes less.
+A better example is https://builds.apache.org/view/A-D/view/Cassandra/job/Cassandra-trunk-dtest/134/testReport/cqlsh_tests.cqlsh_copy_tests/CqlshCopyTest/test_bulk_round_trip_blogposts_with_max_connections/
+
+
+
+seems that the blogposts tests have previously been an issue that wasn't resolved https://issues.apache.org/jira/browse/CASSANDRA-10938
+
+
+
+actually it's always less, and it appears the majority of the issues come from the COPY FROM. Not every test failure seems to be caused by the same thing, but the majority appear to be because when timeouts occur in the COPY FROM they don't actually get retried, so some rows don't get written. Also once the COPY FROM code in cqlsh gets over 1000 failed rows it exits, which kind of explains why a lot of the failures are because of a difference of a 1000 rows.
+
+Corresponding error is the following, note it mentions the # of attempts, however it will never go past 1.
+{code}<stdin>:2:Failed to import 9 rows: OperationTimedOut - errors={'127.0.0.3': 'Client request timeout. See Session.execute[_async](timeout)'}, last_host=127.0.0.3,  will retry later, attempt 1 of 5{code}
+
+Going to fix the error handling in the COPY FROM command to actually do retries (like COPY TO does), that should make the tests less flaky, as COPY TO also suffers from the timeouts but effectively retries and thus rarely has issues. There is still the underlying problem of why COPY is timing out in the first place, but to be honest I'd put it down to the command and nodes simply using too much resources on the servers. If it's still very flaky after fixing the retries we can look into performance issues more.
+
+
+
+bq. however it will never go past 1.
+
+If it succeeds importing rows in a following attempt, it would not log attempt no. 2.
+
+bq. Going to fix the error handling in the COPY FROM command to actually do retries (like COPY TO does),
+
+COPY FROM does retry on timeouts, otherwise {{test_bulk_round_trip_with_timeouts}} would always fail. The code that retries is in the [error callback|https://github.com/apache/cassandra/blob/trunk/pylib/cqlshlib/copyutil.py#L2583].  These [two lines|https://github.com/apache/cassandra/blob/trunk/pylib/cqlshlib/copyutil.py#L2579] just above are because of [PYTHON-652|https://datastax-oss.atlassian.net/browse/PYTHON-652], which doesn't seem fixed yet. You may want to try and see if by any chance these lines cause some time outs not to get retried but I doubt it. The reason why COPY TO and COPY FROM have difference retry mechanisms is performance (CASSANDRA-11053).
+
+bq. Also once the COPY FROM code in cqlsh gets over 1000 failed rows it exits,
+
+This is configurable, see [here|https://github.com/apache/cassandra/blob/trunk/pylib/cqlshlib/copyutil.py#L362].
+
+Thanks [~Stefania]. That's awfully misleading... 
+
+It seems to me that this means that if there enough first attempt failures that trigger the log message to add up to over 1000 rows the COPY FROM will stop. Is that correct? If so it could account for _some_ of the failures but not all, as some of the failed jobs don't have the {{Exceeded maximum number of insert errors 1000}} error.
+
+bq. That's awfully misleading...
+
+I'm not sure what you are referring to but, if it is the print statement on the number of attempts you could consider adding a statement when a batch completes with number of attempts > 0, I would keep it at debug level though.
+
+bq. It seems to me that this means that if there enough first attempt failures that trigger the log message to add up to over 1000 rows the COPY FROM will stop. Is that correct?
+
+Yes.
+
+bq. If so it could account for some of the failures but not all,
+
+Also correct, if it completed with fewer rows than expected then there is something else we don't understand yet.
+
+{quote}I'm not sure what you are referring to but, if it is the print statement on the number of attempts you could consider adding a statement when a batch completes with number of attempts > 0, I would keep it at debug level though.
+{quote}
+One could say that the bug made it misleading. Now that I'm more familiar with the error handling between the tasks and the processes it makes sense, however the fact that insert errors were counted for every attempt made it misleading.
+
+So I think the attached 1 line patch is the way to go, and from my testing it seems to make the test a lot more stable. Occasionally still get client read timeout errors early on which break the test, but this appears to be a resource issue, and doesn't happen when I run the test on a machine more powerful than my laptop.
+
+Patch simply makes it so we count the total insert errors based on failing all attempts, rather than just one attempt. It might be nice to have a dtest that does the same blogpost COPY test but with MAXATTEMPTS=1(or more?) and forced failure to test that it is calculating correctly, but I'll only go down that path if people agree this makes sense.
+
+The alternative is to increase the dtest's MAXINSERTERRORS but personally I don't think it makes sense to count failed attempts as errors.
+
+bq. Patch simply makes it so we count the total insert errors based on failing all attempts, rather than just one attempt.
+
++1, it is clearly a mistake to count attempts as insert errors. I've applied your patch to [this branch|https://github.com/stef1927/cassandra/tree/13209-3.0] and I'm currently running the full cqlsh tests on our CI system. I will post the results later.
+
+Where do you think we should commit this, technically 2.1 is critical fixes only, and this isn't critical. I'm not sure about 2.2 either. I would suggest 3.0+, WDYT? We can set {{MAXINSERTERRORS}} to -1 to stabilize the test on the branches without this fix.
+
+bq. It might be nice to have a dtest that does the same blogpost COPY test but with MAXATTEMPTS=1(or more?) and forced failure to test that it is calculating correctly
+
+We have [{{test_reading_max_insert_errors}}|https://github.com/stef1927/cassandra-dtest/blob/master/cqlsh_tests/cqlsh_copy_tests.py#L1176] for this. It's currently setting {{MAXATTEMPTS}} to 1, you could extend it to use {{MAXATTEMPTS}} > 1 if you wanted to test that attempts are not counted as insert errors.
+
+The whole critical fixes only has always annoyed me as an operator of many clusters of many versions so I'm biased in this regard. I don't see any harm in applying the fix to 2.2 (or 2.1 for that matter). The way I see it is 2.2 will be around for a long time as people won't move to 3, so at the very least we should apply it there. Plus it is a very small patch after all.
+
+I'll have a look at extending on {{test_reading_max_insert_errors}}, thanks for the pointer.
+
+I've run the entire cqlsh tests internally for 3.0, 3.11 and trunk, no problems found. 
+
+OK for committing in 2.2+, I'll run CI for this on Monday.
+
+CI for 2.2 looks good as far as the proposed patch is concerned: only the known failures in cqlshlib and a client request timeout in {{test_bulk_round_trip_blogposts}} when invoking {{SELECT COUNT}} at line 2475, unrelated to this patch. I imagine we would need to reduce the number of records in the bulk tests to fix this sort of problems if they happen on ASF infra, or remove the {{SELECT COUNT}} altogether, if at all possible.
+
+So \+1 for the patch in 2.2\+, even though if may not stabilize the bulk tests fully, I expect the tests can be stabilized with changes in the tests. Do you need me to commit?
+
+
+
+Yeah not sure why the counts are flaky on ASF infra. I rarely ever got the client request timeouts running on a standalone machine, even with a smaller heap. Anyway, probably best those tests are fixed in their own tickets/in dtests where applicable so may as well finish up with this ticket.
+
+Thanks for the review Stefania, and yes I need you to commit.
+
+
+
+Committed to 2.2 as [5807ec|https://github.com/apache/cassandra/commit/5807eca8bbb30091b632e031441939c763b3e054] and merged upwards.
+
+Thank you for the patch!
+

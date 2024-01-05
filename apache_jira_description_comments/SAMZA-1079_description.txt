@@ -1,0 +1,43 @@
+Localizing refers to downloading of resources that a container needs to execute. This could include executables (binaries, jar files etc.) or other resource files that a container needs when it runs. The NM interacts with the HttpFileSystem to fetch the resources.
+
+When there are flaky connection issues to the HttpFileSystem, we should graciously fail localizing with a timeout (instead of hanging the localizing phase forever). At LinkedIn, we have encountered issues with several jobs in our cluster hanging indefinitely. This error is very subtle because Yarn localization happens in a separate process called "ContainerLocalizer".
+
+Based on investigation here are the relevant stack traces:
+{code}
+"ContainerLocalizer Downloader" #27 prio=5 os_prio=0 tid=0x00007fa8252f6000 nid=0x49b6 runnable [0x00007fa7b959d000]
+   java.lang.Thread.State: RUNNABLE
+    at java.net.SocketInputStream.socketRead0(Native Method)
+    at java.io.BufferedInputStream.fill(BufferedInputStream.java:246)...
+    - locked <0x000000008022ca40> (a java.io.BufferedInputStream)
+    at org.apache.commons.httpclient.ContentLengthInputStream.read(ContentLengthInputStream.java:143)
+    at java.io.FilterInputStream.read(FilterInputStream.java:83)...
+    at org.apache.commons.httpclient.AutoCloseInputStream.read(AutoCloseInputStream.java:88)
+    at org.apache.samza.util.hadoop.HttpInputStream.read(HttpInputStream.scala:39)
+    - locked <0x000000008022db10> (a java.lang.Object)...
+    at java.lang.Thread.run(Thread.java:745)
+
+{code}
+
+Investigating heap dumps of the NM and the state of its data-structures revealed a hung socket.
+{code}
+java      18781  app  206r  IPv6 zzz      0t0  TCP ltx1-appzzz.stg.linkedin.com:nnnn->ltx1-artifactory.xxx.linkedin.com:nnnn (ESTABLISHED)
+{code}
+
+The NM threads that consume the STDOUT and STDERR of the ContainerLocalizer are blocked waiting for the ContainerLocalizer to finish download. (This is not surprising since the pipe with the child process has not yet closed and there is no new data to read).
+{code}
+         "LocalizerRunner for container_e03_1481261762048_0541_02_000060" #2335967 prio=5 os_prio=0 tid=0x00007f993c913800 nid=0x4fa4 runnable [0x00007f9929d6f000]
+java.lang.Thread.State: RUNNABLE
+     at java.io.FileInputStream.readBytes(Native Method)
+     at java.io.FileInputStream.read(FileInputStream.java:255)..
+     - locked <0x00000000c7185be0> (a java.lang.UNIXProcess$ProcessPipeInputStream)
+     at org.apache.hadoop.util.Shell$ShellCommandExecutor.parseExecResult(Shell.java:786)
+     at org.apache.hadoop.util.Shell.runCommand(Shell.java:568)..
+     at org.apache.hadoop.yarn.server.nodemanager.LinuxContainerExecutor.startLocalizer(LinuxContainerExecutor.java:237)
+     at org.apache.hadoop.yarn.server.nodemanager.containermanager.localizer.ResourceLocalizationService$LocalizerRunner.run(ResourceLocalizationService.java:1113)
+{code}
+
+The fix is as follows:
+
+Fix the HttpFileSystem to provide timeouts for read calls. The socket time out will cause the NM to shutdown the ContainerLocalizer. This will cause the NM thread stuck on reading from the STDOUT of ContainerLocalizer to be interrupted (since the other end of the pipe is now closed). It will later trigger an AM notification for a killed container and the AM can make a new request to the RM for that container.   
+
+The fix must be tested carefully since this is on the critical path of every single container request.

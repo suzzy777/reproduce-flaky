@@ -1,0 +1,136 @@
+There is an issue with packing TimestampValue. GCC doesn't pack the class because its variables are not explicitly declared as packed. So the compiler complains with the following error for the date_ and time_ attributes:
+{code:java}
+error: ignoring packed attribute because of unpacked non-POD field
+{code}
+However, boost::posix_time::time_duration and boost::gregorian::date each contain single elements of uint64_t and int32_t respectively. I am unaware of any method to explicitly declare them as packed structures. How should we handle this? Would it be acceptable to pack StringValue and CollectionValue for now and create a Jira to track TimestampValue for handling it when boost marks them as packed?
+
+[~poojanilangekar], that sounds like a good approach. There are many other things we can take a look at regarding the boost issue, including patching boost or using components from {{std::}}.
+
+About TimestampValue and boost: it is also a possibility to replace the boost types with uint64_t/int32_t or wrapper structs that have the same layout (nanoseconds from midnight/days since some epoch). The layout itself cannot be changed easily, because Parquet uses the same 96 bit struct for timestamps and memcpy is used to read them. So if we find a better way to store timestamps or boost is updated and these classes change, then the current version still has to be kept to be able to read/write Parquet.
+
+boost::posix_time::time_duration and boost::gregorian::date have some useful functions, but also cause problems:
+- adding duration can overflow, which leads to a lot of wrapper code (an example is https://gerrit.cloudera.org/#/c/11390 )
+- the limitations of the boost classes is the reason behind the limited timestamp range in Impala (1400..9999) - uint32_t could be enough to a much larger range e.g. from 0001
+- some functions can throw exceptions if out of range and Impala is not very good at catching them
+- some functions are slow compared to manipulating the integer representations directly
+
+I am not saying that the boost classes should be replaced in the scope of this Jira, I just wanted to add that the tendency is to move away from boost's time types. Replacing boost/date_time/local_time/tz_database with CCTZ was a big step in this direction.
+
+Also note that Impala's TPCH tables store timestamps are strings (as far as I know), so packing TimestampValue shouldn't affect TPCH performance.
+
+
+[~csringhofer] Agreed. We should be moving away from boost but I am not sure replacing those with uint64_t/int32_t since the TimestampValue class requires some functions which could utilize some existing libraries/wrappers. Hence I thought one approach here would be to seize the benefits of using fewer bytes for StringValue and CollectionValue in this Jira and then handle TimestampValue separately since that structure can't be packed as is. 
+
++1 to Pooja and Csaba's comments. I think using int types for TimestampValue makes sense but it's better to separate that out.
+
+I ran TPCH with a scale factor of 60 on a minicluster with a patch for StringValue and CollectionValue slots. Here is the summary of results: 
+
+{noformat}
++-------------+------------------------------+----------+---------------+-----------------+-----------------------+
+| Workload | File Format                  | Avg (s) | Delta(Avg) | GeoMean(s) | Delta(GeoMean) |
++-------------+------------------------------+----------+---------------+------------------+----------------------+
+| TPCH(60) | parquet / none / none | 12.45   | -29.84%     | 8.63              | -11.30%              |
++--------------+-----------------------------+----------+---------------+------------------+----------------------+
+{noformat}
+
+
+The queries which showed significant performance gain did use strings or timestamps stored as strings. I can understand that we should see an improvement, however I am not sure about the magnitude. 
+
+Also there were only 2 queries which showed a regression > 1 %. In both cases, the absolute difference was less than 5ms while the query took a few seconds to run. So this could just be system noise. 
+
+That's a huge win. I can see it might make a difference for larger scale factors since more data will fit in various levels of cache. Just to check, we ran end-to-end tests right? I.e. there's not a bug or something.
+
+[~tarmstrong] I still need to fix issues with KuduScanners. The other scanners work fine because we read from the file and populate it into the Tuple. However, in case of Kudu, we carry out a memcopy from the kudu tuple because the all slot descriptors are the same (except TimestampValue which is handled because Kudu adds sufficient padding). I spoke to [~bikramjeet.vig] about this, and he explained that replacing the single memcopy per tuple with some mechanism to handle strings (leading to multiple multiple memcopy calls) would cause significant regression for Kudu tables.
+
+That's awesome news then. I think that, for the time being, we should just add padding to the values in our tuple to match the Kudu layout. There's already some Kudu-specific code that adds some extra null bits to handle a similar issue. Long-term it would be nice to rethink this but for now the padding solution seems OK.
+
+From what I understood, you're suggesting packing collection value for now and creating JIRAs for StringValue (due to Kudu) and TimestampValue (due to boost). Is that correct?
+
+In that case, we would only be getting the performance improvements because of packing CollectionValue. (We can pack CollectionValue structs because Kudu does not support it.)
+
+We should make the change for StringValue, but add padding after each StringValue when the tuple is the output tuple of a Kudu scan. The model in Impala is that there is a Tuple layout corresponding to each scan and then every plan node returns a row that is composed of one or more tuples, which can either be based on the input tuple layout or a new layout that it materialised in the plan node. But yeah, the relevant thing is that, given a TupleDescriptor, we can determine if it's associated with a Kudu scan.
+
+If you look at fe/src/main/java/org/apache/impala/analysis/TupleDescriptor.java, you'll see there's some special handling of FeKuduTable which handles a similar Kudu layout issue.
+
+[~poojanilangekar], can you publish your changes on gerrit or a Github repo? I'd like to try out a Jenkins performance job by testing it against your change.
+
+Commit 2a4835cfba7597362cc1e72e21315868c5c75d0a in impala's branch refs/heads/master from poojanilangekar
+[ https://git-wip-us.apache.org/repos/asf?p=impala.git;h=2a4835c ]
+
+IMPALA-7367: Pack StringValue and CollectionValue slots
+
+This change packs StringValue and CollectionValue slots to ensure
+they now occupy 12 bytes instead of 16 bytes. This reduces the
+memory requirements and improves the performance. Since Kudu
+tuples are populated using a memcopy, 4 bytes of padding was
+added to StringSlots in Kudu tables.
+
+Testing:
+Ran core tests.
+Added static asserts to ensure the value sizes are as expected.
+Performance tests on TPCH-40  produced 3.96% improvement.
+
+Change-Id: I32f3b06622c087e4aa288e8db1bf4581b10d386a
+Reviewed-on: http://gerrit.cloudera.org:8080/11599
+Tested-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+Reviewed-by: Tim Armstrong <tarmstrong@cloudera.com>
+
+
+Commit 5e2dcd25d855711508088fd2f9f6e2bf7523fdfc in impala's branch refs/heads/master from poojanilangekar
+[ https://git-wip-us.apache.org/repos/asf?p=impala.git;h=5e2dcd2 ]
+
+IMPALA-7873: Fix flakiness in TestExchangeMemUsage
+
+IMPALA-7367 reduced the memory requirement of the query tested in
+test_exchange_mem_usage_scaling. This change reduces the mem limit
+to ensure that the query runs out of memory as expected.
+
+Testing:
+Ran the test 100 times in a loop without any failures.
+
+Change-Id: Ib2f063fb88ebf0c7f994b55ecfc860d81726fdd8
+Reviewed-on: http://gerrit.cloudera.org:8080/11965
+Reviewed-by: Tim Armstrong <tarmstrong@cloudera.com>
+Tested-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+
+
+Commit af7476d550bcf8b3819bd4816bfe0c16ea78758a in impala's branch refs/heads/master from poojanilangekar
+[ https://git-wip-us.apache.org/repos/asf?p=impala.git;h=af7476d ]
+
+IMPALA-7882: Remove StringValue padding validation
+
+Previously, the StringValue test in the llvm-codegen-test validated
+the padding bytes. The validation check was invalidated by
+IMPALA-7367. This change removes that check.
+
+Testing: Ran core tests with ASAN enabled.
+
+Change-Id: I3e7247b416ae9e1bc6da299572f2b6f326ad1c71
+Reviewed-on: http://gerrit.cloudera.org:8080/11989
+Reviewed-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+Tested-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+
+
+Commit ae96a9fb19e0a2e0a5529f2f36d3b5ee0d336f69 in impala's branch refs/heads/master from poojanilangekar
+[ https://gitbox.apache.org/repos/asf?p=impala.git;h=ae96a9f ]
+
+IMPALA-8151: Use sizeof() in HiveUdfCall to specify non-primitive type's size
+
+Previously, data type sizes were hardcoded in
+HiveUdfCall::Evaluate(). Since IMPALA-7367 removed the padding
+from STRING and VARCHAR types, it could read past the end of the
+actual value and cause a crash. This change replaces the hardcoded
+values with  sizeof() calls to determine the size of non-primitive
+types (STRING, VARCHAR and TIMESTAMP) to avoid similar issues in
+the future.
+
+Testing:
+Ran test_udfs.py on an ASAN build.
+Added logs to manually verify the size of bytes copied.
+
+Change-Id: I919c330546fa86b474ab66245b20ceb1f5525b41
+Reviewed-on: http://gerrit.cloudera.org:8080/12355
+Reviewed-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+Tested-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+
+

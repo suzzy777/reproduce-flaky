@@ -1,0 +1,66 @@
+h3. Description & Root cause
+
+1. ItDataTypesTest is flaky because previous ItCreateTableDdlTest tests failed to stop replicas on node stop:
+
+!Снимок экрана от 2023-04-06 10-39-32.png!
+{code:java}
+java.lang.AssertionError: There are replicas alive [replicas=[b86c60a8-4ea3-4592-abef-6438cfc4cdb2_part_21, b86c60a8-4ea3-4592-abef-6438cfc4cdb2_part_6, b86c60a8-4ea3-4592-abef-6438cfc4cdb2_part_13, b86c60a8-4ea3-4592-abef-6438cfc4cdb2_part_8, b86c60a8-4ea3-4592-abef-6438cfc4cdb2_part_9, b86c60a8-4ea3-4592-abef-6438cfc4cdb2_part_11]]
+    at org.apache.ignite.internal.replicator.ReplicaManager.stop(ReplicaManager.java:341)
+    at org.apache.ignite.internal.app.LifecycleManager.lambda$stopAllComponents$1(LifecycleManager.java:133)
+    at java.base/java.util.Iterator.forEachRemaining(Iterator.java:133)
+    at org.apache.ignite.internal.app.LifecycleManager.stopAllComponents(LifecycleManager.java:131)
+    at org.apache.ignite.internal.app.LifecycleManager.stopNode(LifecycleManager.java:115){code}
+2. The reason why we failed to stop replicas is the race between tablesToStopInCaseOfError cleanup and adding tables to tablesByIdVv.
+
+On TableManager stop, we stop and cleanup all table resources like replicas and raft nodes
+{code:java}
+public void stop() {
+  ...
+  Map<UUID, TableImpl> tables = tablesByIdVv.latest();  // 1*
+  cleanUpTablesResources(tables); 
+  cleanUpTablesResources(tablesToStopInCaseOfError);
+  ...
+}{code}
+where tablesToStopInCaseOfError is a sort of pending tables list which one is cleared on cfg storage revision update.
+
+tablesByIdVv *listens same storage revision update event* in order to publish tables related to the given revision or in other words make such tables accessible from tablesByIdVv.latest(); that one that is used in order to retrieve tables for cleanup on components stop (see // 1* above)
+{code:java}
+public TableManager(
+  ... 
+  tablesByIdVv = new IncrementalVersionedValue<>(registry, HashMap::new);
+
+  registry.accept(token -> {
+    tablesToStopInCaseOfError.clear();
+    
+    return completedFuture(null);
+  });
+  {code}
+However inside IncrementalVersionedValue we have async storageRevision update processing
+{code:java}
+updaterFuture = updaterFuture.whenComplete((v, t) -> versionedValue.complete(causalityToken, localUpdaterFuture)); {code}
+As a result it's possible that we will clear tablesToStopInCaseOfError before publishing same revision tables to tablesByIdVv, so that we will miss that cleared tables in tablesByIdVv.latest() which is used in TableManager#stop.
+h3. Implementation Notes
+
+1. First of all I've renamed tablesToStopInCaseOfError to pending tables, because they aren't only ...InCaseOfError.
+
+2. I've also reworked tablesToStopInCaseOfError cleanup by substituting tablesToStopInCaseOfError.clear on revision change with
+{code:java}
+tablesByIdVv.get(causalityToken).thenAccept(ignored -> inBusyLock(busyLock,  ()-> {      
+  pendingTables.remove(tblId);
+})); {code}
+meaning that we
+
+2.1. remove specific table by id instead of whole map clear.
+
+2.2. do that removal on corresponding table publishing wihtin tablesByIdVv.
+
+3. That means that at some point right after the publishing but before removal it's possible to have same table both within tablesByIdVv and pendingTables thus in order not to stop same table twice (which is safe by the way because of idempotentce) I've substituted
+{code:java}
+cleanUpTablesResources(tables);
+cleanUpTablesResources(tablesToStopInCaseOfError); {code}
+with
+{code:java}
+Map<UUID, TableImpl> tablesToStop = Stream.concat(tablesByIdVv.latest().entrySet().stream(), pendingTables.entrySet().stream()).
+        collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue, (v1, v2) -> v1));
+
+cleanUpTablesResources(tablesToStop); {code}

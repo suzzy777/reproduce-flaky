@@ -1,0 +1,233 @@
+Here is what I am seeing in bootstrap_test.py::TestBootstrap::test_bootstrap_with_reset_bootstrap_state
+
+{code}
+      node3 = new_node(cluster)
+        try:
+            node3.start()
+        except NodeError:
+            pass  # node doesn't start as expected
+        t.join()
+        node1.start()
+{code}
+
+node1.start checks all the alive nodes (according to ccm) to see if node1 is seen as up in the logs.  node3 is dead (or dying), so it should not be included in the watch set
+
+I was able to repro the issue when I limit the environment to 2 cores; trying a patch where we force shutdown node3 before starting node1 to avoid ccm checking node3's logs
+
+bootstrap_test.py::TestBootstrap::test_bootstrap_binary_disabled also fails with the following
+
+{code}
+        try:
+            node3.nodetool('join')
+            pytest.fail('nodetool should have errored and failed to join ring')
+        except ToolError as t:
+>           assert "Cannot join the ring until bootstrap completes" in t.stdout
+E           assert 'Cannot join the ring until bootstrap completes' in ''
+E            +  where '' = ToolError("Subprocess ['nodetool', '-h', 'localhost', '-p', '7300', 'join'] exited with non-zero status; exit status: 1; \nstderr: nodetool: Failed to connect to 'localhost:7300' - SocketException: 'Connection reset'.\n",).stdout
+{code}
+
+In both cases it looks like issue connecting to JMX.  Logs for node3 don't show the process going down during the test so not sure what's up yet.  This is localhost networking so shouldn't have random connection close events, so not sure what leads to this flaky behavior yet.
+
+bootstrap_test.py::TestBootstrap::test_bootstrap_binary_disabled  is more complex it seems, something is causing the JVM to do a graceful shutdown; is see the following in the node3 logs
+
+{code}
+WARN  [main] 2021-11-01 22:43:33,212 CassandraDaemon.java:663 - Not starting client transports in write_survey mode as it's bootstrapping or auth is enabled
+INFO  [main] 2021-11-01 22:43:33,212 CassandraDaemon.java:764 - Startup complete
+INFO  [StorageServiceShutdownHook] 2021-11-01 22:43:33,219 HintsService.java:233 - Paused hints dispatch
+{code}
+
+I enhanced the test to log where it is out, so I can correlate test and server logs
+
+{code}
+22:43:35,415 bootstrap_test INFO Attempting to resume bootstrap on node3
+{code}
+
+
+So, I see that we start a graceful shutdown at 22:43:33,219, and the test tries to resume bootstrap at 22:43:35,415; 2 seconds AFTER we started shutdown.  I don't see us doing a shutdown in the test; and this fails 100% of the time for me, so we always seem to do a graceful shutdown for some reason...
+
+Added the following to CassandraDaemon to detect if System.exit is getting called; it doesn't look to be
+
+{code}
+System.setSecurityManager(new SecurityManager()
+        {
+            public void checkExit(int status)
+            {
+                System.err.println("System.exit("+status+")) callled");
+                new Throwable("System.exit("+status+")) callled").printStackTrace();
+            }
+        });
+{code}
+
+So something else looks to be causing the JVM to halt.
+
+Ok I think I figured out the issue; we have no daemon threads running..
+
+updated drain to log threads
+
+{code}
+protected synchronized void drain(boolean isFinalShutdown) throws IOException, InterruptedException, ExecutionException
+    {
+        logger.info("drain({})", isFinalShutdown);
+        if (isFinalShutdown)
+        {
+            Map<Thread, StackTraceElement[]> traces = Thread.getAllStackTraces();
+            List<String> nonDaemonThreads = new ArrayList<>();
+            for (Entry<Thread, StackTraceElement[]> e : traces.entrySet())
+            {
+                if (e.getKey().isDaemon())
+                    continue;
+                nonDaemonThreads.add(e.getKey().getName());
+            }
+            logger.info("Non-daemon threads: {}", nonDaemonThreads);
+        }
+{code}
+
+This produces
+
+{code}
+INFO  [StorageServiceShutdownHook] 2021-11-01 23:54:50,181 StorageService.java:5003 - Non-daemon threads: [DestroyJavaVM, StorageServiceShutdownHook]
+{code}
+
+Here is what I see different than 4.0
+
+{code}
+$ diff 40.txt trunk.txt
+4,5c4
+< COMMIT-LOG-ALLOCATOR    false
+< CacheCleanupExecutor:1    true
+---
+> COMMIT-LOG-ALLOCATOR    true
+10d8
+< GossipStage:1    true
+12,14d9
+< HintsDispatcher:1    true
+< HintsDispatcher:2    true
+< HintsWriteExecutor:1    true
+23d17
+< MigrationStage:1    true
+27c21
+< PERIODIC-COMMIT-LOG-SYNCER    false
+---
+> PERIODIC-COMMIT-LOG-SYNCER    true
+37d30
+< SecondaryIndexManagement:1    true
+40,42c33
+< ValidationExecutor:1    true
+< ValidationExecutor:2    true
+< ViewBuildExecutor:1    true
+---
+> SnapshotCleanup:1    true
+45a37
+> read-hotness-tracker:1    true
+{code}
+
+This was collected as the last step in main, so just scans every thread and checks if daemon or not
+
+the non-daemon threads in 40 are: nioEventLoopGroup-5-1, PERIODIC-COMMIT-LOG-SYNCER, and COMMIT-LOG-ALLOCATOR
+
+but in trunk it is only: nioEventLoopGroup-5-1
+
+seems PERIODIC-COMMIT-LOG-SYNCER and COMMIT-LOG-ALLOCATOR went daemon; will try to track down where.
+
+PeriodicCommitLogService:
+40: NamedThreadFactory.createThread(new SyncRunnable(MonotonicClock.preciseTime), name) // daemon=false
+trunk: executorFactory().infiniteLoop(name, new SyncRunnable(MonotonicClock.preciseTime), true); // daemon=true in org.apache.cassandra.concurrent.ExecutorFactory.Default#startThread
+
+AbstractCommitLogSegmentManager
+40: NamedThreadFactory.createThread(runnable, "COMMIT-LOG-ALLOCATOR"); // daemon=false
+trunk: executorFactory().infiniteLoop("COMMIT-LOG-ALLOCATOR", runnable, true, interruptHandler); // daemon=true
+
+These two were changed in CASSANDRA-16925
+
+Is it only me or there is no CI run accompanying CASSANDRA-16925, maybe they just forgot to publish the link...? I don't know. 
+
+[~samt] was working on another issue with commit log which is another race condition bug; will ninja that patch into this one as it touches the same code and rewriting the same interface twice is annoying...
+
+Error is
+
+{code}
+ERROR [COMMIT-LOG-WRITER] 2021-10-25 14:51:13,985 Exiting due to error while processing commit log during initialization.
+org.apache.cassandra.io.FSWriteError: java.nio.channels.ClosedByInterruptException
+	at org.apache.cassandra.db.commitlog.CompressedSegment.write(CompressedSegment.java:86)
+	at org.apache.cassandra.db.commitlog.CommitLogSegment.sync(CommitLogSegment.java:360)
+	at org.apache.cassandra.db.commitlog.AbstractCommitLogSegmentManager.sync(AbstractCommitLogSegmentManager.java:555)
+	at org.apache.cassandra.db.commitlog.CommitLog.sync(CommitLog.java:253)
+	at org.apache.cassandra.db.commitlog.AbstractCommitLogService$SyncRunnable.run(AbstractCommitLogService.java:178)
+	at org.apache.cassandra.concurrent.InfiniteLoopExecutor.loop(InfiniteLoopExecutor.java:86)
+	at io.netty.util.concurrent.FastThreadLocalRunnable.run(FastThreadLocalRunnable.java:30)
+	at java.lang.Thread.run(Thread.java:748)
+Caused by: java.nio.channels.ClosedByInterruptException: null
+	at java.nio.channels.spi.AbstractInterruptibleChannel.end(AbstractInterruptibleChannel.java:202)
+	at sun.nio.ch.FileChannelImpl.position(FileChannelImpl.java:269)
+	at org.apache.cassandra.db.commitlog.CompressedSegment.write(CompressedSegment.java:78)
+	... 7 common frames omitted
+{code}
+
+I was hopeful that https://app.circleci.com/pipelines/github/dcapwell/cassandra/1069/workflows/26b7b83a-686f-4516-a56a-0709d428d4f2/jobs/7256/tests#failed-test-1 would pass as it looks like the same pattern; but it didn't... 
+
+{code}
+node3 = new_node(cluster)
+        try:
+            node3.start()
+        except NodeError:
+            pass  # node doesn't start as expected
+        t.join()
+>       node1.start()
+{code}
+
+{code}
+ccmlib.node.TimeoutError: 02 Nov 2021 21:41:45 [node3] after 120.11/120 seconds Missing: ['127.0.0.1:7000.* is now UP'] not found in system.log:
+{code}
+
+Looking at node3's logs
+
+https://circle-production-customer-artifacts.s3.amazonaws.com/picard/5d8cf450ac092b7198121061/6181a8080bc8444c0cfb3495-7-build/artifacts/dtest_j8_upgradetests_without_vnodes_logs/1635889075100_test_bootstrap_with_reset_bootstrap_state/node3.log?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20211102T220735Z&X-Amz-SignedHeaders=host&X-Amz-Expires=60&X-Amz-Credential=AKIAJR3Q6CR467H7Z55A%2F20211102%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Signature=8a0b070e2db9d3e2bed74754d6f34d13171ab5ce1cc7236ec7792003ea14808f
+
+{code}
+ERROR [Stream-Deserializer-/127.0.0.1:7000-f2eb1a15] 2021-11-02 21:35:40,983 DefaultFSErrorHandler.java:104 - Exiting forcefully due to file system exception on startup, disk failure policy "stop"
+org.apache.cassandra.io.FSWriteError: java.nio.channels.ClosedChannelException
+	at org.apache.cassandra.io.sstable.format.big.BigTableZeroCopyWriter.write(BigTableZeroCopyWriter.java:227)
+	at org.apache.cassandra.io.sstable.format.big.BigTableZeroCopyWriter.writeComponent(BigTableZeroCopyWriter.java:206)
+	at org.apache.cassandra.db.streaming.CassandraEntireSSTableStreamReader.read(CassandraEntireSSTableStreamReader.java:125)
+	at org.apache.cassandra.db.streaming.CassandraIncomingFile.read(CassandraIncomingFile.java:84)
+	at org.apache.cassandra.streaming.messages.IncomingStreamMessage$1.deserialize(IncomingStreamMessage.java:51)
+	at org.apache.cassandra.streaming.messages.IncomingStreamMessage$1.deserialize(IncomingStreamMessage.java:37)
+	at org.apache.cassandra.streaming.messages.StreamMessage.deserialize(StreamMessage.java:50)
+	at org.apache.cassandra.streaming.StreamDeserializingTask.run(StreamDeserializingTask.java:62)
+	at io.netty.util.concurrent.FastThreadLocalRunnable.run(FastThreadLocalRunnable.java:30)
+	at java.lang.Thread.run(Thread.java:748)
+Caused by: java.nio.channels.ClosedChannelException: null
+	at org.apache.cassandra.net.AsyncStreamingInputPlus.reBuffer(AsyncStreamingInputPlus.java:136)
+	at org.apache.cassandra.net.AsyncStreamingInputPlus.consume(AsyncStreamingInputPlus.java:155)
+	at org.apache.cassandra.io.sstable.format.big.BigTableZeroCopyWriter.write(BigTableZeroCopyWriter.java:217)
+	... 9 common frames omitted
+{code}
+
+tested on 3.0 and see we do not stop node3
+
+{code}
+WARN  [main] 2021-11-02T22:57:12,390 : - Node is not yet bootstrapped completely. Use nodetool to check bootstrap state and resume. For more, see `nodetool help bootstrap`
+INFO  [main] 2021-11-02T22:57:12,390 : - Startup complete
+{code}
+
+I am in the container and see the JVM is still up;  and tailing the logs shows the following every few seconds
+
+{code}
+INFO  [OptionalTasks:1] 2021-11-02T22:59:32,211 : - Setup task failed with error, rescheduling
+WARN  [OptionalTasks:1] 2021-11-02T22:59:42,178 : - CassandraRoleManager skipped default role setup: some nodes were not ready
+INFO  [OptionalTasks:1] 2021-11-02T22:59:42,178 : - Setup task failed with error, rescheduling
+{code}
+
+so looks like this 1 test hit 2 bugs... nice
+
+I will file a new JIRA for zero-copy-streaming channel close causes node to shutdown.
+
++1 LGTM
+
+Starting commit
+
+CI Results (pending):
+||Branch||Source||Circle CI||Jenkins||
+|trunk|[branch|https://github.com/dcapwell/cassandra/tree/commit_remote_branch/CASSANDRA-17085-trunk-E65F2954-175A-46A4-B954-FC6A91109F61]|[build|https://app.circleci.com/pipelines/github/dcapwell/cassandra?branch=commit_remote_branch%2FCASSANDRA-17085-trunk-E65F2954-175A-46A4-B954-FC6A91109F61]|[build|https://ci-cassandra.apache.org/job/Cassandra-devbranch/1262/]|
+
+

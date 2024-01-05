@@ -1,0 +1,2228 @@
+I posted this design doc to the dev mailing list and intend on working on it in the near future:
+
+[https://docs.google.com/document/d/1qv7Zejpfzg-HvF5azRL49g5lRLQ4437EmJ53GiupcWQ/edit#]
+
+Commit 396b70b24b80b1b0b362910e56e4da3f09c441e0 in kudu's branch refs/heads/master from Andrew Wong
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=396b70b ]
+
+KUDU-2612 p1: add initial transaction status storage
+
+This adds a system tablet storage API for storing the status of
+transactions, in the form of the newly added TxnStatusTablet which is a
+wrapper around a TabletReplica with a schema tailored for storing
+transaction metadata.
+
+The abstraction is comparable to the SysCatalogTable abstraction used by
+the master to store metadata about the Kudu catalog, but rather than
+storing metadata about tables and tablets, the TxnStatusTablet stores
+metadata about transactions and transaction participants.
+
+Partitioning isn't addressed in this patch, but I'm expecting later
+patches to allow for the creation of partitioned transaction status
+tables, and having the individual tablet replicas of that table be
+accessed via this TxnStatusTablet API.
+
+This patch only introduces the schema, basic write calls, and scan calls
+to be used by a transaction management entity to be added in a later
+patch. There is currently no way to create or define partitions for
+TxnStatusTablets on tablet servers.
+
+Change-Id: I94ddbd37c65932120835d6e138307f819935173c
+Reviewed-on: http://gerrit.cloudera.org:8080/16043
+Reviewed-by: Attila Bukor <abukor@apache.org>
+Reviewed-by: Alexey Serbin <aserbin@cloudera.com>
+Tested-by: Andrew Wong <awong@cloudera.com>
+
+
+Commit efd8c4f165460b7fa337b8ebd1856b10bc274311 in kudu's branch refs/heads/master from Andrew Wong
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=efd8c4f ]
+
+KUDU-2612 p2: introduce transaction status management
+
+This introduces the TxnStatusManager, which is backed by the
+TxnStatusTablet that exposes the following APIs that will be called via
+RPC, and will serve as many of the building blocks for orchestrating
+two-phase commit:
+- BeginTransaction: adds a new transaction under management of the
+  TxnStatusManager
+- BeginCommitTransaction: transitions the state of a transaction from
+  OPEN to COMMIT_IN_PROGRESS
+- AbortTransaction: transitions the state of a transaction from OPEN or
+  COMMIT_IN_PROGRESS to ABORTED
+- RegisterParticipant: adds a participant to be associated with a
+  specific transaction ID
+
+For completeness sake w.r.t defining the transaction state's enums, the
+following API is also added, which will be called by the
+TxnStatusManager itself upon determining a transaction has been
+completed.
+- FinalizeCommitTransaction: transitions the state of a transaction from
+  COMMIT_IN_PROGRESS to COMMITTED
+
+This new abstraction mirrors that used by the CatalogManager, which uses
+copy-on-write locking to protect concurrent access to metadata while
+writes to the underlying TabletReplica (i.e. SysCatalogTable, or in this
+case, TxnStatusTablet) are being replicated.
+
+This is at least enough of a jumping off point that we can begin
+plumbing this into the tablet servers and defining an RPC service around
+it -- there are still no facilities to create a TxnStatusManager.
+
+It should be noted that end-users will not call these methods directly,
+but rather through some layer of indirection (e.g. clients won't request
+a specific transaction ID, they'll just request to begin a transaction,
+and some intermediary layer will be in charge of getting an appropriate
+transaction ID). This should give us flexibility in changing the
+TxnStatusManager's interface moving forward.
+
+Change-Id: I371bb200cf65073ae3ac7cb311ab9a0b8344a636
+Reviewed-on: http://gerrit.cloudera.org:8080/16044
+Reviewed-by: Alexey Serbin <aserbin@cloudera.com>
+Tested-by: Andrew Wong <awong@cloudera.com>
+
+
+Commit f08d524ac73dbbac6962a8fa857eaaa5701a6809 in kudu's branch refs/heads/master from Andrew Wong
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=f08d524 ]
+
+KUDU-2612 p3: tserver mechanism to create txn status tablets
+
+This introduces the concept of a table type in tablets. This is used in
+the context of creating transaction status table partitions; if a tablet
+replica is created as a partition of a transaction status table, the
+underlying replica will initialize some state to manage and coordinate
+transactions -- namely, a TxnStatusManager.
+
+For the sake of decoupling submodules, to get a TabletReplica to
+initialize a TxnStatusManager, this patch introduces the
+tablet::TxnCoordinator and tablet::TxnCoordinatorFactory interfaces that
+TxnStatusManager and the new TxnStatusManagerFactory implement
+respectively. The TxnStatusManagerFactory can be created by members of
+the tserver and passed to TabletReplicas upon initialization -- this
+layer of indirection will allow us to use tserver-wide state (e.g. in
+the future, a system client) without muddying the tablet subdirectory
+too much.
+
+This approach lies in contrast to the approach used for the
+CatalogManager, in which the master server owns a CatalogManager that
+owns the underlying SysCatalogTable and TabletReplica. I went down this
+route because unlike the CatalogManager replicas, I expect the replicas
+of TxnStatusTablets to be dynamically moved around, and so it behooves
+us to reuse as much of the existing tserver replica management code as
+possible. To that end, the ownership relationship between management
+state and underyling tablet replica is flipped, with the TabletReplica
+owning the TxnStatusManager.
+
+The plumbing only extends through the tablet servers -- the ability to
+create transaction status tables and define partitioning is not yet
+plumbed into the master. Additionally, there is still currently no means
+to restrict calls to the TxnStatusManagers whose underlying replicas are
+running leaders -- that will also come in later patches.
+
+Change-Id: Ib429f055e12944fa930f3e95ec4f2504466d3d02
+Reviewed-on: http://gerrit.cloudera.org:8080/16116
+Tested-by: Kudu Jenkins
+Reviewed-by: Alexey Serbin <aserbin@cloudera.com>
+
+
+Commit 36c251a99e2243beb6be5173eb9cdad6fb74e4ed in kudu's branch refs/heads/master from Andrew Wong
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=36c251a ]
+
+KUDU-2612 p4: mechanism to create a transaction status table
+
+This plumbs table type into the master, and exercises the code paths by
+adding a TxnSystemClient that can set the table type when creating
+tables (as opposed to KuduClient, which cannot send such requests).
+
+This patch adds the ability to create a transaction status table named
+"kudu_system.kudu_transactions", which foregoes fine-grained
+authorization checks and HMS synchronization.
+
+Coarse-grained access to this table is table is granted only to the
+service- or super-user. For the sake of the create-table and
+add-partition functionality (which will likely come from the Kudu
+service rather than a user), the CreateTable and AlterTable master RPC
+endpoints now permit access to the service user.
+
+This TxnSystemClient can be used by leader masters in the future to
+create the initial transaction status table, but for now is useful for
+testing the plumbing of table type.
+
+Change-Id: I29b9009fa228a7749295b50516991613a28d58fa
+Reviewed-on: http://gerrit.cloudera.org:8080/16124
+Reviewed-by: Alexey Serbin <aserbin@cloudera.com>
+Tested-by: Kudu Jenkins
+
+
+Commit 95f4109518e7b81b9115a4e8bacbd157dcecad0c in kudu's branch refs/heads/master from Andrew Wong
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=95f4109 ]
+
+KUDU-2612 p5: RPC endpoints for txn status management
+
+This adds an endpoint to the TabletServerAdminService that allows for
+RPCs to the TxnStatusManager. Some single-node  error scenarios are
+tested, though it's worth noting that this is only groundwork for a
+later patch that will introduce system client calls that will handle
+such error scenarios automatically.
+
+Change-Id: Id846160724b334d2c52eb9a1bae0ffd19536bcc9
+Reviewed-on: http://gerrit.cloudera.org:8080/16193
+Tested-by: Kudu Jenkins
+Reviewed-by: Alexey Serbin <aserbin@cloudera.com>
+
+
+Commit cb1c2efb59373453e734074a02021f14c403257d in kudu's branch refs/heads/master from Andrew Wong
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=cb1c2ef ]
+
+KUDU-2612 p6: add coordination calls to system client
+
+This adds the following calls to the TxnSystemClient:
+- BeginTransaction()
+- RegisterParticipant()
+
+whose APIs roughly match those of the TxnStatusManager. For the sake of
+a more focused patch, I only added these couple to build out reusable
+pieces of the system client. Later patches will extend the client with
+BeginCommitTransaction() and AbortTransaction() calls.
+
+All of these calls share the same RPC-sending code, which draws loose
+inspiration from the client::Batcher. I considered templatizing/reusing
+the Batcher, but eventually opted not to for several reasons:
+- We don't need all the bells and whistles attached to the Batcher, e.g.
+  timestamp tracking and consistency modes, session-based API, etc.
+- The complexity of abstracting the Batcher to the point of using it for
+  other RPC types would have made the code very unwieldy and difficult
+  to maintain and extend.
+- Not reusing the Batcher gives us an opportunity moving forward to
+  consider other approaches to batching (e.g. batching by server rather
+  than by tablet ID).
+
+Where the implementation draws inspiration from the Batcher is its usage
+of the MetaCache to attach callbacks to tablet lookups, its
+retry-handling, and its memory management -- namely, each request is
+encapsulated in such a way that the memory used to track the call
+automatically frees itself upon completion.
+
+Change-Id: I4126cb3dcf379b397f84578c2265dca3ece3d98c
+Reviewed-on: http://gerrit.cloudera.org:8080/16194
+Reviewed-by: Alexey Serbin <aserbin@cloudera.com>
+Tested-by: Andrew Wong <awong@cloudera.com>
+
+
+Commit 14d4117afa42d0ddf75bfda1926bb2c47cc6e322 in kudu's branch refs/heads/master from Andrew Wong
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=14d4117 ]
+
+KUDU-2612 p7: add transaction participants to tablets
+
+This patch adds state tracking on transaction participants (i.e.
+tablets that are participating in a transaction) in the form of a map
+from transaction ID to transaction state.
+
+Each transaction that a tablet participates in has associated with it a
+state machine that will be controlled by the transaction status manager
+based on global transaction state maintained therein. Participant state
+tracking is plugged into the op driver framework. The details of this
+state machine are outlined in txn_participant.h.
+
+While this patch Raft commits participant ops using the existing op
+driver framework, it doesn't replay participant ops from the WAL or
+anchor WAL segments. As such, tests are only added to test the
+replication aspect of participant op drivers, rather than testing any
+form of durability.
+
+The added state can only be called via internal APIs. There are no RPC
+endpoints with which the code in this patch can be reached.
+
+Change-Id: I39201ce1d911308cd28f3f4790a126e30052f3bf
+Reviewed-on: http://gerrit.cloudera.org:8080/16277
+Tested-by: Kudu Jenkins
+Reviewed-by: Alexey Serbin <aserbin@cloudera.com>
+
+
+Commit a69a1d68e31e0c0eec9a47f7669098ca872baaa3 in kudu's branch refs/heads/master from Andrew Wong
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=a69a1d6 ]
+
+KUDU-2612 p8: replay participant ops on bootstrap
+
+This patch adds the ability to bootstrap a Tablet's TxnParticipant from
+its WALs. The replay is a bit crude, in that we'll always update state
+based on replicate/commit pairs, foregoing the usual state checks. This
+is acceptable because presumably this checking happened the first time
+the participant ops went through replication.
+
+This patch doesn't add any form of WAL anchoring. This will come in a
+separate patch.
+
+Change-Id: I199ed01c2244d16ed6fd7ded063e4c71f3c409ff
+Reviewed-on: http://gerrit.cloudera.org:8080/16304
+Reviewed-by: Alexey Serbin <aserbin@cloudera.com>
+Tested-by: Kudu Jenkins
+
+
+Commit 68ee03c2bd0bae950c08582910e675cda54b6ca7 in kudu's branch refs/heads/master from Andrew Wong
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=68ee03c ]
+
+KUDU-2612 p9: anchor participant ops in WAL
+
+Participant ops will now anchor WAL segments in the same way that we
+anchor WAL segments for other in-memory state (e.g. MRS, DMS) that gets
+rebuilt upon recovery.
+
+Each participant op for a given transaction will update the single
+anchor associated with that transaction. As a transaction is
+transitioned from state to state, the transaction's prior participant op
+is unanchored in favor of anchoring the new op.
+
+Since there currently isn't a need to rid a participant of in-memory
+state associated with a transaction, this adds a test-only method to
+remove a committed or aborted transaction -- once this method called, a
+transaction's anchor is removed and WAL GC may proceed to remove the
+latest participant op.
+
+Change-Id: I936f0a345c4b6095f0d99b6dd244e3092ae3f9d7
+Reviewed-on: http://gerrit.cloudera.org:8080/16358
+Reviewed-by: Alexey Serbin <aserbin@cloudera.com>
+Tested-by: Andrew Wong <awong@cloudera.com>
+
+
+Commit 0f9ff5ff043125be4a1150be0306373619b4ca89 in kudu's branch refs/heads/master from Alexey Serbin
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=0f9ff5f ]
+
+KUDU-2612 p6 (b): add {Abort,BeginCommit}Transaction() to TxnSystemClient
+
+This patch adds to AbortTransaction() and BeginCommitTransaction()
+methods into the TxnSystemClient class.  The newly added code follows
+suit of the logic implemented in TxnSystemClient::BeginTransaction()
+method.  Added corresponding tests as well.
+
+This is a follow-up to cb1c2efb59373453e734074a02021f14c403257d.
+
+Change-Id: I84558b13664d89c7f1769df2483f2bae5a49260b
+Reviewed-on: http://gerrit.cloudera.org:8080/16443
+Tested-by: Alexey Serbin <aserbin@cloudera.com>
+Reviewed-by: Alexey Serbin <aserbin@cloudera.com>
+
+
+Commit 20fde59bca1f9df5a3cdee48f7794e0e8f16784a in kudu's branch refs/heads/master from Alexey Serbin
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=20fde59 ]
+
+KUDU-2612 p2 (b): add transaction status retrieval
+
+After offline discussions with Andrew, it became clear that TxnManager
+should provide an asynchronous interface to commit a transaction, i.e.
+something similar to CreateTable()/IsCreateTableDone().  To implement
+that, the TxnManager needs to check for the status of the transaction
+after initiating the commit phase by issuing corresponding call
+to TxnStatusManager (that's implemented as CoordinateTransaction() RPC
+to TabletServerAdminService with BEGIN_COMMIT_TXN operation type).
+
+This patch introduces the required server-side piece to retrieve the
+information on a transaction status from the TxnStatusManager.  I'm
+planning to introduce corresponding bindings via the TxnSystemClient
+in a separate changelist.
+
+This is a follow-up to efd8c4f165460b7fa337b8ebd1856b10bc274311.
+
+Change-Id: I45f099d943f2b7955d6d561a1cb883343c7b79a4
+Reviewed-on: http://gerrit.cloudera.org:8080/16495
+Reviewed-by: Andrew Wong <awong@cloudera.com>
+Tested-by: Kudu Jenkins
+
+
+Commit 01a9a5a9ca4000862fa92c7cbff42967a067c326 in kudu's branch refs/heads/master from Alexey Serbin
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=01a9a5a ]
+
+KUDU-2612 p6 (c): add GetTransactionStatus() to TxnSystemClient
+
+This patch adds GetTransactionStatus() method into the interface
+of the TxnSystemClient class.  Added corresponding test as well.
+
+This is a follow-up to cb1c2efb59373453e734074a02021f14c403257d
+and 0f9ff5ff043125be4a1150be0306373619b4ca89
+
+Change-Id: I7fac7158df307d03db6a48087e7c5a16269a3bc6
+Reviewed-on: http://gerrit.cloudera.org:8080/16501
+Tested-by: Kudu Jenkins
+Reviewed-by: Andrew Wong <awong@cloudera.com>
+
+
+Commit 9b4a83ac71621211582b9eb0c471d8ac4fd9b984 in kudu's branch refs/heads/master from Alexey Serbin
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=9b4a83a ]
+
+KUDU-2612 p2 (c): small fix on TxnStatusManager's behavior
+
+This patch adds more consistency into the TxnStatusManager's behavior
+during the time interval between the following events:
+
+  * The state of the leader replica of a transaction status tablet
+    changes from BOOTSTRAPPING to RUNNING (see TabletReplica::Start()
+    for details).
+
+  * TxnStatusManager's runtime structures are populated with the
+    information loaded from the tablet
+    (i.e. TxnStatusManager::LoadFromTablet() successfully completes).
+
+Before this patch, relevant methods of the TxnStatusManager class could
+behave inconsistently within the mentioned interval.  With this patch,
+those methods return Status::ServiceUnavailable() and do not exhibit any
+inconsistent behavior.
+
+This patch also adds a new test scenario to cover the new behavior.
+
+This is a follow-up to efd8c4f165460b7fa337b8ebd1856b10bc274311.
+
+Change-Id: Ia95f821d87145aff6587c017a425e205bdcb8b2b
+Reviewed-on: http://gerrit.cloudera.org:8080/16537
+Tested-by: Kudu Jenkins
+Reviewed-by: Alexey Serbin <aserbin@cloudera.com>
+
+
+Commit fa3b5712ec7495e89b32e91c6c8d09d558f7d4f9 in kudu's branch refs/heads/master from Andrew Wong
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=fa3b571 ]
+
+KUDU-2612 p10: have timestamp assignment account for commit timestamps
+
+One of the hurdles to performing a transaction's commit on a participant
+is that the commit process must ensure repeatable reads. Without
+multi-op transactions, this is done via a dance between the TimeManager
+(the entity that tracks and assigns timestamps) and the MvccManager (the
+entity that tracks the lifecycle of ops).
+
+This patch extends the dance between the TimeManager and MvccManager to
+ensure that when a participant commits a transaction, all future ops
+will be assigned a higher timestamp.
+
+I found it time-consuming to peruse the existing codebase for how
+timestamp assignment ensured repeatable reads, so I added a block
+comment to time_manager.h describing how it does so. I also added a
+section about how this patch extends it to ensure repeatable reads in
+the context of transactions.
+
+Change-Id: I0412fd0cf778d96f3fe6b14624d8d06942f40e72
+Reviewed-on: http://gerrit.cloudera.org:8080/16470
+Tested-by: Kudu Jenkins
+Reviewed-by: Alexey Serbin <aserbin@cloudera.com>
+
+
+Commit 90aa4fa7d1527f376803440a4642668e3d798748 in kudu's branch refs/heads/master from Andrew Wong
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=90aa4fa ]
+
+KUDU-2612 p11: persist txn metadata in superblock
+
+Currently, transaction metadata is entirely stored in the WALs; once a
+transaction is begun, it anchors WALs indefinitely. This is untenable,
+as any tablet that participates in a transaction would never be able to
+GC its WALs.
+
+This patch addresses this by storing transaction metadata in the tablet
+superblock for the following participant ops:
+- BEGIN_TXN: an empty record is added to the superblock for the given
+  transaction ID. In the future, this can be used to store the owner of
+  the transaction.
+- FINALIZE_COMMIT: the commit timestamp is added to the superblock for
+  the given transaction ID. The commit timestamp of a transaction will
+  be used when scanning over mutations applied to a tablet instead of
+  the apply timestamp.
+- ABORT_TXN: an abort bit is added to the superblock for the given
+  transaction ID.
+
+Upon applying each of these ops, the op's OpId is anchored in the WALs
+until the tablet metadata is successfully flushed, ensuring that if we
+don't flush the tablet metadata before restarting, we can rebuild any
+ops that whose mutations had not been persisted by replaying the WALs.
+
+What about BEGIN_COMMIT ops? While these ops will still need to be
+anchored, BEGIN_COMMIT ops don't need to persist any long-term
+information. As such, their anchoring is slightly different -- rather
+than mutating the tablet metadata and unanchoring on a metadata flush,
+BEGIN_COMMIT ops will update the in-memory state for the in-flight Txn,
+and unanchor once the corresponding FINALIZE_COMMIT or ABORT_TXN begins
+applying.
+
+On bootstrap, the following rules are applied:
+- If we've persisted terminal information (i.e. abort or commit) about a
+  transaction ID, we can skip replaying any participant op for that
+  transaction.
+- If we otherwise have a persisted record for the transaction ID, we
+  should start an open transaction and replay all participant ops for
+  that transaction.
+- If we have no record of a transaction persisted, we must replay all
+  participant ops for the given transaction.
+
+While storing things in the superblock is not ideal, there are further
+improvements that can be made to reduce its size, e.g. after finalizing
+a transaction, the transactions mutations may be merged in with the rest
+of the tablet; once all mutations of a given transaction have been
+merged, the transaction metadata may be removed from the metadata.
+
+Change-Id: I2f32808aef10484f4e0ad3942bb005f61fbdb34a
+Reviewed-on: http://gerrit.cloudera.org:8080/16492
+Tested-by: Andrew Wong <awong@cloudera.com>
+Reviewed-by: Alexey Serbin <aserbin@cloudera.com>
+
+
+Commit c400daebdbcb7da336d9be8fa1c872369ab1e65d in kudu's branch refs/heads/master from Alexey Serbin
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=c400dae ]
+
+KUDU-2612 p5 (b): add highest_seen_txn_id into CoordinatorOpResultPB
+
+This patch adds the highest transaction identifier seen by the
+TxnStatusManager (TxnStatusManager coordinates the lifecycle of
+transactional operations for a particular tablet of the transaction
+status table).  The new field is populated when responding to
+CoordinateTransaction() RPC of the BEGIN_TXN type.
+
+The signature and the implementation of the related methods in the
+TxnStatusManager and TxnSystemClient classes have been updated as well,
+along with corresponding tests to cover the newly introduced
+functionality.
+
+The newly introduced field will be used in a follow-up patch containing
+the initial implementation of the TxnManager component.  The rationale
+behind having this new field is to allow the TxnManager to 'calibrate'
+its last seen txn_id, so it could make less trial-and-error iterations
+when reserving an identifier for a transaction.
+
+The CoordinatorOpResultPB::highest_seen_txn_id would not be needed
+if TxnStatusManager (or their federation) was able to reserve an
+identifier for a new transaction on their own.  Of course, that would
+require some sort of interaction among TxnStatusManager instances
+(like request forwarding or alike).  But without such a provision,
+the TxnManager needs the newly introduced field to succeed with its
+trial-and-error approach while finding the next available identifier
+for a newly initiated transaction.
+
+This is a follow-up to 95f4109518e7b81b9115a4e8bacbd157dcecad0c.
+
+Change-Id: Ifcb4d90bc10a5695c3f54229688ccdcaf56011d0
+Reviewed-on: http://gerrit.cloudera.org:8080/16526
+Tested-by: Kudu Jenkins
+Reviewed-by: Alexey Serbin <aserbin@cloudera.com>
+
+
+Commit 9306e41c32c8a03e1aedd682b9e158066baba7f4 in kudu's branch refs/heads/master from Alexey Serbin
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=9306e41 ]
+
+KUDU-2612: initial implementation of TxnManager
+
+This is a first implementation of the TxnManager.  The TxnManager class
+encapsulates the logic used by the TxnManagerService while serving RPC
+requests (see txn_manager.proto for the protobuf interface).  The most
+essential piece of the logic to be implemented by this class is the
+assignment of an identifier for a new transaction and initialization
+of the transaction status table, along with creating of its new
+partitions, when needed.  All other methods simply do proxying of
+corresponding requests to the underlying instance of TxnSystemClient.
+
+This changelist also contains test scenarios to cover the newly
+introduced functionality.
+
+The implementation of TxnManager::BeginTransaction() is moved into
+a follow-up changelist by request for simplify the process of reviewing
+these changes.
+
+TxnManager::KeepTransactionAlive() will be implemented as soon
+as the corresponding functionality is ready in the TxnStatusManager.
+
+Change-Id: Ie952977a3ae5f625d1283389f0be8afb79df7d8c
+Reviewed-on: http://gerrit.cloudera.org:8080/16527
+Tested-by: Alexey Serbin <aserbin@cloudera.com>
+Reviewed-by: Andrew Wong <awong@cloudera.com>
+Reviewed-by: Hao Hao <hao.hao@cloudera.com>
+
+
+Commit 97b9827199e8190656ddf356695f06a2e54e39b5 in kudu's branch refs/heads/master from Alexey Serbin
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=97b9827 ]
+
+KUDU-2612: add TxnManager::BeginTransaction()
+
+This patch adds the implementation of the BeginTransaction() method
+to the TxnManager along with tests to cover the newly introduced
+functionality.
+
+Change-Id: I51c476d92bb5b147ffd03fd9f3163ab86d581496
+Reviewed-on: http://gerrit.cloudera.org:8080/16586
+Tested-by: Kudu Jenkins
+Reviewed-by: Andrew Wong <awong@cloudera.com>
+
+
+Commit e64eb7c7ceceec76aeb5cceac9dc42cc0e78f1ec in kudu's branch refs/heads/master from Alexey Serbin
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=e64eb7c ]
+
+KUDU-2612: C++ client sets txn_id in WriteRequestPB
+
+This patch introduces an optional 'txn_id' field into WriteRequestPB
+protobuf message and changes Kudu C++ client to populate it for
+all requests sent out from a transactional KuduSession.  In addition,
+this patch contains unit-level test to verify that KuduSession and
+Batcher have their txn_id_ fields set correspondingly.  It's assumed
+that follow-up changelists will add more comprehensive end-to-end
+coverage once transactional API for Kudu client is introduced and
+tablet servers process the WriteRequestPB:txn_id field as prescribed
+by the design document [1].
+
+A follow-up changelist will introduce corresponding client API changes
+for transaction-related operations, and with those it will be possible
+to begin, commit, and rollback a transaction.  However, I think it's
+important to highlight a few assumptions that Andrew and I discussed
+offline: this patch assumes that a single KuduSession isn't allowed
+to have a mix of transactional and non-transactional write operations.
+Also, all write operations handled by a KuduSession instance can be
+attributed only to a single (the same) transaction.  In other words,
+it's assumed that a separate KuduSession instances should be created
+to handle operations pertaining to different transactions.  This
+restriction doesn't seem to be too harsh, but it helps to avoid a
+complicated dance in handling already accumulated write operation in
+KuduClient.  Otherwise, it would be necessary to flush buffered
+operations if switching from non-transactional writes to transactional
+ones and back.  If it turns out that the functionality of mixing
+transactional and non-transactional write operations is necessary,
+this restriction can be removed: it's feasible to add transaction
+control operations into KuduSession in future (i.e.
+{Begin,Commit,Abort}Transaction() methods), but it will entail adding
+more complexity into already convoluted client-side code of handling
+buffered write operations.
+
+For now, I decided not to expose txn_id via the public client API.
+Also, I specifically avoided exposing txn_id via KuduWriteOperation as
+well, keeping it a private member of internal classes KuduSession::Data
+and Batcher.
+
+[1] https://s.apache.org/kudu-multi-row-transaction-design
+
+Change-Id: Ib60cb0ea8066e2c6417ebe4b2a24aff3512b44f1
+Reviewed-on: http://gerrit.cloudera.org:8080/16625
+Reviewed-by: Andrew Wong <awong@cloudera.com>
+Tested-by: Kudu Jenkins
+Reviewed-by: Hao Hao <hao.hao@cloudera.com>
+
+
+Commit 2ca437e25e93dba3d3678dd20d92ffa0b4ba2e29 in kudu's branch refs/heads/master from Andrew Wong
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=2ca437e ]
+
+KUDU-2612: have MRS iteration account for txn metadata
+
+This patch introduces the ability to iterate through the rows of a MRS
+taking into account the transaction's commit status, rather than relying
+on the apply timestamps of the individual mutations therein. It does so
+by adding a reference to the TxnMetadata in the MRS. Upon iteration, if
+a commit timestamp exists for the transaction, Kudu uses the transaction
+metadata to determine relevancy.
+
+As a refresher, the MvccManager tracks mutations by maintaining a
+"current" MvccSnapshot that encapsulates timestamps for ops that have
+been applied. Rather than keeping track of every applied timestamp
+individually, the MvccManager also keeps track of the currently
+in-flight ops and the lower bound on future ops' timestamps, as
+guaranteed by the TimeManager. Taken together, these define a watermark
+timestamp below which all timestamps can be considered applied, as well
+as a set of higher timestamps that are considered applied, but are
+higher than the earliest in-flight (not-yet-applied) op's timestamp.
+
+The MvccManager passes out MvccSnapshots that detail whether iterators
+should consider certain timestamps as relevant to iteration. These
+snapshots are used in the following ways:
+- Snapshot scans:
+  - The user input is a timestamp, which is used to generate an
+    MvccSnapshot defined by that timestamp, i.e. all timestamps before
+    are applied, and all timestamps above are not applied.
+    - Such a snapshot is defined to be a "clean" snapshot.
+  - Before iterating through data, Kudu waits for the safe time to pass
+    beyond the given timestamp, and waits for all ops with lower
+    timestamps to complete. Only then can Kudu safely iterate through
+    mutations with certainty that relevancy can be determined via a
+    simple comparison against the clean snapshot.
+- Diff scans:
+  - Similar to the above case, but with a second, lower input timestamp
+    to serve as a lower bound on relevant mutation timestamps.
+- READ_LATEST scans:
+  - Unlike the above two scenarios, no input timestamp is given here.
+    Instead, Kudu will use the MvccManager's current MvccSnapshot, which
+    isn't guaranteed to be a clean snapshot.
+  - If it can, Kudu uses the watermark to determine relevancy (fast
+    path, like with clean snapshots), and if not, it falls back on the
+    set of higher timestamps that are considered applied (slow path).
+- Flushes and compactions:
+  - Snapshots are also used in the context of flushes and compactions to
+    track ops that get applied in the process of a flush or compaction,
+    for the sake of duplicating ops onto new data stores if they were
+    missed while swapping in the new data stores.
+  - As with READ_LATEST, the snapshots used here aren't necessarily
+    clean snapshots.
+
+Based on the above usages, this patch distinguishes between two types of
+MvccSnapshots that encapsulate all usage today:
+- kTimestamp: we are iterating as of a specific timestamp T. We must
+  guarantee that iteration will see all mutations made visible before T
+  (i.e. Raft committed before T for non-transaction ops, transaction
+  committed before T for transaction ops). We may wait for MVCC ops to
+  complete to ensure this is guaranteed. Scans in this mode are
+  repeatable. Snapshot and diff scans use kTimestamp snapshots.
+- kLatest: we are iterating without waiting for the completion of any
+  ops -- instead, we only care about seeing a view of the latest
+  completed ops, regardless of whether there are non-applied ops from
+  before the latest applied ops. READ_LATEST scans and flushes use
+  kLatest snapshots.
+
+In the context of evaluating commit status in transactions, these
+snapshot types behave as follows when iterating:
+- kTimestamp: since we care about displaying all ops or transactions
+  from before T, scanners should wait for T to become safe, and for ops
+  before T to complete (including all commit MVCC ops). After waiting,
+  all transactions that would have a commit timestamp lower than T will
+  have a commit timestamp in their metadata. As such, it's sufficient
+  that, while iterating, we look at the commit timestamp of each
+  mutation and compare it to T. If no commit timestamp exists for a
+  transactional mutation, it must not have committed as of T.
+- kLatest: since we don't care about using a clean snapshot, it's
+  sufficient to use the current snapshot, which includes transactions'
+  commit MVCC ops. If that op is finished for a given transaction, Kudu
+  should check whether the transaction was aborted or committed. If the
+  op was not finished in the snapshot, it could not have committed.
+
+This patch only adds the APIs to the MvccManager, with some initial
+usage for snapshot and diff scans in the memrowset; there is still no
+way to exercise these APIs using a real tablet, nor is there a way to
+persist the MVCC op timestamp in metadata. These will come in later
+patches.
+
+Change-Id: I6bb02c6025eea1a327cf9d9ee1f14a38d63ae4ad
+Reviewed-on: http://gerrit.cloudera.org:8080/16510
+Tested-by: Kudu Jenkins
+Reviewed-by: Alexey Serbin <aserbin@cloudera.com>
+
+
+Commit 17cede9da2c7213e05dcca921a0e767dda54f131 in kudu's branch refs/heads/master from Alexey Serbin
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=17cede9 ]
+
+KUDU-2612: Java client sets txnId in WriteRequestPB
+
+With this patch, WriteRequestPB messages generated by a transactional
+AsyncKuduSession have their txnId field populated with corresponding
+transaction identifier.  For more information about the assumed changes
+in the client API see e64eb7c7ceceec76aeb5cceac9dc42cc0e78f1ec.
+
+It's assumed that follow-up changelists will add more comprehensive
+end-to-end coverage once transactional API for Kudu client is introduced
+and tablet servers process the WriteRequestPB:txn_id field as prescribed
+by the design document [1].
+
+[1] https://s.apache.org/kudu-multi-row-transaction-design
+
+Change-Id: I2863ae97541c2124230b3af31acc75d42cd4c6df
+Reviewed-on: http://gerrit.cloudera.org:8080/16644
+Tested-by: Kudu Jenkins
+Reviewed-by: Andrew Wong <awong@cloudera.com>
+
+
+Commit ea1695885067dc5d39ad1f794a91a9d9e0540b1a in kudu's branch refs/heads/master from Andrew Wong
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=ea16958 ]
+
+KUDU-2612: persist commit MVCC op timestamp in txn metadata
+
+We previously didn't persist the MVCC op timestamp used for the
+BEGIN_COMMIT op. This was problematic, as this timestamp is necessary to
+determine relevancy upon iteration.
+
+This adds the timestamp to the TxnMetadata, and ensures that we anchor
+the BEGIN_COMMIT op until we flush metadata, as we do with other
+persistent participant op state.
+
+Change-Id: Ib2400fbb7e96ddba78544a9549965fc095e32ca3
+Reviewed-on: http://gerrit.cloudera.org:8080/16569
+Tested-by: Kudu Jenkins
+Reviewed-by: Hao Hao <hao.hao@cloudera.com>
+
+
+Commit 38aee4b1407b04b8c299768be0ae40d84a8e2a3a in kudu's branch refs/heads/master from Alexey Serbin
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=38aee4b ]
+
+KUDU-2612 C++ client transaction API
+
+This patch adds C++ client API to interact with TxnManager.
+Corresponding tests are added as well.  True end-to-end tests are not
+available yet because they require transaction orchestration
+functionality to be present, but it's not there yet.  I'm planning
+to add more tests as soon as the orchestration starts to appear.
+
+This patch is mostly focused on the client-side transactional API,
+containing several TODOs.  The scope of those is limited to the
+related client-side-only functionality.  I'm planning to address
+those in follow-up patches.  I think that way it's easier to scope,
+implemented and review compared with lumping them all in a single patch.
+
+Change-Id: Ic48233f72873012ea36ff4a05d16c58a0ba9b407
+Reviewed-on: http://gerrit.cloudera.org:8080/16710
+Tested-by: Kudu Jenkins
+Reviewed-by: Andrew Wong <awong@cloudera.com>
+
+
+Commit 2d0631fe289968094c9dc6a7b16fcc6df9a269ba in kudu's branch refs/heads/master from Alexey Serbin
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=2d0631f ]
+
+KUDU-2612 move keep-alive assignment to TxnStatusManager
+
+To prepare for the processing of transactions' keep-alive heartbeats
+and tracking of stale/abandoned transactions, the assignment of the
+keep-alive setting for a newly started transaction has moved from
+TxnManager to TxnStatusManager.
+
+The rationale for this change is the fact that TxnStatusManager will
+have a periodic task to track the staleness of open transactions
+registered with it.  At this point we anticipate the keep-alive setting
+to be a system-wide parameter, not a per-transaction one.  With that,
+it's natural to make TxnStatusManager the single source of truth for
+the transaction keep-alive interval, such that the latter to be used
+to assign the corresponding property for newly created transactions
+and to spot stale/abandoned ones.
+
+An alternative would be keeping TxnManager as the source of truth
+for the transaction keep-alive setting, but that would entail storing
+persistently the value assigned by TxnManager in a per-transaction
+basis, which is hard to justify without a particular use case.
+
+This patch also brings in a few test scenarios and updates the relevant
+existing ones.
+
+Change-Id: Ie98688b2bbe4c673abbfc5801f89eb8182003c18
+Reviewed-on: http://gerrit.cloudera.org:8080/16737
+Tested-by: Kudu Jenkins
+Reviewed-by: Andrew Wong <awong@cloudera.com>
+
+
+Commit 0c6afda4ce30703fdb49248d0ac4a8fdd89be466 in kudu's branch refs/heads/master from Alexey Serbin
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=0c6afda ]
+
+KUDU-2612 flag for txn status table's replication factor
+
+This patch adds --txn_manager_status_table_num_replicas flag to control
+the replication factor of the transaction status table.  By default,
+the flag is set to 3.  It is a kudu-master's flag since TxnManager is
+hosted by kudu-master process.
+
+Change-Id: Ic5f76122ea1ef56f72e416ab12f6908703fc610e
+Reviewed-on: http://gerrit.cloudera.org:8080/16750
+Tested-by: Kudu Jenkins
+Reviewed-by: Andrew Wong <awong@cloudera.com>
+
+
+Commit fd7a40367a81555230eac62a1a8d1467433ed100 in kudu's branch refs/heads/master from Andrew Wong
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=fd7a403 ]
+
+KUDU-2612: add txn memrowsets to tablet
+
+This patch introduces the ability to insert data into per-transaction
+MRSs. When a transaction is started, it creates a new MRS to which
+inserts of that transaction can be applied. This "uncommitted
+transactional MRS" cannot be inserted to by any other transaction and
+cannot be scanned by any scanner. Once the transaction is committed,
+i.e. the FINALIZE_COMMIT op is applied for the transaction, the MRS is
+moved to a separate set of "committed" transactional MRSs that are
+available to be scanned, updated, and flushed. If the transaction is
+aborted, the transactional MRS is excised from the list of transactional
+MRSs entirely.
+
+When inserting, updating, or scanning rows, ops must now consider all
+committed transactional MRSs, in addition to the main, non-transactional
+MRS, checking for row presence in any store that is "committed" and
+visible to users.
+
+Additionally, when a MRS flush is performed, rather than flushing the
+main, non-transactional MRS alone, Kudu will now collect the
+non-transactional MRS along with all committed transactional MRSs, and
+roll DRSs using the same rowset-merging code that exists for
+compactions. The new flushed data will honor each transactions' commit
+timestamp rather than the per-row apply timestamps. Existing MRS-related
+metrics have been updated to reflect that such flush ops now need to
+consider transactional MRSs.
+
+In order to support rebuilding these MRSs when restarting, a new boolean
+field is added to the transaction metadata: 'flushed_committed_mrs',
+which gets set when the transactional MRS is flushed to disk. If true,
+the transaction's write ops do not need to be replayed, since the
+transaction does not have an active MRS. Otherwise, the transaction's
+write ops do need to be replayed, even if the transaction is persisted
+in metadata as being committed.
+
+Additionally, a transaction ID is added to the MutatedStorePB message
+stored in the WAL, for the sake of replaying ops that land in committed,
+transactional MRSs. Upon replay of such mutations, if the transactional
+MRS being mutated to is not active (i.e. it has been flushed), the
+mutation op can be ignored.
+
+When starting up, we start transactional MRSs for all transactions that
+do not have 'flushed_committed_mrs' set, which indicates that the
+transaction's MRS was not flushed before restarting.
+
+NOTE: the locking story here is not complete -- multiple transactions
+can write to the same rows without consequence, which violates our row
+uniqueness constraints. This will be addressed in future patches.
+
+Change-Id: I1dea4031c0acb875993352d452dc4c233e35a502
+Reviewed-on: http://gerrit.cloudera.org:8080/16515
+Tested-by: Kudu Jenkins
+Reviewed-by: Alexey Serbin <aserbin@cloudera.com>
+
+
+Commit 39dba1fd2272b7508043b4fa52066d6123132f4e in kudu's branch refs/heads/master from Alexey Serbin
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=39dba1f ]
+
+KUDU-2612 proper handling of transient errors from TxnManager
+
+This patch fixes the handling of ServiceUnavailable from TxnManager
+in the Kudu C++ client, addressing one of TODOs from [1].
+
+This patch also contains a new test scenario to cover the updated
+functionality.  I verified that without the changes in handling
+ServiceUnavailable from TxnManager this new test scenario failed.
+
+This is a follow-up to [1].
+
+[1] https://github.com/apache/kudu/commit/38aee4b1407b04b8c299768be0ae40d84a8e2a3a
+
+Change-Id: Ia97ddaaf598f2b6d7fcf5fcd42ecb836b82ed547
+Reviewed-on: http://gerrit.cloudera.org:8080/16783
+Tested-by: Alexey Serbin <aserbin@cloudera.com>
+Reviewed-by: Andrew Wong <awong@cloudera.com>
+
+
+Commit 70bce76af3008031e1dd9559bfa6dca1763d895f in kudu's branch refs/heads/master from Andrew Wong
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=70bce76 ]
+
+[tserver] KUDU-2612: participant op RPC endpoint
+
+This adds an RPC endpoint to the tablet servers that allows proxies to
+interact with transaction participants. This will be used in step 13 and
+step 18 of the transaction write path[1], allowing the TxnStatusManagers
+to update participants' transaction states.
+
+[1] https://docs.google.com/document/d/1qv7Zejpfzg-HvF5azRL49g5lRLQ4437EmJ53GiupcWQ/edit#heading=h.4lm41o75ev1x
+
+Change-Id: Ic48895438ce67e453d235934ac560efe8415921b
+Reviewed-on: http://gerrit.cloudera.org:8080/16814
+Reviewed-by: Hao Hao <hao.hao@cloudera.com>
+Tested-by: Kudu Jenkins
+Reviewed-by: Alexey Serbin <aserbin@cloudera.com>
+
+
+Commit fa21bf61821199aedb4fbcdc1b09d0cf3ee56f51 in kudu's branch refs/heads/master from Alexey Serbin
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=fa21bf6 ]
+
+KUDU-2612 keep-alive tracking for transactions
+
+This patch introduces the functionality of tracking the liveness of
+a distributed multi-row transaction into TxnStatusManager and
+provides corresponding proxy methods in TxnManager, so a Kudu client
+now can send keep-alive requests for a transaction (the implementation
+of the latter is planned in a follow-up patch).
+
+From the TxnStatusManager, the newly introduced keep-alive RPC is
+represented as another type of CoordinateTransaction() request:
+CoordinatorOpPB::KEEP_TXN_ALIVE.  New tests to cover the existing
+functionality are added as well.
+
+More end-to-end tests will be added by follow-up changelist once Kudu
+C++ client starts sending keepalive requests for started transactions.
+
+Also, all newly introduced tests in txn_status_manager-itest.cc are
+disabled because without [1] they are a bit flaky.  I added TODO
+to re-enable those once [1] is committed.
+
+[1] https://gerrit.cloudera.org/#/c/16648/
+
+Change-Id: Iae926e02fa7ca597b63ccea90124964c3b6a1175
+Reviewed-on: http://gerrit.cloudera.org:8080/16729
+Tested-by: Kudu Jenkins
+Reviewed-by: Andrew Wong <awong@cloudera.com>
+
+
+Commit 9197e2d5c96b94f227407e5c135c53f1b0182a65 in kudu's branch refs/heads/master from Andrew Wong
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=9197e2d ]
+
+KUDU-2612: fuzz transactional inserts
+
+This patch updates fuzz-itest to include transactionality to the test.
+Since transactionality keeps ops hidden until commit time, this meant
+adding some maps to keep track of new expected and pending state while
+ops were uncommitted.
+
+I also included a couple of test cases that were found to cause issues
+that were addressed in previous patches.
+
+For now, I've commented out the inclusion of transactional ops because
+I've found them to be flaky on account of a potential debug crash when
+merging transactional MRSs. This will be addressed in a follow-up
+commit, but I'd like to merge this first, as this test has been useful
+in testing the follow-up change. When fixed, however, the patches
+together passed fuzz-itest 1000/1000 times with slow tests enabled and
+disabled.
+
+Change-Id: I719d42327ab18fda874332c9d6e1ae34aca8e846
+Reviewed-on: http://gerrit.cloudera.org:8080/16699
+Reviewed-by: Grant Henke <granthenke@apache.org>
+Reviewed-by: Alexey Serbin <aserbin@cloudera.com>
+Tested-by: Andrew Wong <awong@cloudera.com>
+
+
+Commit e75aad09a8dbe295a11cc2042903b74faf72623e in kudu's branch refs/heads/master from Alexey Serbin
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=e75aad0 ]
+
+KUDU-2612 keep-alive txn heartbeating for C++ client
+
+This patch adds keep-alive txn heartbeating into the Kudu C++ client.
+
+The txn keepalive heartbeating is performed automatically by the client,
+and no API is exposed to send keep-alive messages for a transaction.
+The txn keepalive heartbeating continues until the original transaction
+handle (i.e. the handle created by KuduClient::NewTransaction()) goes
+out of scope.  In contrast, if the transaction handle is created by
+KuduTransaction::Deserialize(), the keepalive messages are or aren't
+sent depending on the KuduTransactionSerializer::enable_keepalive()
+setting when serializing the source handle.  By default, keepalive
+messages are not sent for deserialized transaction handles.  This is
+because the most common use case for multiple actors working in the
+context of the same transaction is supposed to be of the
+"star topology", when a transaction is started and committed by
+a top-level application who shares the context of the transaction with
+other applications which only submit their data, but don't manage the
+lifecycle of the transaction.
+
+This patch also contains a couple of test scenarios to cover the
+newly introduced functionality.
+
+Change-Id: I0283d8e16908f641388f7a30b513a672df27a186
+Reviewed-on: http://gerrit.cloudera.org:8080/16779
+Reviewed-by: Andrew Wong <awong@cloudera.com>
+Tested-by: Kudu Jenkins
+
+
+Commit a05254904eff894261134674c246a6311c0adce4 in kudu's branch refs/heads/master from Andrew Wong
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=a052549 ]
+
+KUDU-2612: allow participant ops to detect idempotent calls
+
+Previously, we could return TXN_ILLEGAL_STATE error if we tried to start
+a transaction but one was already present, we tried to begin committing
+but it the commit was already in progress, etc. However, it seems like
+it will be more robust behavior to be able to detect such cases, where
+the requested mutation is already applied. This patch does this by
+sending back a new TXN_OP_ALREADY_APPLIED error code for such calls.
+
+While it would be nice to return an OK response with the participant op,
+it seems non-trivial to exit out of an in-flight op with a success.
+
+Change-Id: If82d3d1aad6737dd4f9f234b122b8c15d65a6604
+Reviewed-on: http://gerrit.cloudera.org:8080/16860
+Reviewed-by: Alexey Serbin <aserbin@cloudera.com>
+Tested-by: Kudu Jenkins
+
+
+Commit ac75ea826f3a6f04bc31d0d487ae924917e64f8c in kudu's branch refs/heads/master from Alexey Serbin
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=ac75ea8 ]
+
+KUDU-2612: two more scenarios for txn keepalive in client
+
+This patch adds two more test scenarios related to txn keepalive
+messages automatically sent by Kudu C++ client.  These are to verify
+the corresponding functionality of the client when TxnManager instances
+are not available for short and long time intervals, where 'short' and
+'long' are relative to the txn keepalive heartbeat timeout interval.
+
+In addition, I sneaked in one small fix to avoid TSAN warnings
+when running the newly introduced tests: the removed CHECK() in
+Master::WaitForTxnManagerInit() isn't crucial.
+
+Change-Id: I42988996f1ddb1cd456d289ea7e15586bd7e3dc7
+Reviewed-on: http://gerrit.cloudera.org:8080/16886
+Tested-by: Kudu Jenkins
+Reviewed-by: Andrew Wong <awong@cloudera.com>
+
+
+Commit cece57bcdf5d8d8ce596a3c1da4c2c26472784bc in kudu's branch refs/heads/master from Andrew Wong
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=cece57b ]
+
+KUDU-2612: add RPC to send participant ops
+
+This adds methods to the TxnSystemClient to send participant ops to
+participants by their tablet ID. This will be used in steps 13 and
+18 of the transactions write path[1].
+
+The new ParticipantRpc abstraction borrows a lot from CoordinatorRpc
+with regards to lookups and error handling, with the following
+differences:
+- Rather than doing the lookup by table and partition key, it performs a
+  lookup by tablet ID, using the functionality recently added to the
+  MetaCache.
+- Since TxnParticipants don't return success on repeated participant op
+  requests calls, some additional handling is done for the
+  TXN_OP_ALREADY_APPLIED error code.
+
+[1] https://docs.google.com/document/d/1qv7Zejpfzg-HvF5azRL49g5lRLQ4437EmJ53GiupcWQ/edit#heading=h.4lm41o75ev1x
+
+Change-Id: Ibb9ba09104761772f9aaffe582776ad34d8dbf57
+Reviewed-on: http://gerrit.cloudera.org:8080/16879
+Tested-by: Andrew Wong <awong@cloudera.com>
+Reviewed-by: Alexey Serbin <aserbin@cloudera.com>
+
+
+Commit 1dc7c83dcab376ae25626c9095d3bf66341c4c2d in kudu's branch refs/heads/master from Alexey Serbin
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=1dc7c83 ]
+
+KUDU-2612 Java client transaction API
+
+This patch is focused on the API rather than the actual functionality
+under the hood.  The functionality to do the heavy-lifting (i.e. issuing
+RPC calls to TxnManager, retrying in case of transient errors, tests,
+etc.) will be posted as a separate patch as per our discussion with
+Andrew and Hao.
+
+The proposed API is mirroring the API for the C++ client with a few
+twists in the functions' signatures: the Java client uses exceptions
+instead of return statuses, etc.
+
+The asynchronous API bindings (i.e. bindings with Deferred<Xxx>) aren't
+provided in this patch.  I'm not sure it makes any sense in investing
+in that at this point given that I'm not aware of any users of the
+asynchronous Kudu client API except for Java Kudu client itself.
+If necessary, we can add AsyncKuduTransaction with appropriate semantics
+later on.
+
+Change-Id: Idbb18e1ac0454a8ef9e3486430dfaa336e381e07
+Reviewed-on: http://gerrit.cloudera.org:8080/16894
+Tested-by: Kudu Jenkins
+Reviewed-by: Alexey Serbin <aserbin@cloudera.com>
+
+
+Commit 7432a7a8aa0c98f8d2177c25b99576b51ff33a93 in kudu's branch refs/heads/master from Alexey Serbin
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=7432a7a ]
+
+KUDU-2612 Java client transaction implementation
+
+This patch implements the functionality behind the transaction-related
+API calls in the Java Kudu client (i.e. issuing RPC calls to TxnManager,
+retrying in case of transient errors, etc.).  Corresponding tests have
+been added as well.  Some of the newly introduced tests are disabled
+and should be re-enabled once the transaction commit orchestration is
+implemented.
+
+Change-Id: Ie0236875e7264877c3f7a13da4a5a3da6423786b
+Reviewed-on: http://gerrit.cloudera.org:8080/16929
+Tested-by: Alexey Serbin <aserbin@cloudera.com>
+Reviewed-by: Hao Hao <hao.hao@cloudera.com>
+
+
+Commit 6b39d88f11abd6e52cf91999aa66ce0642372599 in kudu's branch refs/heads/master from Alexey Serbin
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=6b39d88 ]
+
+KUDU-2612 keep-alive txn heartbeating for Java client
+
+This patch adds keep-alive txn heartbeating into the Kudu Java client.
+
+The txn keepalive heartbeating is performed automatically by the client,
+and no API is exposed to send keep-alive messages for a transaction.
+The txn keepalive heartbeating continues until the original
+auto-closeable transaction handle (i.e. the handle created by
+KuduClient.newTransaction()) goes out of scope or the
+KuduTransaction.close() method called explicitly.
+
+Overall, the keepalive heartbeating behavior in the Kudu Java client
+mirrors the behavior of its C++ counterpart.
+
+This patch also contains a couple of test scenarios to cover the
+newly introduced functionality.
+
+Change-Id: I6326a5452223d8173b2da004bb5f3ab0c1e6ae4e
+Reviewed-on: http://gerrit.cloudera.org:8080/16967
+Tested-by: Alexey Serbin <aserbin@cloudera.com>
+Reviewed-by: Alexey Serbin <aserbin@cloudera.com>
+
+
+Commit 948f92e787136f12dbfb3e7195fef24db0be0088 in kudu's branch refs/heads/master from Andrew Wong
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=948f92e ]
+
+KUDU-2612: add a TxnSystemClient to the tservers
+
+This patch adds a TxnSystemClient that gets initialized asynchronously,
+attempting to connect to the masters in the background in a similar
+fashion to the Heartbeater threads.
+
+There is some intricacy in the initialization of the client to note.
+Namely, if trying to connect to a set of masters while none of the
+masters can be reached, the KuduClientBuilder will attempt to retry
+connecting to each master repeatedly. This is problematic, as several
+tserver tests do not spin up masters. So, taking a page out of the
+Heartbeater book, the initialization will first ping each master. As
+long as at least one of them can connect, the TxnSystemClient will then
+proceed to attempt to connect to the cluster.
+
+This patch focuses only on adding the client initialization logic to the
+tservers, ensuring that even without connecting to a cluster, tservers
+can successfully bootstrap. This client will be used in later patches to
+communicate between the TxnStatusManager and transaction participants.
+
+Also note the similarities between TxnManager initialization, which
+happens on masters in a single-threaded threadpool. I considered reusing
+the implementation for tservers, but opted not to given the TxnManager
+initialization fairly well embedded in master code and has some
+initialization pieces not needed by TxnStatusManagers and participants
+(e.g. tservers aren't in charge of creating the transaction status
+table). I left a TODO to refactor for code reuse.
+
+Change-Id: I33b5a2bb5c56ae4bb4b42069af5813e2780fc4bc
+Reviewed-on: http://gerrit.cloudera.org:8080/16974
+Tested-by: Kudu Jenkins
+Reviewed-by: Alexey Serbin <aserbin@cloudera.com>
+
+
+Commit c033487fd1765f9b3c5045d7c51719ed7e1c4418 in kudu's branch refs/heads/master from Hao Hao
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=c033487 ]
+
+KUDU-2612: restrict TxnStatusManager calls to be made by the leader only
+
+Currently, even though a non-leader TxnStatusManager will be unable to
+write to the underlying table (in the Raft subsystem the write would be
+aborted), we may want to restrict calls to be made by the leader
+TxnStatusManagers only. The motivation is to provide a more robust system,
+which avoids cases when the request was sent to a laggy follower, we may
+end up failing the request with an error.
+
+This patch introduces ScopedLeaderSharedLock (similar to the one in Catalog
+Manager) to be used to ensure the requests were sent to leaders only and
+to block all other operations while reloading the persistent transaction
+status metadata upon leadership changes. Note that during failover the
+leader replica will wait until in-flight ops in the previous consensus
+term to be applied before reloading the metadata.
+
+Change-Id: I42c1ad095dcb4bdffcbe0ecf9631a60bac208c2a
+Reviewed-on: http://gerrit.cloudera.org:8080/16648
+Tested-by: Hao Hao <hao.hao@cloudera.com>
+Reviewed-by: Andrew Wong <awong@cloudera.com>
+
+
+Commit 8c5e655d2d29e7758f26a373ea240631722ea1cf in kudu's branch refs/heads/master from Andrew Wong
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=8c5e655 ]
+
+KUDU-2612: loosen restrictions for BEGIN_COMMIT ops
+
+This patch updates the state validations for the BEGIN_COMMIT. Rather
+than only requiring an in-flight transaction to be kOpen (the common
+case) or kCommitInProgress (if re-attempting a BEGIN_COMMIT call), it's
+more robust to allow the call to be made even after the transaction has
+already been finalized. This will allow a to-be-merged implementation of
+a commit task to be retried with much less fuss.
+
+Here's some pseudo-code for such a commit task:
+1. persist COMMIT_IN_PROGRESS record on TxnStatusManager
+2. foreach participant as p: BEGIN_COMMIT(p)
+3. commit_ts = max timestamp used across BEGIN_COMMIT ops
+4. foreach participant as p: FINALIZE_COMMIT(p, commit_ts)
+5. persist COMMITTED record on TxnStatusManager
+
+If the commit task is interrupted (e.g. by some crash)  between steps 3
+and 5, we may be left with some participants with fully finalized
+commits. In such cases, all other participants _must_ also finalize, and
+they must finalize with the same timestamp. To ensure this, it must be
+possible to re-run a commit task. However, re-running it without this
+patch may lead to issues because the BEGIN_COMMIT ops would yield
+errors, complaining about an illegal state on participants that were
+finalized.
+
+This patch allows for a BEGIN_COMMIT op to succeed and return
+immediately if a FINALIZE_COMMIT op has already completed. If so, the
+finalized commit timestamp is sent back, allowing for the above commit
+task to be repeatable.
+
+Change-Id: Ifa4c5314190c84648c1b1edea7aab776b4882f97
+Reviewed-on: http://gerrit.cloudera.org:8080/16992
+Tested-by: Kudu Jenkins
+Reviewed-by: Alexey Serbin <aserbin@cloudera.com>
+
+
+Commit eba54241ab54fd8522fa7a48561000ec7917d7df in kudu's branch refs/heads/master from Hao Hao
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=eba5424 ]
+
+KUDU-2612: follow up of commit c033487
+
+This patch address leftover comments for commit c033487.
+
+Change-Id: I3ac5c1c123e33d60bc7c23dec015072d5c5ed9fd
+Reviewed-on: http://gerrit.cloudera.org:8080/17013
+Reviewed-by: Hao Hao <hao.hao@cloudera.com>
+Reviewed-by: Alexey Serbin <aserbin@cloudera.com>
+Tested-by: Kudu Jenkins
+
+
+Commit b9a8f2e633af891b6e2b268a71e18a8e7e1ff34d in kudu's branch refs/heads/master from Andrew Wong
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=b9a8f2e ]
+
+KUDU-2612: background task to commit transaction
+
+This patch introduces background tasks that get run when
+KuduTransaction::Commit() is called. The typical workflow is as follows:
+1. Commit() is called, resulting in a BeginCommitTransaction() call on
+   the TxnStatusManager.
+2. An update is made to the transaction status table, marking the
+   transaction's state as COMMIT_IN_PROGRESS.
+3. The commit tasks are initiated -- BEGIN_COMMIT ops are sent
+   asynchronously to every participant of the transaction.
+4. Once all responses are received from the participants, a commit
+   timestamp is determined, and FINALIZE_COMMIT ops are sent
+   asynchronously to every participant.
+5. Once all responses are received from the participants, an update is
+   made to the transaction status table, marking the transaction's state
+   as COMMITTED.
+
+There are some nuances here around error handling. Namely, what do we do
+if there are errors in sending the above requests? Well, it depends on
+the error. Transient errors (i.e. timeouts) are simply retried. More
+permanent errors need a bit more thought though:
+- If a participant has been deleted, what do we do? This patch makes a
+  best effort attempt to abort the transaction if so.
+- Any other kinds of errors (e.g. illegal state errors from a
+  participant) aren't expected in normal operation of a cluster. For
+  this, we stop the commit task and log a warning. Hopefully an operator
+  can intervene.
+
+Some follow-ups to expect:
+- This isn't as robust to failures as an approach that writes an
+  intermediate state to the TxnStatusManager in between steps 3 and 4. A
+  follow-up patch will implement that.
+- A separate patch will implement aborting transactions.
+- I disabled the background tasks in some tests that assume state
+  changes are entirely controlled by clients. A follow-up change will
+  address these to account for the state changes more organically.
+
+Change-Id: Ie2258dded3ab3d527cb5d0abdc7d5e7deb4da15e
+Reviewed-on: http://gerrit.cloudera.org:8080/16952
+Tested-by: Kudu Jenkins
+Reviewed-by: Alexey Serbin <aserbin@cloudera.com>
+
+
+Commit 451a4c61eed132e00b6dc50dcaf4cfeca348be2a in kudu's branch refs/heads/master from Andrew Wong
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=451a4c6 ]
+
+KUDU-2612: add background task to abort transaction participants
+
+This patch implements background tasks that abort a given transaction
+when TxnStatusManager::AbortTransaction() is called. Similar to the
+commit tasks, aborts have the following life cycle:
+1. AbortTransaction() is called. A new state, ABORT_IN_PROGRESS, is
+   written to the TxnStatusManager.
+2. ABORT_TXN ops are sent to all participants in the transaction.
+3. Once all participants have responded, the ABORTED state is written
+   to the TxnStatusManager.
+
+This patch doesn't test races between commits and aborts. Some reworking
+of the commit tasks will be required to account for such races, and will
+be done in a follow-up.
+
+Change-Id: I484c315c6f7331c5ec12cb06370fbaae9c7c343e
+Reviewed-on: http://gerrit.cloudera.org:8080/17017
+Tested-by: Andrew Wong <awong@cloudera.com>
+Reviewed-by: Hao Hao <hao.hao@cloudera.com>
+
+
+Commit fa5fdd8532efa3a634eaba1fea4552f66d881623 in kudu's branch refs/heads/master from Alexey Serbin
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=fa5fdd8 ]
+
+KUDU-2612: non-zero queue size for txn-commit pool
+
+I found my new tests for the automatic txn participant registration
+often hit the following CHECK():
+
+  F0212 06:49:33.448449   611 txn_status_manager.cc:371] Check failed: _s.ok() Bad status: Service unavailable: Thread pool is at capacity (10/10 tasks running, 2/0 tasks queued)
+
+As I can see, the code in
+CommitTasks::Schedule{AbortTxn,FinalizeCommit}Write() doesn't handle
+the condition of running out of the "txn-commit" pool's queue.  That
+means the pool is supposed to have an unlimited queue size, like other
+pools which exhibit similar behaviour: e.g., the pool for removing
+tablets, the pool for opening tablets, etc.  Indeed, since the number of
+concurrently opened multi-row transactions isn't limited,
+TxnStatusManager should be able handle the case when many transactions
+are being aborted and committed simultaneously.
+
+This patch removes the queue size limit for the "txn-commit" pool
+(effectively setting it to INT_MAX), mirroring the behavior of the
+"tablet-open" and "tablet-delete" pools.
+
+Change-Id: Idb3de2fd41936862eec8f2616096db16ff86c070
+Reviewed-on: http://gerrit.cloudera.org:8080/17059
+Reviewed-by: Andrew Wong <awong@cloudera.com>
+Tested-by: Alexey Serbin <aserbin@cloudera.com>
+
+
+Commit b73f75927f703eb7a5fbaaed525fd9c6b8c140f1 in kudu's branch refs/heads/master from Andrew Wong
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=b73f759 ]
+
+KUDU-2612: make BeginCommit return OK if already committed
+
+This patch makes repeat calls to BeginCommit by the TxnStatusManager
+return OK rather than an IllegalState error. This has previously
+surfaced in flakiness in some tests, wherein repeated calls to
+TxnManager::Commit() yields an IllegalState error since the commit has
+already completed.
+
+This also reverts 67018be8ba27480b050c11504df8a732f6a52daf that
+addressed this by increasing commit latency.
+
+Change-Id: I420ba1c5460d59103984ea9a1f16177b82b8d0e1
+Reviewed-on: http://gerrit.cloudera.org:8080/17073
+Reviewed-by: Alexey Serbin <aserbin@cloudera.com>
+Tested-by: Andrew Wong <awong@cloudera.com>
+
+
+Commit 3faeb3d9c6c87e4d6815e06945f331a4a14402ba in kudu's branch refs/heads/master from Andrew Wong
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=3faeb3d ]
+
+KUDU-2612: don't return NOT_FOUND when BEGIN_TXN has not yet run
+
+In testing an in-flight patch[1], it was found that our current handling of
+errors when participant registration hasn't completed can lead to
+incorrect behavior: the path in which we handle NOT_FOUND errors while
+committing expects that such errors only occur if the tablet has been
+deleted, and we currently proceed with the commit. The incorrect
+assumption here was that NOT_FOUND errors are only produced when the
+tablet has been deleted, which is not the case.
+
+This behavior will be amended in an upcoming patch[2], and we'll
+actually abort the transaction on NOT_FOUND errors. Until then, this
+patch adjust the behavior to return ILLEGAL_STATE instead of NOT_FOUND,
+so at least the error type is consistent with the rest of the
+participant op lifecycle errors.
+
+[1] https://gerrit.cloudera.org/c/17037/
+[2] https://gerrit.cloudera.org/c/17022
+
+Change-Id: I8fa8caba384ee30536114a3e6466ad90b6d8e45d
+Reviewed-on: http://gerrit.cloudera.org:8080/17127
+Tested-by: Kudu Jenkins
+Reviewed-by: Alexey Serbin <aserbin@cloudera.com>
+Reviewed-by: Hao Hao <hao.hao@cloudera.com>
+
+
+Commit ceca6abc506fc4c1012ced6e8a6564897b3af4ad in kudu's branch refs/heads/master from Alexey Serbin
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=ceca6ab ]
+
+KUDU-2612 tablet servers automatically register txn participants
+
+With this patch, tablet servers automatically register tablets as
+transaction participants and issue appropriate BEGIN_TXN operations
+upon receiving write operations targeting tablet replicas which they
+host.
+
+Internally, the newly introduced logic is mostly embedded into the
+TxnOpDispatcher class.  Every TxnOpDispatcher object is allowed to
+accumulate up to a certain number of pending write requests in its queue
+while awaiting for the completion of the preliminary tasks mentioned
+above.  Once the TxnOpDispatcher's queue is at capacity, a tablet server
+starts responding with the ErrorStatusPB::ERROR_SERVER_TOO_BUSY error
+code to incoming write requests in the context of the corresponding
+transaction, and Kudu clients automatically retry requests, as expected.
+The capacity of the TxnOpDispatcher's queue is controlled by a newly
+introduced --tablet_max_pending_txn_write_ops flag.  By default, the
+flag is set to 2.  Buffering a few write requests should help to avoid
+needless retries in case if a client packs many operations into one
+write request: that's exactly the behavior for Kudu client sessions
+using the AUTO_FLUSH_BACKGROUND mode.  If such buffering isn't desired
+for some reason, set --tablet_max_pending_txn_write_ops=0: in that case
+a client will retry the very first operation sent to a tablet server
+in the context of a transaction until the tablet server completes the
+preliminary tasks mentioned above.  The flag has runtime semantics,
+so no restart of a tablet server is required upon modification of the
+flag's setting.
+
+Each tablet replica maintains a txn_id --> TxnOpDispatcher map,
+with an entry's lifecycle as below:
+  * An entry is added upon receiving write request in the context
+    of a multi-row transaction.
+  * An entry is removed upon applying either ParticipantOpPB::ABORT_TXN
+    or ParticipantOpPB::FINALIZE_COMMIT operation.
+  * If a write request is received after transaction has been committed
+    or aborted, the entry is automatically removed once receiving
+    corresponding error response from any of the following components:
+      ** from TxnStatusManager in at attempts to register a participant
+         in the context of committed/aborted transaction
+      ** from the replica itself in an attempt to add
+         ParticipantOpPB::BEGIN_COMMIT operation
+In other words, the system automatically gets rid of no-longer-needed
+TxnOpDispatcher entries.
+
+This patch also contains several test scenarios to cover the newly
+introduced functionality.  I also updated other related tests to remove
+the artificial registration of corresponding transaction participants,
+so those tests now rely on the newly introduced functionality.
+
+Change-Id: Ia383f7afd208c44695c57aab82e3818fa1712ce6
+Reviewed-on: http://gerrit.cloudera.org:8080/17037
+Tested-by: Kudu Jenkins
+Reviewed-by: Andrew Wong <awong@cloudera.com>
+
+
+Commit 740e9150d7072d95599951ee998df58d8ffe55b6 in kudu's branch refs/heads/master from Alexey Serbin
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=740e915 ]
+
+KUDU-2612 add perf scenario to TxnWriteOpsITest
+
+This patch adds WriteOpPerf scenario to TxnWriteOpsITest.  The new
+scenario is to evaluate --tablet_max_pending_txn_write_ops setting for
+tablet servers: it runs for a short time to count number of completed
+Write RPCs in context of a transactional session.  The scenario focuses
+on single-row write operations to pinpoint the latency of processing
+txn write operations when performing registration of transaction
+participants.  Probably, the current locking approach for the
+TxnOpDispatcher's queue while submitting the accumulated operations
+isn't optimal.  Apparently, the exponential back-off timing built into
+the client's RPC retry logic is also an important factor: I saw
+significant deviation in the number of completed RPCs from run to run.
+
+Below are results averaged for 100 runs of the benchmark scenario with
+varying --max_pending_txn_write_ops accordingly and the following
+settings fixed:
+  --prepare_connections_to_tservers=true
+  --clients=8
+  --sessions_per_client=1
+  --benchmark_run_time_ms=50
+
+I used the following script to get the accumulated results for
+writes in a transactional context:
+  for i in {0..99}; do
+    ./bin/txn_write_ops-itest --gtest_filter='*WriteOpPerf' \
+        --max_pending_txn_write_ops=<X> 2>&1 | grep 'write RPCs' | \
+        awk '{print $9}'; done | \
+        awk 'BEGIN {sum=0} {sum += $0} END {print sum}'
+
+RELEASE build:
+  --max_pending_txn_write_ops=0  : 442.13 RPCs
+  --max_pending_txn_write_ops=2  : 494.33 RPCs
+  --max_pending_txn_write_ops=5  : 471.90 RPCs
+  --max_pending_txn_write_ops=10 : 490.22 RPCs
+  --max_pending_txn_write_ops=20 : 469.21 RPCs
+
+DEBUG   build:
+  --max_pending_txn_write_ops=0  : 83.74 RPCs
+  --max_pending_txn_write_ops=2  : 98.18 RPCs
+  --max_pending_txn_write_ops=5  : 95.23 RPCs
+  --max_pending_txn_write_ops=10 : 98.12 RPCs
+  --max_pending_txn_write_ops=20 : 94.40 RPCs
+
+I also measured the performance of transactional vs non-transactional
+for various time intervals in RELEASE build, where for transactional
+writes I used --max_pending_txn_write_ops=2 setting:
+
+50ms:
+  non-transactional:    588.33 RPCs (11767 req/sec)
+      transactional:    487.82 RPCs ( 9756 req/sec)
+
+3000ms:
+  non-transactional:  40041.63 RPCs (13347 req/sec)
+      transactional:  39759.07 RPCs (13253 req/sec)
+
+8000ms:
+  non-transactional: 106832.37 RPCs (13354 req/sec)
+      transactional: 105922.65 RPCs (13240 req/sec)
+
+Change-Id: I0370dbb289a4e1cfc154205ae92e13da510682b4
+Reviewed-on: http://gerrit.cloudera.org:8080/17105
+Tested-by: Alexey Serbin <aserbin@cloudera.com>
+Reviewed-by: Alexey Serbin <aserbin@cloudera.com>
+
+
+Commit 058ec9a2baa9edb75904e8aa83716dd2734f3bbd in kudu's branch refs/heads/master from Andrew Wong
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=058ec9a ]
+
+KUDU-2612: allow aborting after beginning to commit
+
+This patch adjusts the TxnStatusManager state machine to include a new
+FINALIZE_IN_PROGRESS state to serve as an intermediate step between
+COMMIT_IN_PROGRESS and COMMITTED.
+
+The goal is to allow for aborts to occur in the event that we've begun
+committing, but not yet called FINALIZE_COMMIT on any of the
+transaction's participants, which may be desirable in cases where
+anything surprising has happened on the participants (e.g. if they're
+deleted).
+
+Change-Id: If1b6596df2db5601f7e17e528ad6dc68057b67f8
+Reviewed-on: http://gerrit.cloudera.org:8080/17022
+Tested-by: Andrew Wong <awong@cloudera.com>
+Reviewed-by: Alexey Serbin <aserbin@cloudera.com>
+
+
+Commit 6983d25c35df8569c1851bf27e2c75e98036c10d in kudu's branch refs/heads/master from Hao Hao
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=6983d25 ]
+
+KUDU-2612: add ScopedPartitionLock
+
+This patch introduces a coarse-grained partition-level lock
+ScopedPartitionLock to prevent dirty writes for multi-row transactions,
+similar to the ScopedRowLock, but for locking the entire LockManager
+instead of individual rows.
+
+A partition lock can only be held by a single transaction at a time. A
+given transaction can acquire the lock multiple times. To prevent
+deadlocks, a wait-die scheme is used -- if a transaction requires a lock
+held by another transaction:
+1. Retry the op if the requesting transaction has a lower txn ID than
+   the current holder ("wait"),
+2. Otherwise abort the requesting transaction immediately ("die").
+
+A later patch will plumb this locking into participant ops and
+transactional write ops.
+
+Change-Id: I158115739ce3e7cfb77bbcb854e834336c1256b1
+Reviewed-on: http://gerrit.cloudera.org:8080/17097
+Reviewed-by: Alexey Serbin <aserbin@cloudera.com>
+Tested-by: Andrew Wong <awong@cloudera.com>
+
+
+Commit 6be9794f91a2eebb291e4db2daf63a0f12c3ae2a in kudu's branch refs/heads/master from Andrew Wong
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=6be9794 ]
+
+KUDU-2612: allow ABORT_TXN txn ops to succeed if txn hasn't started
+
+This patch allows ABORT_TXN ops to proceed even if the participant
+hasn't yet initialized the transaction. This is desirable in the case
+where a participant has successfully registered with the
+TxnStatusManager, but hasn't yet replicated its BEGIN_TXN op. In these
+cases, the ops will unregister any pending TxnOpDispatchers, as well as
+mark the existence of the transaction on the participant, preventing
+further participant registrations for the transaction.
+
+Take the following as an example:
+1. a transactional write op is sent to a participant
+2. the participant successfully registers with the TxnStatusManager
+3. before the BEGIN_TXN op replicates, the node crashes
+4. no further retry of the write is sent
+5. the user attempt to commit the transaction
+6. the BEGIN_COMMIT op fails because the transaction hasn't started on
+   the participant
+7. an ABORT_TXN op is scheduled but that fails too because the the
+   transaction hasn't started on the participant
+
+With this patch, step 7 should succeed, and successfully replicate the
+ABORT_TXN op, even though the transaction doesn't exist. The test[1] for
+this isn't enabled yet -- some additional plumbing is required to ensure
+we return the correct error codes.
+
+Along the way, I hardened up an edge case for BEGIN_COMMIT so
+TXN_ILLEGAL_STATE is returned if the transaction doesn't exist, instead
+of returning a plain IllegalState, which would have resulted in the
+ParticipantRpc being retried.
+
+[1] see TxnOpDispatcherITest.CommitWithWriteOpPendingParticipantRegistered
+
+Change-Id: Ia4c864b4f14e42008d3aa8f4454c8b2abf9bb766
+Reviewed-on: http://gerrit.cloudera.org:8080/17233
+Reviewed-by: Alexey Serbin <aserbin@cloudera.com>
+Tested-by: Andrew Wong <awong@cloudera.com>
+
+
+Commit 78fb2047da74a1ebd051dbfa29c4d188056b47bc in kudu's branch refs/heads/master from Andrew Wong
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=78fb204 ]
+
+KUDU-2612: route txn op dispatching errors to write ops
+
+This patch routes bad statuses from the TxnOpDispatcher to the write ops
+that initiated the registration, and adjusts the batcher code to handle
+such errors.
+
+This also enables a couple of test cases that were written with this
+behavior in mind; and adjusts some expected errors, addressing some
+TODOs that expected this behavior.
+
+A follow-up patch will make a similar change to the Java client.
+
+Change-Id: Ibf85e0724ee579cb20dac642b82e3228faf90935
+Reviewed-on: http://gerrit.cloudera.org:8080/17217
+Tested-by: Kudu Jenkins
+Reviewed-by: Alexey Serbin <aserbin@cloudera.com>
+
+
+Commit 0a32542ca5669c842e91b1b736d108a7ae84ec5c in kudu's branch refs/heads/master from Alexey Serbin
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=0a32542 ]
+
+KUDU-2612: Java client failover scenarios for TxnManager
+
+Added a couple of test scenarios to verify that Java client
+automatically switches to other available TxnManager for performing
+txn-related operations.  Sending txn keep-alive messages isn't covered
+yet: I'm planning to address these separately since some extra changes
+are needed there which would be easier to review in a separate patch.
+
+I also updated the inline doc for KuduTransaction.isCommitComplete()
+to be more explicit about possible exceptions thrown.
+
+Change-Id: I9c7d73ce4a74d426286facbf02dff6e48b46a7c0
+Reviewed-on: http://gerrit.cloudera.org:8080/17297
+Tested-by: Alexey Serbin <aserbin@cloudera.com>
+Reviewed-by: Andrew Wong <awong@cloudera.com>
+
+
+Commit 096f1ddf09047ea11d78a661010dd549ffa9af51 in kudu's branch refs/heads/master from Alexey Serbin
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=096f1dd ]
+
+KUDU-2612: fix txn keepalive failover in Java client
+
+Prior to this patch, transaction keepalive heartbeater in Java client
+wouldn't switch to a different TxnManager instance fast enough when
+current TxnManager is no longer available (e.g., corresponding Kudu
+master stopped or shutdown).  That might lead to unintended termination
+of a multi-row transaction if a leader master was shutdown while the
+transaction was in progress.  The issue was due to:
+  * using long timeout (i.e. the default one) for issuing
+    KeepTransactionAlive RPCs
+  * sending KeepTransactionAlive RPCs synchronously on the client's
+    HashedWheelTimer timer which was supposed to run only short tasks
+
+This patch fixes the issue mentioned above and adds a new test scenario
+which verifies that Kudu Java client switches to a different TxnManager
+instance when the previously used one is no longer available.
+
+Change-Id: I27ecbf3063d0657a20741088060d8562f8c40bc7
+Reviewed-on: http://gerrit.cloudera.org:8080/17305
+Tested-by: Alexey Serbin <aserbin@cloudera.com>
+Reviewed-by: Andrew Wong <awong@cloudera.com>
+
+
+Commit 7fa9beb0f8a6f8902610515d894f7fb79a144154 in kudu's branch refs/heads/master from Alexey Serbin
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=7fa9beb ]
+
+KUDU-2612: send next txn keepalive sooner in case of timeout
+
+This patch updates the code of the C++ client to set the timeout for
+TransactionKeepAlive() RPC to be half of the target period for sending
+keepalive messages.  Also, if the RPC with the prior keepalive message
+timed out, sending next keepalive message sooner gives more chances for
+the transaction to survive before it's automatically aborted by the
+backend due to not receiving keepalive messages for long time.
+
+This patch also makes the corresponding pieces of the Kudu C++ and
+the Java clients consistent (see https://gerrit.cloudera.org/#/c/17305).
+
+Change-Id: Ic12c5615152e61ee81e4f48e4978d4c5b1fa9828
+Reviewed-on: http://gerrit.cloudera.org:8080/17310
+Reviewed-by: Andrew Wong <awong@cloudera.com>
+Tested-by: Alexey Serbin <aserbin@cloudera.com>
+
+
+Commit 8093f95e6b8eb496043562f69df3a66e078ad731 in kudu's branch refs/heads/master from Hao Hao
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=8093f95 ]
+
+KUDU-2612: acquire and release partition lock
+
+This patch plumbs partition locks into write ops for transactional and
+non-transactional operations. Upon attempting to write, we try to
+acquire the partition lock in the WriteOp prepare phase, and upon
+successfully applying the op, we transfer ownership of the lock to the
+Txn that the write was a part of (or just release the partition lock if
+the write was non-transactional). Txns release the lock when
+FINALIZE_COMMIT or ABORT_TXN is applied.
+
+We take the partition lock for non-transactional write ops as well to
+ensure we don’t duplicate keys (e.g. if a transaction inserts key=1 and
+then a non-transactional write inserts key=1 before the transaction
+commits). If the partition lock cannot be acquired, the write op is
+aborted or retried, based on the wait-die mechanics already in the lock
+manager.
+
+A flag is also introduced to disable this locking for tests that
+currently expect support for concurrent transactions.
+
+Change-Id: If26733cae16810f3b3afd1fd05dcb984e6366939
+Reviewed-on: http://gerrit.cloudera.org:8080/17159
+Tested-by: Andrew Wong <awong@cloudera.com>
+Reviewed-by: Alexey Serbin <aserbin@cloudera.com>
+
+
+Commit ee79cdfa9906d14a63d4ec4b487c6eece77cc50f in kudu's branch refs/heads/master from Alexey Serbin
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=ee79cdf ]
+
+KUDU-2612: an extra test for txn keepalive failover in Java client
+
+This is a follow-up to 096f1ddf09047ea11d78a661010dd549ffa9af51.
+
+This patchs adds an extra test scenario similar the one added
+in the prior changelist, but with additional twist of "rolling"
+unavailability of leader masters.  In addition, it verifies that
+RPC error responses from TxnManager due to the unavailability
+of TxnStatusManager are properly handled by the Java client.
+
+Change-Id: Ib278d402bee85fb0442cbce98b2b4ab022229eb4
+Reviewed-on: http://gerrit.cloudera.org:8080/17321
+Reviewed-by: Andrew Wong <awong@cloudera.com>
+Tested-by: Kudu Jenkins
+
+
+Commit d21a0d38373b84f66fa2d37732b7ec7b8fee5f16 in kudu's branch refs/heads/master from Andrew Wong
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=d21a0d3 ]
+
+KUDU-2612: rollback txn on TXN_LOCKED_ABORT
+
+Previously it was required that clients manually rollback transactions
+when their ops failed with TXN_LOCKED_ABORTED (seen as an Aborted
+error). Rather than pushing the burden onto application users, this
+patch attempts to alleviate this by hooking in a callback to rollback
+transactions automatically if any write op fails with TXN_LOCKED_ABORT.
+
+Of course, users are still free to Rollback() on error -- this patch is
+simply meant to automate it in case the user doesn't, giving us a bit
+more control over ensuring our transactions don't lead to a deadlock.
+
+Change-Id: I25415cad0cfb08d260e23bd8b368852a5006c1fb
+Reviewed-on: http://gerrit.cloudera.org:8080/17263
+Tested-by: Andrew Wong <awong@cloudera.com>
+Reviewed-by: Alexey Serbin <aserbin@cloudera.com>
+
+
+Commit 2ce5def8746acae6229dba7b2fd362069eccd1fe in kudu's branch refs/heads/master from Alexey Serbin
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=2ce5def ]
+
+KUDU-2612: more info on abandoned transaction tracking
+
+This patch cross-references the --txn_staleness_tracker_interval_ms
+flag in the description of the --txn_keepalive_interval_ms one.
+That's useful for better understanding of how the abandoned transaction
+tracking works and how to properly change its parameters or disable it,
+if necessary.
+
+This patch doesn't contain any functional changes.
+
+Change-Id: I5b626f1f7e384efd616019013559f171ad7eaddc
+Reviewed-on: http://gerrit.cloudera.org:8080/17341
+Tested-by: Alexey Serbin <aserbin@cloudera.com>
+Reviewed-by: Andrew Wong <awong@cloudera.com>
+
+
+Commit e495d6bb759fdae7cd001d86df3bae5c4f5f2b36 in kudu's branch refs/heads/master from Alexey Serbin
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=e495d6b ]
+
+KUDU-2612: propagate commit timestamp (C++ client)
+
+With this patch, the commit timestamp for a non-empty transaction
+is propagated to a Kudu C++ client upon calling
+KuduTransaction::IsCommitComplete() (that means that committing
+a transaction synchronously via KuduTransaction::Commit() propagates
+the commit timestamp as well).
+
+Updating the last observed timestamp with the commit timestamp is
+necessary to achieve consistency in the READ_YOUR_WRITES mode when
+reading the data of a transaction which has just been committed.  The
+commit phase might take some time and may even be retried in some cases,
+so even the client observed timestamps for all the write operations
+it sent in the context this transaction, the maximum timestamp collected
+among the involved transaction participants might be far ahead of the
+last timestamp observed by the client so far.
+
+Change-Id: If3ff321895a25326b962a47d5fa868e45aefcb4d
+Reviewed-on: http://gerrit.cloudera.org:8080/17345
+Reviewed-by: Andrew Wong <awong@cloudera.com>
+Tested-by: Alexey Serbin <aserbin@cloudera.com>
+
+
+Commit 79c99ea20a5c978a91037a4e1540ea744a83725e in kudu's branch refs/heads/master from Alexey Serbin
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=79c99ea ]
+
+KUDU-2612: address TODOs in TestKuduTransaction
+
+Change-Id: If76b7fb375528939e4af0c0d6e7fc7222109b70a
+Reviewed-on: http://gerrit.cloudera.org:8080/17355
+Reviewed-by: Andrew Wong <awong@cloudera.com>
+Tested-by: Kudu Jenkins
+
+
+Commit 73310d955b4d5d7ec413217d99517cc4b7794975 in kudu's branch refs/heads/master from Andrew Wong
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=73310d9 ]
+
+KUDU-2612: retry abort task on timeout
+
+It's possible that in the event of a node failure, the abort that
+happens automatically to avoid a deadlock will timeout. Instead of
+leaving the failure as is, this patch updates the task to be retried.
+
+To expedite testing, this also introduces a new flag to the
+TxnSystemClient to reduce the default timeout.
+
+This is a follow-up to d21a0d3.
+
+Change-Id: I303a9a8c85a2191594a22d907770a82da5060f19
+Reviewed-on: http://gerrit.cloudera.org:8080/17357
+Reviewed-by: Alexey Serbin <aserbin@cloudera.com>
+Tested-by: Kudu Jenkins
+
+
+Commit 28f2f35fa1ff0e490043a9308b011d8fb5709283 in kudu's branch refs/heads/master from Alexey Serbin
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=28f2f35 ]
+
+KUDU-2612: propagate commit timestamp (Java client)
+
+With this patch, the commit timestamp for a non-empty multi-row
+transaction is propagated to a Kudu Java client upon calling either
+KuduTransaction.isCommitComplete() or KuduTransaction.commit(true).
+The former propagates the timestamp for the case of committing a
+transaction asynchronously, the latter works for the synchronous case.
+
+Updating the last observed timestamp with the commit timestamp is
+necessary to achieve consistency in the READ_YOUR_WRITES mode when
+reading the data of a transaction which has just been committed.  The
+commit phase might take some time and may even be retried in some cases,
+so even if the client observed timestamps for all the write operations
+it sent in the context this transaction, the maximum timestamp collected
+among the involved transaction participants might be far ahead of the
+last timestamp observed by the client so far.
+
+In addition, this patch addresses the most prominent cause of flakiness
+in the recently introduced scenario
+TestKuduTransaction.testTxnKeepaliveRollingSwitchToOtherTxnManager.
+
+This patch is a follow-up to e495d6bb759fdae7cd001d86df3bae5c4f5f2b36.
+
+Change-Id: I4177fe0d137b70bd18dd6c87eb42e8aaf03a00b3
+Reviewed-on: http://gerrit.cloudera.org:8080/17356
+Reviewed-by: Andrew Wong <awong@cloudera.com>
+Tested-by: Kudu Jenkins
+
+
+Commit 4c53ce892a083ff660f4b7af2374fd6b273329f8 in kudu's branch refs/heads/master from Andrew Wong
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=4c53ce8 ]
+
+KUDU-2612: fix race when adopting partition lock
+
+The way we were transferring the partition lock to the Txn wasn't
+thread-safe. This patch wraps the critical section with a spinlock.
+
+This patch includes a test that would trigger a TSAN error.
+
+Change-Id: Ifc7ac7f474baf308860847298355b300c76d9ef5
+Reviewed-on: http://gerrit.cloudera.org:8080/17361
+Reviewed-by: Alexey Serbin <aserbin@cloudera.com>
+Tested-by: Andrew Wong <awong@cloudera.com>
+
+
+Commit 0875f79471a384efb28453a0aff98e5e2eb6c576 in kudu's branch refs/heads/master from Alexey Serbin
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=0875f79 ]
+
+KUDU-2612: update C++ client API to commit a transaction
+
+This patch updates the signature of the KuduTransaction::Commit()
+method to address recent feedback on the txn-related API. The idea is
+to make the API easier to use, since txn.Commit(false) looks a bit vague
+and might be confusing as well.
+
+In essence, the 'wait' parameter is gone and now there are two methods:
+  * KuduTransaction::Commit()
+  * KuduTransaction::StartCommit()
+
+The former starts committing a multi-row transaction and waits for the
+commit phase to finalize.  The latter just starts the commit phase for
+a multi-row transaction and returns, not awaiting for the commit phase
+to finalize.
+
+Change-Id: Iecac338a753e559597a9348e68c9b09813cc8105
+Reviewed-on: http://gerrit.cloudera.org:8080/17392
+Tested-by: Kudu Jenkins
+Reviewed-by: Grant Henke <granthenke@apache.org>
+Reviewed-by: Andrew Wong <awong@cloudera.com>
+
+
+Commit ac91eb51009636a0b68dbc7271f63b62ab6f3350 in kudu's branch refs/heads/master from Alexey Serbin
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=ac91eb5 ]
+
+KUDU-2612: update Java client API to commit a transaction
+
+This patch updates the signature of the KuduTransaction::commit()
+method to address recent feedback on the txn-related API.  The idea is
+to make the API easier to use, since txn.commit(false) looks a bit vague
+and might be confusing as well.
+
+In essence, the 'wait' parameter is gone and now there are two methods:
+  * KuduTransaction.commit()
+  * KuduTransaction.startCommit()
+
+The former starts committing a multi-row transaction and waits for the
+commit phase to finalize.  The latter just starts the commit phase for
+a multi-row transaction and returns, not awaiting for the commit phase
+to finalize.
+
+These changes mirror recent changes in the C++ client API.
+
+Change-Id: Ia8c48b4d375945649c48428401f09ec5c7cc8cb7
+Reviewed-on: http://gerrit.cloudera.org:8080/17393
+Tested-by: Kudu Jenkins
+Reviewed-by: Grant Henke <granthenke@apache.org>
+Reviewed-by: Andrew Wong <awong@cloudera.com>
+
+
+Commit 990976d38ded648b39c1db2e4241d6eda82aee63 in kudu's branch refs/heads/master from Andrew Wong
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=990976d ]
+
+KUDU-2612: re-open TxnSystemTable if transaction is in new range
+
+This patch makes the TxnSystemClient on tablet servers retry if attempts
+to register the participant yield a NotFound error. This happens when
+new ranges are added to the transactions status table.
+
+To disambiguate between the case where the transaction itself doesn't
+exist on the TxnStatusManager, this patch also adjust the return value
+for such cases to be InvalidArugment, which seems equally fitting for
+writing as a part of a bogus transaction ID.
+
+Change-Id: I3af58dcaa3a995dac9dc937c7dfcb652bf004873
+Reviewed-on: http://gerrit.cloudera.org:8080/17368
+Tested-by: Kudu Jenkins
+Reviewed-by: Alexey Serbin <aserbin@cloudera.com>
+
+
+Commit 45ca93f0ef90a8524d0fcd9c3e56e10d5328ca24 in kudu's branch refs/heads/master from Alexey Serbin
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=45ca93f ]
+
+KUDU-2612 automatically flush sessions on txn commit
+
+With this patch, all transactional sessions created off a transction
+handle are automatically flushed upon calling Commit() on the handle.
+
+As for the KuduTransaction::StartCommit() method, it's now necessary
+to flush all the transactional sessions created off the transaction
+handle before calling the method, otherwise Status::IllegalState()
+would be returned.
+
+As Andrew and I discussed offline, it might be an option to return an
+error from KuduSession::Apply() for a transactional session whose
+transaction has already started committing.  However, after looking at
+this closer, I realized that it would require either an atomic or an
+extra synchronization primitive, bringing more complexity into the hot
+path of applying write operations in the context of a session.  So,
+I opted not to perform the consistency check as a part of the
+KuduSession::Apply() method, rather relying on the logic of
+KuduSession::Flush() and KuduSession::FlushAsync() methods instead.
+
+Another design detail worth pointing at is that a KuduTransaction handle
+keeps shared, not weak pointers to transaction sessions originated off
+the handle (I did several back-and-forth iterations on this, though).
+Even if using shared_ptr, not weak_ptr, no circular dependencies are
+introduced since a transactional session doesn't keep a reference
+to the corresponding transactional handle.  The shared_ptr-based
+approach looks better than one with weak_ptr because
+  (1) It might prevent a data loss due to a mistake in an application
+      code, and it takes time to find and fix those.
+  (2) It looks more portable and consistent if thinking about similar
+      functionality to implement in the Java client.
+
+This patch also contains several test scenarios for the newly introduced
+functionality.
+
+Change-Id: I2480129a99fb19d16868e14f9b9e33c83e3d8e7f
+Reviewed-on: http://gerrit.cloudera.org:8080/17431
+Tested-by: Alexey Serbin <aserbin@cloudera.com>
+Reviewed-by: Andrew Wong <awong@cloudera.com>
+
+
+Commit b784a41290365d7eacb10048b45ea86708b5b314 in kudu's branch refs/heads/master from Alexey Serbin
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=b784a41 ]
+
+KUDU-2612 register txn Java sessions with client
+
+Prior to this patch, the assertion in AsyncKuduClient.removeSession()
+would trigger upon closing a transactional session using via
+{AsyncKuduSession,KuduSession}.close().
+
+This patch address the issue by registering the newly created
+transactional session with corresponding AsyncKuduClient.  In addition,
+a test scenario is added to catch regressions.
+
+This is a follow-up to 7432a7a8aa0c98f8d2177c25b99576b51ff33a93.
+
+Change-Id: I117abc938bca0e698854d944c3fd6f831d3f9ce0
+Reviewed-on: http://gerrit.cloudera.org:8080/17451
+Tested-by: Kudu Jenkins
+Reviewed-by: Andrew Wong <awong@cloudera.com>
+
+
+Commit 45551a92dab355feb4d6e4ee0532ee8095120a5f in kudu's branch refs/heads/branch-1.15.x from Alexey Serbin
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=45551a9 ]
+
+KUDU-2612 register txn Java sessions with client
+
+Prior to this patch, the assertion in AsyncKuduClient.removeSession()
+would trigger upon closing a transactional session using via
+{AsyncKuduSession,KuduSession}.close().
+
+This patch address the issue by registering the newly created
+transactional session with corresponding AsyncKuduClient.  In addition,
+a test scenario is added to catch regressions.
+
+This is a follow-up to 7432a7a8aa0c98f8d2177c25b99576b51ff33a93.
+
+Change-Id: I117abc938bca0e698854d944c3fd6f831d3f9ce0
+Reviewed-on: http://gerrit.cloudera.org:8080/17451
+Tested-by: Kudu Jenkins
+Reviewed-by: Andrew Wong <awong@cloudera.com>
+(cherry picked from commit b784a41290365d7eacb10048b45ea86708b5b314)
+Reviewed-on: http://gerrit.cloudera.org:8080/17453
+Reviewed-by: Bankim Bhavsar <bankim@cloudera.com>
+
+
+Commit 1f30113f8f8471cecd10caba9c43f6390c135ae7 in kudu's branch refs/heads/master from Alexey Serbin
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=1f30113 ]
+
+KUDU-2612 automatically flush sessions on txn commit (Java client)
+
+With this patch, all transactional sessions created off a transction
+handle are automatically flushed upon calling commit() on the handle.
+
+As for the KuduTransaction.startCommit() method, it's now necessary
+to flush all the transactional sessions created off the transaction
+handle before calling the method, otherwise a NonRecoverableException
+based on Status.Incomplete() is thrown.
+
+This patch also contains several test scenarios for the newly introduced
+functionality.
+
+This changelist is a Java client's counterpart for 45ca93f0e.
+
+Change-Id: I0c52578dd736906cf2610c8cc58496381a9b73ec
+Reviewed-on: http://gerrit.cloudera.org:8080/17452
+Tested-by: Alexey Serbin <aserbin@cloudera.com>
+Reviewed-by: Andrew Wong <awong@cloudera.com>
+Reviewed-by: Grant Henke <granthenke@apache.org>
+
+
+Commit a6de16122066feb6951f68f557c28374a4e02840 in kudu's branch refs/heads/branch-1.15.x from Alexey Serbin
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=a6de161 ]
+
+KUDU-2612 automatically flush sessions on txn commit (Java client)
+
+With this patch, all transactional sessions created off a transction
+handle are automatically flushed upon calling commit() on the handle.
+
+As for the KuduTransaction.startCommit() method, it's now necessary
+to flush all the transactional sessions created off the transaction
+handle before calling the method, otherwise a NonRecoverableException
+based on Status.Incomplete() is thrown.
+
+This patch also contains several test scenarios for the newly introduced
+functionality.
+
+This changelist is a Java client's counterpart for 45ca93f0e.
+
+Change-Id: I0c52578dd736906cf2610c8cc58496381a9b73ec
+Reviewed-on: http://gerrit.cloudera.org:8080/17452
+Tested-by: Alexey Serbin <aserbin@cloudera.com>
+Reviewed-by: Andrew Wong <awong@cloudera.com>
+Reviewed-by: Grant Henke <granthenke@apache.org>
+(cherry picked from commit 1f30113f8f8471cecd10caba9c43f6390c135ae7)
+Reviewed-on: http://gerrit.cloudera.org:8080/17471
+Tested-by: Kudu Jenkins
+Reviewed-by: Bankim Bhavsar <bankim@cloudera.com>
+
+
+Commit 923245291fade95febc36265cfba8cc92ee457d5 in kudu's branch refs/heads/master from Andrew Wong
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=9232452 ]
+
+KUDU-2612: disable TxnSystemClient initialization by default
+
+Currently the TxnSystemClient gets initialized on tablet servers by
+default, retrying every second until successful, and logging an error
+every minute if unable to. Since transactions support is currently
+experimental and disabled by default, so too should this initialization
+be. This patch hides the initialization with the existing
+--disable_txn_system_client_init flag (previously used for tests),
+adjusted to --enable_txn_system_client_init to match most of our
+feature-gating flags.
+
+Change-Id: I7c020a66db484f88ae1cb7c15d860d503a3f8a3b
+Reviewed-on: http://gerrit.cloudera.org:8080/17499
+Tested-by: Kudu Jenkins
+Reviewed-by: Alexey Serbin <aserbin@cloudera.com>
+Reviewed-by: Grant Henke <granthenke@apache.org>
+
+
+Commit 646679da22ac8ba995a91749fb5b610806116bbe in kudu's branch refs/heads/branch-1.15.x from Andrew Wong
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=646679d ]
+
+KUDU-2612: disable TxnSystemClient initialization by default
+
+Currently the TxnSystemClient gets initialized on tablet servers by
+default, retrying every second until successful, and logging an error
+every minute if unable to. Since transactions support is currently
+experimental and disabled by default, so too should this initialization
+be. This patch hides the initialization with the existing
+--disable_txn_system_client_init flag (previously used for tests),
+adjusted to --enable_txn_system_client_init to match most of our
+feature-gating flags.
+
+Change-Id: I7c020a66db484f88ae1cb7c15d860d503a3f8a3b
+Reviewed-on: http://gerrit.cloudera.org:8080/17499
+Tested-by: Kudu Jenkins
+Reviewed-by: Alexey Serbin <aserbin@cloudera.com>
+Reviewed-by: Grant Henke <granthenke@apache.org>
+(cherry picked from commit 923245291fade95febc36265cfba8cc92ee457d5)
+Reviewed-on: http://gerrit.cloudera.org:8080/17506
+Reviewed-by: Bankim Bhavsar <bankim@cloudera.com>
+
+
+Commit 4e724988fb9dc6eeb8cd4b91f46760a03cfa5fde in kudu's branch refs/heads/master from Alexey Serbin
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=4e72498 ]
+
+KUDU-2612 allow system user to read list of table replicas
+
+It turned out that txn system client wasn't able to send BEGIN_COMMIT to
+participating tablets if fine-grained authz is enabled.  Its request to
+get the list of tablets for a table was rejected: the system user isn't
+granted the METADATA privilege on any of user tables, of course.
+
+This patch addresses that deficiency, bypassing the fine-grained authz
+for the MasterService::GetTabletLocations() RPC if the caller is a
+service- or super-user.  In addition, tests are added to make sure the
+multi-row transaction API works as expected even in the presence of
+fine-grained authorization.
+
+Change-Id: I26f06af17e5ee85522e2ef867d41cf0f3ddbe5d5
+Reviewed-on: http://gerrit.cloudera.org:8080/17529
+Tested-by: Alexey Serbin <aserbin@cloudera.com>
+Reviewed-by: Andrew Wong <awong@cloudera.com>
+
+
+Commit 19d58ad4d05daaa0eb24408ddae4d479444e6e61 in kudu's branch refs/heads/branch-1.15.x from Alexey Serbin
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=19d58ad ]
+
+KUDU-2612 allow system user to read list of table replicas
+
+It turned out that txn system client wasn't able to send BEGIN_COMMIT to
+participating tablets if fine-grained authz is enabled.  Its request to
+get the list of tablets for a table was rejected: the system user isn't
+granted the METADATA privilege on any of user tables, of course.
+
+This patch addresses that deficiency, bypassing the fine-grained authz
+for the MasterService::GetTabletLocations() RPC if the caller is a
+service- or super-user.  In addition, tests are added to make sure the
+multi-row transaction API works as expected even in the presence of
+fine-grained authorization.
+
+Change-Id: I26f06af17e5ee85522e2ef867d41cf0f3ddbe5d5
+Reviewed-on: http://gerrit.cloudera.org:8080/17529
+Tested-by: Alexey Serbin <aserbin@cloudera.com>
+Reviewed-by: Andrew Wong <awong@cloudera.com>
+(cherry picked from commit 4e724988fb9dc6eeb8cd4b91f46760a03cfa5fde)
+Reviewed-on: http://gerrit.cloudera.org:8080/17532
+Reviewed-by: Grant Henke <granthenke@apache.org>
+Reviewed-by: Bankim Bhavsar <bankim@cloudera.com>
+
+
+Commit 4943e338307bd7e886a10fb6f8bccb2377f88d27 in kudu's branch refs/heads/master from Alexey Serbin
+[ https://gitbox.apache.org/repos/asf?p=kudu.git;h=4943e33 ]
+
+[client-test] KUDU-2612 remove FinalizeCommitTransaction
+
+This changelist addresses TODO in client-test, removing some cruft left
+from earlier phases of the txn-related work: FinalizeCommitTransaction()
+helper method is no longer needed because the transaction orchestration
+is already present.
+
+This patch doesn't contain any functional modifications.
+
+Change-Id: I8e5867cce9cb7e06e4b83ba85a40b6f9855bda7b
+Reviewed-on: http://gerrit.cloudera.org:8080/17668
+Reviewed-by: Andrew Wong <awong@cloudera.com>
+Tested-by: Alexey Serbin <aserbin@cloudera.com>
+
+

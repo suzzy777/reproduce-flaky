@@ -1,0 +1,265 @@
+I see that the table functional.lineitem_multiblock is loaded in a very peculiar way:
+{code}
+---- DATASET
+-- IMPALA-1881: Maximize data locality when scanning Parquet files with multiple row groups.
+functional
+---- BASE_TABLE_NAME
+lineitem_multiblock
+---- COLUMNS
+L_ORDERKEY BIGINT
+L_PARTKEY BIGINT
+L_SUPPKEY BIGINT
+L_LINENUMBER INT
+L_QUANTITY DECIMAL(12,2)
+L_EXTENDEDPRICE DECIMAL(12,2)
+L_DISCOUNT DECIMAL(12,2)
+L_TAX DECIMAL(12,2)
+L_RETURNFLAG STRING
+L_LINESTATUS STRING
+L_SHIPDATE STRING
+L_COMMITDATE STRING
+L_RECEIPTDATE STRING
+L_SHIPINSTRUCT STRING
+L_SHIPMODE STRING
+L_COMMENT STRING
+---- ROW_FORMAT
+DELIMITED FIELDS TERMINATED BY '|'
+---- LOAD
+`hadoop fs -mkdir -p /test-warehouse/lineitem_multiblock_parquet && \
+hadoop fs -Ddfs.block.size=1048576 -put -f \
+${IMPALA_HOME}/testdata/LineItemMultiBlock/000000_0 /test-warehouse/lineitem_multiblock_parquet
+====
+{code}
+
+Is it possible that the same blocksize is not set when loading the table from a snapshot?
+
+This is a new test introduced with Sailesh's multi-block parquet change.  It looks like the test assumes the scan ranges will be spread across all three impalads. But looking at the explain plan, it doesn't look like that's the case (anymore?).  Maybe something changed now that there's a snapshot generated with this table. e.g. Looks the file fits in one hdfs block -- not sure how the test tries to ensure the file spans blocks to get parallelism.
+
+I don't have time to look at it further until later tonight. [~sailesh], could you take a look? 
+
+In any case, [~alex.behm] I think this is probably a test bug and you could xfail the test until Sailesh has a chance to sort it out.
+
+That indeed seems to be the problem. I locally changed the block size of the file for lineitem_multiblock_parquet to our default of 128MB and I get exactly the same error.
+
+Looking at it now
+
+Commit in:
+
+http://github.mtv.cloudera.com/CDH/Impala/commit/c21a2032f6b9b6a0861993372da9d749a3e905d1
+
+http://sandbox.jenkins.cloudera.com/job/impala-cdh5.5.0-repeated-runs/13/testReport/query_test.test_scanners/TestParquet/test_verify_runtime_profile_exec_option____disable_codegen___False___abort_on_error___1___exec_single_node_rows_threshold___0___batch_size___0___num_nodes___0____table_format__parquet_none_/
+
+
+{code:java}
+query_test/test_scanners.py:221: in test_verify_runtime_profile
+    assert len(num_row_groups_list) == 4
+E   assert 3 == 4
+E    +  where 3 = len(['100', '117', '83'])
+{code}
+
+http://sandbox.jenkins.cloudera.com/job/impala-cdh5.5.x-exhaustive/52/
+
+
+{code:java}
+Error Message:
+query_test/test_scanners.py:221: in test_verify_runtime_profile     assert len(num_row_groups_list) == 4 E   assert 3 == 4 E    +  where 3 = len(['100', '165', '35'])
+
+Stack Trace:
+query_test/test_scanners.py:221: in test_verify_runtime_profile
+    assert len(num_row_groups_list) == 4
+E   assert 3 == 4
+E    +  where 3 = len(['100', '165', '35'])
+{code}
+
+I've been trying to reproduce this locally but I'm not able to. Not having the actual runtime profile, I believe what happens is that the scheduler probably schedules 2 blocks on the same node because it uses another replica. Which is probably why the test sees only 2 nodes in the runtime profile that read any row groups vs. our expected 3 nodes.
+
+But the result is still correct because we verify the result of the query before this failure. So if it happens quite often, I would just call it a flaky test for now. As for a fix, I think the only way to go is to remove the test, because the goal of the test was to check if 3 nodes read a block each. But if the scheduler has other plans, then we can't make it pass for 100% of the runs.
+
+The simple-scheduler tries to distribute split assignments across as many nodes as possible.  So, it seems that for some reason the file's blocks are not replicated on the third datanode for some reason.  Or, there is a bug in the ProcesSplit() logic that decides which row groups to process for the current split.
+
+How about adding some logging to the test to capture more information so that when it reproduces we can diagnose it?
+
+I think the blocks are replicated to third node. Looking at the exhaustive run logs (http://sandbox.jenkins.cloudera.com/job/impala-cdh5.5.x-exhaustive/52/consoleFull), the test passes 3/4 times, which means that the blocks are replicated on the third node.
+
+Also, I recently wrote a small mail on how the simple scheduler works for some other escalation. I'm pasting that here:
+
+{code:java}
+Looking at the code I saw the following. Roughly this is the order of priority of selecting replicas:
+"cached collocated replicas > collocated replicas > remote (cached or not) replicas"
+
+If cached reads are enabled, it will try to read a replica that is cached. However, as Alan pointed out, this may create a hotspot. So if that is the case you can try enabling the option "disable_cached_reads".
+
+a) If a multiple replicas are cached, it selects one of them randomly.
+
+b) If none of the replicas are cached, it tries to find replicas co-located with impalads and picks the datanode host that has the the least work (i.e. the least number of bytes that is to be read from it among all the co-located datanodes) and assigns it to it's local impalad.
+
+If neither a) or b) are true i.e. none of the replicas are neither cached nor local, it finds a datanode that has the least number of bytes to be read from it and assigns it to an impalad that it picks in a round robin fashion.
+{code}
+
+I think it might have something to do with the cached replicas.
+
+As for adding more logging to verify the problem, I think it would be best to print out the runtime profile in the console output in the case of a failure in this test. I'll put out a patch for that now.
+
+As we discussed in person, the scheduling policy for cached ranges shouldn't apply here because the table isn't cached (the 'location.is_cached' clause should be false).
+
+Next steps we discussed is to determine why there is skew in scheduling for this file (even if all nodes end up with at least one split).  Since each block is the same size and should be replicated on all 3 nodes, we should expect ComputeScanRangeAssignment() to evenly distribute splits across the 3 nodes.
+
+[~sailesh], this build does have the log files. Can you see if you can find something useful in there:
+ http://sandbox.jenkins.cloudera.com/job/impala-cdh5.5.x-exhaustive/52/
+
+I wrote a tiny script to dig through the runtime profiles and looks for the "NumRowGroups" values and none of them match what the error message said. I also couldn't find anything in the logs that pertain to this test. So I think not all the runtime profiles and logs got saved.
+
+This is still happening in various nightly builds. Not just test_verify_runtime_profile but also TestParquet.test_multiple_blocks. I spent a little while looking at it before I found this JIRA, but not sure what the cause is. 
+
+I think we need to prioritize fixing this after the New Year.
+
+A few updates to this issue:
+
+1. I'm going to rename the summary to reflect the test name, which has changed since the issue was filed. There is no {{test_verify_runtime_profile}} anymore; that test was renamed to {{test_multiple_blocks}}.
+
+2. I've been playing with ways to reproduce fails of flaky tests locally, and I used this one as my guinea pig since it's been known to be flaky. [~sailesh] if you still need a failing "runtime profile", I believe I have one for you. In this case it was easy to acquire since the test itself uses the runtime profile to decide whether it passes.
+
+In the attached profile, we only have 3 listings for the following:
+
+{code}
+$ grep -w NumRowGroups: runtime_profile.txt | wc -l
+3
+$ grep -w ScanRangesComplete: runtime_profile.txt | wc -l
+3
+$ 
+{code}
+
+The method of reproduction is awkward but written below in case someone is curious or wants to try his/her own hand at it.
+
+I was not able to reproduce the bug running the test on its own hundreds of times. I figured then that it's the other tests running in parallel that can cause this test to fail. So in one shell, I ran the parallel tests using {{impala-py.test}} directly:
+
+{code}
+impala-py.test -m "not execute_serially and not stress"  -n 4 \
+    --ignore="aux_parquet_data_load" --ignore="test-hive-udfs" \
+    --ignore="target" --ignore="comparison" --ignore="custom_cluster" \
+    --ignore="benchmark" --ignore="results" --ignore="util" \
+    --ignore="experiments" --ignore="verifiers" --ignore="build" \
+    --ignore="performance" --ignore="beeswax" \
+    --ignore="aux_custom_cluster_tests" \
+    --ignore="authorization" --ignore="common" \
+    --junitxml=/home/mikeb/Impala/tests/results/TEST-impala-parallel.xml \
+    --resultlog=/home/mikeb/Impala/tests/results/TEST-impala-parallel.log
+{code}
+
+
+Then in another shell, I ran the flaky test in a loop, set to attach {{pdb}} upon fail:
+
+{code}
+# looping shell script wraps around this
+impala-py.test --ignore custom_cluster -k test_multiple_blocks \
+    --resultlog=/home/mikeb/Impala/tests/results/TEST-impala-flaky.log \
+    --junitxml=/home/mikeb/Impala/tests/results/TEST-impala-flaky.xml \
+    --pdb
+{code}
+
+When the test fails, the runtime profile is already in scope (convenient) and I was able to save it as a text file.
+
+This failed again here: http://sandbox.jenkins.cloudera.com/view/Impala/view/Nightly-Builds/job/impala-master-repeated-runs-cdh5/414/
+
+Still failing.
+
+http://sandbox.jenkins.cloudera.com/job/impala-CI-rhel7/188
+
+{code}
+query_test.test_scanners.TestParquet.test_multiple_blocks[exec_option: {'disable_codegen': True, 'abort_on_error': 1, 'exec_single_node_rows_threshold': 0, 'batch_size': 0, 'num_nodes': 0} | table_format: parquet/none] (from pytest)
+Failing for the past 1 build (Since Unstable#188 )
+Took 1.6 sec.
+add description
+Error Message
+
+query_test/test_scanners.py:227: in test_multiple_blocks     assert len(num_row_groups_list) == 4 E   assert 3 == 4 E    +  where 3 = len(['100', '117', '83'])
+
+Stacktrace
+
+query_test/test_scanners.py:227: in test_multiple_blocks
+    assert len(num_row_groups_list) == 4
+E   assert 3 == 4
+E    +  where 3 = len(['100', '117', '83'])
+
+Standard Error
+
+-- executing against localhost:21000
+select count(l_orderkey) from functional_parquet.lineitem_multiblock;
+{code}
+
+Failed again: http://sandbox.jenkins.cloudera.com/job/impala-master-cdh5-trunk/1640/testReport/junit/query_test.test_scanners/TestParquet/test_multiple_blocks_exec_option____disable_codegen___False___abort_on_error___1___exec_single_node_rows_threshold___0___batch_size___0___num_nodes___0____table_format__parquet_none_/
+
+Hi [~sailesh], do you have an update on this one?  Do we need to collect any more info to make progress?
+
+[~dhecht] Sorry completely missed this. Will take a look again. Thanks for the runtime profile [~mikesbrown]
+
+Hit again: http://sandbox.jenkins.cloudera.com/view/Impala/view/Nightly-Builds/job/impala-master-cdh5-exhaustive/395/
+
+http://sandbox.jenkins.cloudera.com/job/impala-CI-rhel7/197/
+
+FYI, haven't forgotten about this. My top priority now. Still digging into it. Will post an update soon.
+
+FINALLY found the source of the problem. This problem shows up only when there are multiple impalads on the same IP address. What happens is the following:
+
+ComputeScanRangeAssignment() takes the scan ranges and schedules them to read from hosts(datanodes) based on which block is local to which host and a few other factors _(like which host has the least to be read from for the current query)_ as I laid out in one of my previous comments above. All this works fine. For this test, each of the 3 blocks should be scheduled to read from one host each(datanode).
+
+We have 3 hosts which are:
+127.0.0.1:31000
+127.0.0.1:31001
+127.0.0.1:31002
+
+After choosing which datanode to read from for a scan range, the backend local to that datanode has to be selected as per this line of code (simple-scheduler.cc:554):
+{code:java}
+      TBackendDescriptor backend;
+      RETURN_IF_ERROR(GetBackend(*data_host, &backend)); // data_host is the datanode selected for a scan range.
+      exec_hostport = backend.address;
+{code}
+
+GetBackend() basically returns a backend (i.e. an impalad) in _&backend_ which is ultimately assigned the scan range. The problem lies here -> If there are multiple backends on a particular IP address, it round robins the backends and returns one at a time. It does this using a process wide *backend\_map\_*
+
+Since this map is process wide, if there are multiple queries whose scan ranges are being scheduled at the same time, there is a pretty good chance that of the 3 scan ranges for our test, at least 2 are scheduled on the same backend (because the other parallel query could have moved the round robin step by 1 or more). This causes the test to fail (because the test requires each block i.e. scan range to be scanned by a different backend).
+
+This method of scheduling doesn't seem wrong to me. The test is just flaky. We should probably just not allow it to run in parallel with other tests. Any thoughts?
+
+Uploaded a review to mark the test as 'execute_serially'.
+
+http://gerrit.cloudera.org:8080/1889
+
+https://github.com/cloudera/Impala/commit/63e0a09e8a4529d6ddbb0623922e2a7bf282fee1
+
+This seems to have shown up again:
+http://sandbox.jenkins.cloudera.com/job/impala-cdh5.5.x-exhaustive/141/
+
+[~sailesh], please feel free to reassign if you are too busy with other JIRAs.
+
+{noformat}
+Error Message
+
+query_test/test_scanners.py:226: in test_multiple_blocks     assert len(num_row_groups_list) == 4 E   assert 3 == 4 E    +  where 3 = len(['100', '83', '117'])
+Stacktrace
+
+query_test/test_scanners.py:226: in test_multiple_blocks
+    assert len(num_row_groups_list) == 4
+E   assert 3 == 4
+E    +  where 3 = len(['100', '83', '117'])
+Standard Error
+
+-- executing against localhost:21000
+select count(l_orderkey) from functional_parquet.lineitem_multiblock;
+{noformat}
+
+Nevermind. This seems to be from the 5.5 build. May be consider backporting the fix to avoid false positive.
+
+Thanks for notifying [~kwho]. [~jyu@cloudera.com] This test fails in our old 5.5.x builds. The following commit just makes the test execute serially so that this failure does not show up again. Do you think it should be backported?
+
+https://github.com/cloudera/Impala/commit/63e0a09e8a4529d6ddbb0623922e2a7bf282fee1
+
+Closing as we don't see this anymore and we know it's fixed on trunk.
+
+The underlying root cause was properly fixed in aae6dd1e65a9e19c508ef41e0cf8a196739f8dc3
+
+Thanks [~alex.behm].
+
+For reference in the incubator repo, the commit is:
+https://github.com/apache/incubator-impala/commit/0ad935b63c23029bd4cac4beefde6b3b7c0e322b
+

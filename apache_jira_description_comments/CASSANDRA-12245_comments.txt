@@ -1,0 +1,382 @@
+bq. just iterate through sstables, not worrying about duplicates, and include the timestamp of the original write in the MV mutation.
+
+I could misunderstand this but if you talking about dealing with each sstable completely individually, I don't think we can do that. It's not that we have to merge sstables to avoid dealing with duplicates, it's we need to current full version of a row to create the proper MV entry. For instance, say you have a first insert to a row in one sstable that contains the following columns/values {{c1=2, c2=3, c3='foo'}}, and a later update to that row in another sstable containing {{c1=4}}. And further say that {{c1}} is part of your view PK. If we deal with both sstable individually, in the first case we'll insert an entry for {{c1=2}}, with the other value, while for the 2nd sstable we'll create a *different* entry for {{c1=4}} with no other values. Which is doubly wrong as the {{c1=2}} entry shouldn't exist, and the {{c1=4}} entry should have the other values for {{c2}} and {{c3}}.
+
+With that said, several weeks to build a view over 3TB is indeed not ideal, and we can indeed at least do vnodes in parallel. 
+
+Good point about the partial row updates, hadn't thought about that case. Could probably make it do the row retrieval conditionally based on whether all fields are in the sstable or not (most rows will be, thanks to compaction), but then you probably run into a lot of corner cases.
+
+Doing vnodes in parallel can already give a massive boost (~25x in my case, I guess) so that'll do fine :)
+
+[Here|https://github.com/apache/cassandra/compare/trunk...adelapena:12245-trunk] is a first draft of the patch.
+
+At first, it seems that the current implementation is not properly retrieving the view build status because of a mistake at [{{SystemKeyspace.getViewBuildStatus}}|https://github.com/apache/cassandra/blob/9c6f87c35f364ec6a88775cb3d0cf143e36635e7/src/java/org/apache/cassandra/db/SystemKeyspace.java#L501-L521]. This makes the view build to always start from the beginning.
+
+The provided patch does the following:
+* {{ViewBuilder}} changes to be responsible for the building of a view for a single given token range.
+* The newly created {{ViewBuilderController}} reads the local token ranges, splits them to satisfy a concurrency factor, and runs a {{ViewBuilder}} for each of them.
+* Each {{ViewBuilder}} task calls to {{ViewBuilderController}} at termination to know if it is the last pending build task. If it is, it marks the view as built.
+* When {{ViewBuilderController}} receives the finalization signal of the last {{ViewBuilder}}, it double-checks if there are new local ranges that weren't considered at the beginning of the build. If there are new ranges, new {{ViewBuilder}}s are created for them.
+* Given that we have a {{ViewBuilder}} per local range, the key of the table {{system.views_builds_in_progress}} is modified to include the bounds of the token range. So, we will have an entry in the table per each {{ViewBuilder}}. The number of covered keys per range is also recorded in the table.
+
+Some considerations about the implementation:
+* {{ViewBuilder}} and {{ViewBuilderController}} are probably not the best names. Maybe we could rename {{ViewBuilder}} to something like {{ViewBuilderTask}} or {{ViewBuilderForRange}}, and rename {{ViewBuilderController}} to {{ViewBuilder}}.
+* The concurrency factor is based on {{conf.concurrent_compactors}} because the views are built on the {{CompactionManager}}, but we may be interested in a different value.
+* The patch tries to evenly split the token ranges in the minimum number of parts to satisfy the concurrency factor, and it never merges ranges. So, with the default 256 virtual nodes (and a lesser concurrency factor) we create 256 build tasks. We might be interested in a different planning. If we want the number of tasks to be lesser than the number of local ranges we should modify the {{ViewBuilder}} task to be responsible for several ranges, although it will complicate the status tracking.
+* Probably there is a better way of implementing {{ViewBuilder.getCompactionInfo}}. The patch uses {{keysBuilt}}/{{ColumnFamilyStore.estimatedKeysForRange}} to estimate the completion, which could deal to have task completion status over 100%, depending on the estimation.
+
+[~slebresne], [~tjake], what do you think?
+
+[~adelapena] since you change the key of the table {{system.views_builds_in_progress}}, how would we handle migration from previous version of the table to the new version ? ALTER TABLE does not work on primary key columns. 
+
+Good point, [~doanduyhai]. 
+
+I have [updated|https://github.com/adelapena/cassandra/commit/35588ca00337465fedfb42e6cc001773bb739d2f] the patch to use a new separate table, {{system.views_builds_in_progress_v2}}. The downside is that pending view builds will be restarted during an upgrade to 4.x, which seems reasonable to me.
+
+I have also [updated the dtests|https://github.com/adelapena/cassandra-dtest/commit/91f6d3d88de97ec7e18b5243f60c359022bf41c3] to choose the proper system table depending on the version.
+
+Thanks for the patch and sorry for the delay! Had an initial look at the patch, overall looks good, I have the following comments/questions/remarks:
+
+bq. The newly created ViewBuilderController reads the local token ranges, splits them to satisfy a concurrency factor, and runs a ViewBuilder for each of them.
+
+It would be nice to maybe try to reuse the {{Splitter}} methods if possible, so we can reuse tests, or if that's not straightforward maybe put the methods on splitter and add some tests to make sure it's working correctly.
+
+bq.  When ViewBuilderController receives the finalization signal of the last ViewBuilder, it double-checks if there are new local ranges that weren't considered at the beginning of the build. If there are new ranges, new {{ViewBuilder}}s are created for them.
+
+This will not work if the range movement which created the new local range finishes after the view has finished building. This problem exists currently and is unrelated to the view build process itself, but more related to the range movement completion which should ensure the views are properly built before the operation finishes, so I created CASSANDRA-13762 to handle this properly.
+
+bq. Given that we have a ViewBuilder per local range, the key of the table system.views_builds_in_progress is modified to include the bounds of the token range. So, we will have an entry in the table per each ViewBuilder. The number of covered keys per range is also recorded in the table.
+
+Can probably remove the generation field from the builds in progress table and [remove this comment|https://github.com/adelapena/cassandra/blob/94f3d0d02bb5f849e4d54857d0b33531a5650643/src/java/org/apache/cassandra/db/view/ViewBuilder.java#L124]
+
+bq. I have updated the patch to use a new separate table, system.views_builds_in_progress_v2
+
+{{views_builds_in_progress_v2}} sounds a bit hacky, so perhaps we should call it {{system.view_builds_in_progress}} (remove the s) and also add a NOTICE entry informing the previous table was replaced and data files can be removed.
+
+bq. The downside is that pending view builds will be restarted during an upgrade to 4.x, which seems reasonable to me.
+
+Sounds reasonable to me too.
+
+bq. ViewBuilder and ViewBuilderController are probably not the best names. Maybe we could rename ViewBuilder to something like ViewBuilderTask or ViewBuilderForRange, and rename ViewBuilderController to ViewBuilder.
+
+{{ViewBuilder}} and {{ViewBuilderTask}} LGTM
+
+bq. The concurrency factor is based on conf.concurrent_compactors because the views are built on the CompactionManager, but we may be interested in a different value.
+
+I'm a bit concerned about starving the compaction executor for a long period during view build of large base tables, so we should probably have another option like {{concurret_view_builders}} with a conservative default and perhaps control the concurrency at the {{ViewBuilderController}}. WDYT?
+
+bq. The patch tries to evenly split the token ranges in the minimum number of parts to satisfy the concurrency factor, and it never merges ranges. So, with the default 256 virtual nodes (and a lesser concurrency factor) we create 256 build tasks. We might be interested in a different planning. If we want the number of tasks to be lesser than the number of local ranges we should modify the ViewBuilder task to be responsible for several ranges, although it will complicate the status tracking.
+
+I think this is good to start with, we can improve the planning later if necessary. I don't think there is much gain from merging ranges to have smaller tasks.
+
+bq. Probably there is a better way of implementing ViewBuilder.getCompactionInfo. The patch uses keysBuilt/ColumnFamilyStore.estimatedKeysForRange to estimate the completion, which could deal to have task completion status over 100%, depending on the estimation.
+
+How about using {{prevToken.size(range.right)}} (introduced by CASSANDRA-7032)? Even though this will not be available for BytesToken (used by ByteOrderedPartitioner, which is rarely used, so could maybe fallback to the current imprecise calculation in that case).
+
+Other comments:
+
+* Avoid submitting view builder when view is already built instead of checking on the ViewBuilder ([here|https://github.com/adelapena/cassandra/blob/94f3d0d02bb5f849e4d54857d0b33531a5650643/src/java/org/apache/cassandra/db/view/ViewBuilder.java#L109])
+* ViewBuilder seems to be reimplementing some of the logic of {{PartitionRangeReadCommand}}, so I wonder if we shoud take this chance to simplify and use that instead of manually constructing the commands via ReducingKeyIterator and multiple {{SinglePartitionReadCommands}}? We can totally do this in other ticket if you prefer.
+* Perform view marking on ViewBuilderController [instead of ViewBuilder|https://github.com/adelapena/cassandra/blob/94f3d0d02bb5f849e4d54857d0b33531a5650643/src/java/org/apache/cassandra/db/view/ViewBuilder.java#L177]
+* Updating the view built status [at every key|https://github.com/adelapena/cassandra/blob/94f3d0d02bb5f849e4d54857d0b33531a5650643/src/java/org/apache/cassandra/db/view/ViewBuilder.java#L163] is perhaps a bit inefficient and unnecessary, so perhaps we should update it every 1000 keys or so.
+* Would be nice to update the {{interrupt_build_process_test}} to stop halfway through the build (instead of the start of the build) and verify it it's being resumed correctly with the new changes.
+
+[Here|https://github.com/apache/cassandra/compare/trunk...adelapena:12245-trunk] is a new version of the patch addressing the review comments. The updated dtests are [here|https://github.com/apache/cassandra-dtest/compare/master...adelapena:12245].
+
+bq. It would be nice to maybe try to reuse the {{Splitter}} methods if possible, so we can reuse tests, or if that's not straightforward maybe put the methods on splitter and add some tests to make sure it's working correctly.
+
+I have moved the [methods to split the ranges|https://github.com/adelapena/cassandra/blob/af6b2547b58b8215c65be7546173f3c48b398072/src/java/org/apache/cassandra/dht/Splitter.java#L137-L187] to the {{Splitter}}, reusing its [{{valueForToken}}|https://github.com/adelapena/cassandra/blob/af6b2547b58b8215c65be7546173f3c48b398072/src/java/org/apache/cassandra/dht/Splitter.java#L47] method. Tests [here|https://github.com/adelapena/cassandra/blob/af6b2547b58b8215c65be7546173f3c48b398072/test/unit/org/apache/cassandra/dht/SplitterTest.java#L162-L224].
+
+bq. Can probably remove the generation field from the builds in progress table and remove this comment
+
+Removed.
+
+bq. {{views_builds_in_progress_v2}} sounds a bit hacky, so perhaps we should call it {{system.view_builds_in_progress}} (remove the s) and also add a NOTICE entry informing the previous table was replaced and data files can be removed.
+
+Renamed to {{system.view_builds_in_progress}}. Added an [NEWS.txt entry|https://github.com/adelapena/cassandra/blob/af6b2547b58b8215c65be7546173f3c48b398072/NEWS.txt#L183-L185] informing about the replacement.
+
+bq. I'm a bit concerned about starving the compaction executor for a long period during view build of large base tables, so we should probably have another option like {{concurret_view_builders}} with a conservative default and perhaps control the concurrency at the {{ViewBuilderController}}. WDYT?
+
+Agree. I have added a new dedicated [executor|https://github.com/adelapena/cassandra/blob/af6b2547b58b8215c65be7546173f3c48b398072/src/java/org/apache/cassandra/db/compaction/CompactionManager.java#L126] in the {{CompactionManager}}, similar to the executors used for validation and cache cleanup. The concurrency of this executor is determined by the new config property [{{concurrent_materialized_view_builders}}|https://github.com/adelapena/cassandra/blob/af6b2547b58b8215c65be7546173f3c48b398072/conf/cassandra.yaml#L756], which defaults to a perhaps too much conservative value of {{1}}. This property can be modified through both JMX and the new [{{setconcurrentviewbuilders}}|https://github.com/adelapena/cassandra/blob/af6b2547b58b8215c65be7546173f3c48b398072/src/java/org/apache/cassandra/tools/nodetool/SetConcurrentViewBuilders.java] and [{{getconcurrentviewbuilders}}|https://github.com/adelapena/cassandra/blob/af6b2547b58b8215c65be7546173f3c48b398072/src/java/org/apache/cassandra/tools/nodetool/GetConcurrentViewBuilders.java] nodetool commands. These commands are tested [here|https://github.com/adelapena/cassandra-dtest/blob/cf893982c361fd7b6018b2570d3a5a33badd5424/nodetool_test.py#L162-L190].
+
+I'm not sure about if it still makes sense for the builder task to extend {{CompactionInfo.Holder}}. If so, I'm neither sure about how to use {{prevToken.size(range.right)}} (that returns a {{double}}) to create {{CompationInfo}} objects. WDYT?
+
+bq. ViewBuilder seems to be reimplementing some of the logic of PartitionRangeReadCommand, so I wonder if we shoud take this chance to simplify and use that instead of manually constructing the commands via ReducingKeyIterator and multiple SinglePartitionReadCommands? We can totally do this in other ticket if you prefer.
+
+I would prefer to do this in another ticket.
+
+bq. Perform view marking on ViewBuilderController instead of ViewBuilder
+
+I have moved the marking of system tables (and the retries in case of failure) from the {{ViewBuilderTask}} to the {{ViewBuilder}}, using a callback to do the marking. I think the code is clearer this way.
+
+bq. Updating the view built status at every key is perhaps a bit inefficient and unnecessary, so perhaps we should update it every 1000 keys or so.
+
+Done, it is updated [every 1000 keys|https://github.com/adelapena/cassandra/blob/af6b2547b58b8215c65be7546173f3c48b398072/src/java/org/apache/cassandra/db/view/ViewBuilderTask.java#L62]. It doesn't seem to make a great difference in some small benchmarks that I have run.
+
+bq. Would be nice to update the {{interrupt_build_process_test}} to stop halfway through the build (instead of the start of the build) and verify it it's being resumed correctly with the new changes.
+
+Updated [here|https://github.com/adelapena/cassandra-dtest/blob/cf893982c361fd7b6018b2570d3a5a33badd5424/materialized_views_test.py#L935-L969]. It also uses [a byteman script|https://github.com/adelapena/cassandra-dtest/blob/cf893982c361fd7b6018b2570d3a5a33badd5424/byteman/skip_view_build_finalization.btm] to make sure that the MV build isn't finished before stopping the cluster, which is more likely to happen.
+
+CI results seem ok, there are no failures in unit tests and the failing dtests seem unrelated.
+
+Finally getting to this after a while, sorry for the delay. Thanks for the update! Had another look at the patch and this is looking much better, see some follow-up comments below:
+
+bq. I have moved the methods to split the ranges to the Splitter, reusing its valueForToken method. Tests here.
+
+Awesome, looks much better now! It seems like the way the number of tokens in a range was computed by {{abs(range.right - range.left)}} may not work correctly for some wrap-around cases, as shown by [this test case|https://github.com/pauloricardomg/cassandra/blob/2760bbbc25a2ad9a9bbf9d29a0dc19e1e3bfb237/test/unit/org/apache/cassandra/dht/SplitterTest.java#L184]. Even though this shouldn't break when local ranges are used , I fixed it on [this commit|https://github.com/pauloricardomg/cassandra/commit/2760bbbc25a2ad9a9bbf9d29a0dc19e1e3bfb237] to make sure split works correctly for wrap-around ranges. Can you confirm this is correct?
+
+Other than that, it seems like you added unit tests only for {{Murmur3Partitioner}}, would you mind extending {{testSplit()}} to {{RandomPartitioner}}?
+
+bq. Agree. I have added a new dedicated executor in the CompactionManager, similar to the executors used for validation and cache cleanup. The concurrency of this executor is determined by the new config property concurrent_materialized_view_builders, which defaults to a perhaps too much conservative value of 1. This property can be modified through both JMX and the new setconcurrentviewbuilders and getconcurrentviewbuilders nodetool commands. These commands are tested here.
+
+I think having a dedicated executor will ensure view building doesn't compete with compactions for the compaction executor, good job! One problem I see though is that if the user is finding its view building slow it will try to increase the number of concurrent view builders via nodetool, but it will have no effect since the range was split in the previously number of concurrent view builders. Given this will be a pretty common scenario for large datasets, how about splitting the range in multiple smaller tasks, so that if the user increases {{concurrent_view_builders}} the other tasks immediately start executing?
+
+We could use a simple approach of splitting the local range in let's say 1000 hard-coded parts, or be smarter and make each split have ~100MB or so. In this way we can keep {{concurrent_materialized_view_builders=1}} by default, and users with large base tables are able to increase it and see immediate effect via nodetool. WDYT?
+
+bq. I would prefer to do this in another ticket.
+
+Agreed.
+
+bq. I have moved the marking of system tables (and the retries in case of failure) from the ViewBuilderTask to the ViewBuilder, using a callback to do the marking. I think the code is clearer this way.
+
+Great, looks much cleaner indeed! One minor thing is that if there's a failure after some {{ViewBuildTasks}} were completed, it will resume that subtask from its last token while it already finished. Could we maybe set the last_token = end_token when the task is finished to flag it was already finished and avoid resuming the task when that is the case?
+
+bq. Updated here. It also uses a byteman script to make sure that the MV build isn't finished before stopping the cluster, which is more likely to happen.
+
+The dtest looks mostly good, except for the following nits:
+* {{concurrent_materialized_view_builders=1}} when the nodes are restarted. Can you set the configuration value during cluster setup phase (instead of setting via nodetool) to make sure the restarted view builds will be parallel?
+* can probably use {{self._wait_for_view("ks", "t_by_v")}} [here|https://github.com/adelapena/cassandra-dtest/blob/cf893982c361fd7b6018b2570d3a5a33badd5424/materialized_views_test.py#L982]
+* We cannot ensure key 10000 was not built [here|https://github.com/adelapena/cassandra-dtest/blob/cf893982c361fd7b6018b2570d3a5a33badd5424/materialized_views_test.py#L980] which may cause flakiness, so it's probably better to check for {{self.assertNotEqual(len(list(session.execute("SELECT count\(*\) FROM t_by_v;"))), 10000)}} or something like that.
+* It would be nice to check that the view build was actually removed on restart, by checking for the log entry {{Resuming view build for range}}
+
+bq. I'm not sure about if it still makes sense for the builder task to extend CompactionInfo.Holder. If so, I'm neither sure about how to use prevToken.size(range.right) (that returns a double) to create CompationInfo objects. WDYT?
+
+I think it's still useful to show view build progress via {{nodetool compactionstats}}, so I created a new method {{Splitter.positionInRange(Token token, Range<Token> range)}} which gives the position of a token relative to a range and used that to show view build progress when a splitter is present. When it's not (such as the case of {{ByterOrderedPartitioner}}, we fallback to the progress based on the keys estimate. This is implemented on [this commit|https://github.com/pauloricardomg/cassandra/commit/bcdbca614e4e049c3b0c965ae0985a2dea2939d1]. Please let me know what do you think about this approach.
+
+In addition to the suggestion above, I also made the following improvements:
+* Select only sstables that fall into the {{ViewBuildTask}} range ([commit|https://github.com/pauloricardomg/cassandra/commit/3694c63678f6872477531825914a89a072f8f67d])
+* Simplify ViewBuilderTask loop ([commit|https://github.com/pauloricardomg/cassandra/commit/3c4e2ac65b7a3ca050450400392735fb3738ecd7])
+* It's pretty rare but in the case of collisions it's possible for multiple keys to share the same token, so I updated the {{ViewBuilderTask}} loop to build all the keys sharing the same token ([commit|https://github.com/pauloricardomg/cassandra/commit/4ad0deb1de9d5dbc414c8d83d87256481e307d9e])
+
+I created a [PR|https://github.com/adelapena/cassandra/pull/1] on your branch with the above suggestions.
+
+Even though the patch is looking good and has some dtest coverage, I feel that we are still missing some unit testing to have confidence this is working as desired and catch any subtle regression, given this is critical for correct MV functioning. With that said, it would be nice if we could test that {{ViewBuilderTask}} is correctly building a specific range and maybe extend {{ViewTest.testViewBuilderResume}} to test view building/resume with different number of concurrent view builders. What do you think?
+
+Sorry for the delay, and thank for the thorough review. I've updated [the patch|https://github.com/apache/cassandra/compare/trunk...adelapena:12245-trunk] addressing the comments.
+
+bq. It seems like the way the number of tokens in a range was computed by abs(range.right - range.left) may not work correctly for some wrap-around cases, as shown by [this test case|https://github.com/pauloricardomg/cassandra/blob/2760bbbc25a2ad9a9bbf9d29a0dc19e1e3bfb237/test/unit/org/apache/cassandra/dht/SplitterTest.java#L184]. Even though this shouldn't break when local ranges are used , I fixed it on [this commit|https://github.com/pauloricardomg/cassandra/commit/2760bbbc25a2ad9a9bbf9d29a0dc19e1e3bfb237] to make sure split works correctly for wrap-around ranges. Can you confirm this is correct?
+
+I think this is right, merged.
+
+bq. Other than that, it seems like you added unit tests only for Murmur3Partitioner, would you mind extending testSplit() to RandomPartitioner?
+
+Done [here|https://github.com/apache/cassandra/commit/6f92541abaa61ed789f50f67c8800af3f97162a5].
+
+bq. I think having a dedicated executor will ensure view building doesn't compete with compactions for the compaction executor, good job! One problem I see though is that if the user is finding its view building slow it will try to increase the number of concurrent view builders via nodetool, but it will have no effect since the range was split in the previously number of concurrent view builders. Given this will be a pretty common scenario for large datasets, how about splitting the range in multiple smaller tasks, so that if the user increases {{concurrent_view_builders}} the other tasks immediately start executing?
+bq. We could use a simple approach of splitting the local range in let's say 1000 hard-coded parts, or be smarter and make each split have ~100MB or so. In this way we can keep {{concurrent_materialized_view_builders=1}} by default, and users with large base tables are able to increase it and see immediate effect via nodetool. WDYT?
+
+This makes a lot of sense. I'm worried about creating thousands of tasks for large datasets if the number of tasks is relative to the amount of data. Instead, I think we could fix the number of partitions to the higher reasonable number of parallel tasks, something like [a multiple of the number of available processors|https://github.com/adelapena/cassandra/blob/e460b3b76935cad60a9dc1e00c8d3af8bfa9584a/src/java/org/apache/cassandra/db/view/ViewBuilder.java#L59]. This would provide the desired immediate performance improvement if the user increases the number of concurrent view builders while keeping the number of tasks limited, independently of the amount of data. What do you think? Does it make any sense?
+
+bq. Great, looks much cleaner indeed! One minor thing is that if there's a failure after some {{ViewBuildTasks}} were completed, it will resume that subtask from its last token while it already finished. Could we maybe set the last_token = end_token when the task is finished to flag it was already finished and avoid resuming the task when that is the case?
+
+Done [here|https://github.com/adelapena/cassandra/blob/d505d8014524b72422ba1eee036494bda39f53f0/src/java/org/apache/cassandra/db/view/ViewBuilderTask.java#L166-L168].
+
+One case that we hadn't considered is that if the token ranges change or are split in a different way when resuming a build then the progress would be lost, because {{ViewBuildTask}} won't found any entry for the new range at {{system.view_builds_in_progress}}. This would be specially true if we split the ranges by their data size. So, independently of how we finally split the ranges, I think it makes sense to load all the ranges with any progress from {{system.view_builds_in_progress}} at {{ViewBuilder}} before splitting the local ranges, create a task for those of them that are not already finish, and then split any remaining uncovered local range. It also has the advantage of skipping the creation of tasks for already completed ranges. What do you think?
+
+I have also removed the method {{SystemKeyspace.beginViewBuild}} because I don't see any need of saving a range without progress. Indeed, if the view build is restarted it is probably better to don't restore the task without progress and let their tokens to be processed by the split logic. 
+
+bq. The dtest looks mostly good, except for the following nits:
+bq.  * {{concurrent_materialized_view_builders=1}} when the nodes are restarted. Can you set the configuration value during cluster setup phase (instead of setting via nodetool) to make sure the restarted view builds will be parallel?
+
+Sure, done [here|https://github.com/adelapena/cassandra-dtest/blob/12245/materialized_views_test.py#L949-L951].
+
+bq.  * can probably use {{self._wait_for_view("ks", "t_by_v")}} [here|https://github.com/adelapena/cassandra-dtest/blob/cf893982c361fd7b6018b2570d3a5a33badd5424/materialized_views_test.py#L982]
+
+The first wait does the opposite to {{_wait_for_view}}, it waits until there is some progress. But we can use {{self._wait_for_view("ks", "t_by_v")}} [here|https://github.com/adelapena/cassandra-dtest/blob/12245/materialized_views_test.py#L1005]. Did you mean that?
+
+bq.  * We cannot ensure key 10000 was not built here which may cause flakiness, so it's probably better to check for {{self.assertNotEqual(len(list(session.execute("SELECT count(*) FROM t_by_v;"))), 10000)}} or something like that.
+
+Good catch, done [here|https://github.com/adelapena/cassandra-dtest/blob/12245/materialized_views_test.py#L1002].
+
+bq.  * It would be nice to check that the view build was actually removed on restart, by checking for the log entry {{Resuming view build for range}}
+
+Done [here|https://github.com/adelapena/cassandra-dtest/blob/12245/materialized_views_test.py#L1020] and also [before restarting|https://github.com/adelapena/cassandra-dtest/blob/12245/materialized_views_test.py#L991-L994]
+
+bq. I created a [PR|https://github.com/adelapena/cassandra/pull/1] on your branch with the above suggestions.
+
+Merged, thanks!
+
+bq. Even though the patch is looking good and has some dtest coverage, I feel that we are still missing some unit testing to have confidence this is working as desired and catch any subtle regression, given this is critical for correct MV functioning. With that said, it would be nice if we could test that {{ViewBuilderTask}} is correctly building a specific range and maybe extend {{ViewTest.testViewBuilderResume}} to test view building/resume with different number of concurrent view builders. What do you think?
+
+Makes sense. The new test for {{ViewBuilderTask}} is [here|https://github.com/adelapena/cassandra/blob/d505d8014524b72422ba1eee036494bda39f53f0/test/unit/org/apache/cassandra/db/view/ViewBuilderTaskTest.java], and I've extended [{{ViewTest.testViewBuilderResume}}|https://github.com/adelapena/cassandra/blob/d505d8014524b72422ba1eee036494bda39f53f0/test/unit/org/apache/cassandra/cql3/ViewTest.java#L1323-L1388] to run with different number of concurrent view builders.
+
+CI is running at:
+||[utest|http://jenkins-cassandra.datastax.lan/view/Dev/view/adelapena/job/adelapena-12245-trunk-testall/]||[dtest|http://jenkins-cassandra.datastax.lan/view/Dev/view/adelapena/job/adelapena-12245-trunk-dtest/]||
+
+Getting back to this after a while, sorry about the delay. We are really close now, I think we can wrap up after this last round of review. See follow-up below:
+
+bq. This makes a lot of sense. I'm worried about creating thousands of tasks for large datasets if the number of tasks is relative to the amount of data. Instead, I think we could fix the number of partitions to the higher reasonable number of parallel tasks, something like a multiple of the number of available processors. This would provide the desired immediate performance improvement if the user increases the number of concurrent view builders while keeping the number of tasks limited, independently of the amount of data. What do you think? Does it make any sense?
+
+Awesome! One minor thing is that we should probably only split the view build tasks at all if the base table is larger than a given size (let's say 500MB or so?), to avoid 4 * num_processor flushes for base tables with negligible size, WDYT?
+
+bq. One case that we hadn't considered is that if the token ranges change or are split in a different way when resuming a build then the progress would be lost, because ViewBuildTask won't found any entry for the new range at system.view_builds_in_progress. This would be specially true if we split the ranges by their data size. So, independently of how we finally split the ranges, I think it makes sense to load all the ranges with any progress from system.view_builds_in_progress at ViewBuilder before splitting the local ranges, create a task for those of them that are not already finish, and then split any remaining uncovered local range. It also has the advantage of skipping the creation of tasks for already completed ranges. What do you think?
+
+Good idea! This will prevent a node from computing new tasks for already built subranges if a new node joins the ring during view build. I will add a dtest to verify that scenario on CASSANDRA-13762.
+
+bq. I have also removed the method SystemKeyspace.beginViewBuild because I don't see any need of saving a range without progress. Indeed, if the view build is restarted it is probably better to don't restore the task without progress and let their tokens to be processed by the split logic. 
+
++1
+
+bq. The first wait does the opposite to _wait_for_view, it waits until there is some progress. But we can use self._wait_for_view("ks", "t_by_v") here. Did you mean that?
+
+Yep.
+
+bq. Makes sense. The new test for ViewBuilderTask is here, and I've extended ViewTest.testViewBuilderResume to run with different number of concurrent view builders.
+
+Awesome, this looks much better now, thanks!
+
+I had a final skim through the patch and I think we covered everything and this looks much more robust now. Three minor things before we can close this:
+- I noticed we don't stop in-progess view builds when a view is removed, would you mind adding that?
+- ViewBuildExecutor is being constructed with minThreads=1 and maxPoolSize=concurrent_materialized_view_builders, but according to the {{DebuggableThreadPoolExecutor}}'s' [javadoc|https://github.com/apache/cassandra/blob/8b3a60b9a7dbefeecc06bace617279612ec7092d/src/java/org/apache/cassandra/concurrent/DebuggableThreadPoolExecutor.java#L33], this will actually make the executor with size 1 since maxPoolSize is not supported by {{DebuggableThreadPoolExecutor}} - and even if it were, new threads would only be created after the queue of the initial threads were full (which is quite unintuitive), but we actually want the pool to have concurrent_materialized_view_builders concurrent threads at most, so we should use the {{threadCount}} constructor instead - at some point we should actually remove the maximumPoolSize constructors from the TPE's since it can be quite confusing.
+- In the linked dtest branch results, {{base_replica_repair_with_contention_test}} is showing the following error:
+{noformat}
+ERROR [InternalResponseStage:1] 2017-10-11 11:03:16,005 CassandraDaemon.java:211 - Exception in thread Thread[InternalResponseStage:1,5,main]
+java.lang.RuntimeException: javax.management.InstanceAlreadyExistsException: org.apache.cassandra.db:type=Tables,keyspace=ks,table=t
+	at org.apache.cassandra.db.ColumnFamilyStore.<init>(ColumnFamilyStore.java:484) ~[main/:na]
+	at org.apache.cassandra.db.ColumnFamilyStore.createColumnFamilyStore(ColumnFamilyStore.java:639) ~[main/:na]
+	at org.apache.cassandra.db.ColumnFamilyStore.createColumnFamilyStore(ColumnFamilyStore.java:613) ~[main/:na]
+	at org.apache.cassandra.db.ColumnFamilyStore.createColumnFamilyStore(ColumnFamilyStore.java:604) ~[main/:na]
+	at org.apache.cassandra.db.Keyspace.initCf(Keyspace.java:420) ~[main/:na]
+	at org.apache.cassandra.db.Keyspace.<init>(Keyspace.java:333) ~[main/:na]
+	at org.apache.cassandra.db.Keyspace.open(Keyspace.java:133) ~[main/:na]
+	at org.apache.cassandra.db.Keyspace.open(Keyspace.java:110) ~[main/:na]
+	at org.apache.cassandra.service.StorageService.getRangesForEndpoint(StorageService.java:3467) ~[main/:na]
+	at org.apache.cassandra.service.StorageService.getLocalRanges(StorageService.java:161) ~[main/:na]
+	at org.apache.cassandra.db.view.ViewBuilder.build(ViewBuilder.java:125) ~[main/:na]
+	at org.apache.cassandra.db.view.ViewBuilder.loadStatusAndBuild(ViewBuilder.java:93) ~[main/:na]
+	at org.apache.cassandra.db.view.ViewBuilder.<init>(ViewBuilder.java:86) ~[main/:na]
+	at org.apache.cassandra.db.view.View.build(View.java:201) ~[main/:na]
+	at org.apache.cassandra.db.view.ViewManager.reload(ViewManager.java:132) ~[main/:na]
+	at org.apache.cassandra.db.Keyspace.<init>(Keyspace.java:335) ~[main/:na]
+	at org.apache.cassandra.db.Keyspace.open(Keyspace.java:133) ~[main/:na]
+	at org.apache.cassandra.db.Keyspace.open(Keyspace.java:110) ~[main/:na]
+	at org.apache.cassandra.schema.Schema.createKeyspace(Schema.java:647) ~[main/:na]
+	at java.util.HashMap$Values.forEach(HashMap.java:980) ~[na:1.8.0_144]
+	at java.util.Collections$UnmodifiableCollection.forEach(Collections.java:1080) ~[na:1.8.0_144]
+	at org.apache.cassandra.schema.Schema.merge(Schema.java:588) ~[main/:na]
+	at org.apache.cassandra.schema.Schema.mergeAndAnnounceVersion(Schema.java:564) ~[main/:na]
+	at org.apache.cassandra.schema.MigrationTask$1.response(MigrationTask.java:89) ~[main/:na]
+	at org.apache.cassandra.net.ResponseVerbHandler.doVerb(ResponseVerbHandler.java:53) ~[main/:na]
+	at org.apache.cassandra.net.MessageDeliveryTask.run(MessageDeliveryTask.java:72) ~[main/:na]
+	at java.util.concurrent.Executors$RunnableAdapter.call(Executors.java:511) ~[na:1.8.0_144]
+	at java.util.concurrent.FutureTask.run(FutureTask.java:266) ~[na:1.8.0_144]
+	at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1149) ~[na:1.8.0_144]
+	at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:624) [na:1.8.0_144]
+	at org.apache.cassandra.concurrent.NamedThreadFactory.lambda$threadLocalDeallocator$0(NamedThreadFactory.java:81) [main/:na]
+	at java.lang.Thread.run(Thread.java:748) ~[na:1.8.0_144]
+Caused by: javax.management.InstanceAlreadyExistsException: org.apache.cassandra.db:type=Tables,keyspace=ks,table=t
+	at com.sun.jmx.mbeanserver.Repository.addMBean(Repository.java:437) ~[na:1.8.0_144]
+	at com.sun.jmx.interceptor.DefaultMBeanServerInterceptor.registerWithRepository(DefaultMBeanServerInterceptor.java:1898) ~[na:1.8.0_144]
+	at com.sun.jmx.interceptor.DefaultMBeanServerInterceptor.registerDynamicMBean(DefaultMBeanServerInterceptor.java:966) ~[na:1.8.0_144]
+	at com.sun.jmx.interceptor.DefaultMBeanServerInterceptor.registerObject(DefaultMBeanServerInterceptor.java:900) ~[na:1.8.0_144]
+	at com.sun.jmx.interceptor.DefaultMBeanServerInterceptor.registerMBean(DefaultMBeanServerInterceptor.java:324) ~[na:1.8.0_144]
+	at com.sun.jmx.mbeanserver.JmxMBeanServer.registerMBean(JmxMBeanServer.java:522) ~[na:1.8.0_144]
+	at org.apache.cassandra.db.ColumnFamilyStore.<init>(ColumnFamilyStore.java:479) ~[main/:na]
+	... 31 common frames omitted
+{noformat}
+
+I think we could take a {{buildAllViews}} parameter on reload, and set that to false during Keyspace initialization, since views will be build during daemon initialization and keyspace changes anyway, WDYT?
+
+One last thing, can you please add the new yaml option {{concurrent_materialized_view_builders}} to the configuration section of the doc?
+
+After these nits are addressed, feel free to rebase + squash and prepare for commit to submit a final round of CI. Thanks!
+
+Thanks for the comments, this is almost finished :)
+
+[Here|https://github.com/apache/cassandra/compare/trunk...adelapena:12245-trunk] is the new version of the patch, rebased and squashed. The udpated dtests can be found [here|https://github.com/apache/cassandra-dtest/compare/master...adelapena:12245].
+
+bq. One minor thing is that we should probably only split the view build tasks at all if the base table is larger than a given size (let's say 500MB or so?), to avoid 4 * num_processor flushes for base tables with negligible size, WDYT?
+
+As discussed, I have moved the base table flush from {{ViewBuilderTask}} to {{ViewBuilder}} [here|https://github.com/adelapena/cassandra/commit/478ed88b490378caf4f8ddc82c8e3aa3f90e5264], to do a single flush at the begining of the view build. The following writes will be writen to the MV through the regular path so it seems that they won't need any further flushes. I think that with this we don't need to check the table size and give a special treatment to small ones, what do you think?
+
+bq. I noticed we don't stop in-progess view builds when a view is removed, would you mind adding that?
+
+Right, good catch. Done [here|https://github.com/adelapena/cassandra/commit/e1ace2f47be71d48ab1987d0e2c7a07cc9486e97]. I have also added [this dtest|https://github.com/adelapena/cassandra-dtest/blob/12245/materialized_views_test.py#L1025-L1067] to verify that the build is properly stopped.
+
+bq. ViewBuildExecutor is being constructed with minThreads=1 and maxPoolSize=concurrent_materialized_view_builders, but according to the {{DebuggableThreadPoolExecutor}}'s' [javadoc|https://github.com/apache/cassandra/blob/8b3a60b9a7dbefeecc06bace617279612ec7092d/src/java/org/apache/cassandra/concurrent/DebuggableThreadPoolExecutor.java#L33], this will actually make the executor with size 1 since maxPoolSize is not supported by {{DebuggableThreadPoolExecutor}} - and even if it were, new threads would only be created after the queue of the initial threads were full (which is quite unintuitive), but we actually want the pool to have concurrent_materialized_view_builders concurrent threads at most, so we should use the {{threadCount}} constructor instead - at some point we should actually remove the maximumPoolSize
+
+Done [here|https://github.com/adelapena/cassandra/commit/fc14b034bb5d36c23435f313541445dc5adb0078].
+
+bq. I think we could take a {{buildAllViews}} parameter on reload, and set that to false during Keyspace initialization, since views will be build during daemon initialization and keyspace changes anyway, WDYT?
+
+Makes sense, done [here|https://github.com/adelapena/cassandra/commit/c4f19a5461434c0d5ca5e1301d92da26cca5083e].
+
+bq. One last thing, can you please add the new yaml option {{concurrent_materialized_view_builders}} to the configuration section of the doc?
+
+It seems that [the configuration section|https://github.com/apache/cassandra/blob/trunk/doc/source/configuration/index.rst] of the doc is currently empty. I think that writting this section (structure, introduction, etc.) is probably out of the scope of this ticket and it might be done in a separate, dedicated ticket. Instead, I have [updated|https://github.com/adelapena/cassandra/commit/30293f852584189a5b46c2dce5ae4042ae62d3e4] the NEWS.txt file with more detailed info and I have added [a note|https://github.com/adelapena/cassandra/commit/82c446398d0b6b4b1b13b35b3502489fc71fe703] to the doc about {{CREATE MATERIALIZED VIEW}} statement. WDYT?
+
+I have updated the dtest {{interrupt_build_process_test}} to make sure that the build is really interrupted also in 3.x through [new byteman scripts|https://github.com/adelapena/cassandra-dtest/blob/f7aac39ee5d0c661b2f7f5b1db2a7347635f85c5/materialized_views_test.py#L962-L963]. Without that, the build could finish before the cluster stop.
+
+The CI results look good, at least for MVs:
+||[utest|http://jenkins-cassandra.datastax.lan/view/Dev/view/adelapena/job/adelapena-12245-trunk-testall/]||[dtest|http://jenkins-cassandra.datastax.lan/view/Dev/view/adelapena/job/adelapena-12245-trunk-dtest/]||
+
+bq. I have moved the base table flush from ViewBuilderTask to ViewBuilder here, to do a single flush at the begining of the view build. The following writes will be writen to the MV through the regular path so it seems that they won't need any further flushes. I think that with this we don't need to check the table size and give a special treatment to small ones, what do you think?
+
+Much better this way, good job!
+
+bq. It seems that the configuration section of the doc is currently empty. I think that writting this section (structure, introduction, etc.) is probably out of the scope of this ticket and it might be done in a separate, dedicated ticket. Instead, I have updated the NEWS.txt file with more detailed info and I have added a note to the doc about CREATE MATERIALIZED VIEW statement. 
+
+oh, my bad! I just noticed the configuration section is [dynamically generated|https://github.com/apache/cassandra/blob/8b3a60b9a7dbefeecc06bace617279612ec7092d/doc/Makefile#L20] from cassandra.yaml. In any case, the NEWS.txt entry and new MV doc looks great!
+
+bq. I have updated the dtest interrupt_build_process_test to make sure that the build is really interrupted also in 3.x through new byteman scripts. Without that, the build could finish before the cluster stop.
+
+Awesome!
+
+bq. Here is the new version of the patch, rebased and squashed. The udpated dtests can be found here.
+
+I had a final look at the patch and tests, and it mostly looks good, but during the last review I found one edge case still not addressed: if the view build is stopped via {{nodetool stop VIEW_BUILD}}, the view build will be [considered successful|https://github.com/adelapena/cassandra/blob/e1ace2f47be71d48ab1987d0e2c7a07cc9486e97/src/java/org/apache/cassandra/db/view/ViewBuilder.java#L174], so we should probably throw a {{CompactionInterruptedException}} when the view build is stopped and not resubmit a new view build task in this case. 
+
+I think this last case is also present on 3.0 so it's not something introduced by this patch but it would be nice to address it here. Would you mind adding a dtest for this as well to ensure the view will not be marked as built after the view build is stopped?  Sorry for delaying this further, but after this is addressed, this should be ready to go after a new clean CI round.
+
+bq. I had a final look at the patch and tests, and it mostly looks good, but during the last review I found one edge case still not addressed: if the view build is stopped via {{nodetool stop VIEW_BUILD}}, the view build will be [considered successful|https://github.com/adelapena/cassandra/blob/e1ace2f47be71d48ab1987d0e2c7a07cc9486e97/src/java/org/apache/cassandra/db/view/ViewBuilder.java#L174], so we should probably throw a {{CompactionInterruptedException}} when the view build is stopped and not resubmit a new view build task in this case. 
+
+Good catch! Done [here|https://github.com/adelapena/cassandra/commit/640d5b70232deab5b6b54b6158b28e86e53f7612]. I have added an overloaded version of [{{ViewBuilderTask.stop}}|https://github.com/adelapena/cassandra/blob/640d5b70232deab5b6b54b6158b28e86e53f7612/src/java/org/apache/cassandra/db/view/ViewBuilderTask.java#L204-L208] to throw the {{CompactionInterruptedException}} only if the stop call comes from a different place than {{ViewBuilder}}. That is, the exception is not thrown in the case of a schema change (such as a drop), when the current build should be stopped without errors and maybe restarted. 
+
+I've also [extended {{CompactionInterruptedException}}|https://github.com/adelapena/cassandra/blob/640d5b70232deab5b6b54b6158b28e86e53f7612/src/java/org/apache/cassandra/db/view/ViewBuilderTask.java#L215-L249] with {{equals}} and {{hashCode}} methods that consider equals all the compaction interrupted exceptions produced by the same view. Otherwise, the multiple calls to [{{Futures#allAsList}}|https://github.com/adelapena/cassandra/blob/640d5b70232deab5b6b54b6158b28e86e53f7612/src/java/org/apache/cassandra/db/view/ViewBuilder.java#L175]'s [{{FutureCallback#onFailure}}|https://github.com/adelapena/cassandra/blob/640d5b70232deab5b6b54b6158b28e86e53f7612/src/java/org/apache/cassandra/db/view/ViewBuilder.java#L186-L199] with different exceptions make Guava's to log messages of the form {{SEVERE: You called allAsList, and more than one input failed, and the failures were different exceptions}}, which can be quite spamming.
+
+bq. Would you mind adding a dtest for this as well to ensure the view will not be marked as built after the view build is stopped?
+
+I have added a couple of dtests [here|https://github.com/adelapena/cassandra-dtest/commit/c06133e9366aeaec6eeaff8cd2b49103f114cf44]. [{{test_resume_stopped_build}}|https://github.com/adelapena/cassandra-dtest/blob/c06133e9366aeaec6eeaff8cd2b49103f114cf44/materialized_views_test.py#L1132-L1179] uses `nodetool stop VIEW_BUILD` to interrupt the running task of an ongoing view build and verifies that the unmarked build is resumed after restarting the nodes. [{{test_drop_with_stopped_build}}|https://github.com/adelapena/cassandra-dtest/blob/c06133e9366aeaec6eeaff8cd2b49103f114cf44/materialized_views_test.py#L1074-L1130] verifies that a view with interrupted taks can still be dropped, which is something that has been problematic while writting the patch.
+
+CI for utests is clean, the updated dtests are still running:
+||[utest|http://jenkins-cassandra.datastax.lan/view/Dev/view/adelapena/job/adelapena-12245-trunk-testall/]||[dtest|http://jenkins-cassandra.datastax.lan/view/Dev/view/adelapena/job/adelapena-12245-trunk-dtest/]||
+
+bq. Good catch! Done here. I have added an overloaded version of ViewBuilderTask.stop to throw the CompactionInterruptedException only if the stop call comes from a different place than ViewBuilder. That is, the exception is not thrown in the case of a schema change (such as a drop), when the current build should be stopped without errors and maybe restarted. 
+
+Good job! One thing I noticed is that even though the builder task and the view builder is aborted, the other tasks of the same builder keep running. At least until we have the ability to start and stop view builders, I think that stopping a subtask should also abort the other subtasks of the same view builder - since the view builder will not complete anyway. What do you think? I've done this [here|https://github.com/pauloricardomg/cassandra/commit/81853218eee702b778ba801426ba19d48336cf77] and the tests didn't need any change. I've also extended {{SplitterTest}} with a couple more test cases [here|https://github.com/pauloricardomg/cassandra/commit/428a990d6b3d79df9a4848d0f0f87502e72e470e].
+
+bq. I have added a couple of dtests here. test_resume_stopped_build uses `nodetool stop VIEW_BUILD` to interrupt the running task of an ongoing view build and verifies that the unmarked build is resumed after restarting the nodes. test_drop_with_stopped_build verifies that a view with interrupted taks can still be dropped, which is something that has been problematic while writting the patch.
+
+The tests looks good, but sometimes they were failing on my machine because the view builder task finished on some nodes before they were stopped and also {{_wait_for_view_build_start}} did not guarantee the view builder started in all nodes before issuing {{nodetool stop VIEW_BUILD}}, so I fixed this [on this commit|https://github.com/pauloricardomg/cassandra-dtest/commit/667315e42bd2b7d04ac038e79149f1b0e63ba0f2]. I also extended {{test_resume_stopped_build}} to verify that view was not built after abort ([here|https://github.com/pauloricardomg/cassandra-dtest/commit/f4c3ad7ac9e4ea64576d669a1cf30b0ef4e02a3f]).
+
+I've rebased and submitted a new CI run with the suggestions above [here|http://jenkins-cassandra.datastax.lan/view/Dev/view/adelapena/job/pauloricardomg-12245-trunk-dtest/] and [here|http://jenkins-cassandra.datastax.lan/view/Dev/view/adelapena/job/pauloricardomg-12245-trunk-testall/]. 
+
+Besides these minor nits, I'm happy with the latest version of the patch and tests. If you agree with the suggestions above and CI looks good, feel free to incorporate them into your branches and commit. Excellent job and thanks for your patience! :)
+
+bq. One thing I noticed is that even though the builder task and the view builder is aborted, the other tasks of the same builder keep running. At least until we have the ability to start and stop view builders, I think that stopping a subtask should also abort the other subtasks of the same view builder - since the view builder will not complete anyway. What do you think? I've done this [here|https://github.com/pauloricardomg/cassandra/commit/81853218eee702b778ba801426ba19d48336cf77] and the tests didn't need any change. I've also extended {{SplitterTest}} with a couple more test cases here.
+
+Makes sense. I started with a similar solution but changed to stop only the specified task in an attempt to better fulfill the {{nodetool stop}} documentation. But it's true that stopping all the tasks is more useful, especially without another way to stop the view build.
+
+bq. The tests looks good, but sometimes they were failing on my machine because the view builder task finished on some nodes before they were stopped and also {{_wait_for_view_build_start}} did not guarantee the view builder started in all nodes before issuing {{nodetool stop VIEW_BUILD}}, so I fixed this [on this commit|https://github.com/pauloricardomg/cassandra-dtest/commit/667315e42bd2b7d04ac038e79149f1b0e63ba0f2]. I also extended test_resume_stopped_build to verify that view was not built after abort ([here|https://github.com/pauloricardomg/cassandra-dtest/commit/f4c3ad7ac9e4ea64576d669a1cf30b0ef4e02a3f]).
+
+Nice fix, thanks!
+
+I have merged your changes and rebased again, I'll commit if a final CI round looks well:
+||[cassandra|https://github.com/adelapena/cassandra/tree/12245-trunk]||[cassandra-dtest|https://github.com/adelapena/cassandra-dtest/tree/12245]||
+||[utest|http://jenkins-cassandra.datastax.lan/view/Dev/view/adelapena/job/adelapena-12245-trunk-testall/]||[dtest|http://jenkins-cassandra.datastax.lan/view/Dev/view/adelapena/job/adelapena-12245-trunk-dtest/]||
+
+
+Committed to trunk as [4c80eeece37d79f434078224a0504400ae10a20d|https://github.com/apache/cassandra/commit/4c80eeece37d79f434078224a0504400ae10a20d].
+
+Thanks for the thorough review :)
+

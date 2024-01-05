@@ -1,0 +1,175 @@
+Pushed [branch|https://github.com/blambov/cassandra/tree/10202-commitlog-simplify-clsm] which removes a bit of complexity from both {{CommitLogSegmentManager}} and {{*CommitLogService}} and cleans up some potential problems:
+* Replaces the available segments queue in CLSM with a single segment. As taking the segment is already protected by a synchronized block, there was no need for another lock in a blocking queue. The reference is stored in a volatile field, which is set by the management thread and cleared by consumer threads.
+* Takes care of deleting unused constructed segments at shutdown; previously an empty segment would always remain.
+* Corrects expected savings calculation on choosing which segments to flush, which was using the wrong segment size.
+* Removes some now-unnecessary code before issuing a write order barrier.
+* Changes the way segments are filtered for replay on startup to rely on the segment id instead of presense in the CL's active list, which is simpler and less race-prone. Removes related workarounds.
+* Cleans up on how sync is requested and waited for by the two sync strategies and tests.
+* Replaces {{Semaphore}} in sync thread with park/unpark.
+
+The branch uses {{LockSupport.park/unpark}} directly to pause and resume management threads. If this is not considered safe, let me know to replace it with {{WaitQueue}} or anything else that may be more appropriate.
+
+[~benedict], could you put this on your (non-urgent) review list? Your concurrency expertise will help.
+
+Overall it cleans up a number of things. I've pushed a version [here|https://github.com/belliottsmith/cassandra/tree/10202] which modifies the underlying semantics a little to, IMO, _conceptually_ simplify things further. It does so by combining all three "parts" of the segment management into a single list - the current segment simply always being the last or penultimate segment in the list. This also permits a return to lock-free segment swapping. It does introduce extra code since we now have a linked-list to maintain, so it's not absolutely a simplification, so it is debatable if it is an improvement.
+
+From my recollection, there was a bug with {{discard}} having the potential to be called twice if two flushes overlapped, which has been fixed. I can't recall if there were any other issues, but if there were, I fixed them in this branch also. 
+
+I've not had time to self-review my changes, but I'm going on holiday for a while so figured I would post it in advance of that.
+
+[~blambov] Are you good with the modifications suggested by [~benedict] above? If so, would you mind rebasing and running some CI.
+
+Squashed and brought patch up-to-date:
+|[code|https://github.com/blambov/cassandra/tree/10202-commitlog]|[utest|http://cassci.datastax.com/job/blambov-10202-commitlog-testall/]|[dtest|http://cassci.datastax.com/job/blambov-10202-commitlog-dtest/]|
+
+Includes both Benedict's changes and mine. His ones look good to me and he reviewed mine, but I would still prefer someone else to take another look.
+
+[~aweisberg], assigned you tentatively as reviewer, let me know if you are not able to do it.
+
+Dtests are failing, this is not ready for review yet.
+
+Fixed dtest bug, patch is ready for review.
+
+Not super excited about including an intrusive concurrent linked list implementation. It includes no tests including stress tests of concurrent correctness. I looked at it and I think it works, but then again I have written a concurrent linked list that looked like it worked (and did in the application), but failed during stress tests in JMH.
+
+Why is the replay limit stuff necessary? Seems like it replays everything since the limit is set to be higher then anything that is available.
+
+I reviewed it and as far as I can tell it looks like it does what it did before so +1 to that.
+
+I'm -1 on us including our own implementation of a concurrent linked list unless we can strongly justify the inclusion of that complexity. We have to maintain this code and frankly, I find this container even more unnecessarily complex to reason about than our current {{CommitLogSegmentManager.advanceAllocatingFrom}} which is saying something.
+
+This reminds me a lot of CASSANDRA-7282 where we're taking out a battle-tested concurrent collection in favor of writing our own from scratch. I was hesitant about us doing that then and I remain so now.
+
+edit: Also, I find it baffling that a ticket named "simplify CommitLogSegmentManager" includes a hand-rolled concurrent linked list as part of its proposed patch. I must have a different opinion of what simplify means.
+
+It does have an elegance and is inherently simpler than the previous approach once we consider the complexities that one hides, but I agree that it is not as easy to follow. The expected benefit isn't that high either.
+
+Since we have more than one vote against them, I will revert Benedict's changes and rebase.
+
+
+bq. Why is the replay limit stuff necessary? Seems like it replays everything since the limit is set to be higher then anything that is available.
+
+Yes, but we also start the allocation thread which can create a segment and stall before listing it among the managed, causing a replay failure which happened way to often during tests. These changes are already committed as CASSANDRA-11743 and will not be present in the rebased version.
+
+Branch is updated to remove the custom concurrent list implementation.
+
+Rebased again after the CDC patch changes.
+
+For the record - the alternative may appear more difficult to follow at first blush, but I can assure you the prior implementation was no less custom - and in its history in fact had many subtle bugs that were missed despite its apparent ease to follow.  The difference is the new version named it what it was and abstracted it, and by gaining this it becomes a target for criticism.
+
+The prior approach has multiple lists that are effectively chained together, clumsily, into a new composite linked list, which concurrency-wise is much more dangerous. Managing atomicity between these lists is difficult, as they are not designed to know of each other. These transitions were buggy at various times.  It has no stress tests besides the commitlog stress test.
+
+On the safety of the concurrent algorithm for maintaining this logical linked list, I'm pretty certain the new algorithm was easier to verify.  I've written a *lot* of variants of concurrent linked lists. This one kept concurrency tightly to an absolute minimum - much less than the prior one - by only permitting very few operations to access it in a lock-free manner.  The remainder used mutual exclusion.  The nice bit here is that those instances of mutual exclusion were not on the critical path (but *are* in the prior version - which is possibly a meaningful difference, especially for mid-way thread-per-core, where stalling threads might cause more of a latency spike).
+
+So on that front I think your arguments are pretty fundamentally flawed.  
+
+A reasonable rejection might be that we have a "battle tested custom linked list" already so why replace it with another? But we have a lot of battle tested things that are very broken, so I don't think that works as an argument either.  Our battles don't appear to have high information value.
+
+However, it did not simplify the rest of the CommitLog very much at all, and so on that front it was a failure.  Possibly it made the rest worse, I can't recall. I was on the fence on the changes when I made them, so I have no problem with you dismissing them, but I do have an issue with you doing it for entirely the wrong reasons.
+
+I think it is a real shame the project is still ideologically opposed to custom algorithms.  A core piece of infrastructure with weird characteristics like Cassandra needs them.  Whether or not we need this one, I have no strong opinion, but this seems like a blindly dogmatic or emotive rejection rather than a well considered one.
+
+
+
+
+Why can't we use mutual exclusion the entire time? The only lock free access we really need is to allocate from the current active segment right? After that can we use double checked locking to deal with swapping in a new segment?
+
+I am not against implementing our own, but I think we should set the testing bar somewhere that makes it look like it does what it is supposed to do under concurrent access. Maybe [jcstress|http://openjdk.java.net/projects/code-tools/jcstress/] can help with testing this kind of thing.
+
+I am also not a fan of doing the work to implement an intrusive linked list, but not in a generic reusable way. What I don't want to see is a proliferation of custom implementations that are inlined into single use areas. It would be fine if it didn't implement the entire List API to start.
+
+We also ideally want lock-free swapping-in of the new segment, no?  Currently we don't have it, but until we reach _pure_-TPC (probably never) en route fewer application threads exposes us to a higher risk of gumming up the system.
+
+But yes, we could do full mutex, but it is still significantly safer to move it all into one structure where that is well managed.  The prior art has it clumsily littered amongst all the other code.  Thing is, once you do that you essentially have the new algorithm, just with one of the methods wrapped in an unnecessary mutex call.
+
+I do agree the code should be tested better, but that is true of everything - the current code is trusted only on the word of commitlog-stress, making this as trustworthy, but it is always better to improve that.  
+
+I would however reiterate I don't necessarily think the patch entirely warrants inclusion, I just want the discussion to be a bit more informed.
+
+On the topic of generic linked-lists, I have two view points: 1) I've attempted to integrate any number of generic linked-lists, and they are universally rejected\*, so I gave up and tried to stick to hyper-safety-oriented structures that have functionality hamstrung as far as possible in light of the use case constraints; 2) those constraints matter for readability and function, too, and you can end up with a more powerful linked-list for your situation despite a less powerful overall structure, as well as one that tells you more about the behaviour of its users.
+
+I'd point out that this whole code area is massively concurrent, as is the whole project.  This linked-list is by far the easiest part of this code, and most of the project, to reason about concurrency-wise.  If we do not trust ourselves to write it, we should probably start introspecting about what that means.
+
+NB: I must admit I haven't read the code in question for a while, and am typing this all from memory, in bed recovering from flu, so I might just be delirious.  It could all be terrible.
+
+\* Notably, I can recall at least two serious bugs that would have been avoided with one of these structures has they been included when proferred. One occurred in this code, the other was down to a pathological and unexpected behaviour in ConcurrentLinkedQueue, the most battle-tested structure around (it was an understood behaviour by the author, just undocumented and unexpected).
+
+bq. I can assure you the prior implementation was no less custom
+I (probably a bit too snarkily) was alluding to that when I stated "which is saying something".
+
+bq. by gaining this it becomes a target for criticism
+Honestly, having repeatedly run into races and timing issues with tests and changes for CDC, the segment allocation logic in the CommitLog is a target for criticism in my mind as the trade-off between complexity and value gained from this implementation falls on the side of "not worth it" to me, specifically w/regards to new file allocation and swapping.
+
+bq. on that front I think your arguments are pretty fundamentally flawed
+To enumerate them, my arguements are:
+* I'm -1 on us including our own implementation of a concurrent linked list unless we can strongly justify the inclusion of that complexity.
+** I stand by this. While I don't love what we *have* from a subtlety / side-effect management perspective, at least its been in there for awhile and had some bugs flushed out.
+* We have to maintain this code
+** This is less an argument and more something I think we need to remind ourselves of when debating adding a new, custom implementation of a relatively statefully complex customized collection to the code-base.
+* I find this container even more unnecessarily complex to reason about than our current CommitLogSegmentManager.advanceAllocatingFrom
+** Key here is "unnecessarily complex", and I mean this specifically w/regards to the segment allocation logic. Going back and looking at the #'s from CASSANDRA-3578, it's clear there's a marked improvement in CPU utilization and ops/sec throughput, however I'm skeptical as to how much of that is due to the logic surrounding new segment creation and signalling vs. the multi-threaded CommitLogSegment.Allocation logic.
+* This reminds me a lot of CASSANDRA-7282 where we're taking out a battle-tested concurrent collection in favor of writing our own from scratch
+** I don't mean to pick at old wounds or re-start old battles, but the marginal gains in performance we get from these changes seems *heavily* outweighed by the developer man-hours that go into maintaining them and fixing the subtle and complex bugs that come along with these types of implementations.
+
+bq. the project is still ideologically opposed to custom algorithms
+I think it's less that the project is ideologically opposed to custom algorithms, and more that specific vocal people (I am completely guilty of this) are very complexity averse in a code-base of this size and existing complexity and want very strong justifications for decisions that appear to be adding more complexity than the perceived performance benefits they grant.
+
+Have you looked at the code that came prior to #3578 wrt this logic? It's a long time ago, but I remember it being pretty damned bad back then too.
+
+bq. battle-tested concurrent collection
+
+Like I say, this attitude caused us to introduce bugs because we didn't understand either these collections' behaviour, or because the increased complexity of hammering the given screw was too unclear.  It *looked* easier to understand, but in fact it was not, and in being so duplicitous we were fooled.  By taking ownership of the complexity, the alternatives avoided these pitfalls.
+
+And, further, we have these custom algorithms everywhere in the codebase.  The problem we have is that whenever good programming practices of abstraction, separation and isolation of concerns (and better testability) is employed to get a handle on the complexity, it inherently gets _labelled_ a custom algorithm and is anathema.  Thus, again, we simply _disguise_ the complexity, and make ourselves feel better without achieving any positive end result.
+
+Anyway, I'm going to go back to feeling sorry for myself.  I've said plenty on this topic, here and in the distant past.
+
+P.S. #7282 is a completely different topic, one of algorithmic complexity and long-term puzzle-piecing rather than correctness/safety.  But we've already had that discussion, and I've no interest in working it into Cassandra anymore.
+
+bq. We also ideally want lock-free swapping-in of the new segment, no? Currently we don't have it, but until we reach pure-TPC (probably never) en route fewer application threads exposes us to a higher risk of gumming up the system.
+This is the part I don't follow. It's an operation that occurs every N writes, when the segment needs swapping, and the operation itself is generally going to be fast because the segment will already exist so it shouldn't have to wait on anything or even make a system call.
+
+Most allocations will only have to do a volatile read to fetch the current segment and an atomic increment on the segment's offset value, or whatever it's labeled inside each segment, and only if that fails or there is no space will it have to lock and check the condition.
+
+TPC doesn't mean you have to religiously remove every single lock in the system just the ones that are frequently contended or held a long time. IOW anything that will cause stalls. Either fewer long stalls, or many small stalls. It will be a while before we get whacked by Amdahl in this case.
+
+I know you know this already. I am just stating the reasoning I think should be applied in this case. Were the bugs related to concurrency or was it just incorrect handling of the spare segments and allocation in general? It was always pretty finicky looking.
+
+* There is an unused discardSegment in AbstractCommitLogSegmentManager
+* Also an unused createSegment
+* discardSegment(File) also appears unused.
+
+Otherwise +1.
+
+I was going to complain about WaitQueue readability, but in one case it's providing a useful metric and in the other it's no better/worse than synchronized for a simple enough condition.
+
+
+
+The above were real problems, code that wasn't correctly updated for the CDC changes. Fixed now:
+ - {{discardSegment(CommitLogSegment)}} _was_ called, but it wasn't using {{discard}},
+ - management thread changed to use {{createSegment}} instead of the segment factory to allow CDC size/type updates,
+ - {{discardSegment(File)}} was really unused (renamed in newer code)).
+
+Rebased and re-uploaded at the same location:
+|[code|https://github.com/blambov/cassandra/tree/10202-commitlog]|[utest|http://cassci.datastax.com/job/blambov-10202-commitlog-testall/]|[dtest|http://cassci.datastax.com/job/blambov-10202-commitlog-dtest/]|
+
+Tests look good, but CDC unit tests should have caught the problems above. I will add some new tests next week (i.e. ticket not ready to commit/review again yet).
+
+Well, the test exists ({{CommitLogManagerCDCTest}}) but isn't running because it is silently ignored unless run in the {{test-cdc}} build target. AFAICS nothing runs this target at the moment. [~JoshuaMcKenzie], what is the plan for running this target as part of CI? If we don't have the tests running we have to assume the feature is broken.
+
+Fixed one more CDC issue with the patch, it is now ready for review.
+
+We discussed running the testall target weekly with test-cdc. I'll follow up with the TE folks to ensure that gets scheduled.
+
+Next time when you rebase can you add commits and not rewrite existing commits until review is done? It makes it hard to follow what has changed vs what hasn't without re-reading the entire change set.
+
++1
+
+Doesn't build to me, applied to most recent trunk. Can you please rebase, [~blambov]?
+
+Rebased and rerun tests, same location:
+|[code|https://github.com/blambov/cassandra/tree/10202-commitlog]|[utest|http://cassci.datastax.com/job/blambov-10202-commitlog-testall/]|[dtest|http://cassci.datastax.com/job/blambov-10202-commitlog-dtest/]|
+Tests appear ok: dtests improve; there are new unit test failures, one of them failing and the other flaky on trunk.
+
+Committed as [e8907c16abcd84021a39cdaac79b609fcc64a43c|https://github.com/apache/cassandra/commit/e8907c16abcd84021a39cdaac79b609fcc64a43c] to trunk, thanks. Can you include the CHANGES entry next time, and a full commit message in the final version of the commit, though?
+

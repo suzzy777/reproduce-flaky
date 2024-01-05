@@ -1,0 +1,224 @@
+Hi [~aweisberg], any ideas? 
+
+Update, we have found the root cause, we added a keyspace with RF=3 but we had only 2 nodes in DC and join the 3rd node failed.
+I think that:
+# Create keyspace should fail if RF>"number of nodes in DC".
+# The exception thrown wasn't clear.
+
+ALTER the keyspace to RF=2 solved the issue.
+
+have you repeated the process on 3.x line? How did you "join" with the new node? Was this upgrading the cluster or creating a new one?
+
+Hi [~dcapwell] , 
+"have you repeated the process on 3.x line? How did you "join" with the new node? "
+I tried to join few times from different hosts, all join failed, with simple "systemctl start cassandra"
+" Was this upgrading the cluster or creating a new one?"
+Fresh cluster of version 4 without any data.
+
+Thanks for the details!
+
+I just change the following keyspace from RF 3 to 2 on the DC that i tried to join and it's solved the issue:
+{code}
+CREATE KEYSPACE ks WITH replication = {'class': 'NetworkTopologyStrategy', 'V4C': '3', 'V4N': '3'}  AND durable_writes = true;
+{code}
+
+[~blerer] do you mind I take this one or do you have sthg in mind already?
+
+[~Bereng] Feel free to take it. I let my backlog grow to big :-)
+
+bq. Create keyspace should fail if RF>"number of nodes in DC".
+
+No, we allow this on purpose because some people like to create the keyspace first for whatever operational reasons.
+
+{quote} No, we allow this on purpose because some people like to create the keyspace first for whatever operational reasons. {quote}
+
+What about firing a warning? I guess it does not hurt to warn the user.
+
+bq. What about firing a warning?
+
++1.  It also won't fire very often, so quite benign.
+
+I added the warning but I haven't managed to repro:
+
+A. Start node1:
+{noformat}
+bin/nodetool status
+Datacenter: datacenter1
+=======================
+Status=Up/Down
+|/ State=Normal/Leaving/Joining/Moving
+--  Address    Load      Tokens  Owns (effective)  Host ID                               Rack 
+UN  127.0.0.1  68.9 KiB  16      ?                 ccc4653e-14df-4688-a340-3564e344ddd9  rack1
+{noformat}
+B. Create a KS with RF > N:
+{noformat}
+[cqlsh 5.0.1 | Cassandra 4.0-beta5-SNAPSHOT | CQL spec 3.4.5 | Native protocol v4]
+Use HELP for help.
+cqlsh> CREATE KEYSPACE ks1 WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1': '2'};
+
+Warnings :
+Your replication factor 2 is higher than the number of nodes 1 for datacenter: datacenter1
+{noformat}
+C. Start node2 and wait for the node to join
+{noformat}
+bin/nodetool status
+Datacenter: datacenter1
+=======================
+Status=Up/Down
+|/ State=Normal/Leaving/Joining/Moving
+--  Address    Load       Tokens  Owns (effective)  Host ID                               Rack 
+UJ  127.0.0.2  83.11 KiB  16      ?                 6ed6685f-9d1f-4e6d-abb4-fba194bae37b  rack1
+UN  127.0.0.1  74.01 KiB  16      ?                 ccc4653e-14df-4688-a340-3564e344ddd9  rack1
+
+
+bin/nodetool status
+Datacenter: datacenter1
+=======================
+Status=Up/Down
+|/ State=Normal/Leaving/Joining/Moving
+--  Address    Load       Tokens  Owns (effective)  Host ID                               Rack 
+UN  127.0.0.2  93.29 KiB  16      ?                 6ed6685f-9d1f-4e6d-abb4-fba194bae37b  rack1
+UN  127.0.0.1  79.06 KiB  16      ?                 ccc4653e-14df-4688-a340-3564e344ddd9  rack1
+{noformat}
+D. Node2 does have a WARN in logs {{Your replication factor 2 is higher than the number of nodes 1 for datacenter: datacenter1}}.
+
+E. Creating a new KS doesn't trigger the warning message:
+{noformat}
+cqlsh> CREATE KEYSPACE ks2 WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1': '2'};
+cqlsh> 
+{noformat}
+
+I am not being able to repro. These are 2 fresh nodes with no data and just calling 'bin/cassandra -f' to start them up.
+Any help appreciated :-)
+
+bq. Node2 does have a WARN in logs
+
+Why?  I'm not sure if all nodes should have a warning or just the one that received the creation request, but either way isn't it the second node?
+
+
+
+Atm the warning is on the replication strategy options validation so every time that KS/strategy gets validated it triggers that warning. But we can change that. I'm more worried about reproducing the new node's failure to start.
+
+Lacking repro for the node failure to start I am moving into review the warn message bit.
+
+[~Bereng] I think the failure adding the node can be reproduced using multiple datacenters and transient replication:
+{code}
+ccm create test --install-dir=$CASSANDRA_DIR
+ccm populate -n 2:2
+ccm start
+
+cqlsh -e "CREATE KEYSPACE k WITH REPLICATION = {'class' : 'NetworkTopologyStrategy', 'dc1' : '3/1'};"
+
+ccm add node5 -i 127.0.0.5 -j 7500 -b -d dc1
+ccm node5 start
+
+# wait ~1m for gossip to settle and pending range setup
+cat .ccm/test/node5/logs/system.log # contains errors
+ccm node1 status # node5 hasn't joined
+{code}
+If this is a problem exclusive of transient replication we might consider not blocking 4.0 because of it, since transient replication is an experimental feature, wdyt?
+
+As for the warning, I think it's a nice improvement, although I still have to review the PR.
+
+Mmm seems to repro on multi-dc even without transient replication, that's the bit I was missing. I am surprised this didn't come up earlier...:
+
+{noformat}
+cqlsh> CREATE KEYSPACE k WITH REPLICATION = {'class' : 'NetworkTopologyStrategy', 'dc1' : '3/1'};
+ConfigurationException: Transient replication is not enabled on this node
+cqlsh> CREATE KEYSPACE k WITH REPLICATION = {'class' : 'NetworkTopologyStrategy', 'dc1' : '3'};
+cqlsh>
+
+java.lang.IllegalStateException: Multiple strict sources found for Full(/127.0.0.5:7000,(5604327680958034513,-9223372036854775808]), sources: [Full(/127.0.0.1:7000,(100,-9223372036854775808]), Full(/127.0.0.2:7000,(100,-9223372036854775808])]
+{noformat}
+
+Right, it seems that the problem was introduced with transient replication changes but it also happens on multi-DC without transient nodes and with transient replication disabled. I've confirmed that the problematic use case works in 3.11 and 3.0.
+
+I'm pinning it down atm at the strict consistency logic not being dc-aware. I hope to push sthg tomorrow or the next day.
+
+It's taken much longer than I expected due to ccm/dtests issues I've found I am planning opening a ticket for.
+
+Dropping a note for clarification to reviewers and [~edimitrova]. We neeed 16411 merged and then we can add 1 or 2 loc here to improve the the testing. But both are ready for review aside that minor.
+
+Thanks [~Bereng], as we talked, I think it is worth it to see both patches in a combined CI run. Thank you for all your efforts!
+
+[~e.dimitrova] as on CASSANDRA-16411 we decided for a different approach I added the utests there so we no longer need to consolidate them :-)
+
+The fix (and test) for the problem when joining a new node looks good to me, +1.
+
+Regarding the client warning, I'm finding that it sticks for the session, so every {{CREATE KEYSPACE}} statement will emit all the previous warnings:
+{code:java}
+CREATE KEYSPACE k1 WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 2}; # warn about k1
+CREATE KEYSPACE k2 WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};; # warn about k1 again
+{code}
+This is more surprising when we try to fix the problem reducing the RF:
+{code:java}
+CREATE KEYSPACE k WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 2}; # warn about k1
+ALTER KEYSPACE k WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}; # warn about k1 again
+{code}
+As for the warning message in logs, I see that when we create a keyspace with a RF lesser than the number of nodes the warning will be emitted twice in every node. Also, every schema altering statement will emit the warning again in every node:
+{code:java}
+CREATE KEYSPACE k WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 2}; # 2 warnings
+CREATE TABLE k.t (k int PRIMARY KEY, v int); # 1 warning
+ALTER TABLE k.t ADD v2 int; # 1 warning
+{code}
+This behaviour can be seen in the provided dtest, [here|https://github.com/apache/cassandra-dtest/blob/d9287666b80864165e48a37bb76640c16f084dc7/bootstrap_test.py#L301-L302]. I don't think this is wrong and indeed is the common behaviour for keyspace properties validation. However, I understand that having a RF lesser than the number of nodes is legitimate and the warning is just a friendly advice to prevent accidents, so perhaps we might consider warning only once, at keyspace creation time. I think we could do that by moving the warning emission from {{AbstractReplicationStrategy#validateOptions}} to a new separate abstract method in {{AbstractReplicationStrategy}}, and calling that method from {{AbstractReplicationStrategy.validateReplicationStrategy}}, but not from {{AbstractReplicationStrategy#createReplicationStrategy}}, if that makes sense. wdyt?
+
+Finally, the new client warning can also be emitted by {{ALTER KEYSPACE}}, we could add a test to verify it.
+
+ 
+
+The sticky message is a bug indeed. But the creation vs validation vs multi-node warn logging is sthg I thought about and decided to be noisy about it. I have mixed feelings as it is indeed a correct scenario if you are intending to do so. But it's not pretty if you do that by accident :thinking:  I don't like either solution so I'll be happy to take yours. Anybody else having an opinion please chime in :-)
+
+I believe all concerns were addressed already?
+
+Can we squash and run last CI run?
+
+Done. Links in PR :-)
+
+CircleCI runs look good to me, Jenkins is running [here|https://ci-cassandra.apache.org/view/all/job/Cassandra-devbranch/382/]. I think that if that looks good and [~tomasz.lasica] approves the last changes we'll be ready commit.
+
+Seems jenkins failed for some reason and needs restarting...
+
+Seems jenkins failed for some reason and needs restarting...
+
+Trying with separate components:
+
+* [utest|https://ci-cassandra.apache.org/view/all/job/Cassandra-devbranch-test/232/]
+* [jvm-dtest|https://ci-cassandra.apache.org/view/all/job/Cassandra-devbranch-jvm-dtest/223/]
+* [jvm-dtest-upgrade|https://ci-cassandra.apache.org/view/all/job/Cassandra-devbranch-jvm-dtest-upgrade/222/]
+* [python-dtest|https://ci-cassandra.apache.org/view/all/job/Cassandra-devbranch-dtest/396/]
+* [cqlsh-test|https://ci-cassandra.apache.org/view/all/job/Cassandra-devbranch-cqlsh-tests/511/]
+
++1 on the code
+
+It seems many of the Jenkins tasks above have failed, so I have restarted them:
+ * [utest|https://ci-cassandra.apache.org/view/all/job/Cassandra-devbranch-test/233/]
+ * [jvm-dtest|https://ci-cassandra.apache.org/view/all/job/Cassandra-devbranch-jvm-dtest/225/]
+ * [jvm-dtest-upgrade|https://ci-cassandra.apache.org/view/all/job/Cassandra-devbranch-jvm-dtest-upgrade/224]
+ * [python-dtest|https://ci-cassandra.apache.org/view/all/job/Cassandra-devbranch-dtest/402/]
+
+Unit tests are clean and the failures in jvm-dtests seem due to the environment. In the JVM upgrade dtests there is [a failure in {{CompactStorageUpgradeTest.compactStoragePagingTest}}|https://ci-cassandra.apache.org/view/all/job/Cassandra-devbranch-jvm-dtest-upgrade/224/jdk=jdk_1.8_latest,label=cassandra/testReport/junit/org.apache.cassandra.distributed.upgrade/CompactStorageUpgradeTest/compactStoragePagingTest/] that seems to go away after rebasing the PR to {{trunk}}.
+
+As for Python dtests, there are [multiple tests|https://ci-cassandra.apache.org/view/all/job/Cassandra-devbranch-dtest/402/#showFailuresLink] failing with the error message added by CASSANDRA-16411 ({{Please specify the DC this node should be added to}}), I'm not sure why we aren't seeing those errors on the CircleCI runs provided in the PR.
+
+I think the dtest branch is not rebased
+
+bq. I think the dtest branch is not rebased
+
+Makes sense. I have copied both branches and rebased them without conflicts, and now Python dtests are clean as a whistle:
+
+* [j8|https://app.circleci.com/pipelines/github/adelapena/cassandra/186/workflows/88206db3-bff4-4c04-b1e2-45ffefef4e60]
+* [j11|https://app.circleci.com/pipelines/github/adelapena/cassandra/186/workflows/51aa9a8b-44c8-4b5d-a162-c8b9225f5504]
+* [utest|https://ci-cassandra.apache.org/view/all/job/Cassandra-devbranch-test/234/]
+* [dtest|https://ci-cassandra.apache.org/view/all/job/Cassandra-devbranch-dtest/403/]
+* [jvm-test|https://ci-cassandra.apache.org/view/all/job/Cassandra-devbranch-jvm-dtest/226/]
+* [jvm-test-upgrade|https://ci-cassandra.apache.org/view/all/job/Cassandra-devbranch-jvm-dtest-upgrade/225/]
+
+Some jobs haven't finished yet, if they look good when they finish I will proceed to commit the changes.
+
+Thanks [~adelapena], the results look good to me, +1
+
+Thx guys for all the hard work getting these 2 tickets through review
+
+Patch committed to {{trunk}} as [87e4f31e30f6a89f1c17b5a9eb6406208e384d51,|https://github.com/apache/cassandra/commit/87e4f31e30f6a89f1c17b5a9eb6406208e384d51] dtest committed as [493ddae492a9a9a47bc484a7dfa75ef86fd3d9b8|https://github.com/apache/cassandra-dtest/commit/493ddae492a9a9a47bc484a7dfa75ef86fd3d9b8].
+

@@ -1,0 +1,764 @@
+{quote}
+we need to be able to re-insert an entry when a prior one had been deleted before, but we can't rely on timestamps being strictly bigger on the re-insert. In that sense, this can be though as a similar problem than CASSANDRA-10965, though the solution there of a single flag is not enough since we can have to replace more than once.
+{quote}
+
+Agreed.
+
+-How about shipping an extra "view-update-time" (`nowInSecond` that view-operation is triggered) per view row.  it will be used to check who's new when TS ties.-
+
+-The `nowInSeconds` could still be the same in certain cases, but rare, similar to CASSANDRA-1096-
+
+
+h3. Relation: base -> view
+
+First of all, I think all of us should agree on what cases view row should exists.
+
+IMO, there are two main cases:
+
+1. base pk and view pk are the same (order doesn't matter) and view has no filter conditions or only conditions on base pk.
+(filter condition mean: {{c = 1}} in view's where clause. filter condition is not a concern here, since no previous view data to be cleared.)
+
+view row exists if any of following is true:
+* a. base row pk has live livenessInfo(timestamp) and base row pk satifies view's filter conditions if any.
+* b. or one of base row columns selected in view has live timestamp (via update) and base row pk satifies view's filter conditions if any. this is handled by existing mechanism of liveness and tombstone since all info are included in view row
+* c. or one of base row columns not selected in view has live timestamp (via update) and base row pk satifies view's filter conditions if any. Those unselected columns' timestamp/ttl/cell-deletion info are not currently stored on view row.
+
+2. base column used in view pk or view has filter conditions on base non-key column which can also lead to entire view row being wiped.
+
+view row exists if any of following is true:
+* a. base row pk has live livenessInfo(timestamp) && base column used in view pk is not null but no timestamp && conditions are satisfied. ( pk having live livenesInfo means it is not deleted by tombstone)
+* b. or base row column in view pk has timestamp (via update) && conditions are satisfied. eg. if base column used in view pk is TTLed, entire view row should be wiped.
+
+Next thing is to model "view's tombstone and livenessInfo" to maintain view data based on above cases.
+ 
+h3. Previous known issues: 
+(I might miss some issues, feel free to ping me..)
+
+ttl
+* view row is not wiped when TTLed on base column used in view pk or TTLed on base non-key column with filter condition
+* cells with same timestamp, merging ttls are not deterministic.
+
+partial update on base columns not selected in view
+* it results in no view data. because of current update semantics, no view updates are generated
+* corresponding view row' liveness is not depending on liveness of base columns
+
+filter conditions or base column used in view pk causes
+* view row is shadowed after a few modification on base column used in view pk if the base non-key column has TS greater than base pk's ts and view key column's ts. (as mentioned by sylvain: we need to be able to re-insert an entry when a prior one had been deleted need to be careful to hanlde timestamp tie)
+
+tombstone merging is not commutative
+* in current code, shadowable tombstone doesn't co-exist with regular tombstone
+
+sstabledump not supporting current shadowable tombstone
+
+h3. Model
+
+I can think of two ways to ship all required base column info to view:
+    * make base columns that are not selected in view as "virtual cell" and store their imestamp/ttl to view without their actual values. so we can reuse current ts/tb/ttl mechanism with additional validation logic to check if a view row is alive.
+    * or storing those info on view's livenessInfo/deletion with addition merge logic to make sure view liveness/deletion are ordered properly even in the case of timestamp tie. It's like a replacement stragy which uses inserted view row to replace old view row. (In regular table, reconciliation is at cell level. need to research more about the concurrent view update cases, fow now, it looks fine). It also implies that every modification on base, view row will get replaced entirely..
+    
+I will go ahead with -second way since there is an existing shadowable tombstone mechanism.-  VirtualCells to avoid changing low level timestamp comparison..
+
+{code}
+    ColumnInfo: // generated from base column as it is.
+        0. timestamp
+        1. ttl 
+        2. localDeletionTime:  could be used to represent tombstone or TTLed depends on if there is ttl
+
+        supersedes(): if timestamps are different, greater timestamp supersedes; if timestamps are same, greater localDeletionTime supersedes.
+
+
+    Row: // VirtualCells(keyOrConditions and unselected) are always merged with another row's during row merging process
+
+        // base column that are used in view pk or has filter condition on non-pk column.
+        // if any column is not live, entire view row is wiped.
+        // if a column in base is filtered and not selected, it's stored here.
+        // during base modification, if a view row is removed due to base-column-in-view-pk or filter-contiions, then no deletion is issue,
+        // the virtual cell tombstone is added to Row's keyOrConditions.
+        2. Map<ColumnIdentifier, ColumnInfo> keyOrConditions; 
+
+        // if any column is live
+        // during base modification, if base columns not selected in view is modified, then no deletion is issue,
+        // the virtual cell tombstone is added to Row's keyOrConditions.
+        3. Map<ColumnIdentifier, ColumnInfo> unselected;
+
+        // to determina if a row is dead
+        isAliveRow():
+            if any colummn in {{keyOrConditions}} is TTLed or tombstone(dead) or not existed, false
+            if {{timestamp or ttl}} are alive, true
+            if any column in {{unselected}} is alive, true
+            otherwise check any columns in view row are alive
+
+        merge(Row): 
+            // merge 3 parts separates
+            a. for LivenessInfo/Deletion/Cells are merged as it is
+            b. for keyOrConditions, merge by comparing ColumnInfo.supersedes()
+            c. for unselected, same above
+
+    ShadowableDeletion(now removed)
+    Row.Deletion(now removed)
+{code}
+
+
+h3. Examples
+(*_TL;DR;_* validate the model using different tests in each issue)
+
+Reinserting previous deleted view row(11500)
+
+{code}
+CREATE TABLE t (k int PRIMARY KEY, a int, b int);
+CREATE MATERIALIZED VIEW mv AS SELECT * FROM t WHERE k IS NOT NULL AND a IS NOT NULL PRIMARY KEY (k, a);
+
+{{q1}} INSERT INTO t(k, a, b) VALUES (1, 1, 1) USING TIMESTAMP 0;
+{{q2}} UPDATE t USING TIMESTAMP 10 SET b = 2 WHERE k = 1;
+{{q3}} UPDATE t USING TIMESTAMP 2 SET a = 2 WHERE k = 1; 
+{{q4}} UPDATE t USING TIMESTAMP 3 SET a = 1 WHERE k = 1;
+
+After {{q1}}:
+    base: k=1@0, a=1@0, b=1@0    // 'k' is having value '1' with timestamp '0'
+    view:
+        sstable1:  VC(keyOrConditions{a@0}, unselected:{}) (k=1&&a=1)@liveness(ts@0) b=1@0   //VC-> virtualCells
+
+After {{q2}}:
+    base(merged):   (k=1@0, a=1@0, b=2@10)
+    view:
+        sstable1:   VC(keyOrConditions{a@0}, unselected:{}) (k=1&&a=1)@liveness(ts@0) b=1@0  
+        sstable2:   VC(keyOrConditions{a@0}, unselected:{}) (k=1&&a=1)@liveness(no_ts) b=2@10  // the VC here could be ommitted since it's not changed
+        or merged:  VC(keyOrConditions{a@0}, unselected:{}) (k=1&&a=1)@liveness(ts@0) b=2@10
+
+After {{q3}}:
+    base(merged):   (k=1@0, a=2@2, b=2@10)
+    view:
+        sstable1:   VC(keyOrConditions{a@0}, unselected:{}) (k=1&&a=1)@liveness(ts@0) b=1@0 
+        sstable2:   VC(keyOrConditions{a@0}, unselected:{}) (k=1&&a=1)@liveness(no_ts) b=2@10  
+        sstable3:  
+                    VC(keyOrConditions{a@tb0}, unselected:{}) (k=1&&a=1)  // row deletion caused by switch_entry
+                    VC(keyOrConditions{a@2}, unselected:{}) (k=1&&a=2)@liveness(ts@0) b=2@10
+        or merged: 
+                    VC(keyOrConditions{a@tb0}, unselected:{}) (k=1&&a=1) 
+                    VC(keyOrConditions{a@2}, unselected:{}) (k=1&&a=2)@liveness(ts@0) b=2@10
+
+After {{q4}}:
+    base(merged):   (k=1@0, a=1@3, b=2@10)
+    view:
+        sstable1:   VC(keyOrConditions{a@0}, unselected:{}) (k=1&&a=1)@liveness(ts@0) b=1@0 
+        sstable2:   VC(keyOrConditions{a@0}, unselected:{}) (k=1&&a=1)@liveness(no_ts) b=2@10  
+        sstable3:  
+                    VC(keyOrConditions{a@tb0}, unselected:{}) (k=1&&a=1)
+                    VC(keyOrConditions{a@2}, unselected:{}) (k=1&&a=2)@liveness(ts@0) b=2@10
+        sstable4:   
+                    VC(keyOrConditions{a@3}, unselected:{}) (k=1&&a=1)@liveness(ts@0) b=2@10
+                    VC(keyOrConditions{a@tb2}, unselected:{}) (k=1&&a=2)
+        or merged: 
+                    VC(keyOrConditions{a@3}, unselected:{}) (k=1&&a=1)@liveness(ts@0) b=2@10
+                    VC(keyOrConditions{a@tb2}, unselected:{}) (k=1&&a=2)
+{code}
+
+based column used in view key is TTLed (13657)
+
+{code}
+CREATE TABLE t (k int, a int, b int, PRIMARY KEY (k));
+CREATE MATERIALIZED VIEW mv AS SELECT * FROM t WHERE k IS NOT NULL AND a IS NOT NULL PRIMARY KEY (a, k);
+
+{{q1}} INSERT INTO t (k) VALUES (1);
+{{q2}} UPDATE t USING TTL 5 SET a = 10 WHERE k = 1;
+{{q3}} UPDATE t SET b = 100 WHERE k = 1;
+
+After q1:
+    base: k=1@t1
+    view: no view updates generated because no existing view data
+
+After q2:
+    base(merged):  k=1@t1, a=10@(t2, ttl@5)
+    view:          VC(keyOrConditions{a:(ts@t2, ttl@5) }, unselected:{}) (k=1&&a=10)@liveness(ts@t1)
+
+After q2:
+    base(merged):  k=1@t1, a=10@(t2, ttl@5), b=100@t3
+    view:          
+        sstable1:  VC(keyOrConditions{a:(ts@t2, ttl@5) }, unselected:{}) (k=1&&a=10)@liveness(ts@t1)
+        sstable2:  VC(keyOrConditions{a:(ts@t2, ttl@5) }, unselected:{}) (k=1&&a=10) b=100@t3
+        or merged: VC(keyOrConditions{a:(ts@t2, ttl@5) }, unselected:{}) (k=1&&a=10)@liveness(ts@t1) b=100@t3
+
+5 seconds later, view row is considered removed becuase {{keyOrConditions-a}} is TTLed.
+
+{code}
+
+
+View row expires too fast with unselected base column (13127)
+
+{code}
+
+CREATE TABLE ks.base (p int, c int, v int, PRIMARY KEY (p, c)); 
+CREATE MATERIALIZED VIEW ks.mv AS SELECT p, c FROM base WHERE p IS NOT NULL AND c IS NOT NULL PRIMARY KEY (c, p); 
+
+{{q1}} INSERT INTO ks.base (p, c) VALUES (0, 0) USING TTL 3; 
+{{q2}} UPDATE ks.base USING TTL 100 SET v = 0 WHERE p = 0 and c = 0; 
+
+After q1:
+    base: (p=0&&c=0)@(ts@t1, ttl@3)
+    view: VC(keyOrConditions{}, unselected:{}) (c=p&&p=0)@liveness(ts@t1, ttl@3)
+
+After q2:
+    base(merged):    (p=0&&c=0)@(ts@t1, ttl@3) v=0@(ts@t2, ttl@100)
+    view: 
+        sstable1:    VC(keyOrConditions{}, unselected:{}) (c=p&&p=0)@liveness(ts@t1, ttl@3)
+        sstable2:    VC(keyOrConditions{}, unselected:{v@(ts@t2, ttl@100) }) (c=p&&p=0)@liveness(ts@t1, ttl@3)
+        or merged:   VC(keyOrConditions{}, unselected:{v@(ts@t2, ttl@100) }) (c=p&&p=0)@liveness(ts@t1, ttl@3)
+
+after 5 second,
+    base:  p,c,v-> 0,0,0
+    view:  c,p  -> 0,0 because {{unselected has not TTLed column v}}
+
+{code}
+
+Partial update unselected columns in base (13127)
+
+{code}
+CREATE TABLE base (k int, c int, a int, b int, PRIMARY KEY (k, c));
+CREATE MATERIALIZED VIEW mv AS SELECT k,c FROM base WHERE k IS NOT NULL AND c IS NOT NULL PRIMARY KEY (k,c);
+
+{{q1}} UPDATE base USING TIMESTAMP 10 SET b=1 WHERE k=1 AND c=1;
+{{q2}} DELETE b FROM base USING TIMESTAMP 11 WHERE k=1 AND c=1;
+{{q3}} UPDATE base USING TIMESTAMP 1 SET a=1 WHERE k=1 AND c=1;
+
+After q1:
+    base:   (k=1&&c=1),  b=1@10
+    view:   VC(keyOrConditions{}, unselected:{b@(ts@10)}) (k=1&&c=1) 
+
+After q2:
+    base(merged):   (k=1&&c=1),  b@tombstone(ts@11)
+    view:
+        sstable1:   VC(keyOrConditions{}, unselected:{b@(ts@10)}) (k=1&&c=1) 
+        sstable2:   VC(keyOrConditions{}, unselected:{b@(tb@11)}) (k=1&&c=1) 
+        or merged:  VC(keyOrConditions{}, unselected:{b@(tb@11)}) (k=1&&c=1)  // no view row
+
+After q3:
+    base(merged):   (k=1&&c=1),  b@tombstone(ts@11), c=1@1
+    view:
+        sstable1:   VC(keyOrConditions{}, unselected:{b@(ts@10)}) (k=1&&c=1) 
+        sstable2:   VC(keyOrConditions{}, unselected:{b@(tb@11)}) (k=1&&c=1) 
+        sstable3:   VC(keyOrConditions{}, unselected:{c@(ts@1)}) (k=1&&c=1)
+        or merged:  VC(keyOrConditions{}, unselected:{b@(tb@11), c@(ts@1)}) (k=1&&c=1)  // view row a live since one of {{unselected}} is live
+{code}
+
+
+merging should be commutative (13409)
+
+{code}
+create table ks.base (p int primary key, v1 int, v2 int);
+create materialized view ks.my_view as select * from ks.base where p is not null and v1 is not null primary key (v1, p); 
+
+{{q1}} insert into ks.base (p, v1, v2) values (3, 1, 3) using timestamp 1; 
+{{q2}} delete from ks.base using timestamp 2 where p = 3; 
+{{q3} insert into ks.base (p, v1) values (3, 1) using timestamp 3;
+
+at the end:
+    base(merged): p=3@partition_deletion@2, livenesInfo@3, v1=1
+    view:
+        sstable1: VC(keyOrConditions{v1:(ts@0) }, unselected:{}) (v1=3&&p=3)@livenes(ts@1), v2=3
+        sstable2: (v1=3&&p=3)@tombstone(ts@2)
+        sstable3: VC(keyOrConditions{v1:(ts@3) }, unselected:{}) (v1=3&&p=3)@livenes(ts@3, keyOrConditions{v1:(ts@3) }, unselected:{})
+        or merged: VC(keyOrConditions{v1:(ts@3) }, unselected:{}) (v1=3&&p=3)@livenes(ts@3, keyOrConditions{v1:(ts@3) }, unselected:{}) @tombstone(ts@2)
+{code}
+
+
+{code}
+create table ks.base (p int primary key, v1 int, v2 int);
+create materialized view ks.my_view as select * from ks.base where p is not null and v1 is not null primary key (v1, p); 
+
+{{q1}} insert into base (p, v1, v2) values (3, 1, 3) using timestamp 1
+{{q2}} update base using timestamp 2 set v2 = null where p = 3  
+{{q3}} update base using timestamp 3  set v1 = 2 where p = 3 
+{{q4}} update base using timestamp 4 set v1 = 1 where p = 3
+
+at the end:
+    base(merged): p=3@1, v1=1@4, v2@tombstone(ts@3)
+    view:
+        sstable1: VC(keyOrConditions{v1:(ts@1) }, unselected:{}) (v1=1&&p=3)@livenes(ts@1), v2=3
+        sstable2: (v1=1&&p=3) v2@tombstone(ts@2)   
+        sstable3: 
+                  VC(keyOrConditions{v1:(tb@1) }, unselected:{}) (v1=1&&p=3)
+                  VC(keyOrConditions{v1:(ts@3) }, unselected:{}) (v1=2&&p=3)@livenes(ts@1), v2@tombstone(ts@2)   
+        sstable4:
+                  VC(keyOrConditions{v1:(ts@4) }, unselected:{}) (v1=1&&p=3)@liveness(ts@1), v2@tombstone(ts@2)
+                  VC(keyOrConditions{v1: (tb@3)}, unselected:{}) (v1=2&&p=3) 
+
+        or merged 2&3:        
+            sstable1: VC(keyOrConditions{v1:(ts@1) }, unselected:{}) (v1=1&&p=3)@livenes(ts@1), v2=3
+            sstable5: 
+                    VC(keyOrConditions{v1:(tb@1) }, unselected:{}) (v1=1&&p=3) v2@tombstone(ts@2)   
+                    VC(keyOrConditions{v1:(ts@3) }, unselected:{}) (v1=2&&p=3)@livenes(ts@1), v2@tombstone(ts@2)   
+            sstable4:
+                    VC(keyOrConditions{v1:(ts@4) }, unselected:{}) (v1=1&&p=3)@liveness(ts@1), v2@tombstone(ts@2)
+                    VC(keyOrConditions{v1: (tb@3)}, unselected:{}) (v1=2&&p=3)       
+        or merged all:
+                    VC(keyOrConditions{v1:(ts@4) }, unselected:{}) (v1=1&&p=3)@liveness(ts@1), v2@tombstone(ts@2)
+                    VC(keyOrConditions{v1: (tb@3)}, unselected:{}) (v1=2&&p=3) v2@tombstone(ts@2)              
+{code}
+
+{code}
+create table ks.base (p int primary key, v1 int, v2 int);
+create materialized view ks.my_view as select * from ks.base where p is not null and v1 is not null primary key (v1, p); 
+
+{{q1}} insert into base (p, v1, v2) values (3, 1, 3) using timestamp 1
+{{q2}} delete from base using timestamp 2 where p = 3 
+{{q3}} insert into base (p, v1) values (3, 1) using timestamp 3
+{{q4}} update base using timestamp 4 set v1 = 2 where p = 3 // will create a shadowable row tombstone for (v1, p) = (1, 3)
+{{q5}} update base using timestamp 5 set v1 = 1 where p = 3
+
+at the end:
+    base(merged): p=3@partition_deletion(ts@2), livenesInfo@3, v1=1@5
+    view:
+        sstable1: VC(keyOrConditions{v1:(ts@1) }, unselected:{}) (v=1&&p=3)@livenes(ts@1) v2=3
+        sstable2: (v=1&&p=3)@tombstone(ts@2)  // normal deletion
+        sstable3: VC(keyOrConditions{v1:(ts@3) }, unselected:{}) (v=1&&p=3)@liveness(ts@3)
+        sstable4: 
+                  VC(keyOrConditions{v1:(tb@3) }, unselected:{}) (v=1&&p=3)
+                  VC(keyOrConditions{v1:(ts@4) }, unselected:{}) (v=2&&p=3)@liveness(ts@3)
+        sstable5:
+                  VC(keyOrConditions{v1:(ts@5) }, unselected:{}) (v=1&&p=3)@liveness(ts@3)
+                  VC(keyOrConditions{v1:(tb@4) }, unselected:{}) (v=2&&p=3)
+        or merged 2&4:
+            sstable1: VC(keyOrConditions{v1:(ts@1) }, unselected:{}) (v=1&&p=3)@livenes(ts@1) v2=3
+            sstable3: VC(keyOrConditions{v1:(ts@3) }, unselected:{}) (v=1&&p=3)@liveness(ts@3)
+            sstable6: 
+                    VC(keyOrConditions{v1:(tb@3) }, unselected:{}) (v=1&&p=3)@tombstone(ts@2)
+                    VC(keyOrConditions{v1:(ts@4) }, unselected:{}) (v=2&&p=3)@liveness(ts@3)
+            sstable5:
+                    VC(keyOrConditions{v1:(ts@5) }, unselected:{}) (v=1&&p=3)@liveness(ts@3)
+                    VC(keyOrConditions{v1:(tb@4) }, unselected:{}) (v=2&&p=3)  
+            then merged 3&6&5:
+                sstable1: VC(keyOrConditions{v1:(ts@1) }, unselected:{}) (v=1&&p=3)@livenes(ts@1) v2=3
+                sstable7: 
+                        VC(keyOrConditions{v1:(ts@5) }, unselected:{}) (v=1&&p=3)@liveness(ts@3) @tombstone(ts@2)
+                        VC(keyOrConditions{v1:(tb@4) }, unselected:{}) (v=2&&p=3)@liveness(ts@3)
+                then merged 1&7:
+                        VC(keyOrConditions{v1:(ts@5) }, unselected:{}) (v=1&&p=3)@liveness(ts@3) @tombstone(ts@2)
+                        VC(keyOrConditions{v1:(tb@4) }, unselected:{}) (v=2&&p=3)@liveness(ts@3)                   
+        or merged all:
+                  VC(keyOrConditions{v1:(ts@5) }, unselected:{}) (v=1&&p=3)@liveness(ts@3) @tombstone(ts@2)
+                  VC(keyOrConditions{v1:(tb@4) }, unselected:{}) (v=2&&p=3)
+
+{code}
+ 
+with filter conditions (13547)
+
+{code}
+CREATE TABLE test.table1 ( id int, name text, enabled boolean, foo text, PRIMARY KEY (id, name));
+CREATE MATERIALIZED VIEW view1 AS SELECT id, name, foo FROM test.table1 WHERE id IS NOT NULL AND name IS NOT NULL AND enabled = TRUE PRIMARY KEY ((name), id);
+CREATE MATERIALIZED VIEW view2 AS SELECT * FROM test.table1 WHERE id IS NOT NULL AND name IS NOT NULL AND enabled = TRUE PRIMARY KEY ((name), id);
+
+
+{{q1}}  INSERT INTO test.table1 (id, name, enabled, foo) VALUES (1, 'One', TRUE, 'Bar');  // t1
+{{q2}} UPDATE test.table1 SET enabled = FALSE WHERE id = 1 AND name = 'One';              // t2
+{{q3}} UPDATE test.table1 SET enabled = TRUE WHERE id = 1 AND name = 'One';               // t3
+
+At the end:
+    base(merged): (id=1&&name='One')@t1, enabled=TRUE@t3, foo='Bar'
+    View1:
+        sstable1: VC(keyOrConditions{enabled:(ts@t1) }, unselected:{}) (id=1&&name='One')@liveness(ts@t1), foo='bar'@t1
+        sstable2: VC(keyOrConditions{enabled:(tb@t1) }, unselected:{}) (id=1&&name='One')
+        sstable3: VC(keyOrConditions{enabled:(ts@t3) }, unselected:{}) (id=1&&name='One')@liveness(ts@t1), foo='bar'@t1
+        or merged: VC(keyOrConditions{enabled:(ts@t3) }, unselected:{}) (id=1&&name='One')@liveness(ts@t1), foo='bar'@t1
+    View2:
+        sstable1: VC(keyOrConditions{enabled:(ts@t1) }, unselected:{}) (id=1&&name='One')@liveness(ts@t1), enabled=True@t1, foo='bar'@t1
+        sstable2: VC(keyOrConditions{enabled:(tb@t1) }, unselected:{}) (id=1&&name='One')
+        sstable3: VC(keyOrConditions{enabled:(ts@t3) }, unselected:{}) (id=1&&name='One')@liveness(ts@t1), enabled=True@t3, foo='bar'@t1
+        or merged: VC(keyOrConditions{enabled:(ts@t3) }, unselected:{}) (id=1&&name='One')@liveness(ts@t1), enabled=True@t3, foo='bar'@t1
+{code}
+
+
+I also want to through my stuff into the ring right here :)
+
+Following up from CASSANDRA-13657 on this, [my proposal from there|https://issues.apache.org/jira/browse/CASSANDRA-13657?focusedCommentId=16080177&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-16080177] could be adapted to solve this by introducing a {{ShortCircuitingRowDeletion}}: A live, sort-circuiting row-deletion supersedes all columns no matter their timestamp. It can only be superseded by a liveness-info with higher timestamp.
+
+That way, we don't need to take maximum timestamp of cells anymore for the view-tombstone, which prevents the conflict of this issue.
+
+I plan to solve: {{partial update}},{{ttl}}, {{co-existed shadowable tombstone}}, {{view timestamp tie}} all inside this ticket using extended shadowable approach(mentioned [here|https://issues.apache.org/jira/browse/CASSANDRA-11500?focusedCommentId=16082241&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-16082241]). Because all these issues require some storage format changes(extendedFlag), it's better to fix them and refactor in one commit.
+
+I will drafrt a patch using {{ViewTombstone}} and {{ViewLiveness}}.
+
+Any suggestions would be appreciated.
+
+
+
+Thanks [~jasonstack], I think that's a wise approach to solving the issues. I'll give it some thought over the next couple days. Worth giving some thought to [~fsander]'s solution as well, however I think I'm in favour of utilising ShadowableTombstones for the same case. Will give it some serious consideration before ruling anything out however.
+
+Also, just making a note here that we have to solve the issue raised in CASSANDRA-10965 here as well. Pretty sure you're already addressing this but just saying so it's written down somewhere. 
+
+[~jasonstack] do you have a WIP branch you can link here?
+
+[~KurtG] branch is not yet ready for you to test. but you could have a look at [proposal|https://issues.apache.org/jira/browse/CASSANDRA-11500?focusedCommentId=16082241&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-16082241] first, see if there is any missing case.
+
+Yep have been, was just hoping there was some code I could pin it to to make things clearer - as I'm sure you're aware it's hard to figure out all the edge cases unless you actively try them. Not a big deal, I'll keep an eye out for when you have a branch ready.
+
+Your proposal looks good and seems to make sense and cover all the cases I can think of (but there are so many I'm sure I've forgotten some). With this change in place would all deletions/deletions in views be represented as a ViewTombstone? My understanding is that you're essentially combining normal tombstones and shadowables to create the viewtombstone, with a few extra details to catch the edge cases, is that right?
+
+All livenessInfo or row deletion in MV will be ViewLivenessInfo or ViewDeletion with some extra details to check if view row is still alive.
+
+Shadowable mechanism is not used..(single flag is not sufficient and in the proposal, we don't need to bring back the columns shadowed by shadowable-tombstone)
+
+WIP [branch|https://github.com/jasonstack/cassandra/commits/CASSANDRA-11500-cell] [dtest|https://github.com/riptano/cassandra-dtest/commits/CASSANDRA-11500]
+
+
+Changed:
+*  Extra "VirtualCell"(kind of special LivenessInfo for MV) in Row to maintain consistency of view row. It stores: 1. base column used in view PK and base column used in view filter conditions. if any of such column dead, entire view row dead, regardless LivenessInfo or DeletionTime status. or 2. unselected base columns. if any of such column alive, view's pk should be alive. 
+* blocked dropping filter base column
+* fix issue of creating view with token()  filter
+* remove Row.Deletion, it was used to wrap DeletionTime with "Shadowable" flag
+* fix missing partition deletion in view-update
+* for now, ttl on non-frozen collections is not reflected in "VritualCells"
+
+Todo: 
+more dtest
+
+The virtual cell proposal is pretty clever and looks like it would solve most outstanding issues, but I'm a bit concerned about adding new structures to the storage engine to deal with materialized-specific issues.
+
+While I agree we should do if it's our only choice, we should explore alternatives which reuse existing structures if possible to avoid introducing feature-specific stuff into the storage engine.
+
+Looking back at the original scenario which motivated this ticket (CASSANDRA-11500):
+{noformat}
+CREATE TABLE t (k int PRIMARY KEY, a int, b int);
+CREATE MATERIALIZED VIEW mv AS SELECT * FROM t WHERE k IS NOT NULL AND a IS NOT NULL PRIMARY KEY (k, a);
+
+INSERT INTO t(k, a, b) VALUES (1, 1, 1) USING TIMESTAMP 0;
+UPDATE t USING TIMESTAMP 4 SET b = 2 WHERE k = 1;
+UPDATE t USING TIMESTAMP 2 SET a = 2 WHERE k = 1;
+
+SELECT * FROM mv WHERE k = 1; // This currently return 2 entries, the old (invalid) and the new one
+{noformat}
+
+It seems to me that the problem here is applying the definition for standard tables that if a single column is live, then the whole row is live, which does not need to be the case for MV where we can guarantee a view entry will always contain row-level liveness info.
+
+We could solve this  by introducing a "strict " flag to the row liveness info, which has the following semantic:
+- A strict row is only live iff it's row level liveness info is live, regardless of the liveness of its columns
+
+Materialized views rows would have this flag set and perform deletions with its max primary key timestamp (instead of max timestamp of all keys), and this would solve the issue above by ensuring the row {{(1, 1)@(liveness@0, deleted@2)=(b=2@4)}} would not be live.
+
+In addition to solving the original problem we would not create the second problem in the ticket description of updates to the view primary key with a smaller timestamp to be shadowed by a shadowable tombstone using the max timestamp of a non-PK column. In this approach the shadowing tombstone mechanism would still be orthogonal to the strict liveness and working as it is today.
+
+This mechanism alone would not solve all other problems but at least the ones described in this ticket description with minimal change in the storage engine, let's now go through the other issues to see how we could solve them:
+
+*View row expires too fast with unselected base column (CASSANDRA-13127)*
+
+From the discussion on CASSANDRA-13127 it seems like you found and fixed some issues with liveness comparison in addition to no view update being generated when there is an update to an unselected column which seems to solve this issue in addition with the strict row concept above. Even though this will require a read  when updating columns not in the view, the MV user is already expecting to pay an extra price for MVs anyway so it shouldn't be a problem - if you want performance you can build views manually or use CASSANDRA-9779 hopefully when it's ready. :-)
+
+*based column used in view key is TTLed (CASSANDRA-13657)*
+
+This seems to be fixed by the fix above.
+
+*Partial update unselected columns in base (CASSANDRA-13127)*
+
+This seem to be more of an anomaly of the partial row update semantics which has bad consequences for MVs than a problem with MV itself. 6.0 where thrift is gone is a good occasion to revisit this semantics rather than trying to make MV fit into it.
+
+Right now, inserting a non-PK column (in the example {{UPDATE base USING TIMESTAMP 10 SET b=1 WHERE k=1 AND c=1}}) will create a row (k=1, c=1, b=1)@10 on the end-user perspective ({{SELECT * FROM base WHERE k=1 and C=1}}) while internally creating only a column, which destroys the entire row in case the same non-PK column is removed ({{DELETE b FROM base USING TIMESTAMP 11 WHERE k=1 AND c=1;}}).
+
+While this semantics may make sense in a column-oriented world, it's a tad bizarre in a row oriented world, given we can delete a row by simply unsetting a non-PK column. I think the correct and expected semantic would be: {{a column update to a non-existing row will create it}}.
+
+This semantic is IMO what makes the most sense in a row oriented store and it's possible to implement it without falling into the unexpected/inconsistent behaviors of CASSANDRA-6782/CASSANDRA-6668 by adding some kind of {{CREATE_IF_NOT_EXISTS}} flag which basically keeps the oldest liveness entry if more than one is found with this flag when merging.
+
+This semantic change would be the most correct while still preventing this anomaly with MVs due to the current semantic. If you agree we can create another ticket to propose this change.
+
+*merging should be commutative (CASSANDRA-13409)*
+The second case, represented by {{testCellTombstoneAndShadowableTombstones}}, is fixed by [using regular tombstones instead of shadowable tombstones for base table column deletions|https://github.com/pauloricardomg/cassandra/commit/1aeb0acbbaad6cc9520af6d1684043a5078eefa7] (something which was probably overlooked on CASSANDRA-10261), as suggested on CASSANDRA-13409.
+
+The first and third case, represented by {{testCommutativeRowDeletion}} can probably be fixed on the view update generator by emitting column tombstones for columns not being updated when it's detected a partial update on a previously deleted row (unless I'm missing something).
+
+*with filter conditions (CASSANDRA-13547)*
+
+This seems like a genuine bug on the view update generator, already discussed and proposed patch on CASSANDRA-13547, of not including the view conditions on the base table select. The second issue discussed there of a column with lower timestamp being wrongly shadowed should be fixed by the strict liveness fix proposed before.
+
+*unselected columns dropped*
+
+We could still use the virtual cells idea (but probably as an additional flag to the current cell structure) to support this properly, but I'm not sure it makes sense to optimize and add additional storage overhead for this use case so we could maybe just disallow dropping columns on tables with MVs configured altogether (at least initially).
+
+I hacked a [strict liveness prototype|https://github.com/pauloricardomg/cassandra/commits/11500-poc] on top of the original patch for CASSANDRA-13127 which seems to fix most tests except the ones not covered above.
+
+While this still requires changes to the storage engine it's mostly inclusion of new flags, while other changes would be restricted to the view update generator. I could be easily missing something so please let me know if there are cases or inefficiencies not covered by the suggestions above which I did not consider.
+
+I think the scope here is quite big, and while I understood your idea was to solve all these issues with a single approach, if there aren't flaws with the suggestions above (which require less changes in the storage engine) and we decide to go with them, we should probably break up the solution to this as following:
+- On this ticket implement the strict liveness idea and test it thoroughly (compaction, tombstone purging etc) including the original patch for CASSANDRA-13127 (except the shadowable liveness commit which is probably not required)
+- Reopen CASSANDRA-13409 to update view generator to generate column tombstones when receiving a partial update for a previously deleted row
+- Reopen CASSANDRA-13547 to update view generator to include unselected views on base table select (latest patch there should already be good enough I think?)
+- Open a new ticket to deal with dropped unselected columns (either disallow or implement a simplified virtual cell idea to deal with this)
+- Open a new ticket to propose new insert-if-not-exists semantic for column update on non-existing row
+- Open a new ticket to update sstable dump to include new flags and shadowable tombstone
+- In my hacked prototype the frozen collection test is failing, but I didn't investigate into it, is this something that would be solved by any of the above or is it a different issue? Also please let me know if I forgot to comment on any other case which is not covered above.
+
+Talking offline with Zhao, it seems like there is still an outstanding case derived from CASSANDRA-13547 not addressed by the strict liveness suggestion:
+
+{code:none}
+// liveness or deletion using max-timestamp of view-primary-key column in base
+base:  (k), a, b, c
+view:  (k, a), b, c=1
+
+q1: insert (1,1,1,1) with timestamp 0
+
+    base: liveness=ts@0,  k=1, a=1@0, b=1@0, c=1@0
+    view: liveness=ts@0,  (k=1, a=1), b=1@0, c=1@0
+
+q2: update c=1 with timestamp 10 where k = 1  
+
+    base: liveness=ts@0,  k=1, a=1@0, b=1@0, c=1@10
+    view: liveness=ts@0,  (k=1, a=1), b=1@0, c=1@10
+
+q3: update c=2 with timestamp 11 where k = 1  
+
+    base: liveness=ts@0,  k=1, a=1@0, b=1@0, c=2@11
+    view:
+          liveness=ts@0,  (k=1, a=1), b=1@0, c=1@10
+          tombstone=ts@0,  (k=1, a=1)
+
+          with strict-liveness flag, view row is dead
+
+q4: update c=1 with timestamp 12 where k = 1  
+
+    base: liveness=ts@0,  k=1, a=1@0, b=1@0, c=1@12
+    view:
+          liveness=ts@0,  (k=1, a=1), b=1@0, c=1@10
+          tombstone=ts@0,  (k=1, a=1)
+          liveness=ts@0,  (k=1, a=1), b=1@0, c=1@12
+         
+          view row should be live..but it's dead
+{code}
+
+It seems like this scenario where the row liveness depend on a non-view primary key was overlooked by CASSANDRA-10368 and seems to be analogous to the problem Tyler discovered on CASSANDRA-10226 (but with conditions rather than non-base view primary keys):
+
+bq. It seems like when we include multiple non-PK columns in the view PK, we fundamentally have to accept that the view row's existence depends on multiple timestamps. I propose that we solve this by using a set of timestamps for the row's LivenessInfo.
+
+The solution proposed on that ticket of keeping multiple deletion and liveness infos per primary key is similar to the virtual cells solution you independently came up (great job!). While I agree that a solution along those lines is the way to go moving forward, that's a pretty significant change in the storage engine which may introduce unforeseen problems, and would probably be nice to have [~slebresne] blessing given he seems to [feel strongly|https://issues.apache.org/jira/browse/CASSANDRA-10226?focusedCommentId=14740391&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-14740391] about it and will likely want to chime in.
+
+I personally think that before introducing disruptive changes to the storage engine and MV machinery to enable relatively new features (in this case, filtering on non-PK columns which didn't seem to have all of its repercussions considered on CASSANDRA-10368), we should take a conservative approach and spend our energy on stabilizing current MV features.
+
+In practical terms, I'd suggest going with the simpler strict liveness approach I suggested above to fix the current problems (or any alternative which do not require disruptive changes on the storage engine) and disallow filtering on non-PK while the virtual cells are not implemented - MVs with it already enabled would not be affected but users would be susceptible to the problem above (we could maybe print a warning to inform this).
+
+After we have current MV features stabilized we can then think of implementing the virtual cell idea to properly enable other features like filtering on non-view PK columns and support multiple non-PK cols in MV clustering key when partition key is shared (CASSANDRA-10226).
+
+Please let me know what do you think.
+
+Thanks for reviewing and feedback.
+
+Changing the semantic of MV and revising non-key column filtering feature(CASSANDRA-10368) will indeed make it easier. It's a good idea to make a simple non-disruptive change to stabilize basic features and wait for more commiters involved.
+
+Using an extended flag for {{Strict-Liveness}} will allow us to change to future structure easily, either multiple livenessInfos or virtualcells. 
+
+About the {{Strict Liveness}} semantic:
+* A strict row is only live iff it's row level liveness info is live, regardless of the liveness of its columns.
+
+My understanding is: view row is strict iff the view has non-key base row as view pk. When it's {{Strict}}, the view's row liveness/deletion should use this non-key base column's timestamp as well as ttl, unless there is a greater row deletion.(It's like a simplified version of "VirtualCells" which only store metadata for non-key base column in view pk)
+
+For now, the semantic of MV: 
+* if it's strict(non-key base row as view pk), the existence of view row is only with its row livenessInfo
+* if it's not-strict, view row is alive if there is any live selected view columns or live livenessInfo.
+
+{code}
+For 13127: 
+   Unselected columns has no effect on liveness of view row, for now, till we are ready for new design.
+   It cannot be properly supported without disruptive changes, like VirtualCells or multiple livenessInfos.
+   The unsupported corner cases: if base row is removed after unselected column removal(ttl or cell tombstone), we will have problem keeping the view row alive again by setting smaller or equal timestamp on base livenessInfo or other unselected column. (if updating smaller ts on selected column, view row will be alive)
+{code}
+
+{code}
+For 13547:
+    It's necessary to forbid dropping filtered columns from base columns.
+    The filtered column part needs to be reconsidered with 10368.
+    It cannot be properly supported without disruptive changes, like VirtualCells or multiple livenessInfos
+{code}
+
+{code}
+for 13409:
+    As paulo suggested, generating column tombstones when receiving a partial update for a previously deleted row might be a non-disruptive solution if cell tombstone can co-exist with row deletion which has greater timestamp.
+
+    It is resolved by avoid using shadowable tombstone, use expired livenessInfo instead. We won't have the problem of resurrecting previous deleted data.
+{code}
+
+PATCH for 11500: 
+| [trunk|https://github.com/jasonstack/cassandra/commits/11500-poc]|
+| [dtest|https://github.com/riptano/cassandra-dtest/commits/11500-poc]| 
+
+{code}
+Changes:
+1. Removal is shadowable:
+   1.1  if the non-key base column in view-pk is updated or deleted by partial update or partial delete. if this non-key column is removed by row deletion, it's not shadowable.
+   1.2 if there is no non-key base column in view-pk.
+   
+   Current shadowable tombstone is not used to avoid the issue of resurrecting deleted cells. We will expired-livenessInfo instead. 
+
+2. It's strict-liveness iff there is non-key base column in view-pk. The existence of view row is solely base on this non-key base column.
+
+3. If there is no non-pk base column in view-pk, the view's liveness/deletion is using max of base livenessIno + unselected column. unselected column's ttl is used only when it affects view row liveness. Selected columns won't contribute to livenessInfo or row deletion.
+    * this wouldn't support complex cases as explained above. eg. c/d unselected, update c@10, delete c@11, update d@5. view row should be alive but dead
+
+4. in TableViews.java, the DeletionTracker should be applied even if existing has no data, eg. partition-deletion
+
+{code} 
+
+Thanks for the update! See follow-up below:
+
+bq. My understanding is: view row is strict iff the view has non-key base row as view pk. When it's Strict, the view's row liveness/deletion should use this non-key base column's timestamp as well as ttl, unless there is a greater row deletion.(It's like a simplified version of "VirtualCells" which only store metadata for non-key base column in view pk)
+
+That's a good simplification of virtual cells which should allow us to fix the out-of-order update issues with non-base PK column (CASSANDRA-11500,CASSANDRA-13657).
+
+I wasn't very comfortable with our previous approach of enforcing strict liveness during row merge, since it changes a lot of low-level structures/interfaces (like BTreeRow/MergeListener, etc) to enforce a table-level setting. Since we'll probably get rid of this when doing a proper implementation of virtual cells , I updated [on this commit|https://github.com/pauloricardomg/cassandra/commit/2b7b7c8ca79b6ef72c7c92535096c6d1d899ee43] to perform the filtering during read instead which will give us the same result but with less change in unrelated code. Do you see any problem with this approach?
+
+bq. this wouldn't support complex cases as explained above. eg. c/d unselected, update c@10, delete c@11, update d@5. view row should be alive but dead
+
+Actually this is a bit worst than I initially thought, since unselected deletion can also shadow a previous insert (not only update) so I [added|https://github.com/pauloricardomg/cassandra/commit/4200db215bdd6a9338e5d16cc567444537104e4b] an additional test case to testPartialDeleteUnselectedColumn with this scenario. I also [added|https://github.com/pauloricardomg/cassandra/commit/623d5f6d935b57ad3c949206b85206aea15a8844] a note to both NEWS.txt and to the documentation explaining that it might be unsafe to perform deletion on unselected view column. I created CASSANDRA-13826 to add proper support to this and other cases with storage engine changes.
+
+bq. If there is no non-pk base column in view-pk, the view's liveness/deletion is using max of base livenessIno + unselected column. unselected column's ttl is used only when it affects view row liveness. Selected columns won't contribute to livenessInfo or row deletion.
+
+In order to prevent drop of unselected column to keep view row alive, I added a new [commit|https://github.com/pauloricardomg/cassandra/commit/afef09233a9ee0657104319de4c8a4f76e9ad292] disallowing drop of base table columns until we can deal with this properly.
+
+bq.  Current shadowable tombstone is not used to avoid the issue of resurrecting deleted cells. We will expired-livenessInfo instead.
+
+One problem of replacing shadowable tombstones by expired liveness info is that it stores an additional unused ttl field for every shadowed view entry to solve the commutative view deletion problem. In order to avoid this I [updated the patch|https://github.com/pauloricardomg/cassandra/commit/e0da138ab10f6c0fc014de86fb251e11358d80cc] to only use expired ttl when a shadowable tombstone would not work along with an explanation on why that is used since it's a hack.
+
+bq. in TableViews.java, the DeletionTracker should be applied even if existing has no data, eg. partition-deletion
+
+Is this still required after enforcing strict liveness on the [PurgeFunction|https://github.com/pauloricardomg/cassandra/commit/2b7b7c8ca79b6ef72c7c92535096c6d1d899ee43#diff-5636ce30e505443b3e24a1a6ba55e476R112]? I removed this and also [simplified|https://github.com/apache/cassandra/commit/3188feb38fb63c5ca556a8273aadc84571ac1bb6] {{ViewUpdateGenerator.deleteOldEntry}} to always use shadowable deletion and it didn't seem to affect any test. Do you see any other case which could be affected by this?
+
+Also, as we discussed offline, since we are changing the row liveness/deletion computation when the view has non-key base row as view PK, this means that an older update to this column may not generate a correct shadowable deletion in the view, as shown by the example below:
+{noformat}
+before upgrade
+
+base:  (k=1@5)  a=1@1  b=1@1  c=1@1
+
+view:  (k=1 && a=1 @5)  b=1@1  c=1@1    (old way of computing livenessInfo timestamp, max of view pk columns)
+___________
+after upgrade
+
+update a = null @ 1
+
+base:  (k=1@5)  a=null@1  b=1@1  c=1@1
+
+view:
+           (k=1 && a=1 @5)  b=1@1  c=1@1    (old way of computing livenessInfo timestamp, max of view pk columns)
+           (k=1 && a=1 @expired at 1)              (new way of computing livenessInfo timestamp, non-key base column in view pk dominates)
+ 
+           new expired livenessInfo cannot shadow old view row if the removal time is less the previous max
+{noformat}
+
+Even though this should be a pretty unlikely scenario, it would only happen if a missed update that shadows a view PK column arrive after upgrade, which can typically happen after a hint or repair. In order to prevent against this, I added a [note|https://github.com/pauloricardomg/cassandra/commit/623d5f6d935b57ad3c949206b85206aea15a8844#diff-4302f2407249672d7845cd58027ff6e9R75] to the {{Upgrading}} section of {{NEWS.txt}} explaining about this caveat and that running repair before the upgrade should be sufficient to avoid it.
+
+[~jasonstack] I rebased your patch on current trunk and added the above suggestions on top of it, can you take a look and let me know what do you think? Patch and tests available below:
+||trunk||dtest||
+|[branch|https://github.com/apache/cassandra/compare/trunk...pauloricardomg:trunk-11500]|[branch|https://github.com/riptano/cassandra-dtest/compare/master...pauloricardomg:11500]|
+|[testall|http://jenkins-cassandra.datastax.lan/view/Dev/view/paulomotta/job/pauloricardomg-trunk-11500-testall/lastCompletedBuild/testReport/]|
+|[dtest|http://jenkins-cassandra.datastax.lan/view/Dev/view/paulomotta/job/pauloricardomg-trunk-11500-dtest/lastCompletedBuild/testReport/]|
+
+
+[~pauloricardomg] thanks for the feedback (y)
+
+bq. I wasn't very comfortable with our previous approach of enforcing strict liveness during row merge, since it changes a lot of low-level structures/interfaces (like BTreeRow/MergeListener, etc) to enforce a table-level setting. Since we'll probably get rid of this when doing a proper implementation of virtual cells , I updated on this commit to perform the filtering during read instead which will give us the same result but with less change in unrelated code. Do you see any problem with this approach?
+
+As we discussed offline, we need to make sure the raw data including tombstone, expired liveness are shipped to the coordinator side.  Enforcing strict liveness in {{ReadCommand.executeLocally()}} would remove the row before digest or data response. Instead, we add {{enforceStrictLiveness}} to {{Row.purge}} to get the same result but less interfaces changes for {{Row}}.
+
+bq. One problem of replacing shadowable tombstones by expired liveness info is that it stores an additional unused ttl field for every shadowed view entry to solve the commutative view deletion problem. In order to avoid this I updated the patch to only use expired ttl when a shadowable tombstone would not work along with an explanation on why that is used since it's a hack
+
+Shadowable tombstone will be deprecated and use expired livenessInfo if the deletion time is greater than merged-row deletion to avoid uncessary expired livenessInfo.
+
+bq. in TableViews.java, the DeletionTracker should be applied even if existing has no data, eg. partition-deletion
+
+It's tested by  "testRangeDeletionWithFlush()" in ViewTest. Without partition deletion info from deletion tracker, existing row is given as empty and it will resurrect deleted cells.
+
+bq.  In order to prevent against this, I added a note to the Upgrading section of NEWS.txt explaining about this caveat and that running repair before the upgrade should be sufficient to avoid it.
+
+(y)
+
+| source | unit | [dtest| 
+| [trunk|https://github.com/jasonstack/cassandra/commits/trunk-11500-squashed] |  https://circleci.com/gh/jasonstack/cassandra/551 | secondary_indexes_test.TestPreJoinCallback.resumt_test |
+| [3.11|https://github.com/jasonstack/cassandra/commits/CASSANDRA-11500-strict-3.11] |  https://circleci.com/gh/jasonstack/cassandra/557 | counter_tests.TestCounters.test_13691 |
+| [3.0|https://github.com/jasonstack/cassandra/commits/CASSANDRA-11500-strict-3.0] |  https://circleci.com/gh/jasonstack/cassandra/556|  counter_tests.TestCounters.test_13691
+authe_test.TestAuth.sysmtem_auth_ks_is_alterable_test |
+| [dtest|https://github.com/riptano/cassandra-dtest/commits/11500-poc]|
+
+Those failed dtests are not related.
+{code}
+Changes:
+1. Using expired livenessInfo if computed deletion time is greater than merged row deletion. There are only 2 cases:
+      a. non-pk base column used in view pk is removed by partial update or partial delete
+      b. unselected base column is removed by partial update or partial delete
+   
+   Current shadowable tombstone is not used to avoid the issue of resurrecting deleted cells. We will expired-livenessInfo and merged base row deletion instead. 
+
+2. It's strict-liveness iff there is non-key base column in view-pk. The existence of view row is solely base on this non-key base column.
+
+3. If there is no non-pk base column in view-pk, the view's liveness/deletion is using max of base livenessIno + unselected column. unselected column's ttl is used only when it affects view row liveness. Selected columns won't contribute to livenessInfo or row deletion.
+    * this wouldn't support complex cases as explained above. eg. c/d unselected, update c@10, delete c@11, update d@5. view row should be alive but dead
+
+4. in TableViews.java, the DeletionTracker should be applied even if existing has no data, eg. partition-deletion
+
+5. When generating read command to read existing base data, need to query all base columns instead of view's queried column if base and view having same key columns to read unselected column. 
+{code}
+
+bq. As we discussed offline, we need to make sure the raw data including tombstone, expired liveness are shipped to the coordinator side. Enforcing strict liveness in ReadCommand.executeLocally() would remove the row before digest or data response. Instead, we add enforceStrictLiveness to Row.purge to get the same result but less interfaces changes for Row.
+
+Excellent catch, my bad for overlooking this, but gladly you added a new dtest for it: [test_base_column_in_view_pk_complex_timestamp_with_flush|https://github.com/apache/cassandra-dtest/commit/6d77ace5361f020ba182072ade9f4ab98025c213#diff-62ba429edee6a4681782f078246c9893R993]. Enforcing strict liveness during reconciliation on the coordinator is the correct approach to differentiate between non-existing and removed rows via strict liveness. Ideally strict liveness would be a row property but as we saw in the previous version, this requires changes a bunch of other classes and interfaces, so let's keep it as a flag to Row.purge for now.
+
+bq. Shadowable tombstone will be deprecated and use expired livenessInfo if the deletion time is greater than merged-row deletion to avoid uncessary expired livenessInfo.
+
+LGTM, this will prevent using expired liveness info in most cases. We should probably remove this as part of CASSANDRA-13826 since we're overlading ExpiringLivenessInfo for a different purpose but it should be fine for now.
+
+Final patch and CI results look good and I'm confident we've exercised all edge cases properly with unit and dtests. Committed dtests to master as {{6d77ace5361f020ba182072ade9f4ab98025c213}}. Commited to cassandra-3.0 branch as {{1b36740ebe66b8ed4c3d6cb64eb2419a9279dfbf}} and merged up to cassandra-3.11 and trunk. Great job Zhao!
+
+*Summary of improvements and fixed issues*
+
+This patch address most outstanding timestamp problems with MVs on the 3.x series without changing the binary or storage protocol. The remaining issues which requires storage engine and binary protocol changes will be addressed on CASSANDRA-13826 on trunk. Below is a summary of the main changes and fixes this patch introduces.
+
+{noformat}
+* View same PK components as base
+
+* DELETE of selected column should not affect out of order updates (testPartialDeleteSelectedColumn)
+* DELETE of unselected column/collection should not affect ordered updates (testUpdateColumnNotInView, testPartialUpdateWithUnselectedCollections - CASSANDRA-13127)
+* Unselected columns should keep view row alive when other columns expire (testUnselectedColumnsTTL - CASSANDRA-13127)
+
+* Extra column on view PK
+
+* View row should expire when view PK column expires in base (testUpdateColumnInViewPKWithTTL - CASSANDRA-13657)
+* Commutative row deletion (testCommutativeRowDeletion, testCellTombstoneAndShadowableTombstones - CASSANDRA-13409)
+* Out of order updates to extra column on view PK (testUpdateWithColumnTimestampBiggerThanPk, testUpdateWithColumnTimestampSmallerThanPk, CASSANDRA-11500)
+
+* Unsupported scenarios
+
+* DELETE of unselected column should not affect out of order updates (testPartialDeleteUnselectedColumn - CASSANDRA-13127 - Added )
+* Filtering by non-PK base column (Only on C* 3.11+, disallowed on CASSANDRA-13798)
+
+* Additional MV tests
+
+* testNonBaseColumnInViewPk
+* testRangeDeletion
+* testStrictLivenessTombstone
+* testFrozenCollectionsWithComplexInnerType
+* testMVWithDifferentColumns
+* testBaseTTLWithSameTimestampTest
+{noformat}
+
+*Summary of code changes*
+
+{noformat}
+1. Using expired livenessInfo if computed deletion time is greater than merged row deletion. There are only 2 cases:
+      a. non-pk base column used in view pk is removed by partial update or partial delete
+      b. unselected base column is removed by partial update or partial delete
+   
+   Current shadowable tombstone is not used to avoid the issue of resurrecting deleted cells (CASSANDRA-13049). We will expired-livenessInfo and merged base row deletion instead.
+
+2. It's strict-liveness iff there is non-key base column in view-pk. The existence of view row is solely base on this non-key base column.
+
+3. If there is no non-base PK column in view-pk, the view's liveness/deletion is using max of base livenessIno + unselected column. unselected column's ttl is used only when it affects view row liveness. Selected columns won't contribute to livenessInfo or row deletion.
+    * this wouldn't support complex cases as explained above. eg. c/d unselected, update c@10, delete c@11, update d@5. view row should be alive but dead - We added a note to NEWS.txt as well as documentation about this unsupported case.
+    * since we change the way the deletion timestamp is computed in this case, an older deletion to the non-base PK may not properly shadow a previous view row with a greater timestamp, so repair should be run before upgrade on the base table to ensure deletions are properly generated with the previous approach, or alternatively repair can be run on the views after upgrade (added note to NEWS.txt).
+
+4. in TableViews.java, the DeletionTracker should be applied even if existing has no data, eg. partition-deletion
+
+5. When generating read command to read existing base data, need to query all base columns instead of view's queried column if base and view having same key columns to read unselected column.
+
+6. Fix handling of timestamp tie on PrimaryKeyLivenessInfo to match the one for cell resolution: on timestamp tie, greater timestamp supersede lower timestamp and TTL supersedes non-TTL (tested on testBaseTTLWithSameTimestampTest).
+
+7. Disallow drop of columns on base tables with MVs because we cannot tell if the dropped column is keeping a view row alive (will be fixed on CASSANDRA-13826)
+{noformat}
+
+[~pauloricardomg] (y) thanks for the feedback, review, improvements.
+
+Looks good. Thanks for all the hard work [~jasonstack] and [~pauloricardomg]
+
+Committed {{afc55e8fe103597ef2a663be21828861a4832be7}} and {{6220394e84c79e6ef94651fc5e0aa03c12ddd307}} to cassandra-dtest with a minor fix to {{test_base_column_in_view_pk_complex_timestamp}} flakiness and minor change to {{test_base_column_in_view_pk_complex_timestamp}} to make it work on 3.0.
+

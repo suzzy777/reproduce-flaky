@@ -1,0 +1,340 @@
+Would hbase-21271 help? Stop throwing unsupported exception?
+
+I do not think so. The problem here is that we should not try to rollback a TRSP...
+
+I think the problem is that, we will rollback after the MERGE_TABLE_REGIONS_CHECK_CLOSED_REGIONS state, but we will not wait for the completion of the sub procedures, which are two TRSPs.
+
+In the code of ProcedureExecutor, we will wait before the sub procedures are finished, before executing rollback, and in the upload log we can see that the TRSP with pid=43 was finished, but finally we still wanted to rollback it, which is a bit strange. Need to dig more.
+
+OK, for the unsupported exception, I think the problem is that, we will record all the sub procedures, and when rolling back, we first need to rollback the sub procedures, and it will lead to an UnsupportedOperationException.
+
+But the behavior is still a bit strange. After throwing UnsupportedOperationException, the next time we enter the executeProcedure method and output this
+
+{noformat}
+2018-10-08 03:44:31,101 DEBUG [PEWorker-1] procedure2.ProcedureExecutor(1425): pid=43, ppid=42, state=SUCCESS, hasLock=false; TransitRegionStateProcedure table=testRollbackAndDoubleExecution, region=9bac7c539ac0cff6dc5706ed375a3bfb, UNASSIGN is already finished, skipping execution
+{noformat}
+
+Need to dig more...
+
+Good news. After changing the testRecoveryAndDoubleExecution to only quit when the stepNum equals the lastStep, and change the lastStep to 8(It is the id for MERGE_TABLE_REGIONS_UPDATE_META, we can rollback before this state, actually) . The old test does not fail always is because that, we sometimes do not persist the TRSPs so when restarting we do not need to rollback the TRSPs. By changing the lastStep to 8, we make sure that the two TRSPs have been persistent so the test will fail always.
+
+Let me dig.
+
+OK I found the problem. When rolling back a procedure, we also need to acquire the lock. And for TRSP, we need to wait until meta loaded, but when the procedures is woken up by the meta loaded event, we will add it into the scheduler and try to execute it, not rollback it...
+
+I think the first thing here is to decide what is the correct behavior. In the current design, when rolling back a procedure, we will rollback the sub procedures first. At least for MergeTableRegionsProcedure, this does not make sense. There is no rollback for TRSP, and also, we will schedule new TRSPs to rollback the state when rolling back the MergeTableRegionsProcedure, so we do not need to rollback the sub procedures...
+
+
+
+bq. In the current design, when rolling back a procedure, we will rollback the sub procedures first. At least for MergeTableRegionsProcedure, this does not make sense.
+
+... because? Is it be cause "There is no rollback for TRSP"?
+
+Has the TRSP completed successfully? Can it 'ignore' the rollback request? Or, can we not schedule new TRSPs to do the MergeTableRegionsProcedure rollback?
+
+We should do a writeup on rollback, and try and design how it should work?
+
+For MergeTableRegionsProcedure, we will schedule new TRSPs to bring the two regions online, you can see the code. This is natural I think, as the original TRSPs have been finished successfully. It does not make sense to rollback a successful procedure right? Most developers will not consider that the a successful procedure can still be rolled back...
+
+bq. It does not make sense to rollback a successful procedure right?
+
+Agree.
+
+bq. ....so we do not need to rollback the sub procedures...
+
+How to do this, prevent PE calling rollback on subprocedures? TRSP just ignores the calls?
+
+The 'throw new UnsupportedOperationException(this + " unhandled state=" + state);' needs changing too?
+
+
+
+I think there are two scenarios which we want to rollback a procedure.
+
+1. The procedure is aborted.
+2. One of the sub procedure is failed.
+
+I think the proper way to rollback a procedure is:
+
+1. If there are still running sub procedures, wait until they are all done.
+2. Rollback this procedure.
+3. Recursively rollback the parent procedure.
+
+For now the logic is almost the same as above, but we have a complicated way to store the rollback steps, where we will record the execution of sub procedures, and will also rollback the sub procedures when rolling back a procedure.
+
+Let me review the code carefully to see what is going on...
+
+OK, I finally understand the implementation. Every time we execute a procedure we will push it into a stack, and when rolling back, we start to pop from the stack to revert the procedures. So maybe we could just skip reverting some procedures in executeRollback...
+
+I tried and got 'Corrupted Procedures'...
+
+Let me dig more...
+
+
+
+OK I think the first problem is that our rollbackCloseRegionsForMerge is not idempotent, let me see how to fix...
+
+Review board link:
+
+https://reviews.apache.org/r/69014/
+
+Ping [~stack] for reviewing. The old rollback implementation for MergeTableRegionsProcedure and SplitTableRegionProcedure does not work, actually...
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 13s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green}  0m  0s{color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 3 new or modified test files. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 25s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  5m  7s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  2m  7s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 26s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  4m 13s{color} | {color:green} branch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 38s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 44s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 15s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  5m 19s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  2m 14s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  2m 14s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 29s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  4m 23s{color} | {color:green} patch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green} 10m 38s{color} | {color:green} Patch does not cause any errors with Hadoop 2.7.4 or 3.0.0. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 57s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 45s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 14m 59s{color} | {color:red} hbase-procedure in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}130m 43s{color} | {color:red} hbase-server in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 40s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}192m  3s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hbase.procedure2.TestProcedureExecution |
+|   | hadoop.hbase.procedure2.TestStateMachineProcedure |
+|   | hadoop.hbase.master.procedure.TestModifyTableProcedure |
+|   | hadoop.hbase.master.procedure.TestDeleteNamespaceProcedure |
+|   | hadoop.hbase.master.procedure.TestEnableTableProcedure |
+|   | hadoop.hbase.master.procedure.TestCloneSnapshotProcedure |
+|   | hadoop.hbase.master.procedure.TestModifyNamespaceProcedure |
+|   | hadoop.hbase.master.assignment.TestRegionMoveAndAbandon |
+|   | hadoop.hbase.master.procedure.TestCreateTableProcedure |
+|   | hadoop.hbase.master.procedure.TestCreateNamespaceProcedure |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hbase:b002b0b |
+| JIRA Issue | HBASE-21278 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12943759/HBASE-21278.patch |
+| Optional Tests |  dupname  asflicense  javac  javadoc  unit  findbugs  shadedjars  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux eafd8bfa41e0 3.13.0-139-generic #188-Ubuntu SMP Tue Jan 9 14:43:09 UTC 2018 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build/component/dev-support/hbase-personality.sh |
+| git revision | master / 7464e2ef9d |
+| maven | version: Apache Maven 3.5.4 (1edded0938998edf8bf061f1ceb3cfdeccf443fe; 2018-06-17T18:33:14Z) |
+| Default Java | 1.8.0_181 |
+| findbugs | v3.1.0-RC3 |
+| unit | https://builds.apache.org/job/PreCommit-HBASE-Build/14686/artifact/patchprocess/patch-unit-hbase-procedure.txt |
+| unit | https://builds.apache.org/job/PreCommit-HBASE-Build/14686/artifact/patchprocess/patch-unit-hbase-server.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/14686/testReport/ |
+| Max. process+thread count | 4710 (vs. ulimit of 10000) |
+| modules | C: hbase-procedure hbase-server U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/14686/console |
+| Powered by | Apache Yetus 0.8.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Just reviewed the patch, +1 for it. I like the idea that do not rollback the already successful ones. But seems like some UTs are fail, still need to dig? I think this patch can go to branch-2.0 and branch-2.1 also.
+
+Left a few notes up on rb. Do we have to go through all Procedures and see  how they do with this new philosophy where the parent runs the rollback skipping rollback of the subprocedures?
+
+bq. The old rollback implementation for MergeTableRegionsProcedure and SplitTableRegionProcedure does not work, actually....
+
+Say more. What to do here?
+
+Thanks [~Apache9]
+
+I've replied on RB, the old implementation is not idempotent. We will be in trouble if there are crashes... The current testRollbackAndDoubleExecution can cover this problem.
+
+Let me see the failed UTs.
+
+For TestEnableTableProcedure, it is because that I changed the implementation of testRollbackAndDoubleExecution, and we used to pass 0 as the last step so it is broken. But anyway the old UT just tests nothing, as we will quit immediately... I'm afraid there is big hole in our UTs for testing rollback... Will be back later after I fix all the failed UTs...
+
+| (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 12s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green}  0m  0s{color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 12 new or modified test files. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 25s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  5m 29s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  2m 21s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 36s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  6m  5s{color} | {color:green} branch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 30s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 45s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 16s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  5m 12s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  2m  5s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  2m  5s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 14s{color} | {color:green} hbase-procedure: The patch generated 0 new + 19 unchanged - 1 fixed = 19 total (was 20) {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 11s{color} | {color:green} The patch passed checkstyle in hbase-server {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  4m 13s{color} | {color:green} patch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green} 10m 54s{color} | {color:green} Patch does not cause any errors with Hadoop 2.7.4 or 3.0.0. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 40s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 43s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  2m 53s{color} | {color:green} hbase-procedure in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}115m 28s{color} | {color:green} hbase-server in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 43s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}166m 42s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hbase:b002b0b |
+| JIRA Issue | HBASE-21278 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12943835/HBASE-21278-v1.patch |
+| Optional Tests |  dupname  asflicense  javac  javadoc  unit  findbugs  shadedjars  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux ae7091733738 3.13.0-143-generic #192-Ubuntu SMP Tue Feb 27 10:45:36 UTC 2018 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build/component/dev-support/hbase-personality.sh |
+| git revision | master / dde336f6ef |
+| maven | version: Apache Maven 3.5.4 (1edded0938998edf8bf061f1ceb3cfdeccf443fe; 2018-06-17T18:33:14Z) |
+| Default Java | 1.8.0_181 |
+| findbugs | v3.1.0-RC3 |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/14690/testReport/ |
+| Max. process+thread count | 5023 (vs. ulimit of 10000) |
+| modules | C: hbase-procedure hbase-server U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/14690/console |
+| Powered by | Apache Yetus 0.8.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+OK, good, all green.
+
+If no other concerns let's commit this? Will prepare the patch for branch-2.0 & branch-2.1 in another issue, as the assign/unassign are a bit different...
+
+Ping [~allan163] and [~stack]. Will commit if no other concerns. Thanks.
+
+Pushed to master and branch-2.
+
+Results for branch branch-2
+	[build #1397 on builds.a.o|https://builds.apache.org/job/HBase%20Nightly/job/branch-2/1397/]: (x) *{color:red}-1 overall{color}*
+----
+details (if available):
+
+(/) {color:green}+1 general checks{color}
+-- For more information [see general report|https://builds.apache.org/job/HBase%20Nightly/job/branch-2/1397//General_Nightly_Build_Report/]
+
+
+
+
+(x) {color:red}-1 jdk8 hadoop2 checks{color}
+-- For more information [see jdk8 (hadoop2) report|https://builds.apache.org/job/HBase%20Nightly/job/branch-2/1397//JDK8_Nightly_Build_Report_(Hadoop2)/]
+
+
+(x) {color:red}-1 jdk8 hadoop3 checks{color}
+-- For more information [see jdk8 (hadoop3) report|https://builds.apache.org/job/HBase%20Nightly/job/branch-2/1397//JDK8_Nightly_Build_Report_(Hadoop3)/]
+
+
+(/) {color:green}+1 source release artifact{color}
+-- See build output for details.
+
+
+(/) {color:green}+1 client integration test{color}
+
+
+Results for branch master
+	[build #549 on builds.a.o|https://builds.apache.org/job/HBase%20Nightly/job/master/549/]: (x) *{color:red}-1 overall{color}*
+----
+details (if available):
+
+(/) {color:green}+1 general checks{color}
+-- For more information [see general report|https://builds.apache.org/job/HBase%20Nightly/job/master/549//General_Nightly_Build_Report/]
+
+
+
+
+(x) {color:red}-1 jdk8 hadoop2 checks{color}
+-- For more information [see jdk8 (hadoop2) report|https://builds.apache.org/job/HBase%20Nightly/job/master/549//JDK8_Nightly_Build_Report_(Hadoop2)/]
+
+
+(x) {color:red}-1 jdk8 hadoop3 checks{color}
+-- For more information [see jdk8 (hadoop3) report|https://builds.apache.org/job/HBase%20Nightly/job/master/549//JDK8_Nightly_Build_Report_(Hadoop3)/]
+
+
+(/) {color:green}+1 source release artifact{color}
+-- See build output for details.
+
+
+(/) {color:green}+1 client integration test{color}
+
+
+Should we backport a form of this to branch-2.1 [~Apache9] and adopt the philosophy you have here regards rollback? (Though for latter, I suppose we have to wait on 2.2....Can't do it on a point release). Thanks.
+
+Results for branch branch-2.0
+	[build #999 on builds.a.o|https://builds.apache.org/job/HBase%20Nightly/job/branch-2.0/999/]: (/) *{color:green}+1 overall{color}*
+----
+details (if available):
+
+(/) {color:green}+1 general checks{color}
+-- For more information [see general report|https://builds.apache.org/job/HBase%20Nightly/job/branch-2.0/999//General_Nightly_Build_Report/]
+
+
+
+
+(/) {color:green}+1 jdk8 hadoop2 checks{color}
+-- For more information [see jdk8 (hadoop2) report|https://builds.apache.org/job/HBase%20Nightly/job/branch-2.0/999//JDK8_Nightly_Build_Report_(Hadoop2)/]
+
+
+(/) {color:green}+1 jdk8 hadoop3 checks{color}
+-- For more information [see jdk8 (hadoop3) report|https://builds.apache.org/job/HBase%20Nightly/job/branch-2.0/999//JDK8_Nightly_Build_Report_(Hadoop3)/]
+
+
+(/) {color:green}+1 source release artifact{color}
+-- See build output for details.
+
+
+Results for branch branch-2.1
+	[build #517 on builds.a.o|https://builds.apache.org/job/HBase%20Nightly/job/branch-2.1/517/]: (x) *{color:red}-1 overall{color}*
+----
+details (if available):
+
+(/) {color:green}+1 general checks{color}
+-- For more information [see general report|https://builds.apache.org/job/HBase%20Nightly/job/branch-2.1/517//General_Nightly_Build_Report/]
+
+
+
+
+(x) {color:red}-1 jdk8 hadoop2 checks{color}
+-- For more information [see jdk8 (hadoop2) report|https://builds.apache.org/job/HBase%20Nightly/job/branch-2.1/517//JDK8_Nightly_Build_Report_(Hadoop2)/]
+
+
+(x) {color:red}-1 jdk8 hadoop3 checks{color}
+-- For more information [see jdk8 (hadoop3) report|https://builds.apache.org/job/HBase%20Nightly/job/branch-2.1/517//JDK8_Nightly_Build_Report_(Hadoop3)/]
+
+
+(/) {color:green}+1 source release artifact{color}
+-- See build output for details.
+
+
+(/) {color:green}+1 client integration test{color}
+
+

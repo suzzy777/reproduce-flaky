@@ -1,0 +1,175 @@
+Right now, we are testing JDK 11 with a Maven-based build, as in https://amplab.cs.berkeley.edu/jenkins/view/Spark%20QA%20Test%20(Dashboard)/job/spark-master-test-maven-hadoop-3.2/
+
+It looks like _all_ of the Maven-based jobs 'manually' build and invoke tests, and only run tests via Maven -- that is, they do not run Pyspark or SparkR tests. The SBT-based builds do, because they use the {{dev/run-tests}} script that is meant to be for this purpose.
+
+In fact, there seem to be a couple flavors of copy-pasted build configs. SBT builds look like:
+
+{code}
+#!/bin/bash
+
+set -e
+
+# Configure per-build-executor Ivy caches to avoid SBT Ivy lock contention
+export HOME="/home/sparkivy/per-executor-caches/$EXECUTOR_NUMBER"
+mkdir -p "$HOME"
+export SBT_OPTS="-Duser.home=$HOME -Dsbt.ivy.home=$HOME/.ivy2"
+export SPARK_VERSIONS_SUITE_IVY_PATH="$HOME/.ivy2"
+
+# Add a pre-downloaded version of Maven to the path so that we avoid the flaky download step.
+export PATH="/home/jenkins/tools/hudson.tasks.Maven_MavenInstallation/Maven_3.3.9/bin/:$PATH"
+
+git clean -fdx
+./dev/run-tests
+{code}
+
+Maven builds looks like:
+
+{code}
+#!/bin/bash
+
+set -x
+set -e
+
+rm -rf ./work
+git clean -fdx
+
+# Generate random point for Zinc
+export ZINC_PORT
+ZINC_PORT=$(python -S -c "import random; print random.randrange(3030,4030)")
+
+# Use per-build-executor Ivy caches to avoid SBT Ivy lock contention:
+export SPARK_VERSIONS_SUITE_IVY_PATH="/home/sparkivy/per-executor-caches/$EXECUTOR_NUMBER/.ivy2"
+mkdir -p "$SPARK_VERSIONS_SUITE_IVY_PATH"
+
+# Prepend JAVA_HOME/bin to fix issue where Zinc's embedded SBT incremental compiler seems to
+# ignore our JAVA_HOME and use the system javac instead.
+export PATH="$JAVA_HOME/bin:$PATH"
+
+# Add a pre-downloaded version of Maven to the path so that we avoid the flaky download step.
+export PATH="/home/jenkins/tools/hudson.tasks.Maven_MavenInstallation/Maven_3.3.9/bin/:$PATH"
+
+MVN="build/mvn -DzincPort=$ZINC_PORT"
+
+set +e
+
+if [[ $HADOOP_PROFILE == hadoop-1 ]]; then
+    # Note that there is no -Pyarn flag here for Hadoop 1:
+    $MVN \
+        -DskipTests \
+        -P"$HADOOP_PROFILE" \
+        -Dhadoop.version="$HADOOP_VERSION" \
+        -Phive \
+        -Phive-thriftserver \
+        -Pkinesis-asl \
+        -Pmesos \
+        clean package
+    retcode1=$?
+
+    $MVN \
+        -P"$HADOOP_PROFILE" \
+        -Dhadoop.version="$HADOOP_VERSION" \
+        -Phive \
+        -Phive-thriftserver \
+        -Pkinesis-asl \
+        -Pmesos \
+        --fail-at-end \
+        test
+    retcode2=$?
+else
+    $MVN \
+        -DskipTests \
+        -P"$HADOOP_PROFILE" \
+        -Pyarn \
+        -Phive \
+        -Phive-thriftserver \
+        -Pkinesis-asl \
+        -Pmesos \
+        clean package
+    retcode1=$?
+
+    $MVN \
+        -P"$HADOOP_PROFILE" \
+        -Pyarn \
+        -Phive \
+        -Phive-thriftserver \
+        -Pkinesis-asl \
+        -Pmesos \
+        --fail-at-end \
+        test
+    retcode2=$?
+fi
+
+if [[ $retcode1 -ne 0 || $retcode2 -ne 0 ]]; then
+  if [[ $retcode1 -ne 0 ]]; then
+    echo "Packaging Spark with Maven failed"
+  fi
+  if [[ $retcode2 -ne 0 ]]; then
+    echo "Testing Spark with Maven failed"
+  fi
+  exit 1
+fi
+{code}
+
+The PR builder (one of them at least) looks like:
+
+{code}
+#!/bin/bash
+
+set -e  # fail on any non-zero exit code
+set -x
+
+export AMPLAB_JENKINS=1
+export PATH="$PATH:/home/anaconda/envs/py3k/bin"
+
+# Prepend JAVA_HOME/bin to fix issue where Zinc's embedded SBT incremental compiler seems to
+# ignore our JAVA_HOME and use the system javac instead.
+export PATH="$JAVA_HOME/bin:$PATH"
+
+# Add a pre-downloaded version of Maven to the path so that we avoid the flaky download step.
+export PATH="/home/jenkins/tools/hudson.tasks.Maven_MavenInstallation/Maven_3.3.9/bin/:$PATH"
+
+echo "fixing target dir permissions"
+chmod -R +w target/* || true  # stupid hack by sknapp to ensure that the chmod always exits w/0 and doesn't bork the script
+
+echo "running git clean -fdx"
+git clean -fdx
+
+# Configure per-build-executor Ivy caches to avoid SBT Ivy lock contention
+export HOME="/home/sparkivy/per-executor-caches/$EXECUTOR_NUMBER"
+mkdir -p "$HOME"
+export SBT_OPTS="-Duser.home=$HOME -Dsbt.ivy.home=$HOME/.ivy2"
+export SPARK_VERSIONS_SUITE_IVY_PATH="$HOME/.ivy2"
+
+# This is required for tests of backport patches.
+# We need to download the run-tests-codes.sh file because it's imported by run-tests-jenkins.
+# When running tests on branch-1.0 (and earlier), the older version of run-tests won't set CURRENT_BLOCK, so
+# the Jenkins scripts will report all failures as "some tests failed" rather than a more specific
+# error message.
+if [ ! -f "dev/run-tests-jenkins" ]; then 
+  wget https://raw.githubusercontent.com/apache/spark/master/dev/run-tests-jenkins
+  wget https://raw.githubusercontent.com/apache/spark/master/dev/run-tests-codes.sh
+  mv run-tests-jenkins dev/
+  mv run-tests-codes.sh dev/
+  chmod 755 dev/run-tests-jenkins
+  chmod 755 dev/run-tests-codes.sh
+fi
+
+./dev/run-tests-jenkins
+
+
+# Hack to ensure that at least one JVM suite always runs in order to prevent spurious errors from the
+# Jenkins JUnit test reporter plugin
+./build/sbt unsafe/test > /dev/null 2>&1
+{code}
+
+
+Narrowly, my suggestion is:
+
+- Make the master Maven-based builds use {{dev/run-tests}} too, so that Pyspark tests are run. It's meant to support this, if {{AMPLAB_JENKINS_BUILD_TOOL}} is set to "maven". I'm not sure if we've tested this, then, if it's not used. We may need _new_ Jenkins jobs to make sure it works.
+- Leave the Spark 2.x builds as-is as 'legacy'.
+
+But there are probably more things we should consider:
+
+- Why also test with SBT? Maven is the build of reference and presumably one test job is enough? if it was because the Maven configs weren't running all the tests, and we can fix that, then are the SBT builds superfluous? Maybe keep _one_ to verify SBT builds still work
+- Shouldn't the PR builder look more like the other Jenkins builds? maybe it needs to be special, a bit. But should all of them be using {{run-tests-jenkins}}?
+- Looks like some cruft in the configs that has built up over time. Can we review/delete some? things like Java 7 home, hard-coding a Maven path. Perhaps standardizing on the simpler run-tests invocation does this?

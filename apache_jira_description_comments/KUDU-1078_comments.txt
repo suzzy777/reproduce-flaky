@@ -1,0 +1,155 @@
+I think it might be something like this:
+- a leader falls asleep for a bit - another node elects itself and replicates some ops
+- then the leader tries to replicate an op, and gets back an INVALID_TERM response. However, in that response it also sees a newer last_received which is higher than anything it personally sent
+- we call NotifyObserversOfTermChange(), but that's async, so we don't step down quite yet
+- meanwhile, before the notification runs, we try to generate another request, which ends up reading an op "from the future"
+
+I think this can happen under load because NotifyObserversOfTermChange can be slower, plus heavy load might encourage some leader churn.
+
+I've been investigating this for the better part of a day, here's what I have so far:
+
+# As noted by Todd, the queue is updating the stats for a peer even when the peer is reporting that the leader is out of date. I have a fix for this but it doesn't fully solve the problem.
+# There is a bug in ReplicaState where we mistakenly consider an op to have come from the current leader when that is not necessarily true, in AbortOpsAfterUnlocked(). I have a fix for this but it doesn't fully solve the problem either.
+# I currently suspect there is a cache coherency race in LogCache where we can serve ops from disk through LogCache that don't get immediately populated in the cache itself, but I haven't been able to nail it down yet.
+
+Seeing this in the test output. I think somehow there is some op aborting occurring on the leader 3fda1f47315a4fbfb8e86af40c01f5bb queue after entering leader mode.
+
+{noformat}
+I0916 02:53:38.643198  5598 consensus_queue.cc:137] T 5f951db248974a8eb3d8af6ae4ca7119 P 3fda1f47315a4fbfb8e86af40c01f5bb [term 194 LEADER]: Queue going to LEADER mode. State: All replicated op: 186.88, Majority replicated op: 180.84, Committed index: 180.84, Last appended: 186.91, Current term: 194, Majority size: 2, State: 1, Mode: LEADER, active raft config: opid_index: -1 local: false peers { permanent_uuid: "4fe0d1af3e0b4acc946d0629aaeadffc" member_type: VOTER last_known_addr { host: "127.124.79.1" port: 35206 } } peers { permanent_uuid: "3fda1f47315a4fbfb8e86af40c01f5bb" member_type: VOTER last_known_addr { host: "127.124.79.0" port: 36300 } } peers { permanent_uuid: "3eb5ca298fb5431fadc35803d241b00d" member_type: VOTER last_known_addr { host: "127.124.79.2" port: 50435 } }
+I0916 02:53:38.643868  5582 leader_election.cc:211] T 5f951db248974a8eb3d8af6ae4ca7119 P 4fe0d1af3e0b4acc946d0629aaeadffc [CANDIDATE]: Term 195 election: Requesting vote from peer 3fda1f47315a4fbfb8e86af40c01f5bb
+I0916 02:53:38.644038  5582 leader_election.cc:211] T 5f951db248974a8eb3d8af6ae4ca7119 P 4fe0d1af3e0b4acc946d0629aaeadffc [CANDIDATE]: Term 195 election: Requesting vote from peer 3eb5ca298fb5431fadc35803d241b00d
+I0916 02:53:38.644788  5490 raft_consensus.cc:1546] T 5f951db248974a8eb3d8af6ae4ca7119 P 3eb5ca298fb5431fadc35803d241b00d [term 189 LEADER]: Leader election vote request: Denying vote to candidate 4fe0d1af3e0b4acc946d0629aaeadffc for term 195 because replica is either leader or believes a valid leader to be alive.
+I0916 02:53:38.645123  5319 leader_election.cc:349] T 5f951db248974a8eb3d8af6ae4ca7119 P 4fe0d1af3e0b4acc946d0629aaeadffc [CANDIDATE]: Term 195 election: Vote denied by peer 3eb5ca298fb5431fadc35803d241b00d. Message: Invalid argument: T 5f951db248974a8eb3d8af6ae4ca7119 P 3eb5ca298fb5431fadc35803d241b00d [term 189 LEADER]: Leader election vote request: Denying vote to candidate 4fe0d1af3e0b4acc946d0629aaeadffc for term 195 because replica is either leader or believes a valid leader to be alive.
+I0916 02:53:38.645413  5368 raft_consensus.cc:780] T 5f951db248974a8eb3d8af6ae4ca7119 P 4fe0d1af3e0b4acc946d0629aaeadffc [term 195 FOLLOWER]: Rejecting Update request from peer 3eb5ca298fb5431fadc35803d241b00d for earlier term 189. Current term is 195. Ops: []
+I0916 02:53:38.646246  5754 raft_consensus.cc:1895] T 5f951db248974a8eb3d8af6ae4ca7119 P 3eb5ca298fb5431fadc35803d241b00d [term 189 LEADER]: Stepping down as leader of term 189
+I0916 02:53:38.646368  5754 raft_consensus.cc:462] T 5f951db248974a8eb3d8af6ae4ca7119 P 3eb5ca298fb5431fadc35803d241b00d [term 189 LEADER]: Becoming Follower/Learner. State: Replica: 3eb5ca298fb5431fadc35803d241b00d, State: 1, Role: LEADER
+Watermarks: {Received: term: 189 index: 92 Committed: term: 180 index: 84}
+I0916 02:53:38.646603  5698 consensus_queue.cc:538] T 5f951db248974a8eb3d8af6ae4ca7119 P 3eb5ca298fb5431fadc35803d241b00d [term 189 LEADER]: Peer responded that term 189 is out of date. Latest term is 195. Notifying RaftConsensus of updated term. Latest recorded peer state: Peer: 4fe0d1af3e0b4acc946d0629aaeadffc, Is new: false, Last received: 0.0, Next index: 90, Last known committed idx: 0, Last exchange result: ERROR, Needs remote bootstrap: false
+I0916 02:53:38.646934  5754 consensus_queue.cc:154] T 5f951db248974a8eb3d8af6ae4ca7119 P 3eb5ca298fb5431fadc35803d241b00d [term 189 NON_LEADER]: Queue going to NON_LEADER mode. State: All replicated op: 0.0, Majority replicated op: 180.84, Committed index: 180.84, Last appended: 189.92, Current term: 189, Majority size: -1, State: 1, Mode: NON_LEADER
+I0916 02:53:38.647208  5254 raft_consensus.cc:1546] T 5f951db248974a8eb3d8af6ae4ca7119 P 3fda1f47315a4fbfb8e86af40c01f5bb [term 194 LEADER]: Leader election vote request: Denying vote to candidate 4fe0d1af3e0b4acc946d0629aaeadffc for term 195 because replica is either leader or believes a valid leader to be alive.
+I0916 02:53:38.647418  5754 consensus_peers.cc:319] T 5f951db248974a8eb3d8af6ae4ca7119 P 3eb5ca298fb5431fadc35803d241b00d -> Peer 4fe0d1af3e0b4acc946d0629aaeadffc (127.124.79.1:35206): Closing peer: 4fe0d1af3e0b4acc946d0629aaeadffc
+I0916 02:53:38.647683  5366 raft_consensus.cc:780] T 5f951db248974a8eb3d8af6ae4ca7119 P 4fe0d1af3e0b4acc946d0629aaeadffc [term 195 FOLLOWER]: Rejecting Update request from peer 3fda1f47315a4fbfb8e86af40c01f5bb for earlier term 194. Current term is 195. Ops: []
+I0916 02:53:38.647703  5255 raft_consensus.cc:780] T 5f951db248974a8eb3d8af6ae4ca7119 P 3fda1f47315a4fbfb8e86af40c01f5bb [term 194 LEADER]: Rejecting Update request from peer 3eb5ca298fb5431fadc35803d241b00d for earlier term 189. Current term is 194. Ops: []
+I0916 02:53:38.647801  5319 leader_election.cc:349] T 5f951db248974a8eb3d8af6ae4ca7119 P 4fe0d1af3e0b4acc946d0629aaeadffc [CANDIDATE]: Term 195 election: Vote denied by peer 3fda1f47315a4fbfb8e86af40c01f5bb. Message: Invalid argument: T 5f951db248974a8eb3d8af6ae4ca7119 P 3fda1f47315a4fbfb8e86af40c01f5bb [term 194 LEADER]: Leader election vote request: Denying vote to candidate 4fe0d1af3e0b4acc946d0629aaeadffc for term 195 because replica is either leader or believes a valid leader to be alive.
+I0916 02:53:38.647935  5319 leader_election.cc:236] T 5f951db248974a8eb3d8af6ae4ca7119 P 4fe0d1af3e0b4acc946d0629aaeadffc [CANDIDATE]: Term 195 election: Election decided. Result: candidate lost.
+I0916 02:53:38.647982  5754 consensus_peers.cc:319] T 5f951db248974a8eb3d8af6ae4ca7119 P 3eb5ca298fb5431fadc35803d241b00d -> Peer 3fda1f47315a4fbfb8e86af40c01f5bb (127.124.79.0:36300): Closing peer: 3fda1f47315a4fbfb8e86af40c01f5bb
+I0916 02:53:38.648147  5595 raft_consensus.cc:1851] T 5f951db248974a8eb3d8af6ae4ca7119 P 4fe0d1af3e0b4acc946d0629aaeadffc [term 195 FOLLOWER]: Snoozing failure detection for election timeout plus an additional 0.009s
+I0916 02:53:38.648264  5595 raft_consensus.cc:1712] T 5f951db248974a8eb3d8af6ae4ca7119 P 4fe0d1af3e0b4acc946d0629aaeadffc [term 195 FOLLOWER]: Leader election lost for term 195. Reason: None given
+I0916 02:53:38.648653  5574 consensus_queue.cc:538] T 5f951db248974a8eb3d8af6ae4ca7119 P 3fda1f47315a4fbfb8e86af40c01f5bb [term 194 LEADER]: Peer responded that term 194 is out of date. Latest term is 195. Notifying RaftConsensus of updated term. Latest recorded peer state: Peer: 4fe0d1af3e0b4acc946d0629aaeadffc, Is new: false, Last received: 0.0, Next index: 92, Last known committed idx: 0, Last exchange result: ERROR, Needs remote bootstrap: false
+I0916 02:53:38.648795  5694 consensus_queue.cc:538] T 5f951db248974a8eb3d8af6ae4ca7119 P 3eb5ca298fb5431fadc35803d241b00d [term 189 NON_LEADER]: Peer responded that term 189 is out of date. Latest term is 194. Notifying RaftConsensus of updated term. Latest recorded peer state: Peer: 3fda1f47315a4fbfb8e86af40c01f5bb, Is new: false, Last received: 186.89, Next index: 90, Last known committed idx: 84, Last exchange result: ERROR, Needs remote bootstrap: false
+I0916 02:53:38.649312  5754 raft_consensus.cc:1900] T 5f951db248974a8eb3d8af6ae4ca7119 P 3eb5ca298fb5431fadc35803d241b00d [term 189 FOLLOWER]: Advancing to term 192
+I0916 02:53:38.649353  5160 catalog_manager.cc:1483] Tablet: 5f951db248974a8eb3d8af6ae4ca7119 reported consensus state change. New consensus state: current_term: 194 leader_uuid: "3fda1f47315a4fbfb8e86af40c01f5bb" config { opid_index: -1 local: false peers { permanent_uuid: "4fe0d1af3e0b4acc946d0629aaeadffc" member_type: VOTER last_known_addr { host: "127.124.79.1" port: 35206 } } peers { permanent_uuid: "3fda1f47315a4fbfb8e86af40c01f5bb" member_type: VOTER last_known_addr { host: "127.124.79.0" port: 36300 } } peers { permanent_uuid: "3eb5ca298fb5431fadc35803d241b00d" member_type: VOTER last_known_addr { host: "127.124.79.2" port: 50435 } } }
+E0916 02:53:38.649482  5598 consensus_queue.cc:336] T 5f951db248974a8eb3d8af6ae4ca7119 P 3fda1f47315a4fbfb8e86af40c01f5bb [term 194 LEADER]: Error reading the log while preparing peer request: Incomplete: Op with index 91 is in the future (next sequential op: 91). Destination peer: Peer: 4fe0d1af3e0b4acc946d0629aaeadffc, Is new: false, Last received: 0.0, Next index: 92, Last known committed idx: 0, Last exchange result: ERROR, Needs remote bootstrap: false. Queue state: All replicated op: 0.0, Majority replicated op: 180.84, Committed index: 180.84, Last appended: 194.90, Current term: 194, Majority size: 2, State: 1, Mode: LEADER, active raft config: opid_index: -1 local: false peers { permanent_uuid: "4fe0d1af3e0b4acc946d0629aaeadffc" member_type: VOTER last_known_addr { host: "127.124.79.1" port: 35206 } } peers { permanent_uuid: "3fda1f47315a4fbfb8e86af40c01f5bb" member_type: VOTER last_known_addr { host: "127.124.79.0" port: 36300 } } peers { permanent_uuid: "3eb5ca298fb5431fadc35803d241b00d" member_type: VOTER last_known_addr { host: "127.124.79.2" port: 50435 } }
+{noformat}
+
+Oh I didn't include the whole log. I am also dumping the log cache. Here's that part (continuation of the above snippet:
+
+{noformat}
+E0916 02:53:38.649482  5598 consensus_queue.cc:336] T 5f951db248974a8eb3d8af6ae4ca7119 P 3fda1f47315a4fbfb8e86af40c01f5bb [term 194 LEADER]: Error reading the log while preparing peer request: Incomplete: Op with index 91 is in the future (next sequential op: 91). Destination peer: Peer: 4fe0d1af3e0b4acc946d0629aaeadffc, Is new: false, Last received: 0.0, Next index: 92, Last known committed idx: 0, Last exchange result: ERROR, Needs remote bootstrap: false. Queue state: All replicated op: 0.0, Majority replicated op: 180.84, Committed index: 180.84, Last appended: 194.90, Current term: 194, Majority size: 2, State: 1, Mode: LEADER, active raft config: opid_index: -1 local: false peers { permanent_uuid: "4fe0d1af3e0b4acc946d0629aaeadffc" member_type: VOTER last_known_addr { host: "127.124.79.1" port: 35206 } } peers { permanent_uuid: "3fda1f47315a4fbfb8e86af40c01f5bb" member_type: VOTER last_known_addr { host: "127.124.79.0" port: 36300 } } peers { permanent_uuid: "3eb5ca298fb5431fadc35803d241b00d" member_type: VOTER last_known_addr { host: "127.124.79.2" port: 50435 } }
+I0916 02:53:38.650076  5598 log_cache.cc:431] T 5f951db248974a8eb3d8af6ae4ca7119 P 3fda1f47315a4fbfb8e86af40c01f5bb: Pinned index: 92, LogCacheStats(num_ops=6, bytes=2936)
+I0916 02:53:38.650132  5598 log_cache.cc:431] T 5f951db248974a8eb3d8af6ae4ca7119 P 3fda1f47315a4fbfb8e86af40c01f5bb: Messages:
+I0916 02:53:38.650177  5598 log_cache.cc:431] T 5f951db248974a8eb3d8af6ae4ca7119 P 3fda1f47315a4fbfb8e86af40c01f5bb: Message[0] 0.0 : REPLICATE. Type: UNKNOWN_OP, Size: 6
+I0916 02:53:38.650234  5598 log_cache.cc:431] T 5f951db248974a8eb3d8af6ae4ca7119 P 3fda1f47315a4fbfb8e86af40c01f5bb: Message[1] 180.85 : REPLICATE. Type: WRITE_OP, Size: 169
+I0916 02:53:38.650301  5598 log_cache.cc:431] T 5f951db248974a8eb3d8af6ae4ca7119 P 3fda1f47315a4fbfb8e86af40c01f5bb: Message[2] 180.86 : REPLICATE. Type: WRITE_OP, Size: 169
+I0916 02:53:38.650360  5598 log_cache.cc:431] T 5f951db248974a8eb3d8af6ae4ca7119 P 3fda1f47315a4fbfb8e86af40c01f5bb: Message[3] 186.87 : REPLICATE. Type: NO_OP, Size: 21
+I0916 02:53:38.650403  5598 log_cache.cc:431] T 5f951db248974a8eb3d8af6ae4ca7119 P 3fda1f47315a4fbfb8e86af40c01f5bb: Message[4] 186.88 : REPLICATE. Type: WRITE_OP, Size: 169
+I0916 02:53:38.650444  5598 log_cache.cc:431] T 5f951db248974a8eb3d8af6ae4ca7119 P 3fda1f47315a4fbfb8e86af40c01f5bb: Message[5] 186.89 : REPLICATE. Type: WRITE_OP, Size: 169
+I0916 02:53:38.650482  5598 log_cache.cc:431] T 5f951db248974a8eb3d8af6ae4ca7119 P 3fda1f47315a4fbfb8e86af40c01f5bb: Message[6] 194.90 : REPLICATE. Type: NO_OP, Size: 21
+F0916 02:53:38.650549  5598 consensus_queue.cc:341] T 5f951db248974a8eb3d8af6ae4ca7119 P 3fda1f47315a4fbfb8e86af40c01f5bb [term 194 LEADER]: Broke!
+*** Check failure stack trace: ***
+{noformat}
+
+We caught this in the wild on bolt 300:
+
+{code}
+I0921 00:09:47.204509 25805 consensus_peers.cc:164] T 41703922801549318e88fc21c8ec1d48 P f3475754aa1f48e6b0304e39ee3aaeda -> Peer 39c7767079f846f0acdd92dc8e97d804 (c1827.halxg.cloudera.com:7050): Could not obtain request from queue for peer: 39c7767079f846f0acdd92dc8e97d804. Status: Not found: op in future
+I0921 00:09:47.207345 25794 consensus_peers.cc:164] T fe479beaf1f84a8ea0318c12a0f9bbb5 P f3475754aa1f48e6b0304e39ee3aaeda -> Peer 0c1711dc8190499f8b4e853475a2e1b7 (a1530.halxg.cloudera.com:7050): Could not obtain request from queue for peer: 0c1711dc8190499f8b4e853475a2e1b7. Status: Not found: op in future
+I0921 00:09:47.220753 25237 consensus_peers.cc:164] T 41703922801549318e88fc21c8ec1d48 P f3475754aa1f48e6b0304e39ee3aaeda -> Peer d0a91abe0eac4e23bbde815b845a38b5 (c1612.halxg.cloudera.com:7050): Could not obtain request from queue for peer: d0a91abe0eac4e23bbde815b845a38b5. Status: Not found: op in future
+I0921 00:09:47.316778 25288 consensus_peers.cc:164] T fe479beaf1f84a8ea0318c12a0f9bbb5 P f3475754aa1f48e6b0304e39ee3aaeda -> Peer 39c7767079f846f0acdd92dc8e97d804 (c1827.halxg.cloudera.com:7050): Could not obtain request from queue for peer: 39c7767079f846f0acdd92dc8e97d804. Status: Not found: op in future
+W0921 00:09:47.527180 25231 log.cc:503] Time spent Append to log took a long time: real 0.839s  user 0.000s     sys 0.000s
+W0921 00:09:47.527225 25241 log.cc:503] Time spent Append to log took a long time: real 0.768s  user 0.000s     sys 0.000s
+W0921 00:09:47.527318 25235 log.cc:503] Time spent Append to log took a long time: real 0.768s  user 0.000s     sys 0.000s
+W0921 00:09:47.527779 22042 inbound_call.cc:193] Call kudu.consensus.ConsensusService.UpdateConsensus from 10.20.192.23:37063 (request call id 17620) took 769ms (client timeout 1000).
+I0921 00:09:47.535279 25805 raft_consensus.cc:635] T 41703922801549318e88fc21c8ec1d48 P f3475754aa1f48e6b0304e39ee3aaeda: Attempting to remove follower 39c7767079f846f0acdd92dc8e97d804 from the Raft config. Reason: The logs necessary to catch up peer 39c7767079f846f0acdd92dc8e97d804 have been garbage collected. The follower will never be able to 
+I0921 00:09:47.535298 25237 raft_consensus.cc:635] T 41703922801549318e88fc21c8ec1d48 P f3475754aa1f48e6b0304e39ee3aaeda: Attempting to remove follower d0a91abe0eac4e23bbde815b845a38b5 from the Raft config. Reason: The logs necessary to catch up peer d0a91abe0eac4e23bbde815b845a38b5 have been garbage collected. The follower will never be able to 
+W0921 00:09:47.537045 22106 kernel_stack_watchdog.cc:111] Thread 25235 stuck at /data/jenkins/workspace/generic-package-rhel64-6-0/topdir/BUILD/kudu-0.1.0-kudu0.1.0-SNAPSHOT/src/kudu/consensus/log.cc:505 for 521ms:
+{code}
+
+and it evicted a perfectly good follower.
+
+workaround under review
+
+Workaround merged as 2300004a210bf22530915c6f4275455f3c4b12c2
+
+Moved target to GA
+
+Looks like the raft consensus itest is now quite flaky because of the DFATAL we added in the workaround code:
+http://a1228.halxg.cloudera.com:8080/test_drilldown?test_name=raft_consensus-itest
+
+Perhaps David was right after all and we should just stick to ERROR for now instead of DFATAL?
+
+ah, ok. probably more flaky without the fixes i was trying to push last week. will post a patch
+
+Retargeting to 0.7.0 for tracking purposes since I'm digging back into this a bit
+
+Looking at this again in the context of KUDU-1469 (which might be entirely unrelated, but made me look into this code path).
+
+I think the explanation is:
+- in LogCache::AppendOperations, we do the following order:
+1. under lock: add new operations to the cache map
+2. outside lock: Log::AsyncAppendReplicates (which may block when under load)
+3. under lock: increase next_sequential_op_index_
+
+- in LogCache::ReadOps(...), we do:
+1. Look for the operation in the cache.
+2. If it's a hit, iterate forward in the cache until we stop "hitting"
+
+This, ReadOps() can return those operations that are currently in-flight on their way into the log, even before AsyncAppendReplicates completes. That's not in and of itself bad -- the point of the log cache is to provide exactly this "write through caching" so that we can replicate operations remotely before they've been written locally and ride over leader log latency blips. However, we can get the following interleaving which causes the error messages:
+
+*Thread 1*
+- call LogCache::AppendOperations() with batch 10..20
+-- inserts 10..20 into the cache
+-- blocks on AsyncAppendReplicates
+
+*Thread 2*
+- preparing a request for a follower, calls ReadOps(10)
+-- results in ops 10..20 being copied into the outgoing request
+- sends the request
+
+* Later, while Thread 1 is still blocked *
+- response received from the peer for 10..20. 'last_replicated' = 20, so next_index = 21
+- we call ReadOps(21)
+-- next_sequential_op_id_ has still not advanced from 10
+-- this triggers the error message indicated in this JIRA
+
+I think, then, this error is probably harmless, though it's a signature of a blocked leader log.
+
+
+
+Was looking at raft_consensus-itest. What was the final status of this?
+
+I continue to think it's harmless, though the log spew doesn't look good. Maybe we could improve this by changing the order so that we don't append to the consensus queue until after we've appended to the log? might be non-trivial to do that change, though.
+
+Fixed in a8a7773cf28f0069b691d412f9dd23e72e3833fa
+
+Hi [~tlipcon], I use kudu-1.8.0, seems still have this issue:
+
+ 
+{code:java}
+E0130 16:55:58.582803 9979 consensus_queue.cc:699] T bbaf907dfbf04c24b46fff873a94237f P cbc554095f1f4ef5b6442da45a542ac3 [LEADER]: Error trying to read ahead of the log while preparing peer request: Incomplete: Op with index 731 is ahead of the local log (next sequential op: 731). Destination peer: Peer: permanent_uuid: "a33504d2e2fc4447aa054f2589b9f9ae" member_type: VOTER last_known_addr { host: "cm07" port: 7050 }, Status: INVALID_TERM, Last received: 1645.730, Next index: 732, Last known committed idx: 731, Time since last communication: 1.356s
+
+E0130 16:55:58.583446 8244 consensus_queue.cc:699] T 23e82946c5704607bbe118674c493c62 P cbc554095f1f4ef5b6442da45a542ac3 [LEADER]: Error trying to read ahead of the log while preparing peer request: Incomplete: Op with index 726 is ahead of the local log (next sequential op: 726). Destination peer: Peer: permanent_uuid: "083ef4d758854ddd9f4d15a3c718fe4b" member_type: VOTER last_known_addr { host: "cm04" port: 7050 }, Status: INVALID_TERM, Last received: 1623.726, Next index: 727, Last known committed idx: 726, Time since last communication: 1.358s
+E0130 16:55:58.755020 5500 consensus_queue.cc:699] T b5ec089a30fb4b24a353ebbd6d58e7f6 P cbc554095f1f4ef5b6442da45a542ac3 [LEADER]: Error trying to read ahead of the log while preparing peer request: Incomplete: Op with index 740 is ahead of the local log (next sequential op: 740). Destination peer: Peer: permanent_uuid: "083ef4d758854ddd9f4d15a3c718fe4b" member_type: VOTER last_known_addr { host: "cm04" port: 7050 }, Status: INVALID_TERM, Last received: 1670.740, Next index: 741, Last known committed idx: 740, Time since last communication: 1.570s
+E0130 16:55:58.756345 5723 consensus_queue.cc:699] T dc3790caa17b40a79b0d94cb9aa8e69a P cbc554095f1f4ef5b6442da45a542ac3 [LEADER]: Error trying to read ahead of the log while preparing peer request: Incomplete: Op with index 751 is ahead of the local log (next sequential op: 751). Destination peer: Peer: permanent_uuid: "083ef4d758854ddd9f4d15a3c718fe4b" member_type: VOTER last_known_addr { host: "cm04" port: 7050 }, Status: INVALID_TERM, Last received: 1613.751, Next index: 752, Last known committed idx: 751, Time since last communication: 1.584s
+
+{code}
+can you help to give some help? 
+
+ 
+
+Hi [~Simon_Zhang],
+
+In and of itself, this log message is not a sign that anything has gone wrong. In fact, for Kudu 1.9.0, we've downgraded the message's severity from ERROR to INFO. You can see the commit responsible for that and the justification for it [here|https://github.com/apache/kudu/commit/6103f8786358df1766ba41c8d8dc2feb9c8c6f53].
+
+Hi [~adar],  Thanks a lot
+

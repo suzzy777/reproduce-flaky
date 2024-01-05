@@ -1,0 +1,381 @@
+
+Here's the object distribution tlipcon mentioned:
+
+{code}
+The values of this map contain the 1.5M+ edits (in Entry objects) tlipcon mentioned
+
+Map<byte[], LinkedList<Entry>> editsByRegion
+      |                  |
+      |                  |
+      |                  |
+(encodedRegionName)      |
+      .                  |
+      .                  |
+      .                  |
+      .                  |
+      .                  |
+      .                  | 
+      .                  --- WalEdit edit
+      .                  |      |
+      .                  |      |
+      .                  |      |
+      .                  |      --- ArrayList<KeyValue> kvs
+      .                  |                      |
+      .                  |                      |
+      .                  |                      |
+      .                  |                      --- byte[] bytes
+      .                  |                          
+      .                  |
+      .  ----------------------------------------------------------
+      .  |               |                                        |
+      .  |               |                                        |
+      .  |               --- HLogKey key                          |
+      .  |                    |                                   |
+      .  |                    |                                   |
+      .  |                    |                                   |
+      .  |                    |                                   |
+      . .| . . . . . . . . . .--- byte[] encodedRegionName        |
+         |                    |                                   |
+         |                    |                                   |
+         |                    |                                   |
+         |                    --- byte[] tableName                |
+         |                                                        |
+         |                                                        |
+         | this is useless as we could have this in the map key   |
+         ----------------------------------------------------------
+
+{code}
+
+The splitLog workflow loads all the edits in a map indexed by region, and then uses a thread pool to write them to per region directories.
+
+
+As you can see from this diagram, each edit duplicates the tableName and the encodedRegionName (hence the 2 extra byte[]). 
+
+*One simple, partial solution:*
+We can reduce the memory footprint by putting the tableName in the map key with the encodedRegionName (it's free). This would leave us with a LinkedList of WalEdit objects (ArrayList + KeyValue + the actual info: byte[]). Of course this could be further compressed, but it might not be worth it (WalEdit has a replication scope as well IIUC). 
+This is a partial solution since we still don't solve the case when we have too much data in the HLogs.
+
+
+*A second solution/suggestion:*
+
+We can change the split process a bit. Let me explain how HLogs are organized and how we split (please correct me if I'm wrong):
+
+*Context:*
+* Eeach region server has one HLog directory in HDFS (under /hbase/.logs)
+* In each HRegionServer corresponding directory there's a bunch of HLog files. 
+* There's a strict order of the HLog files within a region's dir and edits inside are ordered as well. 
+* We read all the files in memory first because we need all the edits for a particular region and to respect the order of the edits. 
+* Only after everything is read, we use a thread pool to distribute the log entries per regions. 
+
+*Suggestion:*
+We could read the files in parallel, and instead of writing a single file in the HRegion corresponding directory, we write one file for each HLog. This should keep all the edits in strict order. Then HRegionServer could safely load them in the same order and apply edits. 
+
+While we read the files in parallel we don't have to read the entire content in memory: we can just read and write to the corresponding destination file. This should solve the memory footprint problem. 
+
+
+I haven't spent too much time analyzing the second option; it might have been discussed in the past, so if I'm missing something let me know.
+
+
+Cosmin
+
+
+Talking with JD, we figured HBASE-1364 might be a solution as well.
+
+Hi Cosmin. I agree that the log split process can be fixed up a bit to use a smaller amount of memory. Fixing the data structure to get rid of all those extra objects is one thing that's pretty straightfowrard like you mentioned. As for how to change the split process itself, I think following a more typical producer/consumer model makes more sense. For example, something like this:
+
+{noformat}
+buffers = map<region name, arraylist<edit>>
+for each log:
+  for each edit:
+    buf = map.get(region) [inserting a new arraylist if necessary]
+    buf.add(edit)
+    if buf length > some number of bytes:
+      while workqueue length > some threshold: wait
+      workqueue.add(buf)
+      buffers.remove(region)
+{noformat}
+
+then we have a set of threads which pull chunks of edits off the work queue and write into the appropriate file (where the file handles are kept open).
+
+I'm going to take a leap and assume I still remember how to code and work on this one tonight.
+
+Cosmin, on the 'One simple, partial solution', I played with changing the LinkedList from Entry to LinkedList of WALEdits and changing the Map Key to be a data structure of encodedRegionName plus tablename (I used HLogKey rather than add a new data structure and then made a special Comparator that equated HLogKeys that had same encodedRegionName).  All was going nicely till it came to dump out the per region recovered.edit files.  At this point I need the Entry.  A WALEdit will not do.  So it seems.  We need seqid at least (This could change when KV has seqid -- HBASE-2856 'TestAcidGuarantee broken on trunk').
+
+The second option seems viable to me Cosmin.  HBASE-2727 made it so we could pick up multiple files from recovered.edits directory.  The files we write are named fro the seqid of the first edit so we can pick them up in order.
+
+Here's a patch which basically redoes the way log splitting happens. It needs to be commented up and I want to rename some things, but the basic architecture is this:
+
+- Main thread reads logs in order and writes into a structure called EntrySink (I want to rename this to EntryBuffer or sometihng)
+- EntrySink maintains some kind of approximate heap size (I don't think I calculated it quite right, but c'est la vie) and also takes care of managing a RegionEntryBuffer for each region key.
+-- The RegionEntryBuffer just has a LinkedList of Entries right now, but it does size accounting, and I think we could change these to a fancier data structure for more efficient memory usage (eg a linked list of 10000-entry arrays)
+- If the main thread tries to append into the EntrySink but the heap usage has hit a max threshold, it waits.
+
+Meanwhile, there are N threads called WriterThread-n which do the following in a loop:
+- poll the EntrySink to grab a RegionEntryBuffer
+-- The EntrySink returns the one with the most outstanding edits (hope is to write larger sequential chunks if possible)
+-- The EntrySink also keeps track of which regions already have some thread working on them, so we don't end up with out-of-order appends
+- The EntrySink then drains the RegionEntryBuffer into the "OutputSink" which maintains the map from region key to WriterAndPath (bug in patch uploaded: this map needs to be synchronizedMap)
+- Once the buffer is drained, it notifies the EntrySink that the memory is no longer in use (hence unblocking the producer thread)
+
+In summary, it's a fairly standard producer-consumer pattern with some trickery to make a separate queue per region so as not to reorder edits.
+
+As a non-scientific test I patched this into my cluster which was getting the OOME on master startup, and it not only started up fine, the log splits ran about 50% faster than they did before!
+
+Known bug: the "log N of M" always says "log 1 of M"
+
+Thoughts?
+
+Oh, I should also note that you probably want to turn off DEBUG logs or comment them out before testing this on any real log. It's quite noisy at the moment. Also, it seems like the 128M buffer I hardcoded is plenty fine - the writers stayed completely ahead of the reader in the test I ran.
+
+We should make a standalone benchmark for this algorithm too.
+
+I'm part way through a review but have to leave.  So far it looks like less moving parts and cleaner overall.  Will finish up review tomorrow.   We could set the number of splits to 1 and ship the RC with that but at the moment, going by the other issues that need fixing, its looking like next week before new RC and that might be time to test this redo of splits. 
+
+Here's an updated patch, refactored some stuff a bit.
+
+Also fixed up one of the test cases which was flaky in the old version - it used the presence of region directories to determine whether the split had started running, but those were created by generateHLogs, so it was only winning the race sometimes.
+
+er, there's a deadlock in this version of the patch :) but general structure should be good enough to review at this point
+
+Now certified deadlock free by jcarder
+
+I think I pulled the right patch -- the latest one -- 62820 bytes in size (Todd, add a version to your patches?).  I was trying it and got this on the very end
+
+{code}
+2010-12-11 18:39:00,914 INFO org.apache.hadoop.hbase.util.FSUtils: Recovering file hdfs://sv2borg180:10000/hbase/.logs/sv2borg188,60020,1291841481545/sv2borg188%3A60020.1291993339759
+2010-12-11 18:39:00,915 ERROR org.apache.hadoop.hbase.regionserver.wal.HLogSplitter: Error in log splitting write thread
+java.util.ConcurrentModificationException
+        at java.util.LinkedList$ListItr.checkForComodification(LinkedList.java:761)
+        at java.util.LinkedList$ListItr.next(LinkedList.java:696)
+        at org.apache.hadoop.hbase.regionserver.wal.HLogSplitter$WriterThread.writeBuffer(HLogSplitter.java:669)
+        at org.apache.hadoop.hbase.regionserver.wal.HLogSplitter$WriterThread.doRun(HLogSplitter.java:649)
+        at org.apache.hadoop.hbase.regionserver.wal.HLogSplitter$WriterThread.run(HLogSplitter.java:621)
+{code}
+
+So, on restart, the split completed (this is ten servers whose logs were to be split; one split set was of 33 logs... all in a 1G Master heap).
+
+The logging is profuse but I'm grand w/ that.
+
+The below looks like a version of HBASE-2471... is that so?  If so, good stuff.
+
+{code}
+2010-12-11 18:35:43,243 INFO org.apache.hadoop.hbase.regionserver.wal.HLogSplitter: This region's directory doesn't exist: hdfs://sv2borg180:10000/hbase/TestTable/1d4a17311a6bc9f7b34f121bf121f42b. It is very likely that it was already split so it's safe to discard those edits.
+{code}
+
+On the patch, why flip parameter order -- i.e. moving conf from end of list to start?  People want to know!
+
+Whats this about?
+
+{code}
++  public void internTableName(byte []tablename) {
++    assert Bytes.equals(tablename, this.tablename);
++    this.tablename = tablename;
++  }
+{code}
+
+We could call this method mutiple times?  And it'd be an error if tablename was different on an invocation?  The method is public w/o doc.  It has to be public because called from different package?
+
+Sorry... still not done w/ review.  Back later.
+
+It seems in my eagerness to fix up the deadlock I ended up undersynchronizing in the latest patch. Oops! I'm going to write some standalone slower tests that actually split larger amounts of data, so we can get proper benchmarks and do a better job of finding these races.
+
+Will address your other comments in the next version as well.
+
+Here's a new version including some new unit tests that set up a mock log reader and mock writers so as to test a lot of edits going through the splitter without actually taking any IO. This reliably reproduced the split bug Stack found - fixed that now.
+
+Didn't get a chance to do a true benchmark yet.
+
+I have a bunch of praise/+1s for changes made in this patch -- the refactoring of where params are passed to HLogSplitter, the new javadoc on the intern'ing methods, the overall less moving parts -- but will say no more on that other than the improvements are great.
+
+Whats this for:
+
+{code}
++  protected final Path rootDir;
++  protected final Path srcDir;
++  protected final Path oldLogDir;
++  protected final FileSystem fs;
++  protected final Configuration conf;
+{code}
+
+Is stuff protected rather than private for the subclassers -- the transactional hbasers?
+
+
+Minor.... the below javadoc is now stale..
+
+{code}
+    * Create a new HLogSplitter using the given {@link Configuration} and the
+    * <code>hbase.hlog.splitter.impl</code> property to derived the instance
+    * class to use.
+{code}
+
+Address on commit?
+
+Same for this stuff:
+
+{code}
++   * @param oldLogDir  directory where processed (split) logs will be archived to
++   * @param fs FileSystem
++   * @param conf Configuration
++   * @throws IOException will throw if corrupted hlogs aren't tolerated
+...
+{code}
+
+Its javadoc of params no longer present on this method.
+
+
+Mistype '+        "An HLogSplitter instance may only be used one");'
+
+Extremely minor comment, the below formatting will be destroyed when rendered by javadoc:
+
+{code}
++   * through the logs to be split. For each log, we:
++   *   - Recover it (take and drop HDFS lease) to ensure no other process can write
++   *   - Read each edit (see {@link #parseHLog}
++   *   - Mark as "processed" or "corrupt" depending on outcome
+{code}
+
+(... but good documentation).
+
+It would be sweeter if this were a percentage of heap rather than hard MB number --> maxHeapUsage .... but no biggie.  Can do in later issue.
+
+So, it looks like we keep the order in which edits were written across the split process as best as I can tell.  We just append to the Entry List in RegionEntryBuffer.  That looks right.
+
+(Reading this patch makes me reconsider asserts)
+
+You iterate logWriters, a synchronized Map, a couple of times.  Is this safe at the time of iteration?
+
+You keep the old format for naming edit files?  Naming them for the sequenceid of their first edit, it seems (you use getRegionSplitEditsPath -- not in the patch).
+
+On the below
+
+{code}
++    if (scopes != null) {
++      ret += ClassSize.TREEMAP;
++      ret += ClassSize.align(scopes.size() * ClassSize.MAP_ENTRY);
++      // TODO this isn't quite right, need help here
++    }
+{code}
+
+... maybe Jon can help -- but its fine for the moment I'd say.
+
+
+
+
+
+
+
+bq. Is stuff protected rather than private for the subclassers - the transactional hbasers?
+
+Yep, I made it protected since inheritors will need to access this stuff. Hopefully we can get rid of the subclasses in favor of log coprocessors some day.
+
+bq. Minor.... the below javadoc is now stale..
+bq. ...Its javadoc of params no longer present on this method.
+bq. Mistype '+ "An HLogSplitter instance may only be used one");'
+bq. Extremely minor comment, the below formatting will be destroyed when rendered by javadoc:
+
+Fixed.
+
+bq. So, it looks like we keep the order in which edits were written across the split process as best as I can tell. We just append to the Entry List in RegionEntryBuffer. That looks right.
+
+Added verification to the testThreading test that makes sure the edits come in the right order
+
+bq. You iterate logWriters, a synchronized Map, a couple of times. Is this safe at the time of iteration?
+
+It was safe in the current usage, but I added synchronization on this map for getOutputCounts just in case someone starts to call it in a different context.
+
+bq. You keep the old format for naming edit files? Naming them for the sequenceid of their first edit, it seems (you use getRegionSplitEditsPath - not in the patch).
+
+Yep, left that as-is.
+
+
+I'm +1 on committing this patch.  I tried v5 on my little test cluster here killing RSs a few times.  It does the right thing as best as I can tell verified by rowcount of table subsequently to ensure all regions online after the killing.
+
+I did some more testing and came across the following after split was done and HLogSplitter was moving to close all files:
+
+{code}
+2010-12-16 01:07:20,394 INFO org.apache.hadoop.hbase.regionserver.wal.HLogSplitter: Waiting for split writer threads to finish
+2010-12-16 01:07:20,640 INFO org.apache.hadoop.hbase.regionserver.wal.HLogSplitter: Split writers finished
+2010-12-16 01:07:20,650 ERROR org.apache.hadoop.hbase.regionserver.wal.HLogSplitter: Couldn't close log at hdfs://sv2borg180:10000/hbase/TestTable/02495f8b7cb6404cb7ea0521cc183d56/recovered.edits/0000000000000012854
+org.apache.hadoop.ipc.RemoteException: org.apache.hadoop.hdfs.server.namenode.LeaseExpiredException: No lease on /hbase/TestTable/02495f8b7cb6404cb7ea0521cc183d56/recovered.edits/0000000000000012854 File does not exist. [Lease.  Holder: DFSClient_hb_m_sv2borg180:         
+60000_1292460569453, pendingcreates: 178]
+    at org.apache.hadoop.hdfs.server.namenode.FSNamesystem.checkLease(FSNamesystem.java:1418)
+    at org.apache.hadoop.hdfs.server.namenode.FSNamesystem.checkLease(FSNamesystem.java:1409)
+    at org.apache.hadoop.hdfs.server.namenode.FSNamesystem.completeFileInternal(FSNamesystem.java:1464)
+    at org.apache.hadoop.hdfs.server.namenode.FSNamesystem.completeFile(FSNamesystem.java:1452)
+    at org.apache.hadoop.hdfs.server.namenode.NameNode.complete(NameNode.java:471)
+    at sun.reflect.GeneratedMethodAccessor68.invoke(Unknown Source)
+    at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:25)
+    at java.lang.reflect.Method.invoke(Method.java:597)
+    at org.apache.hadoop.ipc.RPC$Server.call(RPC.java:508)
+    at org.apache.hadoop.ipc.Server$Handler$1.run(Server.java:961)
+    at org.apache.hadoop.ipc.Server$Handler$1.run(Server.java:957)
+    at java.security.AccessController.doPrivileged(Native Method)
+    at javax.security.auth.Subject.doAs(Subject.java:396)
+    at org.apache.hadoop.ipc.Server$Handler.run(Server.java:955)
+    at org.apache.hadoop.ipc.Client.call(Client.java:740)
+    at org.apache.hadoop.ipc.RPC$Invoker.invoke(RPC.java:220)
+    at $Proxy5.complete(Unknown Source)
+    at sun.reflect.GeneratedMethodAccessor13.invoke(Unknown Source)
+    at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:25)
+    at java.lang.reflect.Method.invoke(Method.java:597)
+    at org.apache.hadoop.io.retry.RetryInvocationHandler.invokeMethod(RetryInvocationHandler.java:82)
+    at org.apache.hadoop.io.retry.RetryInvocationHandler.invoke(RetryInvocationHandler.java:59)
+    at $Proxy5.complete(Unknown Source)
+    at org.apache.hadoop.hdfs.DFSClient$DFSOutputStream.closeInternal(DFSClient.java:3457)
+    at org.apache.hadoop.hdfs.DFSClient$DFSOutputStream.close(DFSClient.java:3381)
+    at org.apache.hadoop.fs.FSDataOutputStream$PositionCache.close(FSDataOutputStream.java:61)
+    at org.apache.hadoop.fs.FSDataOutputStream.close(FSDataOutputStream.java:86)
+    at org.apache.hadoop.io.SequenceFile$Writer.close(SequenceFile.java:966)
+    at org.apache.hadoop.hbase.regionserver.wal.SequenceFileLogWriter.close(SequenceFileLogWriter.java:138)
+    at org.apache.hadoop.hbase.regionserver.wal.HLogSplitter$OutputSink.closeStreams(HLogSplitter.java:756)
+    at org.apache.hadoop.hbase.regionserver.wal.HLogSplitter$OutputSink.finishWritingAndClose(HLogSplitter.java:741)
+    at org.apache.hadoop.hbase.regionserver.wal.HLogSplitter.splitLog(HLogSplitter.java:291)
+    at org.apache.hadoop.hbase.regionserver.wal.HLogSplitter.splitLog(HLogSplitter.java:186)
+    at org.apache.hadoop.hbase.master.MasterFileSystem.splitLog(MasterFileSystem.java:194)
+    at org.apache.hadoop.hbase.master.handler.ServerShutdownHandler.process(ServerShutdownHandler.java:96)
+    at org.apache.hadoop.hbase.executor.EventHandler.run(EventHandler.java:151)
+    at java.util.concurrent.ThreadPoolExecutor$Worker.runTask(ThreadPoolExecutor.java:886)
+    at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:908)
+    at java.lang.Thread.run(Thread.java:662)
+2010-12-16 01:07:20,685 INFO org.apache.hadoop.hbase.regionserver.wal.HLogSplitter: Closed path hdfs://sv2borg180:10000/hbase/TestTable/03dbd921c75876d6bc3f86c10201fa93/recovered.edits/0000000000000014196 (wrote 12 edits in 470ms)
+2010-12-16 01:07:20,719 INFO org.apache.hadoop.hbase.regionserver.wal.HLogSplitter: Closed path hdfs://sv2borg180:10000/hbase/TestTable/04f81e343d032d43946393636b2b4d2d/recovered.edits/0000000000000012928 (wrote 15 edits in 390ms)
+2010-12-16 01:07:20,725 ERROR org.apache.hadoop.hbase.regionserver.wal.HLogSplitter: Couldn't close log at hdfs://sv2borg180:10000/hbase/TestTable/06d137bd176e2604761243d396c11b3a/recovered.edits/0000000000000012945
+org.apache.hadoop.ipc.RemoteException: org.apache.hadoop.hdfs.server.namenode.LeaseExpiredException: No lease on /hbase/TestTable/06d137bd176e2604761243d396c11b3a/recovered.edits/0000000000000012945 File does not exist. [Lease.  Holder: DFSClient_hb_m_sv2borg180:         
+60000_1292460569453, pendingcreates: 176]
+    at org.apache.hadoop.hdfs.server.namenode.FSNamesystem.checkLease(FSNamesystem.java:1418)
+    at org.apache.hadoop.hdfs.server.namenode.FSNamesystem.checkLease(FSNamesystem.java:1409)
+    at org.apache.hadoop.hdfs.server.namenode.FSNamesystem.completeFileInternal(FSNamesystem.java:1464)
+    at org.apache.hadoop.hdfs.server.namenode.FSNamesystem.completeFile(FSNamesystem.java:1452)
+...
+{code}
+
+It then closes a bunch and fails one or two more until its done with all.
+
+Eventually the split 'completes' and we start assigning out regions:
+
+{code}
+2010-12-16 01:07:32,581 INFO org.apache.hadoop.hbase.master.handler.ServerShutdownHandler: Reassigning 186 region(s) that sv2borg185,60020,1292460570976 was carrying (skipping 1 regions(s) that are already in transition)
+{code}
+
+
+
+Strange... can you grep the NN logs for that directory and try to figure it out? Usually that kind of error happens if someone deletes the file while you're writing it.
+
+Ok. I've overwritten the logs from above.  I've tested more since and haven't run into the issue.  Will keep at it.   Will open new issue if I run into it.   I'd say go ahead still w/ commit of this.
+
+Here is what I committed.  Its Todd's patch updated so it'd apply to branch and trunk.
+
+I think the patch is missing this, at least adding it back in HLogSplitter fixes TestHLogSplitting:
+
+{code}
+} catch (EOFException eof) {
+  // truncated files are expected if a RS crashes (see HBASE-2643)
+  LOG.info("EOF from hlog " + logPath + ".  continuing");
+  processedLogs.add(logPath);
+{code}
+
+Integrated in HBase-TRUNK #1697 (See [https://hudson.apache.org/hudson/job/HBase-TRUNK/1697/])
+    
+
+This issue was closed as part of a bulk closing operation on 2015-11-20. All issues that have been resolved and where all fixVersions have been released have been closed (following discussions on the mailing list).
+

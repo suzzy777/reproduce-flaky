@@ -1,0 +1,50 @@
+It looks like this was in a job running in the "local filesystem configuration". I imagine it's a consequence of the buffer pool change. These mem_limit based tests are prone to being flaky.
+
+This is weird, looks like the cause is DataStreamRecv using lots of memory:
+
+{code}
+DataStreamRecvr: Total=157.20 MB Peak=157.20 MB
+{code}
+
+I think this was probably triggered by the buffer pool change but it looks like there's an underlying bug.
+
+I can reproduce locally by running a 1 node minicluster.
+{code}
+start-impala-cluster.py -s1
+
+use tpch_parquet;
+set mem_limit=800m;
+set num_scanner_threads=1;
+select count(distinct concat(cast(l_comment as char(120)), cast(l_comment as char(120)),
+                             cast(l_comment as char(120)), cast(l_comment as char(120)),
+                             cast(l_comment as char(120)), cast(l_comment as char(120))))
+from lineitem;
+{code}
+
+[~sailesh] [~henryr] Any ideas why DataStreamRecvr might eat up lots of memory? It looks like the only things that live in there are RowBatches. The rows are ~700B each, which means there would need to be at least 200,000 rows, which seems unlikely to me.
+
+It has to be the row batches - nothing else is attached to the memtracker. I did some investigation, and while I don't have a root cause yet, there's some clearly concerning things:
+
+The recvr keeps a buffer of pending batches which has a fixed byte limit of 10MB by default. The byte size of an individual row batch is calculated from the Thrift-serialized {{TRowBatch}} to avoid deserializing a batch that we'd simply then drop if the buffer is too full. 
+
+From the query above, each row batch has about 800 rows, coming in at roughly 30K per {{RowBatch::GetBatchSize(const TRowBatch&)}}, which is about 40 bytes per row on the wire. But the memory per batch consumed per the memtracker is over 20x that, at more than 600k. 
+
+The pattern that I see is that the merging agg (via the xchg), reads some number of batches from the recvr in a one-for-one manner (one received, one consumed). But then the pattern changes and the recvr starts to fill its buffer. But (10 * 1024 * 1024) / 30000 ~= 350 batches that could go in the queue. That blows through the memory limit on my machine somewhere around 200 batches, i.e. around 150MB or so. 
+
+So the question is: how / why has the accounting for the in-memory RowBatch deviated so far from the estimate in {{GetBatchSize()}}? 
+
+It seems to be that the uncompressed size is computed accurately, but is large relative to the {{GetBatchSize()}} estimate for the RowBatches received over the wire, at about 700 bytes per row. If I disable batch compression, the query completes.
+
+I don't know why {{DataStreamRecvr::SenderQueue::AddBatch}} is using the compressed size to figure out the amount of space the uncompressed RowBatch will take in the queue, but it seems like a bug that it does. Since the uncompressed size is sent along with the {{TRowBatch}}... it's a pretty easy fix :)
+
+Tim - what do you think changed in the memory accounting that exposed this bug? The DataStreamRecvr does some unusual things with its memory, and I wonder if there'll be any other regressions because the accounting is much better now.
+
+I don't see how the buffer pool changes directly affects the odds of this happening - the buffer pool memory should expand up to 80% of the mem_limit, same as the old BufferedBlockMgr, then the DataStreamRecvr should fit in the remaining 20%. Maybe timing or memory consumption just changed enough to expose the problem.
+
+Assigning to you since you seem to have a fix in mind. Feel free to assign back.
+
+
+Also seen on Isilon
+
+https://github.com/apache/incubator-impala/commit/f2f52a8e1ce9560329566ee71945b3901a1ef958
+

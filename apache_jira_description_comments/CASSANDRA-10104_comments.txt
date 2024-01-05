@@ -1,0 +1,63 @@
+The initial error was related to hinted handoff failure, but that error [went away in the latest build|http://cassci.datastax.com/view/win32/job/cassandra-3.0_dtest_win32/lastCompletedBuild/testReport/jmx_test/TestJMX/netstats_test_2/] with the introduction of the new [hinted handoff implementation|https://issues.apache.org/jira/browse/CASSANDRA-6230]. There is now a new problem:
+
+{noformat}
+CassandraDaemon.java:635 - Exception encountered during startup java.lang.IllegalArgumentException: Unknown CF 5bc52802-de25-35ed-aeab-188eecebb090 \\tat org.apache.cassandra.db.Keyspace.getColumnFamilyStore(Keyspace.java:209) ~[main/:na]
+at org.apache.cassandra.db.Keyspace.getColumnFamilyStore(Keyspace.java:202) ~[main/:na]
+at org.apache.cassandra.cql3.restrictions.StatementRestrictions.<init>(StatementRestrictions.java:125) ~[main/:na]
+at org.apache.cassandra.cql3.statements.SelectStatement$RawStatement.prepareRestrictions(SelectStatement.java:790) ~[main/:na]
+at org.apache.cassandra.cql3.statements.SelectStatement$RawStatement.prepare(SelectStatement.java:740) ~[main/:na]
+at org.apache.cassandra.auth.CassandraRoleManager.prepare(CassandraRoleManager.java:423) ~[main/:na]
+at org.apache.cassandra.auth.CassandraRoleManager.setup(CassandraRoleManager.java:139) ~[main/:na]
+at org.apache.cassandra.service.StorageService.doAuthSetup(StorageService.java:1044) ~[main/:na]
+at org.apache.cassandra.service.StorageService.joinTokenRing(StorageService.java:975) ~[main/:na]
+at org.apache.cassandra.service.StorageService.initServer(StorageService.java:696) ~[main/:na]
+at org.apache.cassandra.service.StorageService.initServer(StorageService.java:570) ~[main/:na]
+at org.apache.cassandra.service.CassandraDaemon.setup(CassandraDaemon.java:320) [main/:na]
+at org.apache.cassandra.service.CassandraDaemon.activate(CassandraDaemon.java:516) [main/:na]
+at org.apache.cassandra.service.CassandraDaemon.main(CassandraDaemon.java:622) [main/:na]
+{noformat}
+
+It seems this is a race similar to [CASSANDRA-9201|https://issues.apache.org/jira/browse/CASSANDRA-9201], that happens when multiple nodes are started concurrently. Apparently the new auth schema is already available but the ColumnFamilyStore is not yet created when retrieving roles on {{CassandraRoleManager}}.
+
+The not-so-elegant fix is to wait until the CFS is available in a busy loop before calling {{CassandraRoleManager.setup()}}. Maybe there's a better way of synchronizing this, so I'm open to suggestions.
+
+The patch is available [here|https://github.com/apache/cassandra/compare/trunk...pauloricardomg:10104-3.0] for review.Tests will be available shortly below:
+* [3.0 testall|http://cassci.datastax.com/view/Dev/view/paulomotta/job/pauloricardomg-10104-3.0-testall/lastCompletedBuild/testReport/]
+* [3.0 dtest|http://cassci.datastax.com/view/Dev/view/paulomotta/job/pauloricardomg-10104-3.0-dtest/lastCompletedBuild/testReport/]
+* [trunk testall|http://cassci.datastax.com/view/Dev/view/paulomotta/job/pauloricardomg-10104-trunk-testall/lastCompletedBuild/testReport/]
+* [trunk dtest|http://cassci.datastax.com/view/Dev/view/paulomotta/job/pauloricardomg-10104-trunk-dtest/lastCompletedBuild/testReport/]
+
+
+
+ps: the test passes locally, before and after the fix.
+
+While not the most elegant fix, it does look like it'll get the job done w/very little added complexity. [~beobal] / [~iamaleksey]: either of you have an opinion on it?
+
+It seems like the problem is that {{Schema#getCFMetaData}} only fetches the {{KSMetaData}} from schema to get the {{CFMetaData}}, but during {{LegacySchemaTable#mergeSchema}} the {{KSMetaData}} is added in {{mergeKeyspaces}} before the {{ColumnFamilyStore}} is initialised in {{mergeTables}}. So, there's a window in which the {{CFMetaData}} is retrievable, but the {{ColumnFamilyStore}} isn't yet. Could we solve this by just changing the condition checking the table to actually retrieve the {{CFS}} rather than the {{CFM}}? In the case where we race, this would cause us to attempt a redundant {{addTable}}, but that will be harmless.
+
+{code}
+@@ -1029,7 +1029,7 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
+         // Also, the addKeyspace above can be racy if multiple nodes are started
+         // concurrently - see CASSANDRA-9201
+         for (Map.Entry<String, CFMetaData> table : AuthKeyspace.definition().cfMetaData().entrySet())
+-            if (Schema.instance.getCFMetaData(AuthKeyspace.NAME, table.getKey()) == null)
++            if (Schema.instance.getCF(table.getValue().cfId) == null)
+                 maybeAddTable(table.getValue());
+{code}
+
+I don't think we need the check for existence of the Keyspace because we know both the KS and CF will be created ultimately, we just need to make sure we don't progress to the role manager setup until they are and waiting for the table ensures that.
+
+Thanks for spending time on this and finding the exact race spot, [~beobal]. I believe now we're safe to rely on {{Schema.instance.getCF}} to determine if the table needs to be created and avoid this race without the ugly busy wait.
+
+I created a new patch with the suggestion, available [here|https://github.com/apache/cassandra/compare/trunk...pauloricardomg:10104-3.0-v2]  for review. Tests will be available shortly below:
+* [3.0 testall|http://cassci.datastax.com/view/Dev/view/paulomotta/job/pauloricardomg-10104-3.0-v2-testall/lastCompletedBuild/testReport/]
+* [3.0 dtest|http://cassci.datastax.com/view/Dev/view/paulomotta/job/pauloricardomg-10104-3.0-v2-dtest/lastCompletedBuild/testReport/]
+* [trunk testall|http://cassci.datastax.com/view/Dev/view/paulomotta/job/pauloricardomg-10104-trunk-v2-testall/lastCompletedBuild/testReport/]
+* [trunk dtest|http://cassci.datastax.com/view/Dev/view/paulomotta/job/pauloricardomg-10104-trunk-v2-dtest/lastCompletedBuild/testReport/]
+
+Change looks targeted and reasonable. There's a few more failures on your testall results than on the 3.0 head - any ideas on that? They just flaky tests?
+
+Yep, it was a transient failure. Ran them again and they're fine now (previous test links are still valid).
+
+Committed as {{88b05ef4b01bda523ea93211e30401df4d040fdd}}
+

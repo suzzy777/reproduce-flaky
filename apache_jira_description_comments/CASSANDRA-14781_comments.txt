@@ -1,0 +1,189 @@
+Related: https://issues.apache.org/jira/browse/CASSANDRA-12231
+
+[^CASSANDRA-14781.patch]
+
+^The attached trivial patch (built off of 2.2.X) is an easy way to get more info^
+
+[~tpetracca] thanks for the patch! {{Mutation::getColumnFamilies}} was removed in Cassandra 3.0. Would you be interested in updating your patch for 3.0+ and I can review?
+
+I'm significantly less familiar with the 3.0+ code but at a quick glance it looks like every partition update should actually contain all this information at this point.
+
+[^CASSANDRA-14781_3.0.patch]
+
+To cover extreme cases, can you add a limit of like 10 tables then add a " ... and X more" or something? Also can you include the partition keys with a similar cap to prevent the string from getting too large. For the common case where theres only 1 large mutation or a bunch to a single partition that would be monumentally helpful.
+
+[^CASSANDRA-14781_3.11.patch]
+
+Hey [~cnlwsu] [~jrwest], I've attached a patch for 3.11 (should be the same for 3.0) that prints (cf, key) pairs with a limit of 10.
+
+Thanks for the update! A few more things things:
+
+* Lets make this work for 4.0 first, I am not sure about backporting it to 3.11 or 3.0 at this point
+* Can you move the {{limit}} up to a constant? Be great if that was something we can override too in yaml/jmx override incase need to to see more than 10 and accept risk but that can come later if dont want to include it in this patch. 
+* If limited, can you make sure to show largest keys first instead of just taking first off the updates.
+* If we have metadata and the key, instead of doing a toString on the decorated key which gives a large hex dump, you can use {{partitionKeyType.getString(keybytes)}} to get the human readable version.
+
+something like (this is untested, just example):
+{code}
+                 mutation.getPartitionUpdates().stream()
+                         .sorted(Comparator.comparingInt(PartitionUpdate::dataSize).reversed())
+                         .limit(LIMIT)
+                         .map(upd -> String.format("%s[%s]",
+                             upd.metadata().name,
+                             upd.metadata().partitionKeyType.getString(upd.partitionKey().getKey())))
+                         .collect(Collectors.joining(", "));
+{code}
+
+
+I'd say this is a little insufficient. You have the exact same situation with writing hints in {{HintsBuffer.allocate()}}.
+
+What you want is to add an extra validation downstream all the way to {{ModificationStatement}}, so that you can return a meaningful exception to the client immediately - rather than ending up timing out the response.
+
+I would also not bother with listing individual tables; keyspace and partition key should hopefully be sufficient enough, and memoise calculated {{Mutation}} size in the {{Mutation}} object (see {{serializedSize*}} fields in {{Message}} in 4.0) to prevent redundant calculations by subsequent stages.
+
+[~tpetracca] Would you mind if I submit a patch for this? I ran into this requirement and made some progress on the patch.
+
+[~jrwest] Made a patch with the changes. [~tpetracca] apologies if I am overtaking you.
+
+Here is the [patch|https://github.com/nvharikrishna/cassandra/commit/5b3af390ce64860505dfeb3a3549cc9897987771] and [CI|https://app.circleci.com/jobs/github/nvharikrishna/cassandra/95].
+
+I have a small question though. In [CommitLog.java|https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLog.java#L274], it considers commit log entry overhead with mutation size to compare with max mutation size. Shouldn't it consider only the mutation size? I made changes to be compatible with overhead (I can change based on your comments).
+
+{{SizeHolder}} introduced in this patch can be used in {{Message}} as well. I can make this change too if it is okay to mixup.
+
+Thanks for picking this up [~n.v.harikrishna]. Comments below. 
+
+ 
+
+General:
+ * Since this change logs keys which in some use cases may contain PII that users may not want logged, should we add a flag to gate this feature? 
+ * I don’t believe this address [~aleksey]'s concern that the exception be propagated to the client vs. timing out. At a minimum, we should add an in-jvm dtest to show it does (I’m happy to help contribute this unless you’d like to). Its possible to split the patch into two parts (one that changes the logging and one that propagates the exception), however, in prod I’ve seen the lack of this logging and the timeouts be an issue so they are definitely both worth addressing. 
+
+CommitLog:
+ * With your change to validate the size using serializedSize, it looks like its no longer be necessary to use the scratch buffer (which seems to be used primarily to get the length w/o calculating serialized size). However, I wonder if the original approach is better performance wise since we are already serializing the mutation. It would be good to benchmark workloads with all mutations exceeding max size, no mutations exceeding max size, and mixed to check because I can imagine how what I said is wrong as well. We should check if there is any difference or if its negligible. 
+
+SizeHolder:
+ * Since the only call to {{#getSize()}} currently is {{IMutation#validateSize}} which is only called once from CommitLog.java. Consider removing the memoization. 
+ * If the memoization is still desired, I don’t think its necessary to have fields for each version since a mutation is executed within a single version of Cassandra (it may cross network boundaries and thus versions but at this point we have a new SizeHolder). Using a single variable would cleanup {{#getSize}} considerably. Further, it would be cleaner/less error prone to memoize the size in the mutation since nothing maps the object passed to {{#getSize}} to the stored value. 
+
+MutationExceededMaxSizeException:
+ * {{prepareMessage}} recalculates the mutation size. While this is an exceptional case it is still common. Perhaps a place where the memoization could be helpful? 
+ * Spelling error: maxMutaionSize
+ * I almost always prefer a configurable limit to something hardcoded and requiring recompilation to change 
+
+Other:
+ * I don’t think {{IMutation.getMaxMutationSize()}} is necessary. Use {{DatabaseDescriptor}} instead. This is more typical of Cassandra config code. Further, the original code only called {{DatabaseDescriptor.getMaxMutationSize()}} once instead of for every write. Unless we are going to make it a hot-prop its worth putting back to how it was. 
+ * We have a few {{Serializer}} interfaces in C* already, consider renaming {{SizeHolder.Serializer}} if its kept
+
+For what it's worth, I would strongly prefer the memoised fields to be inlined into {{Mutation}}, same way they are in {{Message}}. It's a very common object, and the bloat of the overhead of an extra {{SizeHolder}} object vs. just the 3 inlined fields matters.
+
+We do want the memoisation itself, as otherwise we would be performing this calculation at least twice - once when validation, once when calculating message size for internode.
+
+{quote}Since the only call to #getSize() currently is IMutation#validateSize which is only called once from CommitLog.java. Consider removing the memoization.
+{quote}
+Size is validated at org.apache.cassandra.service.reads.repair.BlockingReadRepairs#createRepairMutation method too. It may use different version for serialization based on destination. I feel memoization is required. Somehow I missed to include changes for this method in the patch. Including this change while addressing other review comments. Will update the patch asap.
+
+Thanks [~n.v.harikrishna] . My comment re: memoization was more to give an option if we didn't need it. Since we do (based on my later comments, your comments, and [~aleksey] comments), I agree w/ [~aleksey] suggestion re: removing {{SizeHolder}}. 
+
+[~jrwest] Made the changes. 
+
+Here is the [updated patch|https://github.com/nvharikrishna/cassandra/commit/1eb9a9846187f669516c88c85fa3550e4efb08f7] and [CI|https://app.circleci.com/jobs/github/nvharikrishna/cassandra/120]. 
+
+Summary of changes:
+ * Removed SizeHolder
+ * MutationExceededMaxSizeException
+ ** Avoided calculating size again.
+ ** Changed constant for limiting no.of keys to size of the message. We are mostly concerned about dumping huge message to log. No.of keys to log has to vary based on its size and there won't be an ideal config by no.of keys. So changed it to message size (1kb for now, we can increase it further).
+ * IMutation
+ ** removed getMaxMutationSize and replaced it with constant from CommitLog. 
+ * Replaced Mutation.serializer.serializedSize with mutation.serializedSize.
+
+Could you flip the size fields to {{int}} from {{long}}? (not a full review, just a super quick skim related to my only previous point)
+
+A few code review comments below. I did want to discuss if we are going to address the user facing concerns Aleksey brought up in this ticket? The patch addresses the operators lack of visibility into keyspace/table/partitions but still results in timeouts for the user. Are we going to address those in a separate ticket? My thought is that something for the operators is better than no patch (having been blind in this situation before besides custom tools) but if the user facing changes require protocol changes we should probably fix it pre-4.0 like we have or plan to w/ other similar tickets – but that could still be in a separate ticket.
+
+ 
+
+Code Comments:  
+ * -{{Mutation#serializedSize}}: you should only need one field to memoize the size and can you pass version directly to {{Serializer#serializedSize}} instead of the switch afterwards?- never mind [~n.v.harikrishna] pointed out code in {{BlockingReadRepairs}} that makes this statement false. 
+ * We also shouldn’t duplicate the implementations between counter and regular mutations
+ * {{validateSize}}: since the two implementations are identical you could move them to a \{{default}} implementation in {{IMutation}}
+ * {\{MaxMutationExceededException}}: the sort in {{#prepareMessage}} could get pretty expensive, is it necessary? It also looks like there is an edge case where “and more” will be added even when there aren’t more. Using {{listIterator.hasNext()}} instead of {{topPartitions.size() > 0}} should fix that
+
+[~jrwest]
+{quote}A few code review comments below. I did want to discuss if we are going to address the user facing concerns Aleksey brought up in this ticket? The patch addresses the operators lack of visibility into keyspace/table/partitions but still results in timeouts for the user. Are we going to address those in a separate ticket? My thought is that something for the operators is better than no patch (having been blind in this situation before besides custom tools) but if the user facing changes require protocol changes we should probably fix it pre-4.0 like we have or plan to w/ other similar tickets – but that could still be in a separate ticket.
+{quote}
+I would prefer to have a separate ticket. +1 on having something better than no patch.
+{quote}
+* We also shouldn’t duplicate the implementations between counter and regular mutations
+* validateSize: since the two implementations are identical you could move them to a default implementation in IMutation
+{quote}
+validateSize methods implementation looks similar, but they use different serialisers (Mutation uses MutationSerializer and CounterMutation uses CounterMutationSerializer) which are not visible in IMutation interface. serializedSize() methods needs memoization (needs serializedSize* fields) be cause of which we cannot move to interface as fields will be final. We had ruled out option having a separate class (i.e. SizeHolder). Now it makes me think about 2 options.
+
+1. I could not find any validation of size for {{CounterMutation}}. If it is expected or not required, then can remove {{CounterMutaiton}} changes and use\{{ Mutation.validateSize}} directly (instead of defining it in {{IMutation}}). The disadvantage I see with this approach is caller has to be aware of implementation and it makes things hard to abstract (code has to be aware of implementation instead of {{IMutation}}).
+
+2. Expect {{VirtualMutaiton}}, I see mutations are expected to be serialized and/or deserialized. Provide serialize, serialziedSize and deserialize methods as part of {{IMutaiton}} (so that we can abstract out direct usages of {{Mutation.serializer}} and {{CounterMutation.serializer}}) with an abstract class in between having common functionality.
+
+Or else pay the price of duplicate code. What do you think?
+{quote}MaxMutationExceededException: the sort in #prepareMessage could get pretty expensive, is it necessary?
+{quote}
+In Mutation, I see that there is only one PartitionUpdate per Table, and according to Mutation.merge() logic, a mutation can have changes related to only one keyspace and one key. Even if there are multiple updates for different rows of same partition, they are merged into single PartitionUpdate.
+
+When I ran a small test for sorting list of Longs (laptop having i7, 6 core and 16gb ram) it took approximately 33ms, 6ms and 1ms for 100K, 10k and 1k respectively.
+
+According to merge logic and test numbers, unless there are thousands of tables in a key space and trying to update all of them at once, I dont see a scenario where sorting can hurt (time taken for sort > 1 or 2ms).
+{quote}It also looks like there is an edge case where “and more” will be added even when there aren’t more. Using listIterator.hasNext() instead of topPartitions.size() > 0 should fix that
+{quote}
+I had moved the code into separte funtion and added unit test cases. It is working as expected. Using listIterator.hasNext() caused few tests to fail. Did I miss any scenario to test?
+
+Converted serializedSize* long fields to int as suggested by Aleksey. Changes are here: https://github.com/apache/cassandra/compare/trunk...nvharikrishna:14781-trunk?expand=1
+
+ 
+
+Thanks [~n.v.harikrishna]. I think the duplicate code is probably simpler than making things more nuanced and thanks for testing the sorting performance. The code looks ok me and I am ok w/ the separate ticket approach so that there is some improvements for operators at a minimum but I would like to get [~aleksey]'s input as well. 
+
+I'm perfectly fine with this level of duplication. Don't mind a separate ticket, either. Although FWIW that other ticket is the important one - we should never ever get to the point when an oversized mutation makes it to the commitlog at all, outside of potentially boundary mixed mode conditions - when a mutation validates for the current messaging version but ends up being slightly over the size for legacy.
+
+Was additional ticket opened?
+What shall we do with this one?
+
+I believe this patch is ready (and has one +1) but needs a committer to review. [~n.v.harikrishna] was another ticket opened? 
+
+[~jrwest] raised CASSANDRA-15741 for validation and/or fixing client timeout when mutation exceeds max size.
+
+Hi [~n.v.harikrishna]. I've picked this back up and am getting it ready to commit. Thanks for your patience. 
+
+ 
+
+I've squashed your branch here: [https://github.com/jrwest/cassandra/commits/14781-trunk.] I made a few minor changes along the way (I also re-reviewed since it had been a little bit since I had read the patch):
+
+ 
+ * Modified {{CHANGES.txt}}
+ * Modified {{IMutation#validateSize}} javadoc
+ * Moved call to {{Keyspace.open}} into the catch block of {{BlockingReadRepairs#createRepairMutation}}. It was only used if we reached that block anyways.
+ * Fixed whitespace formatting in {{MutationExceededMaxSizeException#prepareMessage}}
+
+ 
+
+I ran a build prior to these changes. The build looked good (better than trunk actually) and any failures do not seem related: [https://app.circleci.com/pipelines/github/jrwest/cassandra/4/workflows/e43918eb-40d2-45ad-80c3-dbeaa5ee186b]
+
+ 
+
+I've kicked off a new build with the changes above and with the squash performed: [https://app.circleci.com/pipelines/github/jrwest/cassandra/6/workflows/3c3f674e-db89-488a-bbd5-98f04de4fd0d]
+
+EDIT:
+
+I was slightly concerned about the failure in {{read_repair_test.py}}'s {{test_speculative_data_request}}. Looking closer at the test runs, its flaky and doesn't look like that flakiness could be related to the changes here (since the mutation sizes are static). 
+
+ 
+
+I've also kicked off a Jenkins build for good measure: [https://ci-cassandra.apache.org/view/patches/job/Cassandra-devbranch/107/] 
+
+ 
+
+ 
+
+Tests looked good. Any failures are suspected flaky tests and are unrelated. Committed as d3dadcd6f3bbde471e972f8332eb62de0f2d4aae. 
+
+Thanks a lot [~jwest] for taking it forward!!
+

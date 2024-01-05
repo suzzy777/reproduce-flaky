@@ -1,0 +1,123 @@
+was curious and ran this locally:
+My local env (with bit old dataload):
+ - NumOrcStripes: 12 (12)
+ - RowsRead: 13.50K (13501)
+vs profiles uploaded:
+ - NumOrcStripes: 8 (8)
+ - RowsRead: 20.00K (20000)
+
+I think that the recent commit Revert "IMPALA-9923: Load ORC serially to hack around flakiness" https://github.com/apache/impala/commit/b03e8ef95c856f499d17ea7815831e30e2e9f467 lead to this indeterminisim in dataload
+[~rizaon]
+
+
+
+Is it possible to fix the test rather than reverting the revert commit?
+
+My machine has old dataset, and there is only 1 file in lineitem
+{code:java}
+00:SCAN HDFS [tpch_orc_def.lineitem]
+   HDFS partitions=1/1 files=1 size=142.85MB
+   predicates: l_orderkey = CAST(1609411 AS BIGINT)
+   stored statistics:
+     table: rows=6.00M size=142.85MB
+     columns: all
+   extrapolated-rows=disabled max-scan-range-rows=6.00M
+   orc statistics predicates: l_orderkey = CAST(1609411 AS BIGINT)
+   mem-estimate=176.00MB mem-reservation=4.00MB thread-reservation=1
+   tuple-ids=0 row-size=8B cardinality=4
+   in pipelines: 00(GETNEXT) {code}
+Recent dataload create 4 files instead
+{code:java}
+00:SCAN HDFS [tpch_orc_def.lineitem]
+   HDFS partitions=1/1 files=4 size=142.76MB
+   predicates: l_orderkey = CAST(1609411 AS BIGINT)
+   stored statistics:
+     table: rows=6.00M size=142.76MB
+     columns: all
+   extrapolated-rows=disabled max-scan-range-rows=1.50M
+   orc statistics predicates: l_orderkey = CAST(1609411 AS BIGINT)
+   mem-estimate=96.00MB mem-reservation=4.00MB thread-reservation=1
+   tuple-ids=0 row-size=8B cardinality=4
+   in pipelines: 00(GETNEXT) {code}
+
+[^load-tpch-core-hive-generated-orc-def-block.sql]is the load script run through hive to load tpch_orc_def.
+Got this from running:
+{code:java}
+./testdata/bin/generate-schema-statements.py -f -w tpch --table_formats=orc/def {code}
+Maybe we can adjust some options there to ensure only 1 table writer for lineitem?
+
+I'm trying to compare dataloading log from pass vs failed run.
+
+In pass run ([^ubuntu-20.04-1158-load-tpch-core-hive-generated-orc-def-block.sql.log]), lineitem is loaded with 12 Map and 1 File Merge.
+In failed run ([^ubuntu-20.04-1134-load-tpch-core-hive-generated-orc-def-block.sql.log]), lineitem is loaded with 4 Map and no File Merge.
+
+Using orc-tool, I inspect the file metadata of lineitem table from my local dataset. In [^meta-lineitem.txt]
+{code:java}
+  Stripe 3:
+    Column 0: count: 533501 hasNull: false
+    Column 1: count: 533501 hasNull: false bytesOnDisk: 379090 min: 1075520 max: 1609411 sum: 716213269480
+...
+  Stripe 4:
+    Column 0: count: 533455 hasNull: false
+    Column 1: count: 533455 hasNull: false bytesOnDisk: 378202 min: 1609411 max: 2142211 sum: 1000577484397 {code}
+l_orderkey = 1609411 used by the testcase is in boundary of Stripe 3 and Stripe 4.
+
+One way to make this test more deterministic is to change it to count orders table with o_orderkey = 1. tpch_orc_def.orders are loaded as single file with 3 stripes in both 1134 and 1158 run. And o_orderkey = 1 only lies in the first stripe, as shown by [^meta-orders.txt].
+{code:java}
+Stripe Statistics:
+  Stripe 1:
+    Column 0: count: 591839 hasNull: false
+    Column 1: count: 591839 hasNull: false bytesOnDisk: 4629 min: 1 max: 2367335 sum: 700541773200 {code}
+ 
+
+Filed: [https://gerrit.cloudera.org/c/20794/] 
+
+Some other tests are failing as well due to this non-determinism in ORC data loading.
+Best course of action for now is to revert the revert commit of IMPALA-9923.
+[http://gerrit.cloudera.org:8080/20795] 
+
+Commit 378169be1f571f4d16db2d98b418903c8593889f in impala's branch refs/heads/master from Riza Suminto
+[ https://gitbox.apache.org/repos/asf?p=impala.git;h=378169be1 ]
+
+Revert "Revert "IMPALA-9923: Load ORC serially to hack around ...""
+
+This reverts commit b03e8ef95c856f499d17ea7815831e30e2e9f467.
+
+IMPALA-12630 report several tests were broken due to loading ORC in
+parallel with other non-text table format. ORC tables returns to load
+serially after this commit.
+
+Change-Id: I5d3f2ee1c15f9aff6aa632a78d86ba32c640e53d
+Reviewed-on: http://gerrit.cloudera.org:8080/20795
+Reviewed-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+Tested-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+
+
+Commit 1b93c370b250211195a2b24ecf8c4e8c100dd679 in impala's branch refs/heads/master from Riza Suminto
+[ https://gitbox.apache.org/repos/asf?p=impala.git;h=1b93c370b ]
+
+IMPALA-12630: Deflake TestOrcStats.test_orc_stats
+
+After revert of IMPALA-9923 (b03e8ef95c856f499d17ea7815831e30e2e9f467),
+TestOrcStats.test_orc_stats becomes flaky in the following test case:
+
+select count(*) from tpch_orc_def.lineitem where l_orderkey = 1609411;
+
+This is because tpch_orc_def.lineitem sometimes loaded as 1 ORC file in
+one run, and loaded in as 4 ORC files in the other run (see JIRA
+comments for more analysis).
+
+This patch attempts to deflake the test by changing the test case to
+count over orders table instead. orders table is not as large as
+lineitem table, but more consistently written as 1 ORC file with more
+than 1 stripe.
+
+Testing:
+- Pass TestOrcStats.test_orc_stats after reloading tpch workload.
+
+Change-Id: Ibb7bb25b44878df3e037e750a985656ed6857a7d
+Reviewed-on: http://gerrit.cloudera.org:8080/20794
+Reviewed-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+Tested-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+
+

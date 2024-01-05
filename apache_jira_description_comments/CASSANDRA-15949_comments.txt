@@ -1,0 +1,86 @@
+Marked this as a degradation as from https://docs.oracle.com/javase/8/docs/api/java/util/concurrent/ScheduledThreadPoolExecutor.html#scheduleAtFixedRate-java.lang.Runnable-long-long-java.util.concurrent.TimeUnit-
+
+"If any execution of the task encounters an exception, subsequent executions are suppressed"
+
+So if this hits while a table is being dropped, recomputation of speculative retry thresholds will halt node-wide. 
+
+ 
+
+ 
+
+[~jmeredithco] Took a quick look, and it seems like this is nominally a consequence of {{Schema#keyspaces}} and {{Schema#metadataRefs}} not really being synchronized in any way. (i.e. The {{Keyspace}} constructor finds {{TableMetadata}}, but there is no {{TableMetadataRef}} present by the time we need to pass it to {{initCf()}}). My first instinct is to do two things:
+
+1.) Catch and log at WARN all exceptions from anywhere in the recomputation task rather than halting node-wide.
+2.) Apprehend null {{TableMetadataRef}} references in the {{Keyspace}} constructor and log at INFO to avoid stopping progress even within a particular recomputation task for something transient like this.
+
+I'll work out a test that hits the original error and push up a patch w/ the above shortly...
+
+[trunk|https://github.com/apache/cassandra/pull/733] [j8 tests|https://app.circleci.com/pipelines/github/maedhroz/cassandra/105/workflows/36eededa-b5bc-4ecc-b3fa-592f12109884] [j11 tests|https://app.circleci.com/pipelines/github/maedhroz/cassandra/105/workflows/940fb0c2-7881-40fa-9daa-dc29859d27ec]
+
+UPDATE: Tests are clean outside a couple already identified as flaky.
+
+[~dcapwell] [~jmeredithco] I think I can see a sequence that produces the error above now. Here goes...
+
+1.) We drop a keyspace, which hits {{Schema#dropKeyspace()}}.
+2.) This winds around a bit, but finally clears the keyspace name from the {{keyspaceInstances}} field of {{Schema}}. However, the {{keyspaces}} field still thinks the keyspace is present right before {{dropKeyspace()}} proceeds to {{unload()}}.
+3.) At this point, the speculative retry threshold task decides it's a good time to run. It hits {{Keyspace.open()}} and sees that, according to {{Schema#getKeyspaceInstance()}}, the keyspace doesn't exist!
+4.) We move into the {{Keyspace}} constructor just in time to get a reference to a {{KeyspaceMetadata}} from {{keyspaces}} in {{Schema}} that thinks the table in question still exists.
+5.) Immediately after this happens, the original thread continues into {{unload()}} and drops the hammer on everything, including {{metadataRefs}}.
+6.) The task thread wakes up and proceeds in the {{Keyspace}} constructor to try to get a {{TableMetadataRef}}, but of course, it's gone.
+
+If the sequence above is coherent, I think it means the [current patch|https://github.com/apache/cassandra/pull/733/files] is at least an improvement, given it stops the {{Keyspace}} constructor before it proceeds to {{initCf}} and doesn't kill all future executions of the threshold update task in addition. My only concern is that we might still be able to hit {{initCf()}} if we get a {{TableMetadataRef}} _just_ before {{unload()}} blows it away, which seems like it would create a new {{ColumnFamilyStore}}.
+
+So naïve question...why do we allow the speculative retry threshold updater task to create keyspaces at all, ever? It seems like we could approach this an entirely different way...by just having something like {{Keyspace.allExisting()}} that just uses the non-null results of {{Schema#getKeyspaceInstance()}} instead of {{Keyspace.open()}}. Even if one of those instances is in the process of being removed, updating the thresholds on a doomed CFS is harmless. (Also, we can avoid a new esoteric bit of logging trying to explain how our schema updates work.)
+
+I like the `allExisting()` approach and agree updating thresholds in doomed CFS is harmless as long as there aren't issues relating to them being shutdown (the table metadata being invalid). I'm not sure where the best point to actually iterate-over-metadata-of-all-loaded-CFS-without-loading-ever with the {{updateSpeculationThreshold function}} which is what we really want to do. It's also not the end of the world to miss it as a keyspace is loading as it will be updated next time (as long as this doesn't crash updating of course).
+
+[~jmeredithco] I've taken both the testability ideas from [~dcapwell] and the "only run the update task on existing keyspaces" approach and worked them into the patch, which is now [running through|https://app.circleci.com/pipelines/github/maedhroz/cassandra?branch=CASSANDRA-15949] the tests again. Let me know what you think...
+
+allExisting sounds better in this case, but if what you mentioned is true then we may have other race condition bugs (a lot of places use Keyspace.open) where a dropped keyspace comes back to life, which would impact metrics and would cause the cached Keyspace to have incorrect meta (org.apache.cassandra.schema.Schema#loadNew doesn't update meta)...
+
+Patch looks good to me, it would avoid updater trying to open a keyspace and makes it so the constructor doesn't fail.  I am wondering though if all should actually be allExisting, so rather than adding a new method we fix this method to avoid the problem?  on-startup and on keyspace create we cache the Keyspace object, so Keyspace.open isn't actually needed in the majority of cases.
+
+Given the race above, I still think it may be best if Keyspace.open also locks on Schema so it has a consistent view during the open call and can learn if it still exists (only when the double check locking happens, not in the cache hit case).  [~aleksey] it would be great if we could get your feedback as well.
+
+[~dcapwell] So just to summarize, the plan would be...
+
+1.) Remove the synchronization blocks on {{Keyspace}}.
+2.) Replace the sync block on {{Keyspace}} in {{open()}} w/ a sync block on the {{Schema}} singleton. (This ensures most access still results in a cache hit.)
+3.) Given it's no longer possible, remove the check in my patch for a null {{TableMetadataRef}} and the logging accompanying it.
+
+Unless [~aleksey] has holes to poke in it, I like it...
+
+UPDATE: After taking a stab at this,  the [tests|https://app.circleci.com/pipelines/github/maedhroz/cassandra?branch=CASSANDRA-15949] look unremarkable, aside from indicating that we need to rebase on trunk post-CASSANDRA-15954.
+
+bq. I am wondering though if all should actually be allExisting, so rather than adding a new method we fix this method to avoid the problem?
+
+It looks like you're probably right on this one, but given there are a dozen or so places to audit, I lean toward avoiding it in this patch.
+
+The PR looks good to me as currently is.
+
+And I'm sure we have a ton of {{Keyspace.open()}} around, all lazy-initializing the keyspaces, where sometimes we don't mean to do that. Out of scope of this issue, but maybe should indeed be looked into at some point.
+
+Relatedly, we might want to audit other similar uses of the executor with tasks not handling exceptions properly.
+
+bq.  but given there are a dozen or so places to audit, I lean toward avoiding it in this patch.
+
+sounds good to me.
+
+re-reviewed; with the lock on schema then this LGTM; +1.
+
+bq. The PR looks good to me as currently is.
+
+[~aleksey] Thanks! Should I consider that a "+1"? :)
+
+bq. Thanks! Should I consider that a "+1"?
+
+Indeed you should (:
+
+CI results:
+https://ci-cassandra.apache.org/view/patches/job/Cassandra-devbranch/20/
+https://app.circleci.com/pipelines/github/dcapwell/cassandra?branch=commit_remote_branch%2FCASSANDRA-15949-trunk-B03EA88E-B95B-40C8-BF76-DA566646C28C
+
+I don't have as much history with Jenkins flaky tests, so I went off Circle CI's results for review.
+
+Also, Jenkins didn't have the same commit as circle as I ninja fixed an issue that was on trunk, so jenkins was missing ea322bfaa78b662c95711e6579b480b4d0f741c6
+

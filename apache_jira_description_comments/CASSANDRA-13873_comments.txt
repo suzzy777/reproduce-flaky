@@ -1,0 +1,89 @@
+I should probably mention this happens when we cancel compactions.  In 3.0 they would just wait till previous runs finished, now we cancel them.
+
+It looks like this situation can occur when referencing canonical sstables. As far as I can tell, the issue reproduces only when we have an sstable in a lifecycle transaction with no referencers other than its selfref. If the lifecycle transaction updates this sstable, we'll put a new instance of the sstable reader in the tracker. This causes no problems when getting live sstables, but the canonical sstables can also include sstable readers from the compacting set. In this case, the sstable reader that got updated will still be in the compacting set, but we won't be able to reference it when we try to select and reference canonical sstables, since its instance tidier has run when its last ref was released in the lifecycle transaction. Note that the global tidier doesn't run, since the updated sstable reader is still referenced. With the reproduction provided above in the multiple scrub, the scrubs will eventually proceed once the lifecycle transaction finishes, since it will put an updated sstablereader in the tracker. If there is a situation where a lifecyce transaction needed to select canonical sstables to proceed, this could cause a deadlock.
+
+I pushed a branch at [c13873-2.2|https://github.com/jkni/cassandra/commit/ba70f70d97f648037e742a16bfdf1c8002d2be9c] that implements the simplest fix I can think of. The patch references the original sstables involved in a lifecycle transaction when we create the transaction, releasing these references whenever we do postCleanup or cancel an sstable reader from a transaction. I merged this forward and tests came back clean on all active branches. I'm not sure if there is some existing mechanism that should cover this case - maybe [~krummas] knows from reviewing [CASSANDRA-9699]?
+
+bq. the scrubs will eventually proceed once the lifecycle transaction finishes,
+but shouldn't cancelling the scrub-compaction also finish the txn?
+
+I'll take review unless you had someone else lined up - -is this still "critical" after your analysis [~jkni]-? Edit: yup, looks like it
+
+You're correct that cancelling will also finish the txn and allow operations to select and reference canonical sstables. In the specific repro that Jake provided, which is the case of multiple scrubs over the same cfs (an admittedly somewhat artificial case), we'll try to select and reference canonical sstables in the snapshot before cancelling the original scrub compaction, so the new scrubs will hang until the original scrub finishes.
+
+That'd be great if you could review. I'm admittedly very unfamiliar with this part of the code, so I expect my initial patch is a rough sketch of the eventual solution.
+
+As far as criticality goes, I could go either way. I know of no situations that this causes data loss or permanent deadlocks at this time, but it can potentially cause operations referencing canonical sstables to hang for long periods of time.
+
+looks like this is a problem way back in 2.1 as well and my fix in CASSANDRA-10829 only made the window where this can happen smaller
+
+correction, there is only a tiny race just as we finish up compactions in 2.1 - not worth fixing at this point
+
+The problem seems to be that we don't grab a reference before starting the compaction everywhere - we do it in [CompactionTask|https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/db/compaction/CompactionTask.java#L177], but not during [cleanup|https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/db/compaction/CompactionManager.java#L1095-L1098] for example.
+
+[~jkni] I think we should do your fix (and also remove the external ref-grabbing in CompactionTask), but maybe only in trunk? It feels a tiny bit safer to not touch {{LifecycleTransaction}}/{{CompactionTask}} in older versions and instead take the ref outside where we need it, but I'm not entirely convinced, wdyt?
+
+
++1 - I'd like to introduce as few changes as possible to older versions here. That combination sounds good to me. Do you want to prepare the patch for older versions or would you like me to?
+
+https://github.com/krummas/cassandra/commits/marcuse/13873
+https://github.com/krummas/cassandra/commits/marcuse/13873-3.0
+https://github.com/krummas/cassandra/commits/marcuse/13873-3.11
+
+https://builds.apache.org/view/A-D/view/Cassandra/job/Cassandra-devbranch-dtest/387/
+https://builds.apache.org/view/A-D/view/Cassandra/job/Cassandra-devbranch-dtest/388/
+https://builds.apache.org/view/A-D/view/Cassandra/job/Cassandra-devbranch-dtest/389/
+
+https://circleci.com/gh/krummas/cassandra/tree/marcuse%2F13873
+https://circleci.com/gh/krummas/cassandra/tree/marcuse%2F13873-3.0
+https://circleci.com/gh/krummas/cassandra/tree/marcuse%2F13873-3.11
+
+ping [~jkni] - should we port the trivial patch to trunk as well and get this in? We could improve it in another ticket I guess
+
+Sorry for the latency here - my fault. The patch looks good to me. I considered a few other cases where a similar problem might exist. It seems to me the same issue could exist in in the Splitter/Upgrader, but since they're offline, I don't know what future changes would require another operation to reference canonical sstables in parallel. I also don't see anything in anticompaction grabbing a ref; am I missing something there?
+
+The patches look good for existing cases. Unfortunately, I let the dtests age out before taking a closer look, but I can rerun them after you look at the question above. I'm +1 to merging the relatively trivial patches through to trunk and opening a ticket to improve it later. As you've seen, I don't have a huge amount of bandwidth for this right now, so I'd rather not delay a definite improvement with only the promise of a better one. Thanks for the patience.
+
+bq. Splitter/Upgrader, but since they're offline
+yeah, don't think we need it here, we don't open early when doing offline operations and we should have no concurrent operations referencing sstables
+
+bq. I also don't see anything in anticompaction grabbing a ref;
+looks like we do it [here|https://github.com/apache/cassandra/blob/cassandra-2.2/src/java/org/apache/cassandra/service/ActiveRepairService.java#L565-L584]
+
+I'll prepare the patches and start the dtests
+
+https://github.com/krummas/cassandra/commits/marcuse/13873
+https://github.com/krummas/cassandra/commits/marcuse/13873-3.0
+https://github.com/krummas/cassandra/commits/marcuse/13873-3.11
+https://github.com/krummas/cassandra/commits/marcuse/13873-trunk
+
+https://builds.apache.org/view/A-D/view/Cassandra/job/Cassandra-devbranch-dtest/444/
+https://builds.apache.org/view/A-D/view/Cassandra/job/Cassandra-devbranch-dtest/445/
+https://builds.apache.org/view/A-D/view/Cassandra/job/Cassandra-devbranch-dtest/446/
+https://builds.apache.org/view/A-D/view/Cassandra/job/Cassandra-devbranch-dtest/447/
+
+https://circleci.com/gh/krummas/cassandra/tree/marcuse%2F13873
+https://circleci.com/gh/krummas/cassandra/tree/marcuse%2F13873-3.0
+https://circleci.com/gh/krummas/cassandra/tree/marcuse%2F13873-3.11
+https://circleci.com/gh/krummas/cassandra/tree/marcuse%2F13873-trunk
+
+Thanks for the patches and CI. Both your remarks look correct to me; frankly, I have no idea how I missed that in anticompaction.
+
+Test results look good for the most part. There's a few flaky unit tests on 3.0/3.11 that appear to have failed the same way before the patch, pass for me locally, and appear to be at the limits of CircleCI's timeouts/resources. The 2.2 dtests timed out, so it seems worthwhile to trigger those again just in case. The only unusual failures on 3.0 dtests are a bunch of tests where Jolokia failed to attach for JMX. I'm not sure if this is a known environmental problem on ASF dtests, but I was unable to reproduce this elsewhere.
+
+Overall, +1 to the patch for me, and this looks good to merge if none of the test issues I raised above worry you.
+
+finally got the 2.2 tests run properly and the failures look unrelated: https://builds.apache.org/view/A-D/view/Cassandra/job/Cassandra-devbranch-dtest/456/
+
+I'll get this committed (on monday..)
+
+Great. Thanks!
+
+and committed as {{3cd2c3c4ea4286562b2cb8443d6173ee251e6212}}, thanks
+
+Any chance to get this back-ported also to 2.1.x? We are having a lots of 2.1 nodes out there in production with no immediate plan to upgrade, but e.g. we can't have a combination of {{nodetool cleanup}} (e.g. after extending the cluster with additional nodes) and an hourly cron job taking snapshots. See linked issue CASSANDRA-11155. Thanks.
+
+[~tsteinmaurer] I couldn't reproduce the issue on my end. I suspect you need at least a few large SSTables to trigger the issue. Can you try building from [this branch|https://github.com/kgreav/cassandra/tree/13873-2.1] which is just latest 2.1 with the simple backport on top and seeing if it fixes the issue?
+
+[~KurtG], thanks for the follow-up. Unfortunately, I don't have a larger environment available to give your back-port a try at the moment, cause we have work-arounded the issue for our scaled out clusters beyond our replication factor by disabling and then re-enabling the hourly cron job taking snapshots.
+

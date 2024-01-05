@@ -1,0 +1,444 @@
+Interesting issue, let me see it in more depth ... 
+
+We ran into this issue when upgrading from 3.0 to 4.0. Application get more timeouts caused by blocking read repair when doing node replacement by adding one new node followed by decommission the old node. After applying a hot fix like this, the issue is gone. But I think we still need to fix the latch part.
+
+!image-2023-11-29-15-26-08-056.png|width=511,height=341!
+
+Have you considered to get rid of read repairs completely? It has questionable benefits. Also, do you use dclocal read repair?
+
+[https://thelastpickle.com/blog/2021/01/12/get\_rid\_of\_repair\_repair\_chance.html][https_thelastpickle.com_blog_2021_01_12_get_rid_of_repair_repair_chance.html]
+
+
+Sent from ProtonMail mobile
+
+
+
+\
+
+I think dclocal read repair is removed in 4.0.
+
+Disable all read repair altogether everywhere in 3.0.
+
+There is not (dclocal)_read_repair_chance in table parameters anymore in 4.0.  There is only "read_repair" which is either BLOCKING or NONE. 
+
+[https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/service/reads/repair/BlockingReadRepair.java#L45-L49]
+
+[https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/service/reads/repair/ReadOnlyReadRepair.java#L33-L36]
+
+[https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/service/reads/repair/ReadRepairStrategy.java]
+
+3.0 and 3.11 have "read_repair_chance" and "dclocal_read_repair_chance". 4.0+ has only "read_repair" which is either NONE or BLOCKING.
+
+You said that you hit this issue when upgrading from 3.0 to 4.0 so my idea is to set both dc and read_repair_chance to 0.0 to effectively turn it off and then this will not happen no?
+
+[https://github.com/apache/cassandra/blob/cassandra-3.0/src/java/org/apache/cassandra/config/CFMetaData.java#L720-L730]
+
+ 
+
+What I want to say is that I dont know what it has in common when you are doing upgrades from 3.0 to 4.0.
+
+Anyway ... I think your issue is fixed in trunk (to be 5.1), if you look closely here (1) (this is trunk) and  you compare it with 5.0 (2), in trunk, there is "adjustedBlockFor" and then it is set to "blockFor" which is used in int blockFor() method in that class. In 5.0, this is not there, so int blockFor() will use "writePlan.writeQuorum();" and I think this is the source of that timeout because we are waiting for replicas from other DC in a blocking manner but trunk does not block on replicas from remote DCs.
+
+(1) [https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/service/reads/repair/BlockingPartitionRepair.java#L83-L91]
+(2) [https://github.com/apache/cassandra/blob/cassandra-5.0/src/java/org/apache/cassandra/service/reads/repair/BlockingPartitionRepair.java#L83-L92]
+
+We should backport that to 4.0 and 4.1.
+
+I don't think so; this is completely resolved in the _trunk_ yet. We are still not adjusting the _latch_ if the _pendingRepairs_ include a node from the remote region.
+
+Let me explain with the following scenario:
+ # _pendingRepairs_ at line number 81 [1] has 1 node from the local region and another node from a remote region
+ # At line number 100 [2] _blockFor_ will be 2, i.e., the latch will be 2
+ # When the local node responds, then at line no 122 [3], it includes the response, i.e., the latch will be decremented as *{color:#00875a}expected{color}*
+ # When the remote node responds, then at line no 122 [3], it {color:#de350b}excludes{color} the response, i.e., the latch will not be {color:#de350b}decremented{color}, and this is the *{color:#ff0000}problem{color}*
+
+Could you please double-check the above scenario?
+
+[1][https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/service/reads/repair/BlockingPartitionRepair.java#L81]
+
+[2][https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/service/reads/repair/BlockingPartitionRepair.java#L100]
+
+[3] [https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/service/reads/repair/BlockingPartitionRepair.java#L122]
+
+[~smiklosovic] I think trunk(5.1) and 5.0 is basically same. Although 5.0 the int blockFor() function is returning "writePlan.writeQuorum();", looks like the function is never called. The latch is still initialized with the local variable blockFor in the constructor. This is same as the trunk version of adjustedBlockFor. The problem here for blocking read repair is that the cross DC node has not been contacted before(No read from the cross DC node). It's the [selector|https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/locator/ReplicaPlans.java#L411] which is requiring 1 extra node to response when applying read repair mutation [[1]|https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/locator/ReplicaPlans.java#L572].
+
+This means for replication factor 3 in each DC, sending read request with local_quorum assuming no speculative retry is triggered. When we get digest mismatch, blocking read repair will start. For normal scenario, blocking read repair will only try to repair the replicas that have been contacted(read) before, also we want to satisfy the consistency blockFor. If blockFor is larger than the number of replicas contacted before, we will add more nodes to apply the read-repair-mutation. For normal cases, blockFor should be same as the number of nodes contacted before. However, if we are adding a node in the same DC, the blockFor will be blockFor + pending which requires one more node to be repaired. And this "one more node" can be any node that has not been contacted before. As mentioned, the while the latch is initialized with number of nodes that the read-repair-mutations have been sent to but only count down when getting response from same DC. The coordinator node will get timeout 100% if a cross DC node is selected to perform the read-repair-mutation.
+
+[~chovatia.jaydeep@gmail.com] in your point 2), how did you come to the conclusion that blockFor (hence latch) will be set to 2? Could you elaborate point 2) in more detail?
+
+Sure.
+
+Say we are reading with LOCAL_QUORUM with a replication factor of 3. Now, let's understand the input parameters for the following: 
+
+ 
+{code:java}
+public BlockingPartitionRepair(DecoratedKey key, Map<Replica, Mutation> repairs, ReplicaPlan.ForWrite repairPlan, Predicate<InetAddressAndPort> shouldBlockOn) {code}
+ * {+}_repairPlan_{+}: This could have two local nodes _L1, L2_ and one remote node _R1_ as the _Selector_ [1] could select the remote node as [~curlylrt] mentioned above. So _repairPlan_ parameter has {{_}L1, L2, R1{_}}
+ * {+}_repairs_{+}: This also has _L1_ and _R1_ because these two might be stale and require an update. L2 is not included as it has the latest data.
+ * Now, at the following line, _pendingRepairs_ will have two nodes {{_}L1, R1{_}}.  
+{code:java}
+this.pendingRepairs = new ConcurrentHashMap<>(repairs); {code}
+
+ *  so _adjustedBlockFor_ will be set to 3 at the following line:
+{code:java}
+int adjustedBlockFor = repairPlan.writeQuorum(); {code}
+
+ * Let's analyse L1, L2, and R1 for the following condition: 
+{code:java}
+if (!repairs.containsKey(participant) && shouldBlockOn.test(participant.endpoint())) {code}
+
+ * 
+ ** L1: _false_ as it is a participant
+ ** L2: _true_ as it is not a participant and local as well //{_}adjustedBlockFor{_} 3-->2
+ ** R1: _false_ as it is a participant
+ * The following lines sets _blockFor_ and _latch_ to the value 2 
+{code:java}
+this.blockFor = adjustedBlockFor; 
+...
+latch = newCountDownLatch(Math.max(blockFor, 0));{code}
+
+ * But when we receive a response from {_}R1{_}, then line 122 [2] {color:#de350b}excludes{color} the response, as a result, the latch does not decrement 
+{code:java}
+    void ack(InetAddressAndPort from)
+    {
+        if (shouldBlockOn.test(from))
+        {
+            pendingRepairs.remove(repairPlan.lookup(from));
+            latch.decrement();
+        }
+    } {code}
+
+ 
+
+[1] [https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/locator/ReplicaPlans.java#L411]
+
+[2] [https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/service/reads/repair/BlockingPartitionRepair.java#L122C9-L122C9]
+
+ 
+
+ 
+
+If we have a keyspace with RF 3 and we do a read with CL LOCAL_QUORUM, then this (looking into trunk version of that)
+{code:java}
+int adjustedBlockFor = repairPlan.writeQuorum();
+{code}
+will be set here (1). writeQuorum is computed in the constructor above, and that is computed in (2). It will firstly compute blockFor from the consistency level for LOCAL_QUORUM when RF is 3 which will be 2 (line 176) and since we have LOCAL_QUORUM it will go to the case where it does
+{code:java}
+blockFor += pending.count(InOurDc.replicas());
+{code}
+and since we are assuming that pending is not in local DC, it will add 0 to 2 which is 2 so yeah, adjustedBlockFor will be 2. We are on the same page here.
+
+Now this:
+{code:java}
+        int adjustedBlockFor = repairPlan.writeQuorum();
+        for (Replica participant : repairPlan.contacts())
+        {
+            if (!repairs.containsKey(participant) && shouldBlockOn.test(participant.endpoint()))
+                adjustedBlockFor--;
+        }
+        this.blockFor = adjustedBlockFor;
+{code}
+This is a little bit confusing to go through but in order to decrement adjustedBlockFor (which is 2 at the beginning of this loop), any participant of the repairPlan (contacts) has to be in the local dc (in order to have shouldBlockOn returning true when it is InOurDc.endpoints()).
+
+repairPlan.contacts() in that loop will ultimately take these contacts from (3). In that selector, (4)
+{code:java}
+int add = consistencyLevel.blockForWrite(liveAndDown.replicationStrategy(), liveAndDown.pending()) - contacts.size();
+{code}
+blockForWrite will be called with strategy with RF = 3, LOCAL_QUORUM is 2, pending might be one, so it will do again "blockFor += pending.count(InOurDc.replicas());" which will be 2 += 0 = 2. In order to have add at least 1, when blockForWrite returns 2, contacts.size() has to be 1 (2 - 1 = 1). Then it goes through live replicas and it will choose some which was not contacted {*}and here it might pick remote replica{*}.
+
+so if we return to that "if"
+{code:java}
+            if (!repairs.containsKey(participant) && shouldBlockOn.test(participant.endpoint()))
+                adjustedBlockFor--;
+{code}
+participant can be remote, so "repairs.containsKey(participant)" is "false" (when repairs are all local), so "!repairs.containsKey(participant)" is true. Then the second clause, shouldBlock, will evaluate to false, because participant is not local and shouldBlockOn is InOurDc.endpoints. So true && false = false. So "adjustedBlockFor" will not be decremented. But I think that it should be, because we are not going to block for remote participants. If it is not decremented, then blockFor will be set to 2 but it should be set only to 1. If it is set to 2, then this
+{code:java}
+    void ack(InetAddressAndPort from)
+    {
+        if (shouldBlockOn.test(from))
+        {
+            pendingRepairs.remove(repairPlan.lookup(from));
+            latch.decrement();
+        }
+    }
+{code}
+will decrement it just once, from 2 to 1 and it will never reach 0.
+
+So it seems to me that we should do this:
+{code:java}
+            if (!repairs.containsKey(participant) && !shouldBlockOn.test(participant.endpoint()))
+                adjustedBlockFor--;
+{code}
+Notice the negation for shouldBlockOn. We should not block on remotes. shouldBlockOn will return true when participant is local. In order to not block on remote participants, (!shouldNotBlockOn) should be true, that is only when shouldNotBlockOn is false. That is only when participant is remote one.
+
+Or maybe I am completely wrong? :) Would you guys be so nice to go through this and proof read it?
+
+(1) [https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/locator/ReplicaPlan.java#L326-L329]
+(2) [https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/db/ConsistencyLevel.java#L181-L184]
+(3) [https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/locator/ReplicaPlans.java#L577]
+(4) [https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/locator/ReplicaPlans.java#L572]
+
+{quote}and since we are assuming that pending is not in local DC, it will add 0 to 2 which is 2 so yeah, adjustedBlockFor will be 2. We are on the same page here.
+{quote}
+The pending is in local DC. Because we are adding a node in local DC. So the adjustedBlockFor is 3 not 2.
+
+Then I dont understand how [~chovatia.jaydeep@gmail.com]  concluded that initial adjustedBlockFor is 2. This
+{code}
+blockFor += pending.count(InOurDc.replicas());
+{code}
+
+will be then 3.
+
+Anyway, that does not matter. Whole post can be read with pending being local. It is same thing.
+
+It is the combination of this adding remote replicas
+
+{code}
+                        for (Replica replica : filter(live.all(), r -> !contacts.contains(r)))
+                        {
+                            contacts.add(replica);
+                            if (--add == 0)
+                                break;
+                        }
+{code}
+
+and this
+
+{code}
+            if (!repairs.containsKey(participant) && shouldBlockOn.test(participant.endpoint()))
+                adjustedBlockFor--;
+{code}
+
+not decrementing when participant is remote.
+
+Yeah, [~smiklosovic] and [~curlylrt], _adjustedBlockFor_ would be 3 instead of 2.
+
+Anyway, that does not matter. Whole post can be read with pending being local. It is same thing.
+
+It is the combination of this adding remote replicas
+{code:java}
+                        for (Replica replica : filter(live.all(), r -> !contacts.contains(r)))
+                        {
+                            contacts.add(replica);
+                            if (--add == 0)
+                                break;
+                        }
+{code}
+and this
+{code:java}
+            if (!repairs.containsKey(participant) && shouldBlockOn.test(participant.endpoint()))
+                adjustedBlockFor--;
+{code}
+not decrementing when participant is remote.
+
+If we have participant which is remote, we will have problem when ack:
+{code:java}
+void ack(InetAddressAndPort from)
+    {
+        if (shouldBlockOn.test(from))
+        {
+            pendingRepairs.remove(repairPlan.lookup(from));
+            latch.decrement();
+        }
+    } {code}
+Remote node won't get latch count down.
+
+[~smiklosovic] 
+
+> So it seems to me that we should do this:
+
+The fix you recommended won't work because if the remote node is a participant, the condition will always be _false_ because of the _`&&`_ operator in the _if_ loop. It should be an {_}`||{_}` operator. A slight modification will work:
+{code:java}
+if (!repairs.containsKey(participant) || !shouldBlockOn.test(participant.endpoint()))
+    adjustedBlockFor--;{code}
+
+Whole logic will "end" when latch is 0. Correct? if "from"  in ack() is remote, then it will not enter that "if" so it will not be decremented. But that is all fine, as long as (adjusted)BlockFor contains only blocks for local replicas. Basically we need to set blockFor low enough to get to 0 in ack(). That will be done when we negate shouldBlockFor method in that "if" to exclude remote replicas because remote replicas are not meant to be waited for.
+
+[~chovatia.jaydeep@gmail.com] cool I will run some tests here. Maybe [~curlylrt] could test this on his end in the meanwhile to verify our logic?
+
+[~smiklosovic]
+
+ 
+
+[~curlylrt] and I are also suggesting enhancing the _Selector_ [2] code and not selecting the remote replicas in the first place if the user-specified consistency level is {_}LOCAL{_}*. So, in short, two fixes we are recommending:
+ # _adjustedBlockFor_ should count only the local replicas [1] - {color:#de350b}*must*{color}
+ # Improve the selector not to select the remote replicas in the first place [2] - *{color:#ff8b00}nice to have{color}*
+
+[1] [https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/service/reads/repair/BlockingPartitionRepair.java#L88]
+
+[2][https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/locator/ReplicaPlans.java#L577]
+
+ 
+
+wdyt?
+
+ 
+
+Whole research we did was with LOCAL_QUORUM in mind. If we are not on EACH_QUORUM (1), then the selector logic will be also invoked when we are on QUORUM, right? Then, selecting replicas in remote DCs to participate in read repair is perfectly fine, no? We just should not block for them in BlockingPartitionRepair. 
+
+(1) https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/locator/ReplicaPlans.java#L570
+
+For {_}QUORUM{_}, it is okay to have remote nodes, but for {_}LOCAL_QUORUM{_}, it is better to prioritize local nodes over remote nodes. We can extend the selector code [1] and add a special case for LOCAL_QUORUM to prioritize local node selection first because in a multi-region setup, LOCAL_QUORUM is the most commonly used replication factor.
+
+[1] [https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/locator/ReplicaPlans.java#L572]
+
+ 
+
+I see ... well, I dont know ... something like this?
+
+https://github.com/apache/cassandra/pull/2953/commits/06069fac4f73882115c325722c2cc7bb9b779080
+
+I dont see anything wrong with that special case but we are changing the behavior here and we should be careful. Let's test this idea first and then we can invite another committer to evaluate it as well.
+
+
+
+Well that is not so simple. Yeah as you said, we might prioritize but we should not _exclude them_. E.g. if all live nodes are remote and we are on LOCAL_QUORUM then by what I just sent we would never add them.
+
+I ll play with this and let you know :)
+
+yeah, we should not completely filter the remote nodes with LOCAL_QUORUM as it would lead to other issues. We should simply *prioritize* the local nodes over remote nodes. Something like this can be done....
+{code:java}
+                 if (consistencyLevel != EACH_QUORUM)
+                 {
+                     int add = consistencyLevel.blockForWrite(liveAndDown.replicationStrategy(), liveAndDown.pending()) - contacts.size();
++
++                    if (consistencyLevel == LOCAL_QUORUM)
++                    {
++                        // prioritize local replicas first
++                        for (Replica replica : filter(live.all(), r -> !contacts.contains(r) && InOurDcTester.replicas().test(r)))
++                        {
++                            contacts.add(replica);
++                            if (--add == 0)
++                                break;
++                        }
++                    }
+                     if (add > 0)
+                     {
+                         for (Replica replica : filter(live.all(), r -> !contacts.contains(r)))
+.....
+..... {code}
+
+my idea is more like this
+
+https://github.com/apache/cassandra/pull/2953/files#diff-5f7abad30251655d9a9ba867a9d98d63e915941bf1b5acfe3b1def30a4137cc2
+
+[~smiklosovic] , that works for us!
+
+[~chovatia.jaydeep@gmail.com]
+
+I think we should wrap it in "if" checking if we are on LOCAL_QUORUM because if we do that as I suggested, then it will be preferring local replicas when we are on QUORUM too and I do not think that is desirable. Preferring local replicas when we are on LOCAL_QUORUM is probably just fine. 
+
+Sounds good [~smiklosovic] 
+
+Draft updated.
+
+The draft looks good to me. Will let [~curlylrt] also take a look at it Besides, we should add a JVM dtest or unit test for this fix. If you want [~curlylrt] to take care of it, then let us know, and we can write one.
+
+ 
+
+I am running a build here (1). Let's see what tests will fail on this to have an idea what we are against. 
+
+(1) https://app.circleci.com/pipelines/github/instaclustr/cassandra/3603/workflows/3f5ec3b4-62c3-40e9-8734-88cf55d86327
+
+The Draft looks good, I can create a dtest for this case.
+
+Sure write a test for it. I ll review. I am still looking at it, I am suspicious of what we did though. We will probably discuss more when tests are written ... 
+
+[~smiklosovic] , please check the added dtest: [https://github.com/apache/cassandra-dtest/pull/248]
+
+Tested this new test with 4.0, 4.1, 5.0 and trunk, all of them failed.
+
+3.0 and 3.11 are good with this test.
+
+We need to fix it everywhere, at least in 4.0+. 5.1/trunk is a must I would say. I am not sure about the complexity of this in older branches.
+
+I think that Java tests would be better for this. I updated the draft branch where I tried to write a test for that. If you notice there is BlockingReadRepairTest which tests various scenarios we are covering here quite in depth but there is our test missing. I tried to put it together but that whole test class is little bit cumbersome to work with and it gets complicated pretty fast.
+
+The logic around this is quite complicated and I am not sure I got it right. I think you should focus on tests like these. If it turns out it is too complicated to refactor that class, you might just create completely new but it would be great if we test this in Java rather than doing it in Python which seems to be flaky.
+
+BTW I am still not persuaded that we covered all scenarios. This comment (1) is quite concerning to me. Is our solution covering that too?
+
+(1) https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/service/reads/repair/BlockingPartitionRepair.java#L95-L99
+
+[~smiklosovic] 
+
+I checked the failed test in BlockingReadRepairTest in the linked CI job: [https://app.circleci.com/pipelines/github/instaclustr/cassandra/3603/workflows/3f5ec3b4-62c3-40e9-8734-88cf55d86327.|https://app.circleci.com/pipelines/github/instaclustr/cassandra/3603/workflows/3f5ec3b4-62c3-40e9-8734-88cf55d86327]
+
+The test _remoteDCTest_ is not right.
+ # The replication strategy is simple strategy(1)
+ # The consistency level passed in is not used, no matter what consistency level is passed in, it will finally use Consistency.TWO and the test is passing for a coincident not the validating the right logic  (2)(3)(4)
+
+(1)[https://github.com/apache/cassandra/blob/trunk/test/unit/org/apache/cassandra/service/reads/repair/AbstractReadRepairTest.java#L225]
+
+(2)[https://github.com/apache/cassandra/blob/trunk/test/unit/org/apache/cassandra/service/reads/repair/BlockingReadRepairTest.java#L272]
+
+(3)[https://github.com/apache/cassandra/blob/trunk/test/unit/org/apache/cassandra/service/reads/repair/AbstractReadRepairTest.java#L286]
+
+(4)[https://github.com/apache/cassandra/blob/trunk/test/unit/org/apache/cassandra/service/reads/repair/AbstractReadRepairTest.java#L303]
+
+The comment you mentioned should not be a problem.
+
+ 
+
+ 
+
+Have you gone through my branch with the improved test? What do you think about that?
+
+https://github.com/instaclustr/cassandra/tree/CASSANDRA-19120-5.0
+
+I think the test which is right now in place is just wrong ... it does not truly test scenario with multiple datacenters because it will always evaluate every replica in same DC based on the snitch. The original test is a fake one, there is no real distinction between local and remote nodes which my patch somehow tries to address.
+
+The test you added is not right or at least not testing the bug we are discussing.
+
+The pending node should be joining the first DC instead of second DC (1) which is causing one more remote node to be added to the repairs map (This part is good in your test(2))
+
+If the pending node is joining the first DC, the blockFor will be 3 instead of 2. (3)
+
+Since no node is repairs satisfied the if condition (4), the latch will be initialized with 3.
+
+So the handler.waitingOn should be 3 instead of 2. (5)
+
+Without any change to the latch part, we will run into the timeout error because ack node4 won't do latch count down.
+
+(1) [https://github.com/instaclustr/cassandra/commit/853ced996d3637109bf1e183092f0bd9cbb180ca#diff-1ddca3571de225b02568519eada4b76eb136b84c4cc25f061d5c1f806f0fe145R332]
+
+(2) [https://github.com/instaclustr/cassandra/commit/853ced996d3637109bf1e183092f0bd9cbb180ca#diff-1ddca3571de225b02568519eada4b76eb136b84c4cc25f061d5c1f806f0fe145R309-R312]
+
+(3) [https://github.com/apache/cassandra/blob/cassandra-5.0/src/java/org/apache/cassandra/service/reads/repair/BlockingPartitionRepair.java#L83]
+
+(4) [https://github.com/apache/cassandra/blob/cassandra-5.0/src/java/org/apache/cassandra/service/reads/repair/BlockingPartitionRepair.java#L90]
+
+(5) [https://github.com/instaclustr/cassandra/commit/853ced996d3637109bf1e183092f0bd9cbb180ca#diff-1ddca3571de225b02568519eada4b76eb136b84c4cc25f061d5c1f806f0fe145R343]
+
+ 
+
+Feel free to fix that test I started, no problem with that. I had strong suspicion that I did not do it right anyway ... 
+
+[~smiklosovic] please review this diff for this ticket: [https://github.com/apache/cassandra/pull/2981]
+
+I think we need to keep the original latch part to handle speculative retry introduced remote DC contacts. Let me know what you think. Thanks.
+
+LGTM [~curlylrt] 
+
+[~smiklosovic], Could you please help review the pull request from Runtian?
+
+Hi [~curlylrt], I am currently a little bit busy (on Cassandra Summit) and my availability is limited. I know about this ticket and I plan to return to that next week. (the week from 18th December).
+
+Running a CircleCI build for 4.0 j11 here to see how we do:
+
+https://app.circleci.com/pipelines/github/instaclustr/cassandra/3646/workflows/11a3f988-f6cf-4447-a11e-daa3224dbf1e
+
+[~smiklosovic] , not sure what went wrong with the vnode dtests bootstrap test? Not sure if it is related to this blocking read repair change.
+
+This is still on my radar, I should return to this sometimes this or next week. 
+
+[~curlylrt] would you mind to prepare all other branches? 4.1, 5.0, trunk ... I think there are some minor differences between them.
+
+4.1: [https://github.com/apache/cassandra/pull/3019]
+
+5.0: [https://github.com/apache/cassandra/pull/3020]
+
+trunk: [https://github.com/apache/cassandra/pull/3021]
+
+ 
+

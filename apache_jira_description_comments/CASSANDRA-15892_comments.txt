@@ -1,0 +1,151 @@
+[~e.dimitrova] This test doesn't seem to fail on the latest ci-cassandra runs, also I did run it locally both under j8 and j11 and it passes.
+
+{noformat}
+(dtests) bereng@dxpc:~/work/repos/bdpWS/dtests$ pytest --cassandra-dir=/tmp/test rebuild_test.py::TestRebuild::test_resumable_rebuild
+=============================================================================================================================== test session starts ===============================================================================================================================
+platform linux -- Python 3.6.9, pytest-3.6.4, py-1.8.1, pluggy-0.7.1
+rootdir: /home/bereng/work/repos/bdpWS/dtests, inifile: pytest.ini
+plugins: timeout-1.3.4, flaky-3.6.1
+timeout: 900.0s
+timeout method: signal
+timeout func_only: False
+collected 1 item                                                                                                                                                                                                                                                                  
+
+rebuild_test.py .                                                                                                                                                                                                                                                           [100%]
+===Flaky Test Report===
+
+test_resumable_rebuild passed 1 out of the required 1 times. Success!
+
+===End Flaky Test Report===
+
+============================================================================================================================ 1 passed in 70.18 seconds ============================================================================================================================
+(dtests) bereng@dxpc:~/work/repos/bdpWS/dtests$ java -version
+openjdk version "11.0.7" 2020-04-14
+OpenJDK Runtime Environment (build 11.0.7+10-post-Ubuntu-2ubuntu218.04)
+OpenJDK 64-Bit Server VM (build 11.0.7+10-post-Ubuntu-2ubuntu218.04, mixed mode, sharing)
+
+{noformat}
+
+Can you confirm this is the case for you as well? maybe sthg got fixed in the last few days
+
+Impossible to repro. Suggestion to close until we can.
+
+I can reproduce this locally, assigning to myself for further investigation.
+
+[~gianluca] did you do anything special to manage to repro?
+
+[~Bereng] No, it fails right away.
+
+Sometimes some are reproduced on the Mac, sometimes only in the ubuntu vm...
+
+They do not always fail for everyone :( Happened already to me a couple of times to play around until I manage to reproduce different failures.
+
+ 
+
+Thanks [~gianluca] and [~Bereng] . I will try to look today the other two, at least to ensure whether they are software defects or test failures.
+
+ 
+
+ 
+
+Ah you see... OSS C* should run all tests in my laptop then all things would be great :)
+
+Saw this today in https://app.circleci.com/pipelines/github/maedhroz/cassandra/120/workflows/03a81457-1d8a-47a2-a169-779a346053dc/jobs/653
+
+saw this today https://app.circleci.com/pipelines/github/dcapwell/cassandra/622/workflows/adcd463c-156a-43c7-a9bc-7f3e4938dbe8/jobs/3514
+
+[~gianluca], I was wondering whether you are still working on this one?
+
+Also, I haven't actually seen this one failing lately in CircleCI? [~Bereng], have you seen it by chance?
+
+ 
+
+Maybe [~gianluca] will surprise us in a nice way by saying he can't reproduce it on the latest trunk? :)
+
+[~e.dimitrova] I did some initial investigation to narrow the problem down, but I got sidetracked with some QA work on k8s and couldn't come up with a patch for this yet. But I just started looking into it again.
+
+So, I just rebased with latest trunk and I can still reproduce it locally. I think it just doesn't fail more often on CI because the test has a @flaky annotation, so it gives another chance for the test to pass.
+The behavior I'm seeing is that one of the nodes keeps waiting for a message that never arrives and it will simply sit idle for as long as I let it (I think in CI it times out and reruns).
+
+[~gianluca] thank you for the quick response and looking into it!
+
+That is an important point, I didn't know it was already marked @flaky. Then I can check tomorrow who and why added this and whether this means we can leave it for now. It's good to know the history. Thanks again
+
+I believe it was added here https://github.com/apache/cassandra-dtest/commit/49b2dda4e6643d2b18376d504b5fea4c0b3354a7
+
+Thanks [~gianluca], I checked that ticket and it looks like the only reason to add @flaky as part of CASSANDRA-14134 was to prevent from distractions while working on the pytest migration. So it looks like the ticket and the issue is legit
+
+On the other hand, maybe(I haven't tested it yet) the rest of us might be able to reproduce the problem if the annotation is removed. 
+
+I did some more investigation recently and got to the bottom of this issue and this is actually a runtime problem, not simply a flaky test. I have a patch available, but I'll try to break it down below in a way that makes it easier to understand what's going on:
+
+*Dtest*:
+ - The dtest is designed to initially write data to only 2 nodes, then a third node is started and _nodetool rebuild_ is invoked, so the sstables start to be streamed to node 3.
+ - The goal of the test is to make sure the rebuild process is able to continue later, in case the first attempt fails for whatever reason.
+ - To simulate a failure, byteman is used on node 3 to throw an exception (only once) when it receives a message from node 2.
+ - That will make node 2 receive a Stream Failed message back. If that message is processed and the event-loop thread tries to close the network channel while the writer thread is Parked waiting for the stream to complete, there will be a deadlock.
+ - The second time _nodetool rebuild_ command is invoked by the dtest, node 2 will be in deadlock already, so the test will remain on-hold indefinitely (eventually time out on Jenkins).
+
+*Reproduction steps*:
+
+In your IDE, set a couple of breakpoints at the following lines, then attach the debugger to the process of node 2 and make sure the first method below (_StreamSession#closeSession_) is executed before the line of the second breakpoint.
+
+[https://github.com/apache/cassandra/blob/4d49308a3fbc354850126a5ec128b11a3aca4007/src/java/org/apache/cassandra/streaming/StreamSession.java#L485]
+
+[https://github.com/apache/cassandra/blob/4d49308a3fbc354850126a5ec128b11a3aca4007/src/java/org/apache/cassandra/net/AsyncStreamingOutputPlus.java#L91]
+
+*Patch*:
+
+The patch simply handles the channel's _closeFuture_ callback asynchronously, that allows for the channel to be fully closed and then the [error handler|https://github.com/apache/cassandra/blob/4d49308a3fbc354850126a5ec128b11a3aca4007/src/java/org/apache/cassandra/net/AsyncChannelOutputPlus.java#L100] in _AsyncChannelOutputPlus_ is executed to clean things up and Unpark the thread, so no deadlock occurs.
+
+C* patch: [https://github.com/grighetto/cassandra/pull/3]
+ Dtest patch: [https://github.com/apache/cassandra-dtest/pull/130] (remove @flaky annotation and add ignore-log pattern)
+
+*CircleCI Results*:
+
+JVM 11 Dtests: [https://app.circleci.com/pipelines/github/grighetto/cassandra/32/workflows/77ef945f-8cf9-4c8b-84c6-13bc48078275/jobs/198]
+ JVM 8 Dtests: [https://app.circleci.com/pipelines/github/grighetto/cassandra/32/workflows/dfc132e9-e4c4-4ea5-bc8e-d56e73679bcf/jobs/189]
+
+[~e.dimitrova] Would you be able to try the reproduction steps I shared above and review the patch?
+
+Looks related to Zhao and Benjamin's [commit|https://github.com/grighetto/cassandra/commit/9f6fcc340d89eecc000765f6ab93e862f53a02d9] around closing connections in Apr 2020. 
+
+Failures do exist on ci-cassandra.a.o too, though not many…
+- [Cassandra-trunk #338|https://nightlies.apache.org/cassandra/ci-cassandra.apache.org/job/Cassandra-trunk/338/] \\  !Screenshot 2021-03-23 at 19.37.35.png|width=300! 
+- [Cassandra-trunk #105|https://nightlies.apache.org/cassandra/ci-cassandra.apache.org/job/Cassandra-trunk/105/] \\  !Screenshot 2021-03-23 at 19.53.51.png|width=300! 
+
+bq. That will make node 2 receive a Stream Failed message back. If that message is processed and the event-loop thread tries to close the network channel while the writer thread is Parked waiting for the stream to complete, there will be a deadlock.
+
+[~gianluca] thanks for the fix. can you explain a bit more here? node2 receives {{SESSION_FAILED}} and then closes its channels. how does {{"writer thread"}} get blocked?  I can't think of why {{messageSender.close()}} causes  blocking..
+
+[~jasonstack] I attached a thread dump to this ticket which should make things more clear, but this is the sequence of events:
+
+Node 2 runs {{AsyncChannelOutputPlus#flush -> AsyncStreamingOutputPlus#doFlush}} which contains the following
+
+{code}
+        ChannelPromise promise = beginFlush(byteCount, 0, Integer.MAX_VALUE);
+        channel.writeAndFlush(GlobalBufferPoolAllocator.wrap(flush), promise);
+{code}
+        
+That promise is responsible for unparking the thread in a later moment (it's supposed to be called when the flush either completes or fails).
+Still in {{AsyncChannelOutputPlus#flush}}, it calls {{waitUntilFlushed(0, 0)}} and at this point the thread is parked.
+
+Now it receives a SESSION_FAILED message, so it will try to close the channel, but the problem is that the channel has a close listener that relies on a synchronized method, {{StreamSession#onChannelClose}}, and since that thread is parked, it blocks. In other words, netty can't properly close the channel and the flush promise above is never called, so the thread is never unparked, hence the deadlock.
+
+thanks for the explanation. the thread dump really helps. The fix looks good to me. Alternatively, we can remove the {{synchronized}} from {{StreamSession#onChannelClose}} as it doesn't have to be synchronized.
+
+Thanks for the review, [~jasonstack].
+Here's a new patch simply with the {{synchronized}} modifier removed: https://github.com/grighetto/cassandra/pull/4
+
+*Patches*
+C* patch: https://github.com/grighetto/cassandra/pull/4
+ Dtest patch: https://github.com/apache/cassandra-dtest/pull/130 (removes @flaky annotation and adds ignore-log pattern)
+
+*Circle CI Results*
+Java 11: https://app.circleci.com/pipelines/github/grighetto/cassandra/36/workflows/ae5ab000-e548-4548-a728-bfc525da7b20
+Java 8: https://app.circleci.com/pipelines/github/grighetto/cassandra/36/workflows/beb0f334-8adf-49a4-b612-51f68e4dc462
+
++1
+
+Committed [dc5337bf956ae26447cb8d1ca897512c969f5172|https://github.com/apache/cassandra/commit/dc5337bf956ae26447cb8d1ca897512c969f5172] and [a4186ad83ec1c42c8b0086865f6da80408f9ece4|https://github.com/apache/cassandra-dtest/commit/a4186ad83ec1c42c8b0086865f6da80408f9ece4].
+

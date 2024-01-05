@@ -1,0 +1,120 @@
+Hi [~daniel.becker], assigned this JIRA to you since your recent patch for IMPALA-12074 involves tests in [rle-test.cc|https://github.com/apache/impala/blame/master/be/src/util/rle-test.cc] so you may be more familiar with tests in this area. Feel free to re-assign the ticket as you see appropriate. Thanks!
+
+
+Thanks [~fangyurao], I'm working on it. I can reproduce it in release builds but not in debug builds.
+
+The problem seems to be around this memcpy call: [https://github.com/apache/impala/blob/3e9408480c5285ca925576b7486b35593407a32a/be/src/util/bit-stream-utils.inline.h#L237.]
+
+We're almost certainly running into undefined behaviour because
+ * the error only occurs in release mode, not in debug mode (not even in ASAN or UBSAN mode)
+ * if I add something around the memcpy, for example printing 'buffer_pos_' or 'v', the error doesn't occur
+ * the value with which the test fails, i.e. the value it reads instead of the expected 0 is non-deterministic.
+
+My first theory was this:
+In the test we're decoding bit-packed values of bitwidth 0, so the buffer is only 1 byte long, it only stores the number of elements. After we've read the number of elements, the 'buffer_pos_' field of the underlying 'BatchedBitReader' instance points one past the end of the buffer ('buffer_pos_' == 'buffer_end_').  Calling 'memcpy()' with an invalid pointer, even if the number of bytes to copy is zero, is undefined behaviour. It is not completely clear whether a one-past-the-end pointer is valid, however (see [https://en.cppreference.com/w/cpp/string/byte/memcpy], [https://stackoverflow.com/questions/29844298/is-it-legal-to-call-memcpy-with-zero-length-on-a-pointer-just-past-the-end-of-an]). 
+
+The solution to this, only performing the memcpy if we're not at the end of the buffer, actually works
+{code:java}
+if (LIKELY(buffer_pos_ != buffer_end_)) { 
+  memcpy(v, buffer_pos_, num_bytes);
+  buffer_pos_ += num_bytes;
+} else { 
+  DCHECK_EQ(num_bytes, 0);
+} {code}
+_But if this was the original problem, then using a longer buffer in the test (and setting the remaining space to zero) would also not produce the error, but it does. (There is no error if the above "fix" is applied.)_
+
+Any of the following things also prevents the error from happening:
+ * marking BatchedBitReader::GetBytes() no-inline (this is the function that has the memcpy in question)
+ * marking its caller, RleBatchDecoder<T>::NextCounts() no-inline
+ * marking the caller of the previous one, RleBatchDecoder<T>::GetSingleValue() no-inline
+ ** this means that normally this is inlined into the test case function
+ * if I compile rle-test into a separate executable (normally it's in unifiedbetests) and run it with Valgrind
+
+ 
+
+With git bisect, I determined that the test starts to fail (only in release mode) starting with
+[https://gerrit.cloudera.org/#/c/20073/] (IMPALA-11961/IMPALA-12207: Add Redhat 9 / Ubuntu 22 support),
+which updated to a newer toolchain version. Maybe undefined behaviour is handled differently in the new version; [~joemcdonnell] do you think it's a possibility?
+
+I'll continue investigating but as this breaks some Jenkins builds, we may consider applying the above "fix"/workaround, however that probably doesn't address the root cause and only masks the problem.
+
+ 
+
+[~daniel.becker] That is weird! My change upgraded gperftools/tcmalloc, did a minor patch to LLVMs build, and bumped Kudu version. We didn't change compilers or do anything obvious. Of these changes, maybe the gperftools/tcmalloc is most memory-related, so we could try with the old version of gperftools to see if that impacted it.
+
+Based on the commit [https://gerrit.cloudera.org/#/c/20073/] I changed back {{IMPALA_GPERFTOOLS_VERSION}} in {{bin/impala-config.sh}} from 2.10 to 2.5-p4 and the test passes. There are two possibilities:
+ # there's a bug in gperftools 2.10
+ # there's a bug in Impala that leads to undefined behaviour and that manifests in the test failure with the new gperftools version but not with the old one.
+
+I also compared the assembly code of the RleTest::BitWidthZeroRepeated() test function in the failing case and when the gperftools version is switched back to the old version. Note that RleBatchDecoder<T>::GetSingleValue() is inlined into RleTest::BitWidthZeroRepeated(). The function seems to be unchanged (except for the offsets).
+
+[~joemcdonnell] do you have an idea in which direction we should continue?
+
+[~joemcdonnell] do you think we should apply a workaround (like putting the memcpy within an IF block, as in my comment from the 27 June)?
+
+[~daniel.becker] The new gperftools is necessary for Redhat9 / Ubuntu 22 and we don't have the option of using the old version, so I think we are going to need to apply the workaround. 
+
+[~joemcdonnell] thanks, I uploaded a change request with the workaround: https://gerrit.cloudera.org/#/c/20187/.
+
+Commit 14a5e9a20af59af7a03a9fb480c077d1d8a38187 in impala's branch refs/heads/master from Daniel Becker
+[ https://gitbox.apache.org/repos/asf?p=impala.git;h=14a5e9a20 ]
+
+IMPALA-12239: BitWidthZeroRepeated seems to be flaky
+
+RleTest.BitWidthZeroRepeated seems to be flaky in release builds. A
+possible error message is this:
+
+  Value of: 0 Expected: val Which is: '\x9F' (159)
+  Stacktrace
+
+  .../Impala/be/src/util/rle-test.cc:410
+  Value of: 0
+  Expected: val
+  Which is: '\x9F' (159)
+
+The problem seems to be around this 'memcpy()' call:
+https://github.com/apache/impala/blob/3e9408480c5285ca925576b7486b35593407a32a/be/src/util/bit-stream-utils.inline.h#L237.
+
+We're almost certainly running into undefined behaviour because
+ - the error only occurs in release mode, not in debug mode (not even in
+   ASAN or UBSAN mode)
+ - if we add something around the 'memcpy()', for example printing
+   'buffer_pos_' or 'v', the error doesn't occur
+ - the value with which the test fails, i.e. the value it reads instead
+   of the expected 0 is non-deterministic.
+
+The failure occurs since https://gerrit.cloudera.org/#/c/20073/
+(IMPALA-11961/IMPALA-12207: Add Redhat 9 / Ubuntu 22 support), which
+upgraded gperftools.
+
+We couldn't find the root cause of the bug but the most probable
+possibilities are the following:
+ - there's a bug in Impala that leads to undefined behaviour and that
+   manifests in the test failure with the new gperftools version but not
+   with the old one
+ - there's a bug in the new gperftools version (2.10).
+
+Downgrading gperftools is not an option because it is necessary for
+Redhat 9 and Ubuntu 22. There is a workaround that causes the test to
+pass - putting the 'memcpy()' in a conditional block:
+
+  if (LIKELY(buffer_pos_ != buffer_end_)) {
+    memcpy(v, buffer_pos_, num_bytes);
+    buffer_pos_ += num_bytes;
+  } else {
+    ...
+  }
+
+This most probably does not address the root cause, however; for more
+see the Jira ticket.
+
+Testing:
+  - manually verified that the test RleTest.BitWidthZeroRepeated passes
+    in a release build
+
+Change-Id: I84645271101b4bd594dd25929924a3549c223244
+Reviewed-on: http://gerrit.cloudera.org:8080/20187
+Reviewed-by: Joe McDonnell <joemcdonnell@cloudera.com>
+Tested-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+
+

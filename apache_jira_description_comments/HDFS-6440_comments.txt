@@ -1,0 +1,1312 @@
+Attaching patch for CDH 4.5.0, since this is what we run on at Salesforce. I'll update to the proper open source branches once I've got some consensus that this is the 'right' way to go about doing these changes.
+
+For what its worth, all the unit tests have passed (at one point.. they are a bit flaky :)) and we've been doing some m/r based load tests with a chaos monkey(1) and have been successful (2).
+
+As mentioned in the issue description, there is a majority of the complexity in the checkpointing. For this, I went with a 'first writer wins' approach. From the standpoint of the standby node, if you're checkpoint isn't accepted (the other NN got one there first) then you back-off for 2x the usual wait time before trying to send it again. I had to add another response code to the GetImageServlet to support the 'someone else won' logic - its not the cleanest solution as other HTTP response codes fit better, but they are already being used to indicate other failure cases.
+
+Other notable changes:
+ - EditLogTailer checks all NN when rolling logs
+ - BootstapSTanby uses all namenodes when attempting bootstrap
+ - update block token creation to segment integer space by NN id
+ - updating NN dir creation to include ns index (3)
+ - updated a lot of the tests to support testing across all the NNs, including HAStressTestHarness, and a circular linked list writing test
+ - moved to using a multi-map of NNs in MiniDFSCluster as they are no longer limited to two NNs.
+
+(1) each mapper writes a linked list of files, then ensures it can read it back
+(2) required a bit of tuning to ride over reconnections once we started killing NNs more than every 60 seconds
+(3) Not sure the best way to update the tests for this. Right now made some changes to TestDFSUpgradeFromImage, but that might need a little rework.
+
+Thanks a lot for all of your work on this so far, Jesse. Assigning this JIRA to you.
+
+Attaching a patch on top of trunk (at least as of a couple weeks ago).
+
+Also, attaching a design doc as a guide for anyone who wants to take on reviewing this one :)
+
+FWIW, we are running this patch in production at Salesforce(1), added additional unit tests that pass alongside the original unit tests, and did an extensive load testing under adverse conditions via m/r (see design doc).
+
+(1) well, on top of the latest CDH release :)
+
+In the introduction of the design doc, the second paragraph says:
+{quote}
+the expectation is that any two nodes can fail, except for the NameNode; this availability expectation is true across many deployments - you run at least 3 ZooKeepers, 3 HMasters, and 3 copies of each block on DataNodes.
+{quote}
+
+This should read:
+{quote}
+the expectation is that any two nodes can fail, except for the NameNode; this availability expectation is true across many deployments - you run at least *5 ZooKeepers*, *5 Quorum Journal Managers*, 3 HMasters, and 3 copies of each block on DataNodes.
+{quote}
+
+to correct the oversight that if two ZKs or QJMs go down, you will still have a quorum of nodes.
+
+So, what can I do to help push this along? I'm happy to come talk with folks in person (feel free to PM me) or do short PPTs.
+
+I also want to point out that this has been running, in production, at Salesforce for some time now.
+
+[~jesse_yates] Thanks for working on this cool feature. We have read your design doc and came up only a few questions:
+
+#  What is the procedure for adding or replacing NNs? Could it support dynamically adding NNs without downtime?
+# It seems that whether to upload a fsimage is mostly determined by SNN (e.g., finishing a checkpoint). Would it be possible to avoid mulitple SNNs to upload fsimages with trivial deltas in a short time? E.g., let ANN to reject upload requests if {{lastUploadTime > now - quiet period && num of edits < N}} ?
+# It seems that QJM inherits the behaviors from the current ANN/SNN design that it will purge edit logs after *_one_* SNN uploads a fsimage. Would it be possible that this behavior makes other SNNs miss the edit logs? E.g., if a SNN crashes and comes back online, but the edit logs are purged?
+# Does this work support rolling upgrade?
+# Would it makes client failover more complicated? 
+
+And some minor concerns:
+# What would be the impact on the DN side?
+# What are the changes on the test resources files (hadoop-*-reserved.tgz) ? 
+
+Thanks again for this awesome work!
+
+bq. What is the procedure for adding or replacing NNs?
+Not explicitly more easily than currently supported. The problem is that all the nodes currently have the NNs hard-coded in config. What you could do is roll the NNs with the new NN config. Then roll the rest of the clients with the new config as well, once the new NN is to date. I don't know if you would even do anything different than currently configured.
+
+bq. Could it support dynamically adding NNs without downtime?
+Not really. You would have to push the downtime question up a level, and rely on something like ZK to maintain the list of NNs (on the simple approach). It reduces down to a group membership problem.
+
+bq. Would it be possible to avoid multiple SNNs to upload fsimages with trivial deltas in a short time
+Sure. This was the idea behind adding the 'primary checkpointer' logic - if you are not the primary, then you backoff for 2x the usual wait period, because you assume the primary is up and doing edits, but check again every so often to make sure it hasn't gotten too far behind. Obviously there is a possibility for who is the 'primary checkpointer' to ping-pong back and forth between SNNs, but generally it would be one that gets the lead and keeps it.
+
+bq. Would it be possible that this behavior makes other SNNs miss the edit logs?
+Its possible, but that's a somewhat rare occurrence as you can generally bring the NN back up fairly quickly. If its really far behind, you can then bootstrap up to the current NNs state and run it from there. In practice, we haven't seen any problems with this.
+
+bq. Does this work support rolling upgrade?
+I'm not aware that it would change it.
+
+bq. Would it makes client failover more complicated?
+Now instead of two servers, it can fail over between N. I believe the client code currently supports this as-is.
+
+bq. What would be the impact on the DN side?
+Basically, just in block reports to more than 2 NNs. This can start to cause some bandwidth congestion at some point, but I don't think it would be a problem with up to at least 5 or 7 nodes.
+
+bq. What are the changes on the test resources files (hadoop-*-reserved.tgz) ?
+The mini-cluster is designed for supporting only two NNs, down to the files it writes to maintain the directly layout. Unfortunately, it doesn't manage the directories in any easily updated way, so I had to rip the existing directory structure it uses and replace it with something a little more flexible. The changes to the zip files is just to support this updated structure for the mini-cluster.
+
+[~jesse_yates] Thank you very much for your answers! It looks great.
+
+I only have one minor question left:
+
+bq. This was the idea behind adding the 'primary checkpointer' logic.
+
+And in the design doc,
+ 
+bq. When a SNN (or just Standby Checkpoint node) successfully completes a checkpoint, it marks itself internally as the ‘primary check pointer’; 
+
+Does this mean that there might be multiple SNNs marking themselves as 'primary checkpointer' during the same time period, since it is determined by SNN itself? Would it result multiple SNNs uploading fsimages with small deltas in some rare scenarios? Would it be reasonable to also let ANN to reject fsimage upload request?
+
+
+
+bq. Does this mean that there might be multiple SNNs marking themselves as 'primary checkpointer' during the same time period, since it is determined by SNN itself
+
+Yes, that is a possibility, which I was getting at with my comment about the primary checkpointer "ping-ponging". The images would have small deltas, but the ANN would be kept up to date. As the updates slow down, one of the checkpointers would eventually win. However, either (a) we haven't seen this show up on any of our clusters or (b) have never noticed any service issues because of it.
+
+bq. Would it be reasonable to also let ANN to reject fsimage upload request?
+
+Sure, its possible. My concern was around ensuring that the ANN had to most up to date checkpoint and let the SNNs sort themselves out. It seems a bit more intrusive in the code since you also need to differentiate the source - you don't want to reject an update from the primary checkpointer if it occurs just because of the time elapsed. I'd say worth looking into in a follow up jira though - this is already a pretty large change.
+
+Hey, [~jesse_yates] Thanks for your answers!
+
+I have a few further questions regarding the patch:
+
+1. I did not see where {{isPrimearyCheckPointer}} is set to {{false}}. 
+
+{code:title=StandbyCheckpointer.java}
+private boolean isPrimaryCheckPointer = true;
+...
+if (upload.get() == TransferFsImage.TransferResult.SUCCESS) {
+   this.isPrimaryCheckPointer = true;
+   //avoid getting the rest of the results - we don't care since we had a successful upload
+   break;
+}
+{code}
+
+I guess the default value of {{isPrimaryCheckPointer}} might be a typo, which should be {{false}}. Moreover, is there a case that    SNN switches from primary check pointer to non-primary check pointer?
+
+
+2. Is the following condition correct? I think only {{sendRequest}} is needed. 
+
+{code:title=StandbyCheckpointer.java}
+if (needCheckpoint && sendRequest) {
+{code}
+ 
+Also in the old code,
+
+{code}
+} else if (secsSinceLast >= checkpointConf.getPeriod()) {
+            LOG.info("Triggering checkpoint because it has been " +
+                secsSinceLast + " seconds since the last checkpoint, which " +
+                "exceeds the configured interval " + checkpointConf.getPeriod());
+            needCheckpoint = true;
+          }
+{code}
+
+Does it implies that if {{secsSinceLast >= checkpointConf.getPeriod()}} is {{true}} then {{secsSinceLast >= checkpointConf.getQuietPeriod()}} is always {{true}}, for default {{quite multiplier}} value? If it is the case, are these duplicated conditions?
+
+It looks like that it might be easier to let ANN calculate the above conditions, as it has the actual system-wide knowledge of last upload and last txnid. It could be a nice optimization later.
+
+3. When it uploads fsimage, are {{SC_CONFLICT}} and {{SC_EXPECTATION_FAILED}} not handled in the SNN in the current patch? Do you plan to handle them in a following patch?
+
+4. Could you set {{EditLogTailer#maxRetries}} to {{private final}}? Do we need to enforce an acceptable value range for {{maxRetries}}? For instance, in the following code, it would not try every NN when {{nextNN = nns.size() - 1}} and {{maxRetries = 1}}
+
+{code}
+// if we have reached the max loop count, quit by returning null
+  if (nextNN / nns.size() >= maxRetries) {
+      return null;
+  }
+{code}
+
+5. There are a few changes due to format, e.g., in {{doCheckpointing()}}. Could you remove them to reduce the size of the patch?
+
+Also the following code is indented incorrectly.
+
+{code}
+int i = 0;
+      for (; i < uploads.size(); i++) {
+        Future<TransferFsImage.TransferResult> upload = uploads.get(i);
+        try {
+          // TODO should there be some smarts here about retries nodes that are not the active NN?
+          if (upload.get() == TransferFsImage.TransferResult.SUCCESS) {
+            this.isPrimaryCheckPointer = true;
+            //avoid getting the rest of the results - we don't care since we had a successful upload
+            break;
+          }
+        } catch (ExecutionException e) {
+          ioe = new IOException("Exception during image upload: " + e.getMessage(),
+              e.getCause());
+          break;
+        } catch (InterruptedException e) {
+          ie = null;
+          break;
+        }
+      }
+{code}
+
+Other parts LGTM. Thanks again for working on this, [~jesse_yates]!
+
+Would you prefer doing this over a pull request/RB? Might be easier to point out specific elements. If not, happy to respond here.
+
+I'll post the updated patch somewhere, if you like. However, for the meantime, responses!
+
+I think some stuff got a little messed up with the trunk port... these are all great catches!
+
+bq. I guess the default value of isPrimaryCheckPointer might be a typo, which should be false. 
+Yup and
+
+bq. is there a case that SNN switches from primary check pointer to non-primary check pointer
+
+Not that I can find either :) Should be that we track success in the transfer result from the upload and then update the primary checkpoint status based on the success therein (so if no upload is valid, no longer the primary).
+
+bq. 2. Is the following condition correct? I think only sendRequest is needed.
+
+Kinda. I think it should actually be:
+{code}
+          if (needCheckpoint) {
+            doCheckpoint(sendRequest);
+{code}
+
+and then make and save the checkpoint, but only send it if we need to (sendRequest == true).
+
+bq. If it is the case, are these duplicated conditions?
+
+The quiet period should be larger than the usual checking period (multiplier is 1.5), so its the separation of the sending the request vs. taking the checkpoint that comes into conflict here. I think this logic makes more sense with the above change for separating the use of needCheckpoint and sendCheckpoint.
+
+bq. might be easier to let ANN calculate the above conditions... It could be a nice optimization later.
+
+Definitely! Was trying to keep the change footprint down.
+
+bq. When it uploads fsimage, are SC_CONFLICT and SC_EXPECTATION_FAILED not handled in the SNN in the current patch
+
+They somewhat are - they don't throw an exception back out, but are marked as 'failures'. Either way, in the new version of the patch (coming), in keeping with the changes for setting isPrimaryCheckpointer described above, the primaryCheckpointStatus is set to the correct value. 
+
+Either, it got a NOT_ACTIVE_NAMENODE_FAILURE on the other SNN or it tried to upload an old transaction to the ANN (OLD_TRANSACTION_ID_FAILURE). If its the first, the other NN could succeed (making this pSNN) or its an older transaction, so it shouldn't be the pSNN. With the caveat you mentioned in your last comment about both SNN thinking they are pSNN.
+
+bq.  Could you set EditLogTailer#maxRetries to private final?
+
+That wasn't part of my change set - the code was already there. It looks like that its used to set the edit log in testing.
+
+bq. Do we need to enforce an acceptable value range for maxRetries
+
+An interesting idea! I didn't want to spin forever there and instead surface the issue to the user by bringing down the NN. My question back is, is there another process that will bring down the NN if it cannot reach the other NNs? Otherwise, it can get hopelessly out of date and look like a valid standby when it really isn't.
+
+bq. NN when nextNN = nns.size() - 1 and maxRetries = 1
+
+Oh, yeah - that's a problem, regardless of the above. Pending patch should fix that.
+
+Coming patch should also fix the remainder of the formatting issues.
+
+updated version of the patch as per excellent review comments (thanks [~eddyxu]!). It will probably need another rebase before it goes in as well, but for the moment I wanted to minimize the deltas until everyone is happy.
+
+[~jesse_yates] Thanks for your awesome updates. We will take another look on the changes!
+
+Thanks again for the quick responses!
+
+[~jesse_yates] Sorry for late reply. I am just back from a vocation. I will post the comments very soon.
+
+[~jesse_yates] Thank you so much for working on the patch so quickly. It looks good overall.
+
+I have a few comments on the latest patch.
+
+ 1. {{EditorLogTailer#getActiveNodeProxy}} does not actually throw {{IOException}}. Could you remove it from the function signature?
+
+2. Could you add some descriptions about the expected exceptions for {{MultiNameNodeProxy#doWork()}}, e.g., 
+
+{code:title=EditLogTailer.java}
+387	        try {
+388	          T ret = doWork();
+389	          // reset the loop count on success
+390	          nnLoopCount = 0;
+391	          return ret;
+392	        } catch (RemoteException e) {
+{code}
+
+Is it possible that {{doWork}} throws {{IOException}} other than {{RemoteException}}?
+
+3. Could you enforce that {{maxRetries}} is positive after the following code?
+
+{code}
+157	    maxRetries = conf.getInt(DFSConfigKeys.DFS_HA_TAILEDITS_ALL_NAMESNODES_RETRY_KEY,
+158	        +      DFSConfigKeys.DFS_HA_TAILEDITS_ALL_NAMESNODES_RETRY_DEFAULT);
+{code}
+
+4. {{StandbyCheckpointer#activeNNAddresses}} is confusing, since there should be only one active NN. In the old code, since there is only 1 ANN and 1SNN, so SNN can assume other NN is active.
+
+5. I guess the following code is a typo: {{ie}} should be set in catch()?
+
+{code:title=StandbyCheckpointer.java}
+248        } catch (InterruptedException e) {
+249	        ie = null;
+250	        break;
+251	      }
+{code}
+
+6. {{needCheckpoint == true}} implies {{sendRequests == true}} thus when call {{doCheckpiont()}},  {{sendRequest}} is always {{true}}.
+
+{code}
+414      if (needCheckpoint) {
+415	            doCheckpoint(sendRequest);
+{code}
+
+
+7. Could you break this line
+{code}
+private NameNodeInfo createNameNode(Configuration conf, boolean format, StartupOption operation
+{code}
+
+8. Are the changes in 'log4j.properties' necessary?
+
+9. There is a typo in {{dfs.hs....}}
+{code}
+public static final String DFS_HA_TAILEDITS_ALL_NAMESNODES_RETRY_KEY = "dfs.hs.tail-edits.namenode-retries";
+{code}
+
+10. I saw you removed {final}s from  In my understanding, it is for easier updating {{MiniDFSCluster#namenodes}}, as it is a Multimap. But I still feel that it is safer to set these fields as final and you can use `Multipmap#remove(key, value)` to replace NameNodeInfo?
+
+{code}
+537	    public NameNode nameNode;
+538	    Configuration conf;
+539	    String nameserviceId;
+540	    String nnId;
+{code}
+
+11. Finally, could you reduce the changes in `MiniDFSCluster.java`, as many of them are not changed, e.g. `MiniDFSCluster.java:911-986`.
+
+Thanks again, [~jesse_yates]!
+
+thanks for the comments.  I'll work on a new version, but in the meantime, some responses:
+bq. StandbyCheckpointer#activeNNAddresses
+The standby checkpointer doesn't necessarily run just on the SNN - it could be in multiple places. Further, I think you are presupposing that there is only one SNN and one ANN; since there will commonly be at least 3 NNs, any one of the two other NNs could be the active NN. I could see it being renamed as potentialActiveNNAddresses, but I don't think that gains that much more clarity for the increased verbosity.
+
+bq.  I saw you removed {final}
+I was trying to keep in the spirit of the original mini-cluster code. The final safety concern is really only necessary in this case when you are changing the number of configured NNs and then accessing them in different threads; I have no idea when that would even make sense. Even then you wouldn't have been thread-safe in the original code as it there is no locking on the array of NNs. I removed the finals to keep the same style as the original wrt to changing the topology.
+
+bq. Are the changes in 'log4j.properties' necessary?
+
+Not strictly, but its just the test log4j properties (so no effect on the production version) and just adds more debugging information, in this case, which thread is actually making the log message.
+
+I'll update the others
+
+Some follow up after actually looking at the code:
+
+bq. Is it possible that doWork throws IOException other than RemoteException?
+Yup. In fact, the implemention of doWork at EditLogTailer#ln291 can throw an IOException if the call to the proxy for rollEditLog throws an IOException. Sure, this is a bit brittle - a remoteException could be thrown by that call (or any other) as an IOException, but that really can't be helped because we have no other way of differentiating right now. 
+
+bq. 6. needCheckpoint == true implies sendRequests == true thus when call doCheckpiont(), sendRequest is always true.
+
+Yup, that was a slight logic bug. I think setting send request should look like:
+{code:title=StandbyCheckpointer.java}
+          // on all nodes, we build the checkpoint. However, we only ship the checkpoint if have a
+          // rollback request, are the checkpointer, are outside the quiet period.
+         boolean sendRequest = needCheckpoint &&  (isPrimaryCheckPointer
+              || secsSinceLast >= checkpointConf.getQuietPeriod());
+{code}
+to actually not send the request every time - it wasn't going to break anything before, but now it should actually conserve bandwidth :) 
+
+bq. 7. Could you break this line
+My IDE has that at 99 chars long - isn't 100 chars the standard line width? However, I moved the IOE from the rest of the signature up to the second half of the method declaration.
+
+bq. 11. Finally, could you reduce the changes in `MiniDFSCluster.java`, as many of them are not changed, e.g. `MiniDFSCluster.java:911-986`.
+I think I'm at the minimal number of changes there. Git thinks there are line add and removes frequently when things move around a bit, as this patch necessitates. Fortunately, they should be easy to ignore... but let me know if I'm missing what you are getting at.
+
+Attaching patch addressing round 2 of comments. Thanks for the feedback - its getting better every round!
+
+We're pretty interested in this as well, how's it coming?
+
+Us too. We are waiting on a committer to have time to look at it. Head from Lei that he is happy with the state and had passed it onto [~atm] for review and commit, but that's the last I head about any progress (that was mid february).
+
+[~patrickwhite] maybe you can get one of the FB commiters to help get it committed? I'm just tentative to do _another_ rebase of this patch to not have it be committed.
+
+Honestly, I'm surprised that the various companies that have a stake in HDFS being successful in production haven't been more supportive of getting this patch committed.
+
+Sorry, [~jesse_yates], been busy. I got partway through a review of the patch a few weeks ago, but then haven't gotten back to it yet. Will post my feedback soon here.
+
+[~jesse_yates] I'm not sure I know any HDFS committers here, lemme go bug [~eclark] and see what I can shake out of him
+
+Let me also restate that we are running this in production on hundreds of clusters at Salesforce; we haven't seen any issues. It _is_ a pretty intricate patch, so I understand the hesitation.
+
+
+[~eli], this is the issue I mentioned on Wednesday.
+
+I find it hard to believe that we're the only ones who want this, it's running in production at Salesforce. What's holding this up? How can we help getting this in? Break it into smaller pieces? Something else?
+
+
+Hi Jesse and Lars, 
+
+My sincere apologies it took so long for me to post a review. No good excuse except being busy, but what else is new.
+
+Anyway, the patch looks pretty good to me. Most everything that's below is pretty small stuff.
+
+One small potential correctness issue:
+# In {{StandbyCheckpointer#doCheckpoint}}, unless I'm missing something, I don't think the variable "{{ie}}" can ever be non-null, and yet we check for whether or not it's null later in the method to determine if we should shut down.
+
+Two things I'd really like to see some test coverage for:
+# The changes to {{BlockTokenSecretManager}} - they look fine to me in general, but I'd love to see some extra tests of this functionality with several NNs in play. Unless I missed something, I don't think there are any tests that would exercise more than 2 {{BlockTokenSecretManager}}s.
+# Rolling upgrades/downgrades/rollbacks. I agree with you in general that this change should likely not affect anything, but I think it's important that we have some test(s) exercising this regardless.
+
+Several little nits:
+# In {{MiniZKFCCluster}}, this method now supports more than just two services: "+   * Set up two services and their failover controllers."
+# Recommend making {{intRange}} and {{nnRangeStart}} final in {{BlockTokenSecretManager}}.
+# Should document the behavior of both of the newly-introduced config keys (dfs.namenode.checkpoint.check.quiet-multiplier and dfs.hs.tail-edits.namenode-retries) in hdfs-default.xml.
+# I think this error message could be a bit clearer:
+{quote}
++                    "Node is currently not in the active state, state:" + state +
++                    " does not support reading FSImages from other NameNodes");
+{quote}
+Recommend something like "NameNode <hostname or IP address> is currently not in a state which can accept uploads of new fsimages. State: <state>".
+# Would be great for debugging purposes if we could include the hostname or IP address of the checkpointer already doing the upload with the higher txid in this message:
+{quote}
++                    "Another checkpointer is already in the process of uploading a" +
++                        " checkpoint made up to transaction ID " + larger.last());
+{quote}
+# Spelled "failure" incorrectly here: "AUTHENTICATION_FAILRE"
+# Sorry, I don't quite follow this comment in {{BootstrapStandby}}:
+{quote}
++        // get the namespace from any active NN. On a fresh cluster, this is the active. On a
++        // running cluster, this works on any node.
+{quote}
+What's a "fresh cluster" vs. a "running cluster" in this sense?
+# In {{HATestUtil#waitForStandbyToCatchUp}}, looks like you changed the method comment to indicate that the method takes multiple standbys as an argument, but in fact the method functionality is unchanged. There's just some whitespace changes in that method.
+# In {{TestPipelinesFailover#doWriteOverFailoverTest}}, is changing the value of {{FAILOVER_SEED}} going to do anything, given that it's only ever read at the static initialization of the {{failoverRandom}}?
+
+Also, not a problem at all, but just want to say that I really like the way this patch changes TransferFsImage, and the additional diagnostic info it provides when uploads fail. That's a nice little improvement by itself.
+
+I'll be +1 once this stuff is addressed.
+
+[~atm] thanks for the feedback. I'm working on rebasing on trunk and addressing your comments (hopefully a patch by tomorrow), but a couple of comments/questions first:
+
+bq. Rolling upgrades/downgrades/rollbacks.
+
+I'm not sure how we would test this when needing to change the structure of the FS to support more than 2 NNs. Would you recommend (1) recognizing the old layout and then (2) transfering it into the new layout? The reason this seems silly (to me) is that the layout is only enforced by the way the minicluster is used/setup, rather than the way things would actually be run. By moving things into the appropriate directories per-nn, but keeping everything else below that the same, I think we keep the same upgrade properties but don't need to do the above contrived/synthetic "upgrade".
+
+bq. What's a "fresh cluster" vs. a "running cluster" in this sense?
+
+Maybe some salesforce terminology leak here. "Fresh" would be one where you just formatted the primary NN and are bootstrapping the other NNs from that layout. "Running" would be when bringing up a SNN after some sort of failure and it has an unformatted fs - then it can pull from any node in the cluster. As an SNN it would then be able to catch up by tailing the ANN.
+
+I'll update the comment.
+
+bq. is changing the value of FAILOVER_SEED going to do anything, given that it's only ever read at the static initialization of the failoverRandom?
+
+Yes, it for when there is an error and you want to run the exact sequence of failovers again in the test. Minor helper, but can be useful when trying to track down ordering dependency issues (which there shoudn't be, but sometimes these things can creep in).
+
+
+Otherwise, everything else seems completely reasonable. Thanks!
+
+More comments, as I actually get back into the code:
+{quote}
+In StandbyCheckpointer#doCheckpoint, unless I'm missing something, I don't think the variable "ie" can ever be non-null, and yet we check for whether or not it's null later in the method to determine if we should shut down.
+{quote}
+It can either be an InterruptedException or an IOException when transfering the checkpoint. Interrupted ("ie") thrown if we are interrupted while waiting the any checkpoint to complete. IOE if there is an execution exception when doing the checkpoint. 
+
+After we get out of waiting for the uploads, if we got an "ioe" or an "ie" then we force the rest of the threads that we started for the image transfer to quit by shutting down the threadpool (and then forcibly shutting it down shortly after that). We do checks again for each exception to ensure we throw the right one back up.
+
+We could wrap the exceptions into a parent exception and then just throw that back up to the caller (resulting in less checks), but I didn't want to change the method signature b/c the interrupted means something very different from ioe.
+
+Can do whatever you want there though, don't really matter to me.
+We need to make sure either exception is rethrown 
+
+And finally, after working through the comments...
+{quote}
+The changes to BlockTokenSecretManager - they look fine to me in general, but I'd love to see some extra tests of this functionality with several NNs in play. Unless I missed something, I don't think there are any tests that would exercise more than 2 {{BlockTokenSecretManager}}s
+{quote}
+
+There is {{TestFailoverWithBlockTokensEnabled}} which does ensure that multiple {{BlockTokenSecretManager}}s don't have overlapping ranges, among other standard blocktoken things - its modified to run with 3NNs.
+
+Looking at the other references to the {{BlockTokenSecretManager}} in tests, it doesn't seem to be anywhere else we care about testing when there are multiple NN, just that that the basic range functionality works (which is the main thing that is being modified). Happy to add more, just not sure what exactly you want there.
+
+
+Attaching patch updated on trunk + [~atm]'s comments (less ones that didn't seem to apply). Haven't run local tests since changes seemed innocuous... hoping that HadoopQA bot can handle this on it own. 
+
+\\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:red}-1{color} | patch |   0m  0s | The patch command could not apply the patch during dryrun. |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12731010/hdfs-6440-trunk-v3.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / 31b627b |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/10838/console |
+
+
+This message was automatically generated.
+
+Hey Jesse,
+
+Thanks a lot for working through my feedback, responses below.
+
+bq. I'm not sure how we would test this when needing to change the structure of the FS to support more than 2 NNs. Would you recommend (1) recognizing the old layout and then (2) transfering it into the new layout? The reason this seems silly (to me) is that the layout is only enforced by the way the minicluster is used/setup, rather than the way things would actually be run. By moving things into the appropriate directories per-nn, but keeping everything else below that the same, I think we keep the same upgrade properties but don't need to do the above contrived/synthetic "upgrade".
+
+I'm specifically thinking about just expanding {{TestRollingUpgrade}} with some tests that exercise the > 2 NN scenario, e.g. amending or expanding {{testRollingUpgradeWithQJM}}.
+
+bq. Maybe some salesforce terminology leak here.<snip>
+
+Cool, that's what I figured. The new comment looks good to me.
+
+bq. Yes, it for when there is an error and you want to run the exact sequence of failovers again in the test. Minor helper, but can be useful when trying to track down ordering dependency issues (which there shoudn't be, but sometimes these things can creep in).
+
+Sorry, maybe I wasn't clear. I get the point of using the random seed in the first place, but I'm specifically talking about the fact that in {{doWriteOverFailoverTest}} we change the value of that variable, log the value, and then never read it again. Doesn't seem like that's doing anything.
+
+bq. It can either be an InterruptedException or an IOException when transfering the checkpoint. Interrupted ("ie") thrown if we are interrupted while waiting the any checkpoint to complete. IOE if there is an execution exception when doing the checkpoint.<snip>
+
+Right, I get that, but what I was pointing out was just that in the previous version of the patch the variable "{{ie}}" was never being assigned to anything but "{{null}}". Here was the code in that patch, note the 4th-to-last line:
+{code}
++    InterruptedException ie = null;
++    IOException ioe= null;
++    int i = 0;
++    boolean success = false;
++    for (; i < uploads.size(); i++) {
++      Future<TransferFsImage.TransferResult> upload = uploads.get(i);
++      try {
++        // TODO should there be some smarts here about retries nodes that are not the active NN?
++        if (upload.get() == TransferFsImage.TransferResult.SUCCESS) {
++          success = true;
++          //avoid getting the rest of the results - we don't care since we had a successful upload
++          break;
++        }
++
++      } catch (ExecutionException e) {
++        ioe = new IOException("Exception during image upload: " + e.getMessage(),
++            e.getCause());
++        break;
++      } catch (InterruptedException e) {
++        ie = null;
++        break;
++      }
++    }
+{code}
+That's fixed in the latest version of the patch, where the variable "{{ie}}" is assigned to "{{e}}" when an {{InterruptedException}} occurs, so I think we're good.
+
+bq. There is {{TestFailoverWithBlockTokensEnabled}}<snip>
+
+Ah, my bad. Yes indeed, that looks good to me. The overlapping range issue is exactly what I wanted to see tested.
+
+{quote}
+Right, I get that, but what I was pointing out was just that in the previous version of the patch the variable "ie" was never being assigned to anything but "null". 
+{quote}
+Oh, yeah. That was a problem. Sorry for the misunderstanding!
+
+bq. I'm specifically thinking about just expanding TestRollingUpgrade with some tests that exercise the > 2 NN scenario, e.g. 
+
+Yea, I'll look into that - look for it in the next patch. Shouldn't be too hard (and might be cleaner codewise!)
+
+{quote}
+I get the point of using the random seed in the first place, but I'm specifically talking about the fact that in doWriteOverFailoverTest we change the value of that variable, log the value, and then never read it again. 
+{quote}
+
+Well, we use it again through the random variable which will determine the ID of the NN to become the ANN.
+{code}
+ int nextActive = failoverRandom.nextInt(NN_COUNT);
+{code}
+
+By setting the seed, you get the same sequence nn failures. So one seed would do 1->2->1->3, while another might do 1->3->2->1. Then, with the seed you could reproduce the series of failovers in the same order, which seems like a laudable goal for the test- especially when trying to debug weird error cases. Unless I'm missing something?
+
+bq. By setting the seed, you get the same sequence nn failures. So one seed would do 1->2->1->3, while another might do 1->3->2->1. Then, with the seed you could reproduce the series of failovers in the same order, which seems like a laudable goal for the test- especially when trying to debug weird error cases. Unless I'm missing something?
+
+Right, I get the intended purpose, but one of us must be missing something because I still think there's some funny stuff going on with the {{FAILOVER_SEED}} variable. :)
+
+In the latest patch, you'll see that the variable {{FAILOVER_SEED}} is used in the following steps:
+
+# Statically declare {{FAILOVER_SEED}} and initialize it to the value of {{System.currentTimeMillis()}}
+# Statically create {{failoverRandom}} to be a new {{Random}} object, initialized with the value of {{FAILOVER_SEED}}.
+# In a static block, log the value of {{FAILOVER_SEED}}.
+# In {{doWriteOverFailoverTest}}, reset the value of {{FAILOVER_SEED}} to again be {{System.currentTimeMillis()}}.
+# Immediately thereafter in {{doWriteOverFailoverTest}}, log the new value of {{FAILOVER_SEED}}.
+
+Note that there is no step 6 that resets {{failoverRandom}} to use the new value of {{FAILOVER_SEED}} that was set in step 4, nor is {{FAILOVER_SEED}} used for anything else after step 5. Thus, unless I'm missing something, seems like steps 4 and 5 are at least superfluous, and at worst misleading since the test logs will contain a message about using a random seed that is in fact never used.
+
+Ah, Ok. Yes, that second set seed will clearly not be used and is definitely be misleading. Sorry for being dense :-/ I was just looking at the usage of the Random, not the seed!
+
+I'm thinking to just pull the better log message up to the static initialization and remove the those two lines (4-5). 
+
+I _think_ the original idea was to make it easier to reproduce an individual test failures, since each cluster in the methods is managed independently... but I don't know if it really matters at this point; it just sucks to have to rerun all the tests to debug the single test. Thoughts?
+
+bq. Ah, Ok. Yes, that second set seed will clearly not be used and is definitely be misleading. Sorry for being dense :-/ I was just looking at the usage of the Random, not the seed!
+
+No sweat. I figured we were talking past each other a bit.
+
+bq. I'm thinking to just pull the better log message up to the static initialization and remove the those two lines (4-5).
+
+I agree, this seems like the right move to me. Just have a single seed for the whole test class. Possible that we may at some point encounter some inter-test dependencies, and if so it'll be nice that there's only a single seed used across all the tests, instead of having to manually set several seeds to reproduce the same sequence. The fact that we already clearly log which NN is becoming active should be sufficient for reproducing individual test failures if one wants to do that.
+
+Thanks, Jesse.
+
+Attaching updated patch. Working through some local test failures - seem like they might be just due to rebase changes? Looking into it.
+
+Changes of note:
+* fixing concurrent checkpoint management - was breaking TestRollingUpgrade - to not keep around completed checkpoints
+* Adding tests to TestRollingUpgrade
+ Removing random seed setting in testpipelinesfailover
+* Fixing startup option setting in minidfscluster#restartNode
+* Fixing block manager to use correct nnid lookup
+
+FYI, on vacation through memorial day, so not going to be doing much for the next few days. Back on Tuesday.
+
+\\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:red}-1{color} | patch |   0m  0s | The patch command could not apply the patch during dryrun. |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12734365/hdfs-6440-trunk-v4.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / fb6b38d |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/11079/console |
+
+
+This message was automatically generated.
+
+Attaching updated patch, rebased on latest trunk. My usual covering suite of mNN tests* passed locally a few times.
+
+Notable changes:
+- Moving checkpoint lock inside actually needing to take the checkpoint (not functional change, just a locking improvement)
+- Cleanup determining when to send checkpoints, so we only calculate if we should send it when we know that the checkpoint will actually be created.
+
+{code}
+*mvn clean test -Dtest=TestPipelinesFailover,TestRollingUpgrade,TestZKFailoverController,TestBookKeeperHACheckpoints,TestBlockToken,TestBackupNode,TestCheckpoint,TestDFSUpgradeFromImage,TestBootstrapStandby,TestBootstrapStandbyWithQJM,TestEditLogTailer,TestFailoverWithBlockTokens,TestHAConfiguration,TestRemoteNameNodeInfo,TestSeveralNameNodes,TestStandbyCheckpoints,TestDNFencingWithReplication
+{code}
+
+\\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | pre-patch |  17m 12s | Pre-patch trunk compilation is healthy. |
+| {color:green}+1{color} | @author |   0m  0s | The patch does not contain any @author tags. |
+| {color:green}+1{color} | tests included |   0m  0s | The patch appears to include 24 new or modified test files. |
+| {color:green}+1{color} | javac |   8m 41s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |  10m 26s | There were no new javadoc warning messages. |
+| {color:green}+1{color} | release audit |   0m 23s | The applied patch does not increase the total number of release audit warnings. |
+| {color:red}-1{color} | checkstyle |   2m 45s | The applied patch generated  6 new checkstyle issues (total was 34, now 40). |
+| {color:red}-1{color} | whitespace |   3m 37s | The patch has 15  line(s) that end in whitespace. Use git apply --whitespace=fix. |
+| {color:green}+1{color} | install |   1m 37s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 34s | The patch built with eclipse:eclipse. |
+| {color:red}-1{color} | findbugs |   5m 33s | The patch appears to introduce 3 new Findbugs (version 3.0.0) warnings. |
+| {color:green}+1{color} | common tests |  23m  0s | Tests passed in hadoop-common. |
+| {color:red}-1{color} | hdfs tests | 164m  0s | Tests failed in hadoop-hdfs. |
+| {color:green}+1{color} | hdfs tests |   3m 49s | Tests passed in bkjournal. |
+| | | 242m 19s | |
+\\
+\\
+|| Reason || Tests ||
+| FindBugs | module:hadoop-hdfs |
+|  |  Should org.apache.hadoop.hdfs.server.namenode.ImageServlet$ImageUploadRequest be a _static_ inner class?  At ImageServlet.java:inner class?  At ImageServlet.java:[lines 593-628] |
+|  |  Invocation of java.net.URL.equals(Object), which blocks to do domain name resolution, in org.apache.hadoop.hdfs.server.namenode.ha.RemoteNameNodeInfo.equals(Object)  At RemoteNameNodeInfo.java:to do domain name resolution, in org.apache.hadoop.hdfs.server.namenode.ha.RemoteNameNodeInfo.equals(Object)  At RemoteNameNodeInfo.java:[line 122] |
+|  |  Invocation of java.net.URL.hashCode(), which blocks to do domain name resolution, in org.apache.hadoop.hdfs.server.namenode.ha.RemoteNameNodeInfo.hashCode()  At RemoteNameNodeInfo.java:to do domain name resolution, in org.apache.hadoop.hdfs.server.namenode.ha.RemoteNameNodeInfo.hashCode()  At RemoteNameNodeInfo.java:[line 105] |
+| Failed unit tests | hadoop.hdfs.server.namenode.ha.TestPipelinesFailover |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12735756/hdfs-6440-trunk-v5.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / 5450413 |
+| checkstyle |  https://builds.apache.org/job/PreCommit-HDFS-Build/11146/artifact/patchprocess/diffcheckstylehadoop-common.txt |
+| whitespace | https://builds.apache.org/job/PreCommit-HDFS-Build/11146/artifact/patchprocess/whitespace.txt |
+| Findbugs warnings | https://builds.apache.org/job/PreCommit-HDFS-Build/11146/artifact/patchprocess/newPatchFindbugsWarningshadoop-hdfs.html |
+| hadoop-common test log | https://builds.apache.org/job/PreCommit-HDFS-Build/11146/artifact/patchprocess/testrun_hadoop-common.txt |
+| hadoop-hdfs test log | https://builds.apache.org/job/PreCommit-HDFS-Build/11146/artifact/patchprocess/testrun_hadoop-hdfs.txt |
+| bkjournal test log | https://builds.apache.org/job/PreCommit-HDFS-Build/11146/artifact/patchprocess/testrun_bkjournal.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/11146/testReport/ |
+| Java | 1.7.0_55 |
+| uname | Linux asf904.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/11146/console |
+
+
+This message was automatically generated.
+
+New version, hopefully fixing the findbugs/checkstyle issues and increasing the TestPipelinesFailover timeout to get it to pass.
+
+\\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | pre-patch |  20m  2s | Pre-patch trunk compilation is healthy. |
+| {color:green}+1{color} | @author |   0m  1s | The patch does not contain any @author tags. |
+| {color:green}+1{color} | tests included |   0m  0s | The patch appears to include 24 new or modified test files. |
+| {color:green}+1{color} | javac |   7m 31s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |   9m 32s | There were no new javadoc warning messages. |
+| {color:green}+1{color} | release audit |   0m 23s | The applied patch does not increase the total number of release audit warnings. |
+| {color:red}-1{color} | checkstyle |   2m 23s | The applied patch generated  1 new checkstyle issues (total was 34, now 35). |
+| {color:red}-1{color} | whitespace |   3m 38s | The patch has 15  line(s) that end in whitespace. Use git apply --whitespace=fix. |
+| {color:green}+1{color} | install |   1m 39s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 32s | The patch built with eclipse:eclipse. |
+| {color:green}+1{color} | findbugs |   5m 50s | The patch does not introduce any new Findbugs (version 3.0.0) warnings. |
+| {color:green}+1{color} | common tests |  23m 24s | Tests passed in hadoop-common. |
+| {color:red}-1{color} | hdfs tests | 164m 13s | Tests failed in hadoop-hdfs. |
+| {color:green}+1{color} | hdfs tests |   3m 54s | Tests passed in bkjournal. |
+| | | 243m 44s | |
+\\
+\\
+|| Reason || Tests ||
+| Failed unit tests | hadoop.hdfs.server.namenode.ha.TestPipelinesFailover |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12735911/hdfs-6440-trunk-v6.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / 5504a26 |
+| checkstyle |  https://builds.apache.org/job/PreCommit-HDFS-Build/11152/artifact/patchprocess/diffcheckstylehadoop-common.txt |
+| whitespace | https://builds.apache.org/job/PreCommit-HDFS-Build/11152/artifact/patchprocess/whitespace.txt |
+| hadoop-common test log | https://builds.apache.org/job/PreCommit-HDFS-Build/11152/artifact/patchprocess/testrun_hadoop-common.txt |
+| hadoop-hdfs test log | https://builds.apache.org/job/PreCommit-HDFS-Build/11152/artifact/patchprocess/testrun_hadoop-hdfs.txt |
+| bkjournal test log | https://builds.apache.org/job/PreCommit-HDFS-Build/11152/artifact/patchprocess/testrun_bkjournal.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/11152/testReport/ |
+| Java | 1.7.0_55 |
+| uname | Linux asf909.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/11152/console |
+
+
+This message was automatically generated.
+
+Ok, looks like didn't fix whitespace like I thought :-/ However, manually fixed up checkstyle/whitespace issues. Also, slight improvement in TestPipelinesFailover to abstract cluster creation b/c rebase failed to update all relevant tests to run 3 NNs, causing periodic test failures. Now passing every time locally.
+
+Hopefully, this should get the greenlight from QA :)
+
+\\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | pre-patch |  20m 53s | Pre-patch trunk compilation is healthy. |
+| {color:green}+1{color} | @author |   0m  0s | The patch does not contain any @author tags. |
+| {color:green}+1{color} | tests included |   0m  0s | The patch appears to include 24 new or modified test files. |
+| {color:green}+1{color} | javac |   8m  8s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |   9m 53s | There were no new javadoc warning messages. |
+| {color:green}+1{color} | release audit |   0m 23s | The applied patch does not increase the total number of release audit warnings. |
+| {color:green}+1{color} | checkstyle |   3m  1s | There were no new checkstyle issues. |
+| {color:red}-1{color} | whitespace |   4m  2s | The patch has 1  line(s) that end in whitespace. Use git apply --whitespace=fix. |
+| {color:green}+1{color} | install |   1m 43s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 36s | The patch built with eclipse:eclipse. |
+| {color:green}+1{color} | findbugs |   5m 59s | The patch does not introduce any new Findbugs (version 3.0.0) warnings. |
+| {color:green}+1{color} | common tests |  23m 25s | Tests passed in hadoop-common. |
+| {color:red}-1{color} | hdfs tests | 168m 33s | Tests failed in hadoop-hdfs. |
+| {color:red}-1{color} | hdfs tests |   0m 18s | Tests failed in bkjournal. |
+| | | 247m  4s | |
+\\
+\\
+|| Reason || Tests ||
+| Failed unit tests | hadoop.hdfs.TestEncryptedTransfer |
+| Timed out tests | org.apache.hadoop.hdfs.server.datanode.TestFsDatasetCache |
+| Failed build | bkjournal |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12736032/hdfs-6440-trunk-v7.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / d725dd8 |
+| whitespace | https://builds.apache.org/job/PreCommit-HDFS-Build/11157/artifact/patchprocess/whitespace.txt |
+| hadoop-common test log | https://builds.apache.org/job/PreCommit-HDFS-Build/11157/artifact/patchprocess/testrun_hadoop-common.txt |
+| hadoop-hdfs test log | https://builds.apache.org/job/PreCommit-HDFS-Build/11157/artifact/patchprocess/testrun_hadoop-hdfs.txt |
+| bkjournal test log | https://builds.apache.org/job/PreCommit-HDFS-Build/11157/artifact/patchprocess/testrun_bkjournal.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/11157/testReport/ |
+| Java | 1.7.0_55 |
+| uname | Linux asf908.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/11157/console |
+
+
+This message was automatically generated.
+
+Failed tests pass locally. Missed a whitespace in TestPipelinesFailover :( Could fix on commit, unless there are other comments on the latest version, in which case I'll wrap that into a new revision.
+
+Otherwise, i'd say this is go to go, [~atm]?
+
+All these changes look good to me, thanks a lot for making them, Jesse. I'll fix the {{TestPipelinesFailover}} whitespace issue on commit.
+
++1 from me. I'm going to commit this tomorrow morning, unless someone speaks up in the meantime.
+
+Hey Jesse, I was just about to commit this and did one final run of the relevant tests, and discovered that {{TestDFSUpgradeFromImage}} seems to start failing after applying the patch. It currently passes on trunk. I also asked Eddy to give this a shot to see if this was something local to my box, and it fails for him too.
+
+Could you please look into what's going on there? Sorry about this.
+
+I ran the test (independently) a couple of times locally after rebasing on latest trunk (as of 3hrs ago - YARN-3802) and didn't see any failures. However, when running a bigger battery of tests, my "multi-nn suite", I got the following failure:
+{quote}
+testUpgradeFromRel1BBWImage(org.apache.hadoop.hdfs.TestDFSUpgradeFromImage)  Time elapsed: 11.115 sec  <<< ERROR!
+java.io.IOException: Cannot obtain block length for LocatedBlock{BP-362680364-127.0.0.1-1434673340215:blk_7162739548153522810_1020; getBlockSize()=1024; corrupt=false; offset=0; locs=[DatanodeInfoWithStorage[127.0.0.1:59215,DS-8d6d81c3-5027-4fbf-a7c8-a8be86cb7e00,DISK]]}
+	at org.apache.hadoop.hdfs.DFSInputStream.readBlockLength(DFSInputStream.java:394)
+	at org.apache.hadoop.hdfs.DFSInputStream.fetchLocatedBlocksAndGetLastBlockLength(DFSInputStream.java:336)
+	at org.apache.hadoop.hdfs.DFSInputStream.openInfo(DFSInputStream.java:272)
+	at org.apache.hadoop.hdfs.DFSInputStream.<init>(DFSInputStream.java:263)
+	at org.apache.hadoop.hdfs.DFSClient.open(DFSClient.java:1184)
+	at org.apache.hadoop.hdfs.DFSClient.open(DFSClient.java:1168)
+	at org.apache.hadoop.hdfs.DFSClient.open(DFSClient.java:1154)
+	at org.apache.hadoop.hdfs.TestDFSUpgradeFromImage.dfsOpenFileWithRetries(TestDFSUpgradeFromImage.java:174)
+	at org.apache.hadoop.hdfs.TestDFSUpgradeFromImage.verifyDir(TestDFSUpgradeFromImage.java:210)
+	at org.apache.hadoop.hdfs.TestDFSUpgradeFromImage.verifyFileSystem(TestDFSUpgradeFromImage.java:225)
+	at org.apache.hadoop.hdfs.TestDFSUpgradeFromImage.upgradeAndVerify(TestDFSUpgradeFromImage.java:597)
+	at org.apache.hadoop.hdfs.TestDFSUpgradeFromImage.testUpgradeFromRel1BBWImage(TestDFSUpgradeFromImage.java:619)
+{quote}
+
+...but only sometimes. Is this at all what you guys are seeing too?
+
+btw, I'm running OSX - maybe its a linux issue? I'm gonna re-submit (+ fix for whitespace) and see how jenkins likes it.
+
+
+Attaching updated patch w/ whitespace fix. Lets see what QA thinks of the upgrade test.
+
+Hey Jesse,
+
+Here's the error that it's failing with on my (and Eddy's) box:
+
+{noformat}
+testUpgradeFromRel2ReservedImage(org.apache.hadoop.hdfs.TestDFSUpgradeFromImage)  Time elapsed: 0.901 sec  <<< ERROR!
+org.apache.hadoop.hdfs.server.common.InconsistentFSStateException: Directory /home/atm/src/apache/hadoop.git/src/hadoop-hdfs-project/hadoop-hdfs/target/test/data/dfs/name-0-1 is in an inconsistent state: storage directory does not exist or is not accessible.
+	at org.apache.hadoop.hdfs.server.namenode.FSImage.recoverStorageDirs(FSImage.java:327)
+	at org.apache.hadoop.hdfs.server.namenode.FSImage.recoverTransitionRead(FSImage.java:215)
+	at org.apache.hadoop.hdfs.server.namenode.FSNamesystem.loadFSImage(FSNamesystem.java:976)
+	at org.apache.hadoop.hdfs.server.namenode.FSNamesystem.loadFromDisk(FSNamesystem.java:685)
+	at org.apache.hadoop.hdfs.server.namenode.NameNode.loadNamesystem(NameNode.java:584)
+	at org.apache.hadoop.hdfs.server.namenode.NameNode.initialize(NameNode.java:644)
+	at org.apache.hadoop.hdfs.server.namenode.NameNode.<init>(NameNode.java:809)
+	at org.apache.hadoop.hdfs.server.namenode.NameNode.<init>(NameNode.java:793)
+	at org.apache.hadoop.hdfs.server.namenode.NameNode.createNameNode(NameNode.java:1482)
+	at org.apache.hadoop.hdfs.MiniDFSCluster.createNameNode(MiniDFSCluster.java:1208)
+	at org.apache.hadoop.hdfs.MiniDFSCluster.configureNameService(MiniDFSCluster.java:971)
+	at org.apache.hadoop.hdfs.MiniDFSCluster.createNameNodesAndSetConf(MiniDFSCluster.java:882)
+	at org.apache.hadoop.hdfs.MiniDFSCluster.initMiniDFSCluster(MiniDFSCluster.java:814)
+	at org.apache.hadoop.hdfs.MiniDFSCluster.<init>(MiniDFSCluster.java:473)
+	at org.apache.hadoop.hdfs.MiniDFSCluster$Builder.build(MiniDFSCluster.java:432)
+	at org.apache.hadoop.hdfs.TestDFSUpgradeFromImage.testUpgradeFromRel2ReservedImage(TestDFSUpgradeFromImage.java:480)
+{noformat}
+
+I'll poke around myself a bit as well to see if I can figure out what's going on. This happens very reliably for me.
+
+[~jesse_yates] I am also running OSX, and re-produced it on OSX.
+
+Looks like maybe the binary changes from the tarball image aren't getting applied? That's all that I can think, since you fellas aren't seeing the cluster even start up.
+
+Just went back to trunk and applied the patch directly (rather than using my branch) and test passed again w/o issue ($ mvn install -DskipTests; mvn clean test -Dtest=TestDFSUpgradeFromImage)
+
+Aha, that was totally it. Applied v8 correctly (surprised patch didn't complain about not being able to apply the binary diff) and the test passes just fine.
+
+I'll wait for Jenkins to come back on the latest patch and then check that in.
+
+\\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | pre-patch |  20m 29s | Pre-patch trunk compilation is healthy. |
+| {color:green}+1{color} | @author |   0m  0s | The patch does not contain any @author tags. |
+| {color:green}+1{color} | tests included |   0m  0s | The patch appears to include 24 new or modified test files. |
+| {color:green}+1{color} | javac |   7m 47s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |   9m 49s | There were no new javadoc warning messages. |
+| {color:green}+1{color} | release audit |   0m 22s | The applied patch does not increase the total number of release audit warnings. |
+| {color:green}+1{color} | checkstyle |   3m  3s | There were no new checkstyle issues. |
+| {color:green}+1{color} | whitespace |   4m  1s | The patch has no lines that end in whitespace. |
+| {color:green}+1{color} | install |   1m 39s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 33s | The patch built with eclipse:eclipse. |
+| {color:green}+1{color} | findbugs |   6m  0s | The patch does not introduce any new Findbugs (version 3.0.0) warnings. |
+| {color:green}+1{color} | common tests |  22m 32s | Tests passed in hadoop-common. |
+| {color:red}-1{color} | hdfs tests | 142m 30s | Tests failed in hadoop-hdfs. |
+| {color:red}-1{color} | hdfs tests |   0m 16s | Tests failed in bkjournal. |
+| | | 219m 10s | |
+\\
+\\
+|| Reason || Tests ||
+| Failed unit tests | hadoop.hdfs.shortcircuit.TestShortCircuitLocalRead |
+|   | hadoop.hdfs.server.namenode.TestCheckpoint |
+| Timed out tests | org.apache.hadoop.hdfs.server.namenode.TestNameNodeAcl |
+| Failed build | bkjournal |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12740539/hdfs-6440-trunk-v8.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / 077250d |
+| hadoop-common test log | https://builds.apache.org/job/PreCommit-HDFS-Build/11441/artifact/patchprocess/testrun_hadoop-common.txt |
+| hadoop-hdfs test log | https://builds.apache.org/job/PreCommit-HDFS-Build/11441/artifact/patchprocess/testrun_hadoop-hdfs.txt |
+| bkjournal test log | https://builds.apache.org/job/PreCommit-HDFS-Build/11441/artifact/patchprocess/testrun_bkjournal.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/11441/testReport/ |
+| Java | 1.7.0_55 |
+| uname | Linux asf904.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/11441/console |
+
+
+This message was automatically generated.
+
+Rebased on trunk, tests pass locally for me.
+
+\\
+\\
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:red}-1{color} | pre-patch |  17m 39s | Findbugs (version 3.0.0) appears to be broken on trunk. |
+| {color:green}+1{color} | @author |   0m  0s | The patch does not contain any @author tags. |
+| {color:green}+1{color} | tests included |   0m  0s | The patch appears to include 24 new or modified test files. |
+| {color:green}+1{color} | javac |   7m 39s | There were no new javac warning messages. |
+| {color:green}+1{color} | javadoc |   9m 46s | There were no new javadoc warning messages. |
+| {color:green}+1{color} | release audit |   0m 22s | The applied patch does not increase the total number of release audit warnings. |
+| {color:green}+1{color} | checkstyle |   2m 16s | There were no new checkstyle issues. |
+| {color:green}+1{color} | whitespace |   3m 59s | The patch has no lines that end in whitespace. |
+| {color:green}+1{color} | install |   1m 38s | mvn install still works. |
+| {color:green}+1{color} | eclipse:eclipse |   0m 32s | The patch built with eclipse:eclipse. |
+| {color:green}+1{color} | findbugs |   5m 52s | The patch does not introduce any new Findbugs (version 3.0.0) warnings. |
+| {color:green}+1{color} | common tests |  22m 20s | Tests passed in hadoop-common. |
+| {color:red}-1{color} | hdfs tests | 162m 16s | Tests failed in hadoop-hdfs. |
+| {color:red}-1{color} | hdfs tests |   0m 15s | Tests failed in bkjournal. |
+| | | 234m 40s | |
+\\
+\\
+|| Reason || Tests ||
+| Failed unit tests | hadoop.hdfs.TestDFSPermission |
+|   | hadoop.hdfs.TestSafeMode |
+|   | hadoop.hdfs.shortcircuit.TestShortCircuitCache |
+| Failed build | bkjournal |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Patch URL | http://issues.apache.org/jira/secure/attachment/12740539/hdfs-6440-trunk-v8.patch |
+| Optional Tests | javadoc javac unit findbugs checkstyle |
+| git revision | trunk / 99271b7 |
+| hadoop-common test log | https://builds.apache.org/job/PreCommit-HDFS-Build/11442/artifact/patchprocess/testrun_hadoop-common.txt |
+| hadoop-hdfs test log | https://builds.apache.org/job/PreCommit-HDFS-Build/11442/artifact/patchprocess/testrun_hadoop-hdfs.txt |
+| bkjournal test log | https://builds.apache.org/job/PreCommit-HDFS-Build/11442/artifact/patchprocess/testrun_bkjournal.txt |
+| Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/11442/testReport/ |
+| Java | 1.7.0_55 |
+| uname | Linux asf904.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/11442/console |
+
+
+This message was automatically generated.
+
+I re-ran the failed tests locally and they all passed, and I don't think those tests have much of anything to do with this patch anyway.
+
++1, the latest patch looks good to me. I realized just now doing some final looks at the patch that we should also update the HDFSHighAvailabilityWithQJM.md document to indicate that more than two NNs are now supported, but I think that can be done as a follow-up JIRA since continuing to rebase this patch is pretty unwieldy.
+
+I'm going to commit this momentarily.
+
+I've just committed this change to trunk.
+
+Thanks a lot for the monster contribution, Jesse. Thanks also very much to Eddy for doing a bunch of initial reviews, and to Lars for keeping on me to review this patch. :)
+
+[~jesse_yates] - mind filing a follow-up JIRA to amend the docs appropriately?
+
+Yeah. Thanks [~atm]!
+
+Great, thanks [~atm]! Just filed HDFS-8657
+
+Cool, thanks. I'll review HDFS-8657 whenever you post a patch.
+
+FAILURE: Integrated in Hadoop-trunk-Commit #8054 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/8054/])
+HDFS-6440. Support more than 2 NameNodes. Contributed by Jesse Yates. (atm: rev 49dfad942970459297f72632ed8dfd353e0c86de)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSNNTopology.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSUpgradeFromImage.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestEditLogTailer.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestBootstrapStandbyWithQJM.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop-0.23-reserved.tgz
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCheckpoint.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestDNFencingWithReplication.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/HATestUtil.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/RemoteNameNodeInfo.java
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ha/ZKFailoverController.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestRemoteNameNodeInfo.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSCluster.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/HAUtil.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/HAStressTestHarness.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestStandbyCheckpoints.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/security/token/block/TestBlockToken.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestSeveralNameNodes.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/StandbyCheckpointer.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/TransferFsImage.java
+* hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ha/TestZKFailoverController.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestRollingUpgrade.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/contrib/bkjournal/src/test/java/org/apache/hadoop/contrib/bkjournal/TestBookKeeperHACheckpoints.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop-22-dfs-dir.tgz
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/BootstrapStandby.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestBootstrapStandby.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestHAConfiguration.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ImageServlet.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/log4j.properties
+* hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ha/MiniZKFCCluster.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/DFSZKFailoverController.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop1-bbw.tgz
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestFailoverWithBlockTokensEnabled.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestBackupNode.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/qjournal/MiniQJMHACluster.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop-2-reserved.tgz
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeHttpServer.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/CheckpointConf.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop-1-reserved.tgz
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestPipelinesFailover.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/security/token/block/BlockTokenSecretManager.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/EditLogTailer.java
+
+
+Yeah, that failure looks wildly unrelated. Someone messing about with the poms?
+
+Is there a plan to add this feature to branch-2?
+
+FAILURE: Integrated in Hadoop-Yarn-trunk #968 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/968/])
+HDFS-6440. Support more than 2 NameNodes. Contributed by Jesse Yates. (atm: rev 49dfad942970459297f72632ed8dfd353e0c86de)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestBootstrapStandby.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop-1-reserved.tgz
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestStandbyCheckpoints.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop-0.23-reserved.tgz
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/RemoteNameNodeInfo.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/log4j.properties
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/HAStressTestHarness.java
+* hadoop-hdfs-project/hadoop-hdfs/src/contrib/bkjournal/src/test/java/org/apache/hadoop/contrib/bkjournal/TestBookKeeperHACheckpoints.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeHttpServer.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop-2-reserved.tgz
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestBootstrapStandbyWithQJM.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/EditLogTailer.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/HAUtil.java
+* hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ha/MiniZKFCCluster.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSUpgradeFromImage.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestHAConfiguration.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/TransferFsImage.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/qjournal/MiniQJMHACluster.java
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ha/ZKFailoverController.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ImageServlet.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop-22-dfs-dir.tgz
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/BootstrapStandby.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestEditLogTailer.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/security/token/block/BlockTokenSecretManager.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestPipelinesFailover.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSNNTopology.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestRemoteNameNodeInfo.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestFailoverWithBlockTokensEnabled.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCheckpoint.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestRollingUpgrade.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSCluster.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/StandbyCheckpointer.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestDNFencingWithReplication.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestBackupNode.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestSeveralNameNodes.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/CheckpointConf.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop1-bbw.tgz
+* hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ha/TestZKFailoverController.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/security/token/block/TestBlockToken.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/DFSZKFailoverController.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/HATestUtil.java
+
+
+SUCCESS: Integrated in Hadoop-Yarn-trunk-Java8 #238 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk-Java8/238/])
+HDFS-6440. Support more than 2 NameNodes. Contributed by Jesse Yates. (atm: rev 49dfad942970459297f72632ed8dfd353e0c86de)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestBootstrapStandby.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCheckpoint.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestBootstrapStandbyWithQJM.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop-1-reserved.tgz
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestEditLogTailer.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/StandbyCheckpointer.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestSeveralNameNodes.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/log4j.properties
+* hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestFailoverWithBlockTokensEnabled.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ImageServlet.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/CheckpointConf.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop-22-dfs-dir.tgz
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestRemoteNameNodeInfo.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestPipelinesFailover.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/HATestUtil.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/HAUtil.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeHttpServer.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/DFSZKFailoverController.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/qjournal/MiniQJMHACluster.java
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ha/ZKFailoverController.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/RemoteNameNodeInfo.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop-0.23-reserved.tgz
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop-2-reserved.tgz
+* hadoop-hdfs-project/hadoop-hdfs/src/contrib/bkjournal/src/test/java/org/apache/hadoop/contrib/bkjournal/TestBookKeeperHACheckpoints.java
+* hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ha/MiniZKFCCluster.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestStandbyCheckpoints.java
+* hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ha/TestZKFailoverController.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/EditLogTailer.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSCluster.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/BootstrapStandby.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSUpgradeFromImage.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestHAConfiguration.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestDNFencingWithReplication.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/security/token/block/BlockTokenSecretManager.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/TransferFsImage.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/security/token/block/TestBlockToken.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestRollingUpgrade.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestBackupNode.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/HAStressTestHarness.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSNNTopology.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop1-bbw.tgz
+
+
+FAILURE: Integrated in Hadoop-Hdfs-trunk-Java8 #227 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk-Java8/227/])
+HDFS-6440. Support more than 2 NameNodes. Contributed by Jesse Yates. (atm: rev 49dfad942970459297f72632ed8dfd353e0c86de)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestBootstrapStandbyWithQJM.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ImageServlet.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/CheckpointConf.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop-22-dfs-dir.tgz
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSCluster.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestRollingUpgrade.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop-1-reserved.tgz
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestEditLogTailer.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestStandbyCheckpoints.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop-0.23-reserved.tgz
+* hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/security/token/block/BlockTokenSecretManager.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/BootstrapStandby.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSNNTopology.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/EditLogTailer.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/HAStressTestHarness.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop1-bbw.tgz
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/DFSZKFailoverController.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestBackupNode.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSUpgradeFromImage.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/RemoteNameNodeInfo.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/security/token/block/TestBlockToken.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/log4j.properties
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop-2-reserved.tgz
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestRemoteNameNodeInfo.java
+* hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ha/TestZKFailoverController.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestBootstrapStandby.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestSeveralNameNodes.java
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ha/ZKFailoverController.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestFailoverWithBlockTokensEnabled.java
+* hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ha/MiniZKFCCluster.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/qjournal/MiniQJMHACluster.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestDNFencingWithReplication.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeHttpServer.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/TransferFsImage.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/StandbyCheckpointer.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestPipelinesFailover.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/HATestUtil.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCheckpoint.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/HAUtil.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestHAConfiguration.java
+* hadoop-hdfs-project/hadoop-hdfs/src/contrib/bkjournal/src/test/java/org/apache/hadoop/contrib/bkjournal/TestBookKeeperHACheckpoints.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+
+
+SUCCESS: Integrated in Hadoop-Hdfs-trunk #2166 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/2166/])
+HDFS-6440. Support more than 2 NameNodes. Contributed by Jesse Yates. (atm: rev 49dfad942970459297f72632ed8dfd353e0c86de)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestBootstrapStandby.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestSeveralNameNodes.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/DFSZKFailoverController.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop-0.23-reserved.tgz
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/RemoteNameNodeInfo.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/TransferFsImage.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop-1-reserved.tgz
+* hadoop-hdfs-project/hadoop-hdfs/src/contrib/bkjournal/src/test/java/org/apache/hadoop/contrib/bkjournal/TestBookKeeperHACheckpoints.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSNNTopology.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/security/token/block/TestBlockToken.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop-2-reserved.tgz
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestStandbyCheckpoints.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestFailoverWithBlockTokensEnabled.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestPipelinesFailover.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/HAUtil.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestRemoteNameNodeInfo.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/BootstrapStandby.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/EditLogTailer.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/log4j.properties
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestBackupNode.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ImageServlet.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeHttpServer.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/HATestUtil.java
+* hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ha/MiniZKFCCluster.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/StandbyCheckpointer.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestDNFencingWithReplication.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/CheckpointConf.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop1-bbw.tgz
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCheckpoint.java
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ha/ZKFailoverController.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop-22-dfs-dir.tgz
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestEditLogTailer.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/HAStressTestHarness.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestRollingUpgrade.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSUpgradeFromImage.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/qjournal/MiniQJMHACluster.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/security/token/block/BlockTokenSecretManager.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestHAConfiguration.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestBootstrapStandbyWithQJM.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSCluster.java
+* hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ha/TestZKFailoverController.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+
+
+FAILURE: Integrated in Hadoop-Mapreduce-trunk-Java8 #236 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk-Java8/236/])
+HDFS-6440. Support more than 2 NameNodes. Contributed by Jesse Yates. (atm: rev 49dfad942970459297f72632ed8dfd353e0c86de)
+* hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSCluster.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestStandbyCheckpoints.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/HAUtil.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/security/token/block/TestBlockToken.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/EditLogTailer.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/BootstrapStandby.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/security/token/block/BlockTokenSecretManager.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestRemoteNameNodeInfo.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/TransferFsImage.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/HATestUtil.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop-22-dfs-dir.tgz
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestEditLogTailer.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestBootstrapStandbyWithQJM.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/CheckpointConf.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestSeveralNameNodes.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/qjournal/MiniQJMHACluster.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSUpgradeFromImage.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/log4j.properties
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestPipelinesFailover.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestRollingUpgrade.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeHttpServer.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSNNTopology.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop-2-reserved.tgz
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ImageServlet.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestBootstrapStandby.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestFailoverWithBlockTokensEnabled.java
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ha/ZKFailoverController.java
+* hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ha/TestZKFailoverController.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestHAConfiguration.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/RemoteNameNodeInfo.java
+* hadoop-hdfs-project/hadoop-hdfs/src/contrib/bkjournal/src/test/java/org/apache/hadoop/contrib/bkjournal/TestBookKeeperHACheckpoints.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/DFSZKFailoverController.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/HAStressTestHarness.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCheckpoint.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestDNFencingWithReplication.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/StandbyCheckpointer.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop1-bbw.tgz
+* hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ha/MiniZKFCCluster.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestBackupNode.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop-0.23-reserved.tgz
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop-1-reserved.tgz
+
+
+FAILURE: Integrated in Hadoop-Mapreduce-trunk #2184 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/2184/])
+HDFS-6440. Support more than 2 NameNodes. Contributed by Jesse Yates. (atm: rev 49dfad942970459297f72632ed8dfd353e0c86de)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/qjournal/MiniQJMHACluster.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/HAStressTestHarness.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop-2-reserved.tgz
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestBootstrapStandbyWithQJM.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestBootstrapStandby.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSCluster.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestHAConfiguration.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/EditLogTailer.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/DFSZKFailoverController.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop-22-dfs-dir.tgz
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/security/token/block/BlockTokenSecretManager.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/HATestUtil.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/RemoteNameNodeInfo.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop-0.23-reserved.tgz
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestStandbyCheckpoints.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestDNFencingWithReplication.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestDFSUpgradeFromImage.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestEditLogTailer.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestFailoverWithBlockTokensEnabled.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/HAUtil.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSNNTopology.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestBackupNode.java
+* hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ha/MiniZKFCCluster.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop1-bbw.tgz
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestCheckpoint.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/BootstrapStandby.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/TransferFsImage.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestRollingUpgrade.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNodeHttpServer.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestSeveralNameNodes.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestPipelinesFailover.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/StandbyCheckpointer.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/hadoop-1-reserved.tgz
+* hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/ha/TestZKFailoverController.java
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/ha/ZKFailoverController.java
+* hadoop-hdfs-project/hadoop-hdfs/src/contrib/bkjournal/src/test/java/org/apache/hadoop/contrib/bkjournal/TestBookKeeperHACheckpoints.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ImageServlet.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/ha/TestRemoteNameNodeInfo.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/CheckpointConf.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/resources/log4j.properties
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/security/token/block/TestBlockToken.java
+
+
+Is this support can be merged to branch-2?
+
++1 on the ask: will this be in branch-2?
+
++1 for branch-2 please.
+
+HDFS-10536 got filed. I just looked at the edit log tailor change alone and saw multiple potential issues. I will file jiras for what I can spot, but it looks like this needs a lot more testing and hardening.  If bringing this to branch-2 will facilitate its maturing process, I am for it.  But I expect it will entail a lot of work.  If there are enough people who are interested in this feature, may be we can move forward.
+
+Hi [~jesse_yates], was it a design goal to ensure compatibility for rolling upgrades/downgrades? Alternatively do you know of anything that can result in upgrade incompatibilities?
+
+From a quick look at the patch I saw two potential sources of incompatibility but haven't analyzed closely enough to be sure - (1) changes to the image transfer protocol and (2) BlockTokenSecretManager index range partitioning.
+
+Upgrades/downgrades between major versions isn't supported AFAIK. Those seem like the major 2 places for upgrade issues.
+
+Thank you for the quick response Jesse.
+
+Would love to see this feature in branch-2. How much work is involved to merge it?
+
+Do we initiate the back-port of this feature to branch-2? 
+According to my understanding, if I back port this feature to branch2 which is running on my server, there is no way to roll back, due to:
+(1) changes to the image transfer protocol and 
+(2) BlockTokenSecretManager index range partitioning. 
+Is that right?
+
+

@@ -1,0 +1,856 @@
+Encountered this class looking at hbase-client codebase to see what would it take to have multiple masters. A few comments/questions:
+
+ - looks like the only thing it does now is looking up/waiting for/checking meta,which is pretty much delegating to MetaRegionTracker. So should this class be removed and this functionality be just all in MetaRegionTracker?
+ - in light of zookeeper abstraction work, could we get away without ZK watchers/connection for meta lookup on client side? Meta is collocated with master (will be). The list of active masters can be set in config on client side, so location of meta could be retrieved with RPC call to master then.
+
+Thoughts?
+
+bq. So should this class be removed and this functionality be just all in MetaRegionTracker?
+
+CT is the remnant of a direction only part taken.  It should go away.  Above suggestion sounds good.
+
+bq. in light of zookeeper abstraction work, could we get away without ZK watchers/connection for meta lookup on client side? 
+
+I thought the client opened connection to zk to find meta and then closed its zk connection?  No watchers in client?  If they exist still, there is a JIRA to undo this (asynchbase does this -- asks zk, then lets go of its zk connection... no permanent connnection).
+
+bq. Meta is collocated with master (will be). The list of active masters can be set in config on client side, so location of meta could be retrieved with RPC call to master then.
+
+This seems a little dangerous?  If Masters in cluster are changed, all clients must be updated rather than just zk?
+
+Or are you saying that just as client has address of the zk ensemble, we'd have the equivalent for the cluster of hbase masters?  An address for the hbase massters quorum?
+
+
+
+bq. I thought the client opened connection to zk to find meta and then closed its zk connection?
+MetaRegionTracker subclasses ZooKeeperNodeTracker and hence it does track the znode through watcher, and this class is using within ConnectionManager. Unless I'm missing something, it's client<-->zk connection? I would also think that having client subscribed to ZK watchers isn't good.
+
+bq. This seems a little dangerous? If Masters in cluster are changed, all clients must be updated rather than just zk? Or are you saying that just as client has address of the zk ensemble, we'd have the equivalent for the cluster of hbase masters? An address for the hbase massters quorum?
+
+Yes, that's what I mean. My thinking is that we will have quorum of multiple active masters, each one hosting replica of meta (how to make meta splittable across machine is important consideration, but bit off this topic), and in this picture client shouldn't need to know ZK ansimble.
+
+ - each client knows about quorum of active masters (like ip:port;ip:port list or so)
+ - on initial connection client chooses which master to connect to, and then sticks to it as long, as master is alive. If this master fails, client fails over to next one in the list (round-robin)
+ - meta location isn't need to client, as it's collocated with meta. Strictly speaking, even if meta is split apart for scalability, client can find out location for required meta region by sending RPC to his master.
+
+What do you think? I can pick up this one. Aligns with my work anyway and seems worth doing.
+
+
+bq. What do you think? I can pick up this one. Aligns with my work anyway and seems worth doing.
+
+Removing CT?  If so, that'd be great.
+
+HBASE-5573 is the issue discussing undoing of watchers.
+
+On  multi masters, that is another issue right?  (What you describe sounds right).
+
+
+Yes, on removing CT (if everybody agreed on the approach).
+
+Thanks for the pointer - reading through now.
+
+HBASE-11241 - that's the one for multiple masters. i"m working on design for that.
+
+As I'm working on that, I'm also doing the following, unless objections:
+
+ - merge MetaReader and MetaEditor into single class (that is also what TODOs suggest), make it just single class MetaEditor to be living in hbase-client.
+ - remove org.apache.hadoop.hbase.catalog.MetaMigrationConvertingToPB, as javadoc says "@deprecated will be removed for the major release after 0.96."
+ - remove package org.apache.hadoop.hbase.catalog as not needed anymore.
+
+Actually, as I think more about it, why do we need to have MetaRegionTracker now, as we have hbase:meta collocated with master. I think it can be subsequent jira to delete or rework this piece.
+
+bq. Actually, as I think more about it, why do we need to have MetaRegionTracker now, as we have hbase:meta collocated with master.
+
+IIRC, there is a flag still which says whether above is true or not and we have yet to decide if for 1.0 the above will be true.
+
+On the rest of the things you are doing, +1.  That'd be excellent [~mantonov]
+
+[~stack] yep, you're right. I guess, when/if co-location of meta is decided to be mandatory, that may be discussed separately.
+
+Few more notes as I'm making up patch.
+
+ I think it makes sense to refactor MetaRegionTracker to not extend ZooKeeperNodeTracker (as I digged into the code, its interesting. First, it doesn't really use cached value of znode, but goes actually to ZK each time anyway, second, when used from client, e.g. HBaseAdmin, we just start CatalogTracker with this MetaRegionTracker inside, do the lookup, shut the tracker. watcher get's technically registered, but isn't used).
+
+The other thing. Currently Server has method to retrieve instance of CatalogTracker. As we're getting rid of this, I think I'm just about to remove this method, and instead have method up there to retrieve short-circuit HConnection (this is what is used now inside CatalogTracker when instantiated inside HRS or HM).
+
+Thoughts?
+
+Attacked is really just a sketchy patch to maybe get initial feedback (apologize for the size, but this CT is widespread). I expect a good portion of this patch to go away or be reworked after reviews.
+
+Key changes and points to discuss:
+
+ - removed CT class and ported some logic pertaining to it into MetaRegionTracker
+ - As described above, MetaRegionTracker was subclassing ZooKeeperNodeTracker - i.e. watcher -  class needlessly (as all actual lookups were not against the cached znode value, but to actual ZK quorum even from the server side - and on client side we, as discussed, don't want to set watchers). So, renamed it to MetaRegionLocator.
+ - during this work..here's the thing to discuss, almost always what we need is HConnection instance to the server and/or instance of ZooKeeperWatcher, which is something i want to get rid of, eventually, but here I had to actually pass it around to make it available in the meta lookups. Hope we can simplify it a lot if meta lookups are made thru MasterProto rpc calls.
+ - Also, as part of this rework, I made the MetaRegionLocator to mostly be static util class, so it doesn't actually have lifecycle (not sure whether it's good idea to have lifecycle about logic like -getting meta location, if we don't use ZK watchers. getting location is stateless call, right?). Feedback appreciated.
+ - in light of this effort above, I removed reference to CatalogTracker from Server interface, and instead added a method getShortCircuitConnection (as in quite a lot of places we're doing the lookups on server side where it's convenient to get short circuit connection directly from the server, and on client side - we just can get it using HConnectionManager.getConnection(conf))
+ - Removed MetaMigrationConvertingToPB class, as javadoc suggests it to be obsolete (this patch I actually extracted and posted under HBASE-11333, seems independent change..)
+ - Merged together MetaReader and MetaEditor and called the result MetaTableAccessor.
+
+Something like that. Thinking that patch may (shall?) be broken down to smaller pieces, though they would be cross-dependent probably anyway.
+
+
+rebased, same draft version
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12650221/HBASE-4495.patch
+  against trunk revision .
+  ATTACHMENT ID: 12650221
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 124 new or modified tests.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:red}-1 javadoc{color}.  The javadoc tool appears to have generated 5 warning messages.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 lineLengths{color}.  The patch introduces the following lines longer than 100:
+    +  public static int getRegionCount(final Configuration c, final String tableName) throws IOException {
++   * Adds a (single) hbase:meta row for the specified new region and its daughters. Note that this does
++   * Adds a (single) hbase:meta row for the specified new region and its daughters. Note that this does
++                                 final HRegionInfo regionInfo, final ServerName sn, final long openSeqNum)
++                                  HRegionInfo mergedRegion, HRegionInfo regionA, HRegionInfo regionB,
++  private static void multiMutate(HTable table, byte[] row, Mutation... mutations) throws IOException {
++    MultiRowMutationProtos.MutateRowsRequest.Builder mmrBuilder = MultiRowMutationProtos.MutateRowsRequest.newBuilder();
++        mmrBuilder.addMutationRequest(ProtobufUtil.toMutation(ClientProtos.MutationProto.MutationType.PUT, mutation));
++        mmrBuilder.addMutationRequest(ProtobufUtil.toMutation(ClientProtos.MutationProto.MutationType.DELETE, mutation));
++    Pair<HRegionInfo, ServerName> pair = MetaTableAccessor.getRegion(connection, tableNameOrRegionName);
+
+  {color:green}+1 site{color}.  The mvn site goal succeeds with this patch.
+
+     {color:red}-1 core tests{color}.  The patch failed these unit tests:
+     
+
+     {color:red}-1 core zombie tests{color}.  There are 2 zombie test(s): 	at org.apache.hadoop.hbase.catalog.TestMetaRegionLocator.testInterruptWaitOnMeta(TestMetaRegionLocator.java:163)
+	at org.apache.hadoop.hbase.master.TestAssignmentManager.testSSHTimesOutOpeningRegionTransition(TestAssignmentManager.java:1050)
+
+Test results: https://builds.apache.org/job/PreCommit-HBASE-Build/9762//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9762//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-examples.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9762//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-hadoop-compat.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9762//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-prefix-tree.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9762//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-thrift.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9762//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-server.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9762//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-client.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9762//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-hadoop2-compat.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9762//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-common.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9762//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-protocol.html
+Console output: https://builds.apache.org/job/PreCommit-HBASE-Build/9762//console
+
+This message is automatically generated.
+
+@stack would you prefer this version of patch on RB?
+
+[~mantonov] It would make it easier to review sir.
+
+Posted - https://reviews.apache.org/r/22599/
+
+patch v2 for testing
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12652295/HBASE-4495.patch
+  against trunk revision .
+  ATTACHMENT ID: 12652295
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 126 new or modified tests.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:red}-1 javadoc{color}.  The javadoc tool appears to have generated 3 warning messages.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 2 new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 lineLengths{color}.  The patch introduces the following lines longer than 100:
+    +#org.apache.hadoop.hbase.mapreduce.TestTableInputFormatScan,org.apache.hadoop.hbase.catalog.TestMetaTableAccessorNoCluster,org.apache.hadoop.hbase.catalog.TestMetaTableAccessor,org.apache.hadoop.hbase.mapreduce.TestHFileOutputFormat,org.apache.hadoop.hbase.mapred.TestTableMapReduce,org.apache.hadoop.hbase.coprocessor.TestMasterCoprocessorExceptionWithAbort,org.apache.hadoop.hbase.coprocessor.TestMasterCoprocessorExceptionWithRemove,org.apache.hadoop.hbase.client.TestAdmin,org.apache.hadoop.hbase.master.TestMasterFailover,org.apache.hadoop.hbase.regionserver.wal.TestLogRolling,org.apache.hadoop.hbase.master.TestDistributedLogSplitting,org.apache.hadoop.hbase.master.TestMasterRestartAfterDisablingTable,org.apache.hadoop.hbase.TestGlobalMemStoreSize,
++  public static int getRegionCount(final Configuration c, final String tableName) throws IOException {
++   * Adds a (single) hbase:meta row for the specified new region and its daughters. Note that this does
++   * Adds a (single) hbase:meta row for the specified new region and its daughters. Note that this does
++                                 final HRegionInfo regionInfo, final ServerName sn, final long openSeqNum)
++                                  HRegionInfo mergedRegion, HRegionInfo regionA, HRegionInfo regionB,
++  private static void multiMutate(HTable table, byte[] row, Mutation... mutations) throws IOException {
++    MultiRowMutationProtos.MutateRowsRequest.Builder mmrBuilder = MultiRowMutationProtos.MutateRowsRequest.newBuilder();
++        mmrBuilder.addMutationRequest(ProtobufUtil.toMutation(ClientProtos.MutationProto.MutationType.PUT, mutation));
++        mmrBuilder.addMutationRequest(ProtobufUtil.toMutation(ClientProtos.MutationProto.MutationType.DELETE, mutation));
+
+  {color:green}+1 site{color}.  The mvn site goal succeeds with this patch.
+
+     {color:red}-1 core tests{color}.  The patch failed these unit tests:
+                       org.apache.hadoop.hbase.regionserver.TestHRegion
+
+Test results: https://builds.apache.org/job/PreCommit-HBASE-Build/9838//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9838//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-examples.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9838//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-hadoop-compat.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9838//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-prefix-tree.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9838//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-thrift.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9838//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-server.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9838//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-client.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9838//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-hadoop2-compat.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9838//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-common.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9838//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-protocol.html
+Console output: https://builds.apache.org/job/PreCommit-HBASE-Build/9838//console
+
+This message is automatically generated.
+
+Retry to see if the TestHRegion failure 'real'.
+
+re-running...
+
+testBatchPut(org.apache.hadoop.hbase.regionserver.TestHRegion): Metrics Counters should be equal expected:<208> but was:<207>
+
+ - that doesn't look like something related to by changes, yeah. Will fix warnings in the next version.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12652315/HBASE-4495.patch
+  against trunk revision .
+  ATTACHMENT ID: 12652315
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 126 new or modified tests.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:red}-1 javadoc{color}.  The javadoc tool appears to have generated 3 warning messages.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 2 new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 lineLengths{color}.  The patch introduces the following lines longer than 100:
+    +#org.apache.hadoop.hbase.mapreduce.TestTableInputFormatScan,org.apache.hadoop.hbase.catalog.TestMetaTableAccessorNoCluster,org.apache.hadoop.hbase.catalog.TestMetaTableAccessor,org.apache.hadoop.hbase.mapreduce.TestHFileOutputFormat,org.apache.hadoop.hbase.mapred.TestTableMapReduce,org.apache.hadoop.hbase.coprocessor.TestMasterCoprocessorExceptionWithAbort,org.apache.hadoop.hbase.coprocessor.TestMasterCoprocessorExceptionWithRemove,org.apache.hadoop.hbase.client.TestAdmin,org.apache.hadoop.hbase.master.TestMasterFailover,org.apache.hadoop.hbase.regionserver.wal.TestLogRolling,org.apache.hadoop.hbase.master.TestDistributedLogSplitting,org.apache.hadoop.hbase.master.TestMasterRestartAfterDisablingTable,org.apache.hadoop.hbase.TestGlobalMemStoreSize,
++  public static int getRegionCount(final Configuration c, final String tableName) throws IOException {
++   * Adds a (single) hbase:meta row for the specified new region and its daughters. Note that this does
++   * Adds a (single) hbase:meta row for the specified new region and its daughters. Note that this does
++                                 final HRegionInfo regionInfo, final ServerName sn, final long openSeqNum)
++                                  HRegionInfo mergedRegion, HRegionInfo regionA, HRegionInfo regionB,
++  private static void multiMutate(HTable table, byte[] row, Mutation... mutations) throws IOException {
++    MultiRowMutationProtos.MutateRowsRequest.Builder mmrBuilder = MultiRowMutationProtos.MutateRowsRequest.newBuilder();
++        mmrBuilder.addMutationRequest(ProtobufUtil.toMutation(ClientProtos.MutationProto.MutationType.PUT, mutation));
++        mmrBuilder.addMutationRequest(ProtobufUtil.toMutation(ClientProtos.MutationProto.MutationType.DELETE, mutation));
+
+  {color:green}+1 site{color}.  The mvn site goal succeeds with this patch.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in .
+
+Test results: https://builds.apache.org/job/PreCommit-HBASE-Build/9840//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9840//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-examples.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9840//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-hadoop-compat.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9840//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-prefix-tree.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9840//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-thrift.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9840//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-server.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9840//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-client.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9840//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-hadoop2-compat.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9840//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-common.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9840//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-protocol.html
+Console output: https://builds.apache.org/job/PreCommit-HBASE-Build/9840//console
+
+This message is automatically generated.
+
+patch v2. reworked according to comments on RB + fixed javadoc warnings and long lines.
+
+rebased patch
+
+Looks like Hadoop-QA is stuck and not building?
+
+Rebased after HBASE-10070 merge to master branch (jumped to v5 to re-align with versions posted on RB). Will post on RB too.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12653277/HBASE-4495-v5.patch
+  against trunk revision .
+  ATTACHMENT ID: 12653277
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 132 new or modified tests.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:red}-1 javadoc{color}.  The javadoc tool appears to have generated 5 warning messages.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 13 new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 lineLengths{color}.  The patch introduces the following lines longer than 100:
+    +#org.apache.hadoop.hbase.mapreduce.TestTableInputFormatScan,org.apache.hadoop.hbase.catalog.TestMetaTableAccessorNoCluster,org.apache.hadoop.hbase.catalog.TestMetaTableAccessor,org.apache.hadoop.hbase.mapreduce.TestHFileOutputFormat,org.apache.hadoop.hbase.mapred.TestTableMapReduce,org.apache.hadoop.hbase.coprocessor.TestMasterCoprocessorExceptionWithAbort,org.apache.hadoop.hbase.coprocessor.TestMasterCoprocessorExceptionWithRemove,org.apache.hadoop.hbase.client.TestAdmin,org.apache.hadoop.hbase.master.TestMasterFailover,org.apache.hadoop.hbase.regionserver.wal.TestLogRolling,org.apache.hadoop.hbase.master.TestDistributedLogSplitting,org.apache.hadoop.hbase.master.TestMasterRestartAfterDisablingTable,org.apache.hadoop.hbase.TestGlobalMemStoreSize,
++  public static void removeRegionReplicasFromMeta(Set<byte[]> metaRows, int replicaIndexToDeleteFrom,
++    Pair<HRegionInfo, ServerName> pair = MetaTableAccessor.getRegion(connection, tableNameOrRegionName);
++      sb.append("\nRegion server holding hbase:meta: " + new MetaTableLocator().getMetaRegionLocation(zkw));
++  public DisableTableHandler(Server server, TableName tableName, AssignmentManager assignmentManager,
++        MetaTableAccessor.mergeRegions(server.getShortCircuitConnection(), mergedRegion.getRegionInfo(), region_a
++        mergeRegionsAndPutMetaEntries(server.getShortCircuitConnection(), mergedRegion.getRegionInfo(),
++          return HConnectionTestingUtility.getMockedConnectionAndDecorate(TESTUTIL.getConfiguration(),
++          return HConnectionTestingUtility.getMockedConnectionAndDecorate(TESTUTIL.getConfiguration(),
++        deleteOneReplicaLocation.deleteColumns(HConstants.CATALOG_FAMILY, MetaTableAccessor.getServerColumn(1));
+
+  {color:green}+1 site{color}.  The mvn site goal succeeds with this patch.
+
+     {color:red}-1 core tests{color}.  The patch failed these unit tests:
+     
+
+     {color:red}-1 core zombie tests{color}.  There are 1 zombie test(s): 	at org.apache.hadoop.hbase.master.TestMasterOperationsForRegionReplicas.testCreateTableWithSingleReplica(TestMasterOperationsForRegionReplicas.java:91)
+
+Test results: https://builds.apache.org/job/PreCommit-HBASE-Build/9906//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9906//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-protocol.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9906//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-thrift.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9906//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-client.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9906//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-hadoop2-compat.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9906//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-examples.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9906//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-prefix-tree.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9906//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-common.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9906//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-server.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9906//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-hadoop-compat.html
+Console output: https://builds.apache.org/job/PreCommit-HBASE-Build/9906//console
+
+This message is automatically generated.
+
+Retry
+
+Hm, that's genuine failure (hanging) in test. looking.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12653320/HBASE-4495-v5.patch
+  against trunk revision .
+  ATTACHMENT ID: 12653320
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 132 new or modified tests.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 13 new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 lineLengths{color}.  The patch introduces the following lines longer than 100:
+    +#org.apache.hadoop.hbase.mapreduce.TestTableInputFormatScan,org.apache.hadoop.hbase.catalog.TestMetaTableAccessorNoCluster,org.apache.hadoop.hbase.catalog.TestMetaTableAccessor,org.apache.hadoop.hbase.mapreduce.TestHFileOutputFormat,org.apache.hadoop.hbase.mapred.TestTableMapReduce,org.apache.hadoop.hbase.coprocessor.TestMasterCoprocessorExceptionWithAbort,org.apache.hadoop.hbase.coprocessor.TestMasterCoprocessorExceptionWithRemove,org.apache.hadoop.hbase.client.TestAdmin,org.apache.hadoop.hbase.master.TestMasterFailover,org.apache.hadoop.hbase.regionserver.wal.TestLogRolling,org.apache.hadoop.hbase.master.TestDistributedLogSplitting,org.apache.hadoop.hbase.master.TestMasterRestartAfterDisablingTable,org.apache.hadoop.hbase.TestGlobalMemStoreSize,
++  public static void removeRegionReplicasFromMeta(Set<byte[]> metaRows, int replicaIndexToDeleteFrom,
++    Pair<HRegionInfo, ServerName> pair = MetaTableAccessor.getRegion(connection, tableNameOrRegionName);
++      sb.append("\nRegion server holding hbase:meta: " + new MetaTableLocator().getMetaRegionLocation(zkw));
++  public DisableTableHandler(Server server, TableName tableName, AssignmentManager assignmentManager,
++        MetaTableAccessor.mergeRegions(server.getShortCircuitConnection(), mergedRegion.getRegionInfo(), region_a
++        mergeRegionsAndPutMetaEntries(server.getShortCircuitConnection(), mergedRegion.getRegionInfo(),
++          return HConnectionTestingUtility.getMockedConnectionAndDecorate(TESTUTIL.getConfiguration(),
++          return HConnectionTestingUtility.getMockedConnectionAndDecorate(TESTUTIL.getConfiguration(),
++        deleteOneReplicaLocation.deleteColumns(HConstants.CATALOG_FAMILY, MetaTableAccessor.getServerColumn(1));
+
+  {color:green}+1 site{color}.  The mvn site goal succeeds with this patch.
+
+     {color:red}-1 core tests{color}.  The patch failed these unit tests:
+     
+
+Test results: https://builds.apache.org/job/PreCommit-HBASE-Build/9914//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9914//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-examples.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9914//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-hadoop-compat.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9914//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-prefix-tree.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9914//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-thrift.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9914//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-server.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9914//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-client.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9914//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-hadoop2-compat.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9914//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-common.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9914//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-protocol.html
+Console output: https://builds.apache.org/job/PreCommit-HBASE-Build/9914//console
+
+This message is automatically generated.
+
+v6 patch for QA run.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12653355/HBASE-4495-v6.patch
+  against trunk revision .
+  ATTACHMENT ID: 12653355
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 145 new or modified tests.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 13 new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 lineLengths{color}.  The patch introduces the following lines longer than 100:
+    +#org.apache.hadoop.hbase.mapreduce.TestTableInputFormatScan,org.apache.hadoop.hbase.catalog.TestMetaTableAccessorNoCluster,org.apache.hadoop.hbase.catalog.TestMetaTableAccessor,org.apache.hadoop.hbase.mapreduce.TestHFileOutputFormat,org.apache.hadoop.hbase.mapred.TestTableMapReduce,org.apache.hadoop.hbase.coprocessor.TestMasterCoprocessorExceptionWithAbort,org.apache.hadoop.hbase.coprocessor.TestMasterCoprocessorExceptionWithRemove,org.apache.hadoop.hbase.client.TestAdmin,org.apache.hadoop.hbase.master.TestMasterFailover,org.apache.hadoop.hbase.regionserver.wal.TestLogRolling,org.apache.hadoop.hbase.master.TestDistributedLogSplitting,org.apache.hadoop.hbase.master.TestMasterRestartAfterDisablingTable,org.apache.hadoop.hbase.TestGlobalMemStoreSize,
++   * Callers should call close on the returned {@link org.apache.hadoop.hbase.client.HTable} instance.
++  public static Result getMetaTableRowResultAsSplitRegion(final HRegionInfo hri, final ServerName sn)
++    //windows fix: tgz file has hbase:meta directory renamed as -META- since the original is an illegal
++    //name under windows. So we rename it back. See src/test/data//TestMetaMigrationConvertingToPB.README and
++   * Does {@link org.apache.hadoop.hbase.MetaTableAccessor#getRegion(org.apache.hadoop.hbase.client.HConnection,
++      Put putA = MetaTableAccessor.makePutFromRegionInfo(daughterRegions.getFirst().getRegionInfo());
++      Put putB = MetaTableAccessor.makePutFromRegionInfo(daughterRegions.getSecond().getRegionInfo());
+
+  {color:green}+1 site{color}.  The mvn site goal succeeds with this patch.
+
+     {color:red}-1 core tests{color}.  The patch failed these unit tests:
+                       org.apache.hadoop.hbase.client.TestMultiParallel
+
+     {color:red}-1 core zombie tests{color}.  There are 3 zombie test(s): 	at org.apache.hadoop.hbase.mapreduce.TestMultiTableInputFormat.testScan(TestMultiTableInputFormat.java:244)
+	at org.apache.hadoop.hbase.mapreduce.TestMultiTableInputFormat.testScanOBBToOPP(TestMultiTableInputFormat.java:189)
+	at org.apache.hadoop.hbase.mapreduce.TestImportExport.testDurability(TestImportExport.java:562)
+
+Test results: https://builds.apache.org/job/PreCommit-HBASE-Build/9917//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9917//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-hadoop2-compat.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9917//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-prefix-tree.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9917//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-client.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9917//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-common.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9917//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-protocol.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9917//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-server.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9917//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-examples.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9917//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-thrift.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9917//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-hadoop-compat.html
+Console output: https://builds.apache.org/job/PreCommit-HBASE-Build/9917//console
+
+This message is automatically generated.
+
+All tests which failed in v6 patch pass on my local. Reattaching patch, v7, with fixed long lines.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12653428/HBASE-4495-v7.patch
+  against trunk revision .
+  ATTACHMENT ID: 12653428
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 145 new or modified tests.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 13 new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 lineLengths{color}.  The patch does not introduce lines longer than 100
+
+  {color:green}+1 site{color}.  The mvn site goal succeeds with this patch.
+
+     {color:red}-1 core tests{color}.  The patch failed these unit tests:
+                       org.apache.hadoop.hbase.replication.TestReplicationDisableInactivePeer
+                  org.apache.hadoop.hbase.regionserver.TestSplitTransactionOnCluster
+
+     {color:red}-1 core zombie tests{color}.  There are 1 zombie test(s): 	at org.apache.hadoop.hbase.client.TestReplicaWithCluster.testCreateDeleteTable(TestReplicaWithCluster.java:138)
+
+Test results: https://builds.apache.org/job/PreCommit-HBASE-Build/9923//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9923//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-examples.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9923//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-hadoop-compat.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9923//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-prefix-tree.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9923//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-thrift.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9923//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-server.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9923//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-client.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9923//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-hadoop2-compat.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9923//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-common.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9923//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-protocol.html
+Console output: https://builds.apache.org/job/PreCommit-HBASE-Build/9923//console
+
+This message is automatically generated.
+
+Failures seem unrelated.  Retry.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12653459/HBASE-4495-v7.patch
+  against trunk revision .
+  ATTACHMENT ID: 12653459
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 145 new or modified tests.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 13 new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 lineLengths{color}.  The patch does not introduce lines longer than 100
+
+  {color:green}+1 site{color}.  The mvn site goal succeeds with this patch.
+
+     {color:red}-1 core tests{color}.  The patch failed these unit tests:
+                       org.apache.hadoop.hbase.replication.TestReplicationDisableInactivePeer
+                  org.apache.hadoop.hbase.regionserver.TestSplitTransactionOnCluster
+
+     {color:red}-1 core zombie tests{color}.  There are 1 zombie test(s): 	at org.apache.hadoop.hbase.client.TestReplicaWithCluster.testCreateDeleteTable(TestReplicaWithCluster.java:138)
+
+Test results: https://builds.apache.org/job/PreCommit-HBASE-Build/9926//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9926//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-examples.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9926//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-hadoop-compat.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9926//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-prefix-tree.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9926//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-thrift.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9926//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-server.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9926//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-client.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9926//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-hadoop2-compat.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9926//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-common.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/9926//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-protocol.html
+Console output: https://builds.apache.org/job/PreCommit-HBASE-Build/9926//console
+
+This message is automatically generated.
+
+On my local TestSplitTransactionOnCluster passes w/ and w/ this pach. However, TestReplicationDisableInactivePeer TestReplicaWithCluster fail even without this patch on master. Anybody seen that?
+
+Same fails for me on master
+
+------------------------------------------------------
+ T E S T S
+-------------------------------------------------------
+Java HotSpot(TM) 64-Bit Server VM warning: ignoring option MaxPermSize=256m; support was removed in 8.0
+Running org.apache.hadoop.hbase.replication.TestReplicationDisableInactivePeer
+
+
+
+Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 87.652 sec <<< FAILURE!
+
+Results :
+
+Failed tests:   testDisableInactivePeer(org.apache.hadoop.hbase.replication.TestReplicationDisableInactivePeer): Waited too much time for put replication
+
+Tests run: 1, Failures: 1, Errors: 0, Skipped: 0
+
+
+
+Ok.  Then unrelated to this patch.  I'm +1 on commit.  [~enis] Was going to apply to 0.99 too... if good by you.
+
+reported failing test in HBASE-11453
+
+Skimmed the patch. +1 for branch-1. It is a step in the right direction. 
+
+Thanks [~enis]!
+
+Committed to master and branch-1.  Thanks for removing this ugly wart Mikhail.
+
+Thanks [~stack] and [~enis] !
+
+FAILURE: Integrated in HBase-TRUNK #5264 (See [https://builds.apache.org/job/HBase-TRUNK/5264/])
+HBASE-4495 CatalogTracker has an identity crisis; needs to be cut-back in scope (Mikhail Antonov) (stack: rev 1d8958685ad94f2705df7205a7baeb055a419ccd)
+* hbase-client/src/main/java/org/apache/hadoop/hbase/zookeeper/MetaTableLocator.java
+* hbase-protocol/src/main/java/org/apache/hadoop/hbase/util/ByteStringer.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/MetaMockingUtil.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/TestMetaTableAccessor.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/TestMetaTableAccessorNoCluster.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/MetaMigrationConvertingToPB.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/MetaTableAccessor.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/TestMetaTableLocator.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/TestMetaMigrationConvertingToPB.java
+HBASE-4495 CatalogTracker has an identity crisis; needs to be cut-back in scope (Mikhail Antonov) (stack: rev ea085c6373ae238e896be755becdec7727bb89de)
+* hbase-server/src/test/java/org/apache/hadoop/hbase/catalog/TestCatalogTracker.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestMetaScanner.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/master/cleaner/TestLogsCleaner.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/FavoredNodeLoadBalancer.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/TestDrainingServer.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestScannerTimeout.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/MetaServerShutdownHandler.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/catalog/TestMetaReaderEditor.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/MetaScanner.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/MasterRpcServices.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/TestRegionRebalancing.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RegionMergeTransaction.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestGetClosestAtOrBefore.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/replication/regionserver/TestReplicationSourceManager.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestMasterFailover.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/catalog/MetaMockingUtil.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RegionServerServices.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/snapshot/CloneSnapshotHandler.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/TruncateTableHandler.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/catalog/MetaReader.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/replication/regionserver/ReplicationSyncUp.java
+* hbase-server/src/main/resources/hbase-webapps/master/table.jsp
+* hbase-client/src/main/java/org/apache/hadoop/hbase/zookeeper/MetaRegionTracker.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/util/hbck/OfflineMetaRebuildTestCore.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestSplitTransactionOnCluster.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestRegionServerNoMaster.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/master/cleaner/TestHFileLinkCleaner.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestAssignmentManagerOnCluster.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/snapshot/MasterSnapshotVerifier.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/ConnectionManager.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityController.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/RegionPlacementMaintainer.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/BaseLoadBalancer.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/MasterStatusServlet.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestMaster.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/RegionStates.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/snapshot/TestRestoreSnapshotHelper.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/handler/OpenRegionHandler.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/snapshot/RestoreSnapshotHandler.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/security/access/AccessController.java
+* bin/region_mover.rb
+* hbase-client/src/main/java/org/apache/hadoop/hbase/Server.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestClockSkewDetection.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/catalog/MetaMigrationConvertingToPB.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/replication/TestReplicationTrackerZKImpl.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/DeleteTableHandler.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestLoadIncrementalHFilesSplitRecovery.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/snapshot/SnapshotManager.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestRegionMergeTransactionOnCluster.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/MockRegionServerServices.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/DisableTableHandler.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/mapreduce/TableMapReduceUtil.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/util/HMerge.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/catalog/TestMetaReaderEditorNoCluster.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/TableEventHandler.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/snapshot/TakeSnapshotHandler.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestAdmin.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/catalog/TestMetaMigrationConvertingToPB.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/CatalogJanitor.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/RackManager.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/EnableTableHandler.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestMasterNoCluster.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/AssignmentManager.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestHeapMemoryManager.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/SplitTransaction.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/ModifyTableHandler.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/HConnection.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/zookeeper/ZKUtil.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/master/cleaner/TestHFileCleaner.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/ZooKeeperRegistry.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestMergeTable.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/coprocessor/TestRegionServerObserver.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/util/MockServer.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestCatalogJanitor.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestRestartCluster.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/HRegionInfo.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/catalog/MetaEditor.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/RegionStateStore.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/util/HBaseFsck.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/catalog/CatalogTracker.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/replication/TestReplicationStateZKImpl.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/CreateTableHandler.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/mapred/TableMapReduceUtil.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/procedure/flush/MasterFlushTableProcedureManager.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/migration/NamespaceUpgrade.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/FavoredNodeAssignmentHelper.java
+* dev-support/hbasetests.sh
+* hbase-server/src/main/java/org/apache/hadoop/hbase/util/RegionSplitter.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestActiveMasterManager.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/SnapshotOfRegionAssignmentFromMeta.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestHBaseFsck.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/ServerShutdownHandler.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/TableNamespaceManager.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestAssignmentManager.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/util/HBaseFsckRepair.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestRegionReplicas.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/security/token/TestTokenAuthentication.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/master/MockRegionServer.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/snapshot/RestoreSnapshotHelper.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestEndToEndSplitTransaction.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestMasterOperationsForRegionReplicas.java
+
+
+That doesn't look related to the patch, but rather strange. Bogus failures or dependencies are messed?
+
+{code}[ERROR] COMPILATION ERROR : 
+[INFO] -------------------------------------------------------------
+[ERROR] /home/jenkins/jenkins-slave/workspace/HBase-TRUNK/hbase-protocol/src/main/java/org/apache/hadoop/hbase/util/ByteStringer.java:[20,33] error: package org.apache.commons.logging does not exist
+[ERROR] /home/jenkins/jenkins-slave/workspace/HBase-TRUNK/hbase-protocol/src/main/java/org/apache/hadoop/hbase/util/ByteStringer.java:[21,33] error: package org.apache.commons.logging does not exist
+[ERROR] /home/jenkins/jenkins-slave/workspace/HBase-TRUNK/hbase-protocol/src/main/java/org/apache/hadoop/hbase/util/ByteStringer.java:[31,23] error: cannot find symbol
+[ERROR]   symbol:   class Log
+  location: class ByteStringer
+/home/jenkins/jenkins-slave/workspace/HBase-TRUNK/hbase-protocol/src/main/java/org/apache/hadoop/hbase/util/ByteStringer.java:[31,33] error: cannot find symbol
+[INFO] 4 errors 
+{code}
+
+SUCCESS: Integrated in HBase-1.0 #7 (See [https://builds.apache.org/job/HBase-1.0/7/])
+HBASE-4495 CatalogTracker has an identity crisis; needs to be cut-back in scope (Mikhail Antonov) (stack: rev 24a0a2a2bf17234fb391c27fc9da051c721e4b08)
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/ZooKeeperRegistry.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/catalog/MetaMigrationConvertingToPB.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestSplitTransactionOnCluster.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/MockRegionServerServices.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/migration/NamespaceUpgrade.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/TestDrainingServer.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestRegionReplicas.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/util/hbck/OfflineMetaRebuildTestCore.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/zookeeper/ZKUtil.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/util/MockServer.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestScannerTimeout.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/util/HBaseFsckRepair.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/util/HBaseFsck.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/master/cleaner/TestHFileLinkCleaner.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/ServerShutdownHandler.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/ModifyTableHandler.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/replication/regionserver/ReplicationSyncUp.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/handler/OpenRegionHandler.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/catalog/MetaMockingUtil.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestClockSkewDetection.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/snapshot/TakeSnapshotHandler.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/DisableTableHandler.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RegionServerServices.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/util/RegionSplitter.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/RegionStateStore.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestMasterNoCluster.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/security/visibility/VisibilityController.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/TestRegionRebalancing.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/master/cleaner/TestHFileCleaner.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/MasterRpcServices.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/Server.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestRegionServerNoMaster.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/BaseLoadBalancer.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/catalog/TestMetaReaderEditor.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/security/token/TestTokenAuthentication.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/snapshot/CloneSnapshotHandler.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestLoadIncrementalHFilesSplitRecovery.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestAssignmentManagerOnCluster.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/TruncateTableHandler.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestMergeTable.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/RegionStates.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/RackManager.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/SplitTransaction.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/snapshot/RestoreSnapshotHelper.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/CreateTableHandler.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestEndToEndSplitTransaction.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/replication/TestReplicationStateZKImpl.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/snapshot/RestoreSnapshotHandler.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestRestartCluster.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestHeapMemoryManager.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/TableEventHandler.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/SnapshotOfRegionAssignmentFromMeta.java
+* bin/region_mover.rb
+* hbase-client/src/main/java/org/apache/hadoop/hbase/catalog/MetaReader.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/catalog/TestMetaMigrationConvertingToPB.java
+* dev-support/hbasetests.sh
+* hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RegionMergeTransaction.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestMasterOperationsForRegionReplicas.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/snapshot/SnapshotManager.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/MetaScanner.java
+* hbase-server/src/main/resources/hbase-webapps/master/table.jsp
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/MetaServerShutdownHandler.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestMaster.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/RegionPlacementMaintainer.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestActiveMasterManager.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/FavoredNodeLoadBalancer.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/CatalogJanitor.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestRegionMergeTransactionOnCluster.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/EnableTableHandler.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/catalog/TestMetaReaderEditorNoCluster.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/mapreduce/TableMapReduceUtil.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/master/cleaner/TestLogsCleaner.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/procedure/flush/MasterFlushTableProcedureManager.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/replication/TestReplicationTrackerZKImpl.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/util/HMerge.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/ConnectionManager.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/snapshot/TestRestoreSnapshotHelper.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/balancer/FavoredNodeAssignmentHelper.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/HRegionInfo.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/replication/regionserver/TestReplicationSourceManager.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestGetClosestAtOrBefore.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestMetaScanner.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestMasterFailover.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/master/MockRegionServer.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestAdmin.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/util/TestHBaseFsck.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/TableNamespaceManager.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/MasterStatusServlet.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/security/access/AccessController.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestAssignmentManager.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/catalog/MetaEditor.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/catalog/TestCatalogTracker.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/HConnection.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestCatalogJanitor.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/zookeeper/MetaRegionTracker.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/coprocessor/TestRegionServerObserver.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/DeleteTableHandler.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/AssignmentManager.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/catalog/CatalogTracker.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/master/snapshot/MasterSnapshotVerifier.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/mapred/TableMapReduceUtil.java
+HBASE-4495 CatalogTracker has an identity crisis; needs to be cut-back in scope (Mikhail Antonov) (stack: rev 3b2de6233b246d23e529c7e05b96dbc976c3c060)
+* hbase-server/src/test/java/org/apache/hadoop/hbase/TestMetaTableLocator.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/MetaMigrationConvertingToPB.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/TestMetaMigrationConvertingToPB.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/MetaTableAccessor.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/zookeeper/MetaTableLocator.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/TestMetaTableAccessorNoCluster.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/MetaMockingUtil.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/TestMetaTableAccessor.java
+
+
+FAILURE: Integrated in HBase-TRUNK #5265 (See [https://builds.apache.org/job/HBase-TRUNK/5265/])
+HBASE-4495 CatalogTracker has an identity crisis; needs to be cut-back in scope (Mikhail Antonov); REMOVE ByteString.java accidentally added (stack: rev b79d6bf72989610abdd4d14e0c62d4363b828f6c)
+* hbase-protocol/src/main/java/org/apache/hadoop/hbase/util/ByteStringer.java
+
+
+I've noticed that the TestMetaTableLocator fails on me flakily a lot. I think this is because of the short (10ms) timeout which is shorter than rpc socket timeout (200ms). 
+
+I'll commit the addendum patch which fixes the problem for me. [~mantonov] can you please take a look. 
+
+[~enis] Thanks for noticing that.  Just looked the code in MetaTableLocator.waitMetaRegionLocation(), it seems wrong.
+
+Doc states it should return null if meta location isn't available, and this is what doWaiting() method checks, but in fact this method could never return null, it throws NotAllMetaRegionsOnlineException is location is null. Let me think a minute on that.
+
+Sure, we can also open a follow up jira if this gets involved. If not, just add an addendum, I'll commit. 
+
+If that fix resolves the problem for you, let's commit (that's only change in the test class)? I'll look into how to cleanup this piece of code meanwhile.
+
+Sounds good. I've committed the addendum. 
+
+Thanks [~enis].
+
+Attached cleanup patch (needs QA run). [~enis] could you take a look?
+
+Should this still be 100ms wait? 
+{code}
+-      try {
+-        while (new MetaTableLocator().waitMetaRegionLocation(watcher, 10000) == null);
+-      } catch (NotAllMetaRegionsOnlineException e) {
+-        //Ignore
+-      }
++      while (new MetaTableLocator().waitMetaRegionLocation(watcher, 100) == null);
+{code}
+
+Old CatalogTracker returned null, and we want to keep this behavior from my understanding of the addendum2, is this it Mikhail? 
+
+Old code wanted to loop with 100ms interval up until meta becomes available (as javadocs suggests that null being returned is indication that meta isn't available), but when NotAllMetaRegionsOnlineException exception is thrown, the loop is aborted. That code never really worked, I believe (need to double check the history), as internal call to waitMetaRegionLocation() could never return null - it throws this exception instead if meta isn't available.
+
+The wait in this place should be not 100ms, but until meta becomes available, and new code loops until returned ServerName isn't null. Old code (before your addendum patch) just did one iteration of 100ms, and then threw exception and exited the loop.
+
+FAILURE: Integrated in HBase-TRUNK #5303 (See [https://builds.apache.org/job/HBase-TRUNK/5303/])
+HBASE-4495 CatalogTracker has an identity crisis; needs to be cut-back in scope (ADDENDUM patch to fix flaky unit test) (enis: rev 0b22eb07bb8ecfa456f170dc9a1dec418ed01e2a)
+* hbase-server/src/test/java/org/apache/hadoop/hbase/TestMetaTableLocator.java
+
+
+FAILURE: Integrated in HBase-1.0 #42 (See [https://builds.apache.org/job/HBase-1.0/42/])
+HBASE-4495 CatalogTracker has an identity crisis; needs to be cut-back in scope (ADDENDUM patch to fix flaky unit test) (enis: rev 11fccd94c0d6fce523c5e0eab55968b4ed5864b6)
+* hbase-server/src/test/java/org/apache/hadoop/hbase/TestMetaTableLocator.java
+
+
+[~stack] could you take a look at addendum-2 patch? Or it may may sense to file a separate cleanup jira for that.
+
+Closing this issue after 0.99.0 release. 
+

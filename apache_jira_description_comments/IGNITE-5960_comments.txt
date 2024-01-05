@@ -1,0 +1,175 @@
+failure scenario pseudo-code: 
+Suppose we have 3 instances of GridCacheMapEntry: E1, E2, E3.
+Which got updated in threads T1, T2, T3 respectively.
+User hasn't set any continuous query listeners yet.
+Threads update entries by CacheMapEntry#innerUpdate()
+
+1)T1 invokes cctx.continuousQueries().updateListeners() and got null.
+2)User set continuous query listener
+3)T2 invokes cctx.continuousQueries().updateListeners() and got listeners
+4)T2 evaluates updateCounter to 1 for E2(c.updateRes.updateCounter())
+5)T1 evaluates updateCounter to 2 for E1(c.updateRes.updateCounter())
+6)T2 evaluates cctx.continuousQueries().onEntryUpdated() and processes continuous entry
+7)T1 doesn't evaluate cctx.continuousQueries().onEntryUpdated()(because listeners are null)
+
+All entries are placed in CacheContinuousQueryEventBuffer.Batch#_entries_ before being processed.
+So, now there is only E2 in _entries_ array.
+8)T3 evaluates update counter 3 and put it into _entries_ array.
+Now, E3 would not been sent to users's listener due to E2 abscense in _entries_. Next entries would not been sent to user because CacheContinuousQueryEventBuffer.Batch#processEntry0 doesn’t return resulting entities(they just accumulate in _entries_).
+
+
+[~sergey-chugunov] Have fixed the issue. It can be reviewed.
+
+[~Alexey Kuznetsov] I reviewed your fix, it seems that the initial problem is still here, your change just reduces probability to spot it.
+
+As you correctly identified, bug is caused by the fact that entities of some updates (and corresponding update counters) may be skipped.
+
+Even with your fix lets consider the following sequence of events:
+1) T1 updates E1 (updateCounter gets incremented to 1);
+2) T2 updates E2 (updateCounter gets incremented to 2);
+3) T2 finishes update and exits GridCacheMapEntry::innerUpdate method;
+4) user adds continuous query listener;
+5) T1 proceeds, picks up listener (not null thanks to the fix) and notifies listener;
+6) T3 updates E3 (updateCounter gets incremented to 3) and notifies listener;
+
+After steps 5 and 6 we'll face the same issue as without fix (although its probability is much less).
+
+Proposed fix masks the problem not fixes it, so we need to come up with another approach.
+
+[~sergey-chugunov] Bug is the following, when we update entries, there is an empty cell in array CacheContinuousQueryEventBuffer#Batch#entries which prevents from sending events to user's listener.Empty cell appears due to certain entry wasn't updated in 
+ CacheContinuousQueryEventBuffer#processEntry(because lsnrs in CacheMapEntry#innerUpdate() is null)
+
+Actualy, the sequence of events you provided doesn't lead to an issue.
+
+Let's consider your sequence again:
+
+1) T1 updates E1 (updateCounter gets incremented to 1);
+2) T2 updates E2 (updateCounter gets incremented to 2);
+3) T2 finishes update and exits GridCacheMapEntry::innerUpdate method;{color:red} In this point we have CacheContinuousQueryEventBuffer#currentPartitionCounter equals 2{color}
+4) user adds continuous query listener;
+5) T1 proceeds, picks up listener (not null thanks to the fix) and notifies listener; {color:red}Batch#startCntr equals 2 (currentPartitionCounter() returns 2) so 
+ entry E1 would be filtered out of Batch (E1 update counter would be smaller than Batch#startCntr)
+PS E1 also can be sent to remote node(if we have remote listener installed) and processed in CacheContinuousQueryPartitionRecovery#collectEntries but it would be filtered out there.{color}
+6) T3 updates E3 (updateCounter gets incremented to 3) and notifies listener;
+
+After 6) user's listener would be notified only once by key 3.
+
+
+This issue has affected our application preventing live restart for our node. I have further investigated the issue and tired the propose fix but it didn't completely resolved the issue.
+
+Using my own extra debugging statements, I have determine that the missing events is down to the fact that if you have lots of concurrent threads updating the cache entries, the listener updates could potentially be out of sequence as there is no lock, like this:
+
+1) T1 test lsnrs!=null, assume no listener and obtain update counter 1
+2) T2 test lsnrs==null, assume no listener and obtain update counter 2
+3) T3 test lsnrs!=null, so there is a listener and obtain update counter 3
+
+So we end up with T1, T3 will send update event but T2 won't and this caused a gap in the update sequence.
+
+I will propose a fix which introduces a ReadWriteLock in the CCQM, and when we update the listener list we will obtain the write lock. Then in GridCacheMapEntry before we enter the synchronized block for the GridEntry, we obtain the Read lock. This way we ensure that the before the listener is updated all update/set cache entry will be completed. I have ran the unit test repeatedly using this fix and it seems to pass 100% of the time.
+
+[~sunnychanclsa] I have already created [Pull request|https://github.com/apache/ignite/pull/2728]
+This PR must fix your issue.
+
+[~akuznetsov] I have tried your patch but I can still reproduce the issue on my machine, using the unit test above and our own application.
+
+
+
+Pull request: https://github.com/apache/ignite/pull/3100
+
+[~sunnychanclsa] Can you provide reproducer of your problem, so that i can see the steps you described above?
+
+[~akuznetsov] The CacheContinuousQueryConcurrentPartitionUpdateTest is a redux of our problem. From our application prospective we did this:
+
+# Setup a cache with a pair of node
+# Setup continuous query, and update entries in the cache that would trigger the CQ
+# Remove one node forcefully (e.g. kill -9). The thread that update entries should continue in the background
+# Now restart the killed node and you will find the continuous query no longer gets any event even the update continuous.
+
+[~dpavlov] Hi!
+
+Could please review the ticket or suggest somebody to review it?
+Seems, [~sergey-chugunov] don't want to review it any longer
+The maintener of affected code was [~sboikov].
+
+[TC run|https://ci.ignite.apache.org/viewLog.html?buildId=1162426&tab=buildResultsDiv&buildTypeId=IgniteTests24Java8_RunAll]
+
+I rerun failed tests :
+[1 rerun |https://ci.ignite.apache.org/viewLog.html?buildId=1166871&tab=buildResultsDiv&buildTypeId=IgniteTests24Java8_Cache5]
+[2 rerun|https://ci.ignite.apache.org/viewLog.html?buildId=1166877&tab=buildResultsDiv&buildTypeId=IgniteTests24Java8_IgniteQueries2]
+[3 rerun|https://ci.ignite.apache.org/viewLog.html?buildId=1166878&tab=buildResultsDiv&buildTypeId=IgniteTests24Java8_IgniteQueries]
+
+As you can see all failed tests are flacky.
+
+Hi [~Alexey Kuznetsov],
+
+I see suspicious failure here:
+IgniteCacheTestSuite5: CacheLateAffinityAssignmentTest.testCreateCloseClientCacheOnCoordinator1 (master fail rate 0,0%) 
+
+Probably rebase (merge) of master into branch will solve this failure.
+
+[~dpavlov] Hi!
+
+I rerun the suspicious test, it passed after merge : [passed suite|https://ci.ignite.apache.org/viewLog.html?buildId=1168517&tab=buildResultsDiv&buildTypeId=IgniteTests24Java8_Cache5]
+
+I think this tikcet is ready for review
+
+[~Alexey Kuznetsov] I do not think that the fix is complete:
+Note that it would be cleaner to acquire the listeners map after the partition update counter is incremented, however, the listeners map is used in the {{needVal}}  flag evaluation. Currently it is possible that {{evtOldVal}} will be {{null}} if we read {{null}} from {{updateListeners}} in the first place.
+
+[~agoncharuk] 
+ > Note that it would be cleaner to acquire the listeners map after the partition update counter is incremented, however, the listeners map is used in the needVal flag evaluation.
+
+Yeah, I tried to acquire the listeners map *after* the partition update counter is incremented:
+ To do so, we firstly need to move _needVal_ and _readFromStore_ flags evaluation after update counter is incremented.
+ But _readFromStore_ flag must be evaluated strongly *before* partition counter is incremented, see _GridCacheMapEntry.AtomicCacheUpdateClosure#call_ where we load data from store.
+
+So, we cannot acquire the listeners map *after* the partition update counter is incremented.
+
+ 
+
+> Currently it is possible that {{evtOldVal}} will be {{null}} if we read {{null}} from {{updateListeners}} in the first place.
+
+In my fix, query entry must be filtered out  if we read {{null}} from {{updateListeners}} in the first place(this fixes the essential bug).
+
+To filter out entry, _newVal_ and _oldVal_ must be passed as nulls to _cctx.continuousQueries().onEntryUpdated_ ,
+ see _CacheContinuousQueryManager#onEntryUpdated_ , _CacheContinuousQueryManager#skipUpdateEvent_ .
+
+Let's consider again the scenario:
+
+1) T1 updates E1 (updateCounter gets incremented to 1);
+ 2) T2 updates E2 (updateCounter gets incremented to 2);
+ 3) T2 finishes update and exits GridCacheMapEntry::innerUpdate method; In this point we have CacheContinuousQueryEventBuffer#currentPartitionCounter equals 2
+ 4) user adds continuous query listener;
+ 5) T1 proceeds, picks up listener (not null thanks to the fix) and notifies listener; Batch#startCntr equals 2 (currentPartitionCounter() returns 2) so 
+ entry E1 would be filtered out of Batch (E1 update counter would be smaller than Batch#startCntr)
+ PS E1 also can be sent to remote node(if we have remote listener installed) and processed in CacheContinuousQueryPartitionRecovery#collectEntries,
+ but it would be filtered out there.
+ 6) T3 updates E3 (updateCounter gets incremented to 3) and notifies listener;
+
+After 6) user's listener would be notified only once by key 3.
+
+After listener is set by user, entry E1 must be filtered out.
+
+ 
+
+Are you agree with such changes ?
+
+[~Alexey Kuznetsov] If I understand correctly, in your last case the user will be notified with entry E2, but since the listeners map is re-acquired after the {{needVal}} flag evaluation, the event notification may see incorrect previous value. Also note that other methods such as {{innerSet}} and {{innerRemove}} also suffer from this race.
+
+I like the solution suggested by [~sunnychanclsa] better, because it linearizes entry update and CQ registration. 
+
+[~sunnychanclsa], would you mind pulling master to your PR (there are some conflicts due to changes related to Java 9 compatibility) and replacing the {{ReentrantReadWriteLock}} with {{StripedCompositeReadWriteLock}} to reduce contention because these updates are on a hot path? After this, we will need to run a benchmark to verify there are no performance regression.
+
+[~agoncharuk] Sure I will get the patch updated and get back to you shortly.
+
+I have updated the patch:
+ # Merge with master to refresh the code
+ # The patch now use StripedCompositeReadWriteLock
+ # Refactor and put docs around the new code
+
+Please review and let me know if there is anything else I need to change.
+
+[~sunnychanclsa] Thanks, we will check the benchmarks and merge the PR if all is ok shortly.
+
+Thanks, [~sunnychanclsa], merged your changes to master.
+

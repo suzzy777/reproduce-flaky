@@ -1,0 +1,186 @@
+Obtained a heap dump and poked around quite a bit and observed that in-memory state of the {{RingBufferEventHandler}} is corrupted. After analyzing it and eyeballing the code (long story short), came up with the following theory...
+
+This is the current implementation of SyncFuture#reset()
+{noformat}
+1  synchronized SyncFuture reset(final long sequence, Span span) {
+2    if (t != null && t != Thread.currentThread()) throw new IllegalStateException();
+3    t = Thread.currentThread();
+4    if (!isDone()) throw new IllegalStateException("" + sequence + " " + Thread.currentThread());
+5    this.doneSequence = NOT_DONE;
+6    this.ringBufferSequence = sequence;
+7    this.span = span;
+8    this.throwable = null;
+9    return this;
+10 }
+{noformat}
+We can see, there are guards against overwriting un-finished sync futures with checks on ‘current thread’ (L2) and !isDone() (L4). These are not tight checks, consider the following sequence of interleaved actions that can result in a deadlock..
+ # RPC handler#1 → WAL sync - SyncFuture#1 (from ThreadLocalCache) → Add to RingBuffer - state: NOT_DONE
+ # RingBufferConsumer#onEvent() → SyncFuture#1 dispatch → old state: NOT_DONE, new state: DONE (via releaseSyncFuture() in SyncRunner.run())
+ # RPCHandler#1 (reused for another region operation) → ThreadLocal SyncFuture#1 NOT_DONE (via reset()) (*this goes through because isDone() now returns true and L2 always returns true because we reuse the ThreadLocal instance*).
+ #  RingBufferConsumer#onEvent() - attainSafePoint() -> works on the overwritten sync future state (from step 3)
+ #  ======== DEADLOCK ======= (as the sync future remains in the state forever)
+
+The problem here is that once a SyncFuture is marked DONE, it is eligible for reuse. Even though ring buffer still has references to it and is checking on it to attain a safe point, in the background another handler can just overwrite it resulting in ring buffer operating on a wrong future and deadlocking the system. Very subtle bug.. I'm able to reproduce this in a carefully crafted unit test (attached). I have a fix solves this problem, will create a PR for review soon.
+
+This has been a recurring problem for us under load deadlocking a bunch of region servers and severely dropping the ingestion throughput until our probes trigger a force abort of the RS pods and the throughput recovers. I cannot share the heap dump for obvious reasons but can share any other details that reviewers might be interested in.
+
+[~bharathv] I think you can create PR. Support to run QA with uploaded patch is no longer available IIRC.
+
+After reading the AsyncFSWAL implementation, I think the overwrites of the futures are possible but it does not cause a deadlock because of the way the safe point is attained. I uploaded a draft patch that removes the usage of ThreadLocals for both the WAL implementations. It only matters for the FSHLog implementation but in general it seems risky to use ThreadLocals that are prone to overwrites. [~zhangduo] Any thoughts?
+
+FWIW I would prefer we use ThreadLocals only when there is no reasonable alternative. I don't think that bar is reached here, because as the PR demonstrates, a shared cache can work. I'm familiar with this work and some microbenchmarks done on the result (for branch-1, though) where the shared cache approach does not hurt performance and in fact produces a small performance benefit. Let me hold back on further comment until we have microbenchmarks comparing thread local vs shared cache approaches for async WAL.
+
+Results for branch master
+	[build #325 on builds.a.o|https://ci-hadoop.apache.org/job/HBase/job/HBase%20Nightly/job/master/325/]: (x) *{color:red}-1 overall{color}*
+----
+details (if available):
+
+(/) {color:green}+1 general checks{color}
+-- For more information [see general report|https://ci-hadoop.apache.org/job/HBase/job/HBase%20Nightly/job/master/325/General_20Nightly_20Build_20Report/]
+
+
+
+
+
+
+(/) {color:green}+1 jdk8 hadoop3 checks{color}
+-- For more information [see jdk8 (hadoop3) report|https://ci-hadoop.apache.org/job/HBase/job/HBase%20Nightly/job/master/325/JDK8_20Nightly_20Build_20Report_20_28Hadoop3_29/]
+
+
+(/) {color:green}+1 jdk11 hadoop3 checks{color}
+-- For more information [see jdk11 report|https://ci-hadoop.apache.org/job/HBase/job/HBase%20Nightly/job/master/325/JDK11_20Nightly_20Build_20Report_20_28Hadoop3_29/]
+
+
+(/) {color:green}+1 source release artifact{color}
+-- See build output for details.
+
+
+(/) {color:green}+1 client integration test{color}
+
+
+PR is merged. What is the status of this JIRA? Backports in progress? 
+
+Back port PRs are WIP (PR - jira auto link isn't working, it will catch up soon).
+
+https://github.com/apache/hbase/pull/3392
+https://github.com/apache/hbase/pull/3393
+https://github.com/apache/hbase/pull/3394
+
+Results for branch branch-2.3
+	[build #239 on builds.a.o|https://ci-hadoop.apache.org/job/HBase/job/HBase%20Nightly/job/branch-2.3/239/]: (x) *{color:red}-1 overall{color}*
+----
+details (if available):
+
+(/) {color:green}+1 general checks{color}
+-- For more information [see general report|https://ci-hadoop.apache.org/job/HBase/job/HBase%20Nightly/job/branch-2.3/239/General_20Nightly_20Build_20Report/]
+
+
+
+
+(/) {color:green}+1 jdk8 hadoop2 checks{color}
+-- For more information [see jdk8 (hadoop2) report|https://ci-hadoop.apache.org/job/HBase/job/HBase%20Nightly/job/branch-2.3/239/JDK8_20Nightly_20Build_20Report_20_28Hadoop2_29/]
+
+
+(/) {color:green}+1 jdk8 hadoop3 checks{color}
+-- For more information [see jdk8 (hadoop3) report|https://ci-hadoop.apache.org/job/HBase/job/HBase%20Nightly/job/branch-2.3/239/JDK8_20Nightly_20Build_20Report_20_28Hadoop3_29/]
+
+
+(x) {color:red}-1 jdk11 hadoop3 checks{color}
+-- For more information [see jdk11 report|https://ci-hadoop.apache.org/job/HBase/job/HBase%20Nightly/job/branch-2.3/239/JDK11_20Nightly_20Build_20Report_20_28Hadoop3_29/]
+
+
+(/) {color:green}+1 source release artifact{color}
+-- See build output for details.
+
+
+(/) {color:green}+1 client integration test{color}
+
+
+Results for branch branch-2
+	[build #279 on builds.a.o|https://ci-hadoop.apache.org/job/HBase/job/HBase%20Nightly/job/branch-2/279/]: (x) *{color:red}-1 overall{color}*
+----
+details (if available):
+
+(/) {color:green}+1 general checks{color}
+-- For more information [see general report|https://ci-hadoop.apache.org/job/HBase/job/HBase%20Nightly/job/branch-2/279/General_20Nightly_20Build_20Report/]
+
+
+
+
+(/) {color:green}+1 jdk8 hadoop2 checks{color}
+-- For more information [see jdk8 (hadoop2) report|https://ci-hadoop.apache.org/job/HBase/job/HBase%20Nightly/job/branch-2/279/JDK8_20Nightly_20Build_20Report_20_28Hadoop2_29/]
+
+
+(/) {color:green}+1 jdk8 hadoop3 checks{color}
+-- For more information [see jdk8 (hadoop3) report|https://ci-hadoop.apache.org/job/HBase/job/HBase%20Nightly/job/branch-2/279/JDK8_20Nightly_20Build_20Report_20_28Hadoop3_29/]
+
+
+(/) {color:green}+1 jdk11 hadoop3 checks{color}
+-- For more information [see jdk11 report|https://ci-hadoop.apache.org/job/HBase/job/HBase%20Nightly/job/branch-2/279/JDK11_20Nightly_20Build_20Report_20_28Hadoop3_29/]
+
+
+(/) {color:green}+1 source release artifact{color}
+-- See build output for details.
+
+
+(x) {color:red}-1 client integration test{color}
+-- Something went wrong with this stage, [check relevant console output|https://ci-hadoop.apache.org/job/HBase/job/HBase%20Nightly/job/branch-2/279//console].
+
+
+Results for branch branch-2.4
+	[build #144 on builds.a.o|https://ci-hadoop.apache.org/job/HBase/job/HBase%20Nightly/job/branch-2.4/144/]: (/) *{color:green}+1 overall{color}*
+----
+details (if available):
+
+(/) {color:green}+1 general checks{color}
+-- For more information [see general report|https://ci-hadoop.apache.org/job/HBase/job/HBase%20Nightly/job/branch-2.4/144/General_20Nightly_20Build_20Report/]
+
+
+
+
+(/) {color:green}+1 jdk8 hadoop2 checks{color}
+-- For more information [see jdk8 (hadoop2) report|https://ci-hadoop.apache.org/job/HBase/job/HBase%20Nightly/job/branch-2.4/144/JDK8_20Nightly_20Build_20Report_20_28Hadoop2_29/]
+
+
+(/) {color:green}+1 jdk8 hadoop3 checks{color}
+-- For more information [see jdk8 (hadoop3) report|https://ci-hadoop.apache.org/job/HBase/job/HBase%20Nightly/job/branch-2.4/144/JDK8_20Nightly_20Build_20Report_20_28Hadoop3_29/]
+
+
+(/) {color:green}+1 jdk11 hadoop3 checks{color}
+-- For more information [see jdk11 report|https://ci-hadoop.apache.org/job/HBase/job/HBase%20Nightly/job/branch-2.4/144/JDK11_20Nightly_20Build_20Report_20_28Hadoop3_29/]
+
+
+(/) {color:green}+1 source release artifact{color}
+-- See build output for details.
+
+
+(/) {color:green}+1 client integration test{color}
+
+
+Results for branch branch-1
+	[build #135 on builds.a.o|https://ci-hadoop.apache.org/job/HBase/job/HBase%20Nightly/job/branch-1/135/]: (x) *{color:red}-1 overall{color}*
+----
+details (if available):
+
+(x) {color:red}-1 general checks{color}
+-- For more information [see general report|https://ci-hadoop.apache.org/job/HBase/job/HBase%20Nightly/job/branch-1/135//General_Nightly_Build_Report/]
+
+
+(/) {color:green}+1 jdk7 checks{color}
+-- For more information [see jdk7 report|https://ci-hadoop.apache.org/job/HBase/job/HBase%20Nightly/job/branch-1/135//JDK7_Nightly_Build_Report/]
+
+
+(x) {color:red}-1 jdk8 hadoop2 checks{color}
+-- For more information [see jdk8 (hadoop2) report|https://ci-hadoop.apache.org/job/HBase/job/HBase%20Nightly/job/branch-1/135//JDK8_Nightly_Build_Report_(Hadoop2)/]
+
+
+
+
+(/) {color:green}+1 source release artifact{color}
+-- See build output for details.
+
+
+git bisect flags this pr as why we have 100% fail running TestPostIncrementAndAppendBeforeWAL on branch 2.3 (Run on mac or see bottom of [https://ci-hadoop.apache.org/view/HBase/job/HBase/job/HBase-Find-Flaky-Tests/job/branch-2.3/lastSuccessfulBuild/artifact/output/dashboard.html)] Let me see if can fix.
+
+Ignore my previous comment. Bisect (or more likely the pilot) identified the wrong issue... it is not this that is cause of failed test.
+

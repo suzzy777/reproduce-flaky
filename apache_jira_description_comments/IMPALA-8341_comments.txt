@@ -1,0 +1,171 @@
+The initial goal is to keep a working set in the local storage (e.g. SSD, HDD) at the compute nodes and to rely on the OS kernel page cache management to keep the hot working set in memory.
+
+Initially, the data cached will be purely blocks within a file on the remote storage. There are definitely a lot of rooms for experimentation / improvement in the future:
+ - context aware caching (e.g. caching uncompressed column chunks of Parquet files, caching deserialized footer of Parquet files)
+ - cache tiering (e.g. keep hot data in memory and evict cold entries to secondary storage (e.g. NVME, SSD))
+
+The rationale behind a simple storage based cache as an initial step is that:
+ 1. storage is relatively inexpensive compared to memory
+ 2. if after the initial cold miss, the working set fits in local storage, the performance should be close to that of local read configurations.
+
+Commit 2ece4c9b2e114a5e8873c5ac69e75b84c62bf5bd in impala's branch refs/heads/master from Michael Ho
+[ https://gitbox.apache.org/repos/asf?p=impala.git;h=2ece4c9 ]
+
+IMPALA-8341: Data cache for remote reads
+
+This is a patch based on PhilZ's prototype: https://gerrit.cloudera.org/#/c/12683/
+
+This change implements an IO data cache which is backed by
+local storage. It implicitly relies on the OS page cache
+management to shuffle data between memory and the storage
+device. This is useful for caching data read from remote
+filesystems (e.g. remote HDFS data node, S3, ABFS, ADLS).
+
+A data cache is divided into one or more partitions based on
+the configuration string which is a list of directories, separated
+by comma, followed by the storage capacity per directory.
+An example configuration string is like the following:
+  --data_cache_config=/data/0,/data/1:150GB
+
+In the configuration above, the cache may use up to 300GB of
+storage space, with 150GB max for /data/0 and /data/1 respectively.
+
+Each partition has a meta-data cache which tracks the mappings
+of cache keys to the locations of the cached data. A cache key
+is a tuple of (file's name, file's modification time, file offset)
+and a cache entry is a tuple of (backing file, offset in the backing
+file, length of the cached data, optional checksum). Note that the
+cache currently doesn't support overlapping ranges. In other words,
+if the cache contains an entry of a file for range [m, m+4MB), a lookup
+for [m+4K, m+8K) will miss in the cache. In practice, we haven't seen
+this as a problem but this may require further evaluation in the future.
+
+Each partition stores its set of cached data in backing files created
+on local storage. When inserting new data into the cache, the data is
+appended to the current backing file in use. The storage consumption
+of each cache entry counts towards the quota of that partition. When a
+partition reaches its capacity, the least recently used (LRU) data in
+that partition is evicted. Evicted data is removed from the underlying
+storage by punching holes in the backing file it's stored in. As a
+backing file reaches a certain size (by default 4TB), new data will
+stop being appended to it and a new file will be created instead. Note
+that due to hole punching, the backing file is actually sparse. When
+the number of backing files per partition exceeds,
+--data_cache_max_files_per_partition, files are deleted in the order
+in which they are created. Stale cache entries referencing deleted
+files are erased lazily or evicted due to inactivity.
+
+Optionally, checksumming can be enabled to verify read from the cache
+is consistent with what was inserted and to verify that multiple attempted
+insertions with the same cache key have the same cache content.
+Checksumming is enabled by default for debug builds.
+
+To probe for cached data in the cache, the interface Lookup() is used;
+To insert data into the cache, the interface Store() is used. Please note
+that eviction happens inline currently during Store().
+
+This patch also added two startup flags for start-impala-cluster.py:
+'--data_cache_dir' specifies the base directory in which each Impalad
+creates the caching directory
+'--data_cache_size' specifies the capacity string for each cache directory.
+
+Testing done:
+- added a new BE and EE test
+- exhaustive (debug, release) builds with cache enabled
+- core ASAN build with cache enabled
+
+Perf:
+- 16-streams TPCDS at 3TB in a 20 node S3 cluster shows about 30% improvement
+over runs without the cache. Each node has a cache size of 150GB per node.
+The performance is at parity with a configuration of a HDFS cluster using
+EBS as the storage.
+
+Change-Id: I734803c1c1787c858dc3ffa0a2c0e33e77b12edc
+Reviewed-on: http://gerrit.cloudera.org:8080/12987
+Reviewed-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+Tested-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+
+
+Initial implementation merged. Improvement may be needed in the future.
+
+@kwho Is this a high priority feature to be documented? As a performance improvement or a scalability improvement?
+
+[~arodoni_cloudera], yes. We probably should document how this cache should be enabled at a minimum. Let me file a doc JIRA to track it.
+
+Commit 25db9ea8f3f4de3086610ccb6040a101691e6340 in impala's branch refs/heads/master from Michael Ho
+[ https://gitbox.apache.org/repos/asf?p=impala.git;h=25db9ea ]
+
+IMPALA-8496: Fix flakiness of test_data_cache.py
+
+test_data_cache.py was added as part of IMPALA-8341 to verify
+that the DataCache hit / miss counts and the DataCache metrics
+are working as expected. The test seems to fail intermittently
+due to unexpected cache misses.
+
+Part of the test creates a temp table from tpch_parquet.lineitem
+and uses it to join against tpch_parquet.lineitem itself on the
+l_orderkey column. The test expects a complete cache hit for
+tpch_parquet.lineitem when joining against the temp table as it
+should be cached entirely as part of CTAS statement. However, this
+doesn't work as expected all the time. In particular, the data cache
+internally divides up the key space into multiple shards and a key
+is hashed to determine the shard it belongs to. By default, the
+number of shards is the same as number of CPU cores (e.g. 16 for AWS
+m5-4xlarge instance). Since the cache size is set to 500MB, each shard
+will have a capacity of 31MB only. In some cases, it's possible that
+some rows of l_orderkey are evicted if the shard they belong to grow
+beyond 31MB. The problem is not deterministic as part of the cache key
+is the modification time of the file, which changes from run-to-run as
+it's essentially determined by the data loading time of the job. This
+leads to flakiness of the test.
+
+To fix this problem, this patch forces the data cache to use a single
+shard only for determinisim. In addition, the test is also skipped for
+non-HDFS and HDFS erasure encoding builds as it's dependent on the scan
+range assignment. To exercise the cache more extensively, the plan is
+to enable it by default for S3 builds instead of relying on BE and E2E
+tests only.
+
+Testing done:
+- Ran test_data_cache.py 10+ times, each with different mtime
+  for tpch_parquet.lineitem; Used to fail 2 out of 3 runs.
+
+Change-Id: I98d5b8fa1d3fb25682a64bffaf56d751a140e4c9
+Reviewed-on: http://gerrit.cloudera.org:8080/13242
+Reviewed-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+Tested-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+
+
+Commit e29b387ea10739e78075bac8170e45722d4b9940 in impala's branch refs/heads/master from Alex Rodoni
+[ https://gitbox.apache.org/repos/asf?p=impala.git;h=e29b387 ]
+
+IMPALA-8341: [DOCS] Describe the setting for remote data caching
+
+Change-Id: I7dd958e4de109b46eaf906fe93145799af123b3f
+Reviewed-on: http://gerrit.cloudera.org:8080/13724
+Tested-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+Reviewed-by: Michael Ho <kwho@cloudera.com>
+
+
+Commit 875961da6fc60901685b2cc2de50644464ae102e in impala's branch refs/heads/master from Alex Rodoni
+[ https://gitbox.apache.org/repos/asf?p=impala.git;h=875961d ]
+
+IMPALA-8341: [DOCS] Added a note about the experiemental feature
+
+Change-Id: If9f5795a28738f7df435a3bea06ffa1a216fd04e
+Reviewed-on: http://gerrit.cloudera.org:8080/13788
+Tested-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+Reviewed-by: Michael Ho <kwho@cloudera.com>
+
+
+Commit 5fdef39fcf7e1b59bcf8d670d217ca7a88fc2738 in impala's branch refs/heads/master from Alex Rodoni
+[ https://gitbox.apache.org/repos/asf?p=impala.git;h=5fdef39 ]
+
+IMPALA-8341: [DOCS] Added a note about the requirement for existing dirs
+
+Change-Id: I5feddddff3ab7c09ee681098ec3e630977cb92f1
+Reviewed-on: http://gerrit.cloudera.org:8080/13793
+Reviewed-by: Alex Rodoni <arodoni@cloudera.com>
+Tested-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+
+

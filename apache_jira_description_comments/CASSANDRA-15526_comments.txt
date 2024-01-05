@@ -1,0 +1,105 @@
+The failure was seen on java 11
+
+I was able to reproduce locally and added a message to the assertion to get a bit more insight. When the {{TrieMemIndex}} is instantiated the map has a first and last key (it looks like a single key in this case) but size is returning 0. 
+
+ 
+{code:java}
+junit.framework.AssertionFailedError: min = -7787472368264638040, max = -7787472368264638040, count = 0 {code}
+
+[~jrwest] , are you looking into this one? I see it unassigned so I wasn't sure. 
+
+As I said in CASSANDRA-15527, on Ubuntu VM I am able to reproduce this one. Still no success with the other two reported by [~dcapwell] so I think his point that this one might be the main trouble maker is a valid assumption to start with.
+
+Do you want me to look into it?
+
+[~e.dimitrova] any input here is appreciated. I hadn't assigned it to myself since I wasn't able to look at it immediately (likely early next week I can) but I have been thinking about it on and off. The challenge, at first glance, is that {{ConcurrentSkipListSet#size()}} doesn't seem to be reliable (and the javadoc hints that this is sort of the case -- although I can't explain what I am seeing in that assert above just yet). The problem is we rely on the count (which is what we use {{size()}} for) for one important thing in RangeIntersectionIterator, the heuristic to determine if we use bounce or lookup. 
+
+[~jrwest]  Alright, I will try to dig into this now until the rest of the day and try to come up with some feedback too. 
+
+Thanks for sharing your findings, I was in the same direction yesterday but need to explore more the code.
+
+[~e.dimitrova] forgot to mention that you may find this minor change helpful: https://github.com/jrwest/cassandra/tree/sasi-concurrent-read-write-failure. Its the added assertion message above. 
+
+[~jrwest] thanks!
+
+As mentioned on Slack, I spent my afternoon to understand the codebase. 
+
+I don't see any other explanation for this flakiness than the one provided in the java doc for the size function (as you also pointed out). Why we only see it in java 11, that I am not sure about. Maybe we were just lucky before as there is the same note for the size method for Java 8.
+
+So this makes me think the efforts here should be to figure out a more stable test which could assure the needed results with higher certainty. Let me know if you agree with me here or if you have a different vision. 
+
+ 
+
+[~e.dimitrova] the use of {{size()}} in the code is definitely suspicious given the javadoc. Whats odd to me is {{isEmpty}}, {{first}}, {{size}} all rely on an internal method called {{findFirst}}. Unless we are deleting from the set, which right now I don't believe we are, it seems unexpected that the first two would return indicating elements are present but {{size}} does not -- even with the javadoc warning. With that in mind I'd like to better understand the root cause of the failure. I also explored if we could get rid of using {{size}} but I don't see a clear path to doing so at this time.
+
+I'm able to consistently reproduce this test failure in my dev environment on OSX with JDK 11 using breakpoints. If I set a breakpoint at the following line and keep stepping over it in the IDE, it will eventually throw the assertion error in RangeIterator.
+
+[https://gitbox.apache.org/repos/asf?p=cassandra.git;a=blob;f=test/unit/org/apache/cassandra/index/sasi/SASIIndexTest.java;h=0be05b901a3425adbb1bcd88d6d96a9f1efe5652;hb=HEAD#l1087]
+
+Note, you'll have to increase the test.timeout and range_request_timeout_in_ms to be able to debug it properly.
+
+The implementation of {{ConcurrentSkipListMap}} changed significantly from Java v8 to v11. In v8, {{ConcurrentSkipListMap#size}} iterates over the elements in the map and counts them as it goes. But in v11, {{ConcurrentSkipListMap}} holds an internal {{LongAdder}} instance, which is incremented as new elements are added.
+ In both versions, {{isEmpty}} will return false if it's able to find the head node.
+ The issue is that in v11 there's a potential race condition in which the head node may have been initialized, but the {{LongAdder}} hasn't been incremented yet, which leaves it briefly in an inconsistent state.
+ I confirmed that's the case by logging the value of {{keys.size()}} in {{TrieMemIndex#search}} right before and after the {{keys.isEmpty()}} check. The size is 0 at runtime, but when the IDE debugger inspects the value, it has changed to 1 already.
+
+I'm attaching a patch that fixes this issue by replacing the {{!keys.isEmpty()}} check by {{keys.size() > 0}} in {{TrieMemIndex}}.
+ {{ConcurrentSkipListMap#size}} also checks the head node first, if it's unset, it returns 0 right away. Otherwise, it will compute the sum of the {{LongAdder}}, which also already happens in the constructor of {{KeyRangeIterator}} anyway, so it shouldn't be too big of a performance penalty, asymptotically speaking.
+
+I was looking at the same java11 implementation 10 minutes ago but didn't have a patch yet. I will make the review for you. At least what I observed was exactly what you are saying. Thanks!
+
+[~gianluca] can you, please, assign and move through the different phases this ticket?
+
+ 
+
+In-JVM and Unit tests run results attached as per our agreement. One failed unit test - checkTTLIsCapped
+
+Without checking it in detail I don't think it is related. But in all cases it would be good to figure out this failure related to this or not. (if it is not, it is good to open a new ticket for it if needed) Quick search didn't find any related tickets. 
+
+I also looped this test 100 times and it definitely doesn't fail anymore. And I also didn't find a different issue here.
+
+Please attach the dtests results 
+
+ 
+
+Stop review until I get all the CI results in place, attached to the ticket. Thanks
+
+{quote}The issue is that in v11 there's a potential race condition in which the head node may have been initialized, but the LongAdder hasn't been incremented yet, which leaves it briefly in an inconsistent state.
+{quote}
+{quote}I confirmed that's the case by logging the value of keys.size() in TrieMemIndex#search right before and after the keys.isEmpty() check. The size is 0 at runtime, but when the IDE debugger inspects the value, it has changed to 1 already.
+{quote}
+
+Good catch! Should we fix {{SkipListMemIndex}} as well? we can also pass the size via {{KeyRangeIterator}} constructor, so that it's computed once.
+
+In jdk 11 {{ConcurrentSkipListMap#size()}} javadoc:
+{quote} * <p>Beware that, unlike in most collections, this method is
+ * <em>NOT</em> a constant-time operation. Because of the
+ * asynchronous nature of these sets, determining the current
+ * number of elements requires traversing them all to count them.
+ * Additionally, it is possible for the size to change during
+ * execution of this method, in which case the returned result
+ * will be inaccurate. Thus, this method is typically not very
+ * useful in concurrent applications.{quote}
+I think it's safe not to include keys when size()=0 but isEmpty()=false, as write is not considered successful from client POV.
+
+Thanks [~jasonstack] Indeed, SkipListMemIndex will need the same fix. 
+Calculating the size once sounds reasonable to me.
+
+
+Thanks for the review and suggestions [~jasonstack].
+
+I've just submitted a new patch and a clean [PR|https://github.com/apache/cassandra/pull/478] to address the requested changes in {{SkipListMemIndex}} and the {{KeyRangeIterator}} constructor.
+
+[~e.dimitrova] The dtests are running in CI again, I'll upload them here when ready.
+
++1 LGTM
+
+[~e.dimitrova] I just attached the dtests [results|https://issues.apache.org/jira/secure/attachment/12997150/15526-dtests-results.png] for the open PR.
+
+LGTM +1
+[~brandon.williams] can you, please commit this one? Thanks!
+
+[~gianluca] you might want actually to squash first your commits
+
+Committed, thanks!
+

@@ -1,0 +1,143 @@
+While testing 2.5.3RC2, I found out that, if I run this UT on a loaded machine, it is easy to fail, the error is like this
+
+{noformat}
+2023-02-02T16:53:34,165 DEBUG [RS_REFRESH_PEER-regionserver/zhangduo-VirtualBox:0-0.replicationSource,2.replicationSource.wal-reader.zhangduo-virtualbox%2C33915%2C1675327981383,2] wal.ProtobufLogReader(448): Encountered a malformed edit, seeking back to last good position in file, from 65558 to 65536
+java.io.EOFException: Invalid PB, EOF? Ignoring; originalPosition=65536, currentPosition=65558, messageSize=21, currentAvailable=434
+        at org.apache.hadoop.hbase.regionserver.wal.ProtobufLogReader.readNext(ProtobufLogReader.java:383) ~[classes/:?]
+        at org.apache.hadoop.hbase.regionserver.wal.ReaderBase.next(ReaderBase.java:104) ~[classes/:?]
+        at org.apache.hadoop.hbase.regionserver.wal.ReaderBase.next(ReaderBase.java:92) ~[classes/:?]
+        at org.apache.hadoop.hbase.replication.regionserver.WALEntryStream.readNextEntryAndRecordReaderPosition(WALEntryStream.java:258) ~[classes/:?]
+        at org.apache.hadoop.hbase.replication.regionserver.WALEntryStream.tryAdvanceEntry(WALEntryStream.java:172) ~[classes/:?]
+        at org.apache.hadoop.hbase.replication.regionserver.WALEntryStream.hasNext(WALEntryStream.java:101) ~[classes/:?]
+        at org.apache.hadoop.hbase.replication.regionserver.ReplicationSourceWALReader.tryAdvanceStreamAndCreateWALBatch(ReplicationSourceWALReader.java:241) ~[classes/:?]
+        at org.apache.hadoop.hbase.replication.regionserver.ReplicationSourceWALReader.run(ReplicationSourceWALReader.java:139) ~[classes/:?]
+Caused by: org.apache.hbase.thirdparty.com.google.protobuf.InvalidProtocolBufferException: Protocol message contained an invalid tag (zero).
+        at org.apache.hbase.thirdparty.com.google.protobuf.InvalidProtocolBufferException.invalidTag(InvalidProtocolBufferException.java:133) ~[hbase-shaded-protobuf-4.1.4.jar:4.1.4]
+        at org.apache.hbase.thirdparty.com.google.protobuf.CodedInputStream$StreamDecoder.readTag(CodedInputStream.java:2122) ~[hbase-shaded-protobuf-4.1.4.jar:4.1.4]
+        at org.apache.hadoop.hbase.shaded.protobuf.generated.WALProtos$WALKey$Builder.mergeFrom(WALProtos.java:2778) ~[hbase-protocol-shaded-2.5.3.jar:2.5.3]
+        at org.apache.hadoop.hbase.shaded.protobuf.generated.WALProtos$WALKey$Builder.mergeFrom(WALProtos.java:2396) ~[hbase-protocol-shaded-2.5.3.jar:2.5.3]
+        at org.apache.hbase.thirdparty.com.google.protobuf.AbstractMessage$Builder.mergeFrom(AbstractMessage.java:418) ~[hbase-shaded-protobuf-4.1.4.jar:4.1.4]
+        at org.apache.hbase.thirdparty.com.google.protobuf.AbstractMessage$Builder.mergeFrom(AbstractMessage.java:317) ~[hbase-shaded-protobuf-4.1.4.jar:4.1.4]
+        at org.apache.hadoop.hbase.shaded.protobuf.ProtobufUtil.mergeFrom(ProtobufUtil.java:2564) ~[hbase-client-2.5.3.jar:2.5.3]
+        at org.apache.hadoop.hbase.regionserver.wal.ProtobufLogReader.readNext(ProtobufLogReader.java:379) ~[classes/:?]
+        ... 7 more
+{noformat}
+
+Obviously the message size is incorrect.
+
+Will dig more.
+
+When working on WAL value compression a while back I remember the first version used a temporary growable buffer (a ByteArrayOutputStream if I recall correctly) to collect all encrypted bytes of the value before submitting the payload to the codec. Later in code review Bharath and I went back and forth a bit on a trick with input streams to reduce the number of copies. To fix this I would go back to the earlier approach. Although there are more copies, only when this feature is enabled though, it is straightforward to ensure all bytes of the value have arrived before decryption is attempted. Or, perhaps an additional pair of eyes can spot the issue and only a minor change is required. 
+
+Thanks [~apurtell] for providing the information.
+
+I chekced the code in ProtobufLogReader, it is a bit strange that when hitting InvalidProtocolBufferException, we set resetPosition to true at line 381, but in the below catch block, we will not test the resetPosition flag, and just seek to the originalPosition, while I think resetPosition means reset to the beginning.
+
+IIRC, there are some back and forth here as I do not think we should always reset to beginning while we read an incomplete protobuf message, but when compression is enabled, especially we use a dict which is built on the fly, the only way to seek back is to create a new dict and read from beginning.
+
+Let me see if I can provide a UT to reproduce the problem.
+
+Thanks.
+
+I see on HBASE-27621 that you are looking at a general problem with EOF handling when reading from the input stream when any WAL compression feature is enabled, as part of a redo of EOF or partial read handling. It will be interesting to see if that de-flakes this test. There is a good chance.
+
+Seems HBASE-27621 can not fix the flaky TestReplicationValueCompressedWAL.
+
+[~Xiaolin Ha] sent me a WAL file which can not be fully read with WALPrettyPrinter offline where value compression is enabled, as it may contain some company specified information so I can not share it publicly. I will try to see if I can find out something and post the result here.
+
+Thanks.
+
+Ah I really can not understand the implementation of hadoop's CompressionStream related classes, especially the loop when writing, where we keep passing the safe buffer again and again...
+Maybe I need to look deep into the Compressor implementation to see what is going on there...
+
+OK I missunderstood the API... The buffer we pass to the compress method is used as output 'buffer', not the content...
+
+Ah, I think I found the possible cause of the problem...
+
+I added some breakpoint when we hit exception while reading the broken WAL file provided by [~Xiaolin Ha], it turned out that, if the value length is 0, then the compressed length will be 4, but while reading, we will read nothing so we will not read the 4 bytes, so when we want to move to the next cell, we will start reading from the wrong position and cause strange problem...
+
+Let me see if I can reproduce this problem with a simpler test case.
+
+Thanks.
+
+OK, very easy to reproduce...
+
+{code}
+  public static void main(String[] args) throws Exception {
+    CompressionContext ctx =
+      new CompressionContext(LRUDictionary.class, false, false, true, Compression.Algorithm.GZ);
+    ValueCompressor compressor = ctx.getValueCompressor();
+    byte[] compressed = compressor.compress(new byte[0], 0, 0);
+    System.out.println("compressed length: " + compressed.length);
+    ByteArrayInputStream bis = new ByteArrayInputStream(compressed);
+    int read = compressor.decompress(bis, compressed.length, new byte[0], 0, 0);
+    System.out.println("read length: " + read);
+    System.out.println("position: " + (compressed.length - bis.available()));
+  }
+{code}
+
+The output is
+{noformat}
+compressed length: 20
+read length: 0
+position: 0
+{noformat}
+
+So we will read from the wrong position after an empty value...
+
+I tried a simple fix, to manually skip the bytes after calling compressedIn.read in CompressionContext.ValueCompressor.decompress, then I can read the 'broken' WAL file provided by [~Xiaolin Ha] successfully.
+
+I'm not sure if this would break the compressor's state and also not sure whether this is the root cause of the flakiness of TestReplicationValueCompressedWAL.testMultiplePuts as I do not think we will write empty value in this test?
+
+Anyway, let me file a new issue to address the specific problem and see if it could fix the flakiness here.
+
+Thanks.
+
+bq. not sure whether this is the root cause of the flakiness of TestReplicationValueCompressedWAL.testMultiplePuts 
+
+There are two issues here I think. 
+
+1. Flakiness with WAL compression in general that affects this test, with this test being merely more coverage for the basic functionality. 
+
+2. The specific issue diagnosed from the WAL file from [~Xiaolin Ha]. 
+
+bq. let me file a new issue to address the specific problem
+
+Sounds good!
+
+The test is still flaky...
+
+https://ci-hbase.apache.org/job/HBase-Flaky-Tests/job/master/7265/testReport/junit/org.apache.hadoop.hbase.replication.regionserver/TestReplicationValueCompressedWAL/testMultiplePuts/
+
+So we still have other problems here...
+
+Why they all failed at position 65536...
+
+2023-02-15T07:48:13,027 DEBUG [RS_REFRESH_PEER-regionserver/jenkins-hbase10:0-0.replicationSource,2.replicationSource.wal-reader.jenkins-hbase10.apache.org%2C34825%2C1676447248661,2] wal.ProtobufLogReader(464): Encountered a malformed edit, seeking back to last good position in file, from 65538 to 65536
+
+2023-02-02T16:53:34,165 DEBUG [RS_REFRESH_PEER-regionserver/zhangduo-VirtualBox:0-0.replicationSource,2.replicationSource.wal-reader.zhangduo-virtualbox%2C33915%2C1675327981383,2] wal.ProtobufLogReader(448): Encountered a malformed edit, seeking back to last good position in file, from 65558 to 65536 java.io.EOFException: Invalid PB, EOF? Ignoring; originalPosition=65536, currentPosition=65558, messageSize=21, currentAvailable=434
+
+bq. Why they all failed at position 65536...
+
+Yes it is suspicious and possibly a buffering issue leading to a short read when a buffer becomes full. My comment above may be relevant:
+
+{quote}
+When working on WAL value compression a while back I remember *the first version used a temporary growable buffer (a ByteArrayOutputStream if I recall correctly) to collect all encrypted bytes of the value before submitting the payload to the codec*. Later in code review Bharath and I went back and forth a bit on a trick with input streams to reduce the number of copies. To fix this I would go back to the earlier approach. 
+{quote}
+
+when I said "encrypted" I meant "compressed", sorry about that. 
+
+This may be happening outside of value compression. Turn off value compression and leave only the base WAL compression enabled and see if it still reproduces. However the underlying cause would be the same if my theory is correct... First we read a length indicating the size of the compressed bytes to read, then we read that length until it is fully complete, and only then can we submit it for decompression. We may need a middle buffer to collect the full number of compressed bytes over multiple reads from the input stream, if the input stream is returning before the full number of bytes are read in a single read call and it is necessary to read multiple times from the input stream before the full number of compressed bytes are available.
+
+I prefer we fix before releasing 2.6.0 and 3.0.0, as it may prevent our users to make use of an important new feature...
+
+The sub task has been resolved.
+
+Let's keep an eye on the flaky dashboard.
+
+Will resolve the issue once the flaky dashboard is also OK.
+
+The flaky dashboard is OK now. Let me resolve.
+
+Thanks all for helping here!
+

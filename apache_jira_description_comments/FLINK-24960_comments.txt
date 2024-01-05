@@ -1,0 +1,182 @@
+Hi [~chesnay]  could you help to have a look at this issue~?
+
+Another instance: https://dev.azure.com/apache-flink/apache-flink/_build/results?buildId=28931&view=logs&j=fc5181b0-e452-5c8f-68de-1097947f6483&t=995c650b-6573-581c-9ce6-7ad4cc038461&l=35283
+
+https://dev.azure.com/apache-flink/apache-flink/_build/results?buildId=30001&view=logs&j=fc5181b0-e452-5c8f-68de-1097947f6483&t=995c650b-6573-581c-9ce6-7ad4cc038461&l=34898
+
+https://dev.azure.com/apache-flink/apache-flink/_build/results?buildId=32611&view=logs&j=fc5181b0-e452-5c8f-68de-1097947f6483&t=995c650b-6573-581c-9ce6-7ad4cc038461&l=37651
+
+1.14: [https://dev.azure.com/apache-flink/apache-flink/_build/results?buildId=32582&view=logs&j=a5ef94ef-68c2-57fd-3794-dc108ed1c495&t=2c68b137-b01d-55c9-e603-3ff3f320364b&l=34954]
+
+ 
+
+An early analysis.
+ # We start the JobManager via YARN - Works
+ # We identify the address of the REST server - We get the right address
+ # We start a RestClient to submit a job via YARN - Works
+ # RestClusterClient tries to submit job
+
+In the last step, a default address "localhost:8081" is used instead of the correct external address port combination. This leads to a connection refused error. I am not sure why this happens though. From how I understand {{RestClusterClient#sendRetriableRequest}}, it tries to get the address by using web monitor leader retrieval. It doesn't make sense to me, why this would return localhost:8081. I also don't see any place where this could fallback to the localhost:8081 pair.
+
+Anyhow, the failure alone doesn't explain why the test gets stuck.
+
+We have three threads here
+# The outer thread running the test.
+# A Flink cluster running the JobManager and TaskManager. 
+# A rest client thread that submits the job.
+
+The rest client thread fails:
+# Contacting the Rest Server fails (it retries for about 1 minute)
+# The job submission fails
+# The Session interface returns a nonzero exit code
+# An assertion failure is created
+# The assertion failure is caught and stored on the Runner class
+# The inner thread exits
+
+The outer thread should in principle either re-throw the exception or fail due to the timeout (also 1 minute). There should be no way out of this thread that doesn't lead to an exception. Yet, we see no indicator that the outer thread acknowledges the failure of the inner thread. Instead, the thread hangs in the finally part of the try-finally of the main thread. It is unable to close the Flink Cluster.
+
+In contrast, from the JobManager logs we see that it doesn't receive any stop signal. So, somehow the connection seems to be severed?
+
+https://dev.azure.com/apache-flink/apache-flink/_build/results?buildId=33025&view=logs&j=fc5181b0-e452-5c8f-68de-1097947f6483&t=995c650b-6573-581c-9ce6-7ad4cc038461&l=38866
+
+[~mapohl] and I debugged this some more.
+
+It looks like the external address of the rest server is set by the [YarnClusterDescriptor|https://github.com/apache/flink/blob/c16e4b4ce20704a0ad4387591894f13105d5e530/flink-yarn/src/main/java/org/apache/flink/yarn/YarnClusterDescriptor.java#L1801]. In short, the MiniYarnCluster propages the YarnClusterDescriptor into the execution process of the RestClusterClient. The address is then set via leader retrieval, but there is no actual leader retrieval taking place. Instead, the StandaloneHaServices returns the preconfigured rest server address.
+
+In principle, this should never return a "localhost" address. To better debug future scenarios of this bug, we add a PR that ensures that the log line in the code above is always printed. If this returns "localhost", then there is something going wrong with the address the YARN application report includes. If instead, it returns an external address but the RestClusterClient can still not connect, then we missed another place where this property is set. Finally, if the log line does not appear at all, then we need to figure out if there is yet another code path.
+
+Turns out that the [relevant log line|https://github.com/apache/flink/blob/c16e4b4ce20704a0ad4387591894f13105d5e530/flink-yarn/src/main/java/org/apache/flink/yarn/YarnClusterDescriptor.java#L1799] is hidden by a [test rule|https://github.com/apache/flink/blob/c16e4b4ce20704a0ad4387591894f13105d5e530/flink-yarn-tests/src/test/java/org/apache/flink/yarn/YARNSessionCapacitySchedulerITCase.java#L120]. We recorded this as a bug in FLINK-26710. 
+
+https://dev.azure.com/apache-flink/apache-flink/_build/results?buildId=33780&view=logs&j=8fd975ef-f478-511d-4997-6f15fe8a1fd3&t=494f6362-8ffa-5ff8-9158-c7f00e541279&l=36852
+
+https://dev.azure.com/apache-flink/apache-flink/_build/results?buildId=34743&view=logs&j=298e20ef-7951-5965-0e79-ea664ddc435e&t=d4c90338-c843-57b0-3232-10ae74f00347&l=36026
+
+[~ferenc-csaky] [~bgeng777] may one of you have a closer look at it? [~nsemmler] worked on a fix around the missing logs in FLINK-26710. Maybe, that's of help to fix this test instability.
+
+Hi [~mapohl], I tried to do some research but in latest [failure|https://dev.azure.com/apache-flink/apache-flink/_build/results?buildId=34743&view=logs&j=298e20ef-7951-5965-0e79-ea664ddc435e&t=d4c90338-c843-57b0-3232-10ae74f00347&l=36026] posted by Yun, I did not find the {{Extracted hostname:port: }} was not shown. Though in the description of this ticket, it shows  {{Extracted hostname:port: 5718b812c7ab:38622}} in the old CI test, which seems to be correct. 
+I plan to verify {{yarnSessionClusterRunner.sendStop();}}  works fine(i.e. the session cluster will be stopped normally) first but I have not found a way to run the cron test's "test_cron_jdk11 misc" test only on the my own [azure pipeline|https://dev.azure.com/samuelgeng7/Flink/_build/results?buildId=109&view=results], which made the verification pretty slow and hard. Is there any guidelines about debugging the azure pipeline with some specific tests?
+
+HI [~bgeng777], unfortunately, running individual tests within CI is a bit tedious right now. The only way, I know so far, is to alter {{tools/ci/test_controller.sh}} to run the test you want to execute
+
+I took another look at this instability and tried to retrace my earlier steps. There are two aspects about this instability:
+
+1. Why is the {{localhost:8081}} address used in this Yarn context? (Instead of the Yarn container & port)
+2. Why does the exception not halt the program? I.e., why is the program continuing to run after the exception is thrown?
+
+Previously I thought that {{localhost}} was set via the setup of the YarnClusterDescriptor. In the newer logs, the following [log line|https://github.com/apache/flink/blob/c16e4b4ce20704a0ad4387591894f13105d5e530/flink-yarn/src/main/java/org/apache/flink/yarn/YarnClusterDescriptor.java#L1799] shows that the address is still correctly set in the YarnClusterDescriptor: 
+
+{{7:09:15,731 [Frontend (CLI/YARN Client) runner thread (startWithArgs()).] INFO org.apache.flink.yarn.YarnClusterDescriptor [] - Found Web Interface 6dad280b2159:40493 of application}}
+
+Apparently the {{localhost}} address is added somewhere else. But where? Maybe it is done when the job is submitted? It may make sense to change the log level of this [log line|https://github.com/apache/flink/blob/f9438dd54fa6896563b152d50b7a4b3c47ad9ebf/flink-clients/src/main/java/org/apache/flink/client/cli/CliFrontend.java#L244] by changing it [here|https://github.com/apache/flink/blob/7d85b273ccdbd5a2242e05e5d645ea82280f5eea/flink-yarn-tests/src/test/java/org/apache/flink/yarn/YARNSessionCapacitySchedulerITCase.java#L116].
+
+This would however just explain point 1 not point 2. My intuition is that there is some timing problem at play that we are so far missing. Let's compare a successful to an erroneous execution:
+
+*Successful execution*
+{code}
+05:26:42,745 [Frontend (CLI/YARN Client) runner thread (startWithArgs()).] INFO  org.apache.flink.yarn.YarnClusterDescriptor                  [] - YARN application has been deployed successfully.
+05:26:42,745 [Frontend (CLI/YARN Client) runner thread (startWithArgs()).] INFO  org.apache.flink.yarn.YarnClusterDescriptor                  [] - Found Web Interface 6d4ce71bbaec:45932 of application 'application_1650173077369_0008'.    05:26:42,931 [                main] INFO  org.apache.flink.yarn.YarnTestBase                           [] - Found expected output in redirected streams
+05:26:42,933 [                main] INFO  org.apache.flink.yarn.YARNSessionCapacitySchedulerITCase     [] - Extracted hostname:port: 6d4ce71bbaec:45932
+05:26:42,934 [                main] INFO  org.apache.flink.yarn.YarnTestBase                           [] - Running with args [run, --detached, /__w/3/s/flink-yarn-tests/target/programs/WindowJoin.jar]
+05:26:42,940 [Frontend (CLI/YARN Client) runner thread (startWithArgs()).] INFO  org.apache.flink.yarn.cli.FlinkYarnSessionCli                [] - Found Yarn properties file under /tmp/.yarn-properties-agent03_azpcontainer.
+05:26:42,940 [Frontend (CLI/YARN Client) runner thread (startWithArgs()).] WARN  org.apache.flink.core.plugin.PluginConfig                    [] - The plugins directory [plugins] does not exist.
+05:26:42,941 [Frontend (CLI/YARN Client) runner thread (startWithArgs()).] INFO  org.apache.flink.client.cli.CliFrontend                      [] - Running 'run' command.
+05:26:42,942 [Frontend (CLI/YARN Client) runner thread (startWithArgs()).] INFO  org.apache.flink.client.cli.CliFrontend                      [] - Building program from JAR file
+05:26:42,945 [Frontend (CLI/YARN Client) runner thread (startWithArgs()).] INFO  org.apache.flink.client.ClientUtils                          [] - Starting program (detached: true)
+05:26:42,975 [Frontend (CLI/YARN Client) runner thread (startWithArgs()).] INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - class org.apache.flink.streaming.api.datastream.CoGroupedStreams$TaggedUnion does not      contain a setter for field one                                                                                                                                                                                                                05:26:42,975 [Frontend (CLI/YARN Client) runner thread (startWithArgs()).] INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - Class class org.apache.flink.streaming.api.datastream.CoGroupedStreams$TaggedUnion cannot  be used as a POJO type because not all fields are valid POJO fields, and must be processed as GenericType. Please read the Flink documentation on "Data Types & Serialization" for details of the effect on performance.                      05:26:42,978 [Frontend (CLI/YARN Client) runner thread (startWithArgs()).] INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - class org.apache.flink.streaming.api.datastream.CoGroupedStreams$TaggedUnion does not      contain a setter for field one                                                                                                                                                                                                                05:26:42,978 [Frontend (CLI/YARN Client) runner thread (startWithArgs()).] INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - Class class org.apache.flink.streaming.api.datastream.CoGroupedStreams$TaggedUnion cannot  be used as a POJO type because not all fields are valid POJO fields, and must be processed as GenericType. Please read the Flink documentation on "Data Types & Serialization" for details of the effect on performance.                      05:26:43,033 [Frontend (CLI/YARN Client) runner thread (startWithArgs()).] WARN  org.apache.flink.yarn.configuration.YarnLogConfigUtil        [] - The configuration directory ('/tmp/junit8048407617893879030/conf') already contains a      LOG4J config file.If you want to use logback, then please delete or rename the log configuration file.                                                                                                                                        05:26:43,033 [Frontend (CLI/YARN Client) runner thread (startWithArgs()).] WARN  org.apache.flink.runtime.util.HadoopUtils                    [] - Could not find Hadoop configuration via any of the supported methods (Flink configuration, environment variables).                                                                                                                                                                                                                       05:26:43,082 [Frontend (CLI/YARN Client) runner thread (startWithArgs()).] INFO  org.apache.hadoop.yarn.client.RMProxy                        [] - Connecting to ResourceManager at 6d4ce71bbaec/192.168.192.2:42104
+05:26:43,083 [Frontend (CLI/YARN Client) runner thread (startWithArgs()).] INFO  org.apache.flink.yarn.YarnClusterDescriptor                  [] - No path for the flink jar passed. Using the location of class org.apache.flink.yarn.       YarnClusterDescriptor to locate the jar
+05:26:43,086 [Frontend (CLI/YARN Client) runner thread (startWithArgs()).] INFO  org.apache.flink.yarn.YarnClusterDescriptor                  [] - Found Web Interface 6d4ce71bbaec:45932 of application 'application_1650173077369_0008'.
+05:26:43,101 [Flink-RestClusterClient-IO-thread-1] INFO  org.apache.flink.client.program.rest.RestClusterClient       [] - Submitting job 'Windowed Join Example' (8e2a9cb1e08a4b6642ac342bd4d96dcb).                                         05:26:43,620 [Flink-RestClusterClient-IO-thread-4] INFO  org.apache.flink.client.program.rest.RestClusterClient       [] - Successfully submitted job 'Windowed Join Example' (8e2a9cb1e08a4b6642ac342bd4d96dcb) to 'http://6d4ce71bbaec:     45932'.
+{code}
+
+*Erroneous execution*
+{code}
+07:09:15,731 [Frontend (CLI/YARN Client) runner thread (startWithArgs()).] INFO  org.apache.flink.yarn.YarnClusterDescriptor                  [] - YARN application has been deployed successfully.
+07:09:15,731 [Frontend (CLI/YARN Client) runner thread (startWithArgs()).] INFO  org.apache.flink.yarn.YarnClusterDescriptor                  [] - Found Web Interface 6dad280b2159:40493 of application 'application_1650179225006_0008'.    07:09:15,750 [                main] INFO  org.apache.flink.yarn.YarnTestBase                           [] - Found expected output in redirected streams
+07:09:15,752 [                main] INFO  org.apache.flink.yarn.YARNSessionCapacitySchedulerITCase     [] - Extracted hostname:port: 6dad280b2159:40493
+07:09:15,752 [                main] INFO  org.apache.flink.yarn.YarnTestBase                           [] - Running with args [run, --detached, /__w/2/s/flink-yarn-tests/target/programs/WindowJoin.jar]
+07:09:15,757 [Frontend (CLI/YARN Client) runner thread (startWithArgs()).] WARN  org.apache.flink.core.plugin.PluginConfig                    [] - The plugins directory [plugins] does not exist.
+07:09:15,758 [Frontend (CLI/YARN Client) runner thread (startWithArgs()).] INFO  org.apache.flink.client.cli.CliFrontend                      [] - Running 'run' command.
+07:09:15,759 [Frontend (CLI/YARN Client) runner thread (startWithArgs()).] INFO  org.apache.flink.client.cli.CliFrontend                      [] - Building program from JAR file
+07:09:15,762 [Frontend (CLI/YARN Client) runner thread (startWithArgs()).] INFO  org.apache.flink.client.ClientUtils                          [] - Starting program (detached: true)
+07:09:15,867 [Frontend (CLI/YARN Client) runner thread (startWithArgs()).] INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - class org.apache.flink.streaming.api.datastream.CoGroupedStreams$TaggedUnion does not      contain a setter for field one                                                                                                                                                                                                                07:09:15,867 [Frontend (CLI/YARN Client) runner thread (startWithArgs()).] INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - Class class org.apache.flink.streaming.api.datastream.CoGroupedStreams$TaggedUnion cannot  be used as a POJO type because not all fields are valid POJO fields, and must be processed as GenericType. Please read the Flink documentation on "Data Types & Serialization" for details of the effect on performance.                      07:09:15,871 [Frontend (CLI/YARN Client) runner thread (startWithArgs()).] INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - class org.apache.flink.streaming.api.datastream.CoGroupedStreams$TaggedUnion does not      contain a setter for field one                                                                                                                                                                                                                07:09:15,871 [Frontend (CLI/YARN Client) runner thread (startWithArgs()).] INFO  org.apache.flink.api.java.typeutils.TypeExtractor            [] - Class class org.apache.flink.streaming.api.datastream.CoGroupedStreams$TaggedUnion cannot  be used as a POJO type because not all fields are valid POJO fields, and must be processed as GenericType. Please read the Flink documentation on "Data Types & Serialization" for details of the effect on performance.                      07:09:16,194 [Flink-RestClusterClient-IO-thread-1] INFO  org.apache.flink.client.program.rest.RestClusterClient       [] - Submitting job 'Windowed Join Example' (2788aebd84c123f092c0992e5a7321ca).
+07:09:16,236 [flink-rest-client-netty-thread-1] WARN  org.apache.flink.client.program.rest.RestClusterClient       [] - Attempt to submit job 'Windowed Join Example' (2788aebd84c123f092c0992e5a7321ca) to 'http://localhost:8081' has       failed.                                                                                                                                                                                                                                       java.util.concurrent.CompletionException: org.apache.flink.shaded.netty4.io.netty.channel.AbstractChannel$AnnotatedConnectException: Connection refused: localhost/127.0.0.1:8081
+{code}
+
+It is noteworthy that the line {{The configuration directory ('/tmp/junit8048407617893879030/conf') already contains a      LOG4J config file}} only appears in the successful execution. This may indicate a timing issue.
+
+Note, the code on master has now replaced {{TestLoggerResource}} by {{LoggerAuditingExtension}}. In my understanding {{LoggerAuditingExtension}} has the same problem as the previous implementation of {{TestLoggerResource}}. See https://issues.apache.org/jira/browse/FLINK-26710
+
+Ok, so I think what happens here is roughly the following.
+
+The test submits a packaged program. This program is invoked [here|https://github.com/apache/flink/blob/c6997c97c575d334679915c328792b8a3067cfb5/flink-clients/src/main/java/org/apache/flink/client/ClientUtils.java#L114]. There is a thread local context setup that determines how the program is executed. If set up correctly, the program will be run using a Yarn specific code path (using the {{YarnSessionClusterExecutorFactory}} and {{YarnClusterDescriptor}}). In this case, the rest address of the job manager will be retrieved via {{YarnClusterDescriptor}}. Everything is well.
+
+If things don't work out correctly, I _think_ the Yarn specific code path is not set up and during the program execution the rest address is extracted from the default config file. This leads to the use of the wrong {{localhost}} address.
+
+Now the big question is: Why is the Yarn specific code path not set up correctly for the erroneous executions? Again, I _think_ this has something to do with the timing of the different threads. But how exactly is still unclear to me.
+
+I just noticed, that the line {{Found Yarn properties file under /tmp/.yarn-properties-agent03_azpcontainer}} is missing for the errorneous execution. The file is loaded here [here|https://github.com/apache/flink/blob/6086e327cd4168e09eac4f6b0b86fb29ebe3860c/flink-yarn/src/main/java/org/apache/flink/yarn/cli/FlinkYarnSessionCli.java#L288] and the content ends up in the configuration [here|https://github.com/apache/flink/blob/f9438dd54fa6896563b152d50b7a4b3c47ad9ebf/flink-clients/src/main/java/org/apache/flink/client/cli/CliFrontend.java#L241]. If the file contains the Yarn specific settings and is not available for the erroneous execution, then this explains why the Yarn code path is not used.
+
+This file is written [here|https://github.com/apache/flink/blob/6086e327cd4168e09eac4f6b0b86fb29ebe3860c/flink-yarn/src/main/java/org/apache/flink/yarn/cli/FlinkYarnSessionCli.java#L617]. 
+
+In the test we wait for the thread, but only for the print output that comes before writing the Yarn properties file. (see [here|https://github.com/apache/flink/blob/b98c66cfe44d1b4002fe56dbf323d8ea8ce0409c/flink-yarn-tests/src/test/java/org/apache/flink/yarn/YARNSessionCapacitySchedulerITCase.java#L309]).
+
+We should be able to fix the issue by exchanging the order of the print and the write file command.
+
+I finally found an explanation for the aspect 2: Why the yarn session thread sometimes continues to run even when an exception is thrown.
+
+There is a race condition happening between the [interactive CLI of the YARN session|https://github.com/apache/flink/blob/6086e327cd4168e09eac4f6b0b86fb29ebe3860c/flink-yarn/src/main/java/org/apache/flink/yarn/cli/FlinkYarnSessionCli.java#L874] and the [job submission|https://github.com/apache/flink/blob/98a6a5432b642aa647f6edcd60dae49ef9093786/flink-yarn-tests/src/test/java/org/apache/flink/yarn/YarnTestBase.java#L890].
+
+To explain the problem:
+ # The _main thread_ executing the test starts two threads: the _jobmanager thread_ executing the job manager as part of a yarn session and the _submission thread_ submitting the Flink job.
+ # The _jobmanager thread_ is created before and ends after the _submission thread_.
+ # Communication between _main thread_ and the other threads happens via rerouted stdin, stdout, stderr channels. The rerouting takes place when the _jobmanager thread_ and _submission thread_ are created respectively.
+ # The _main thread_ waits for the _jobmanager thread_ and _submission thread_ to print a specific output message to the rerouted stdout before continuing. 
+ # The _jobmanager thread_ needs to be explicitly shutdown via "stop" string communicated via the rerouted stdin
+
+The problem appears, if _submission thread_ reroutes the stdin before _jobmanager thread_ opens a BufferedReader on the old stdin. In this case, the stop message from the _main thread_ to the _jobmanager thread_ is lost and the {*}_jobmanager thread_ continues running indefinitely{*}. In this cases even an exception will not fail the test.
+
+We can improve on this by changing the output the _main thread_ matches on. Instead of the [current|https://github.com/apache/flink/blob/b98c66cfe44d1b4002fe56dbf323d8ea8ce0409c/flink-yarn-tests/src/test/java/org/apache/flink/yarn/YARNSessionCapacitySchedulerITCase.java#L309], we could add a new output after the creation of the [BufferedReader|https://github.com/apache/flink/blob/6086e327cd4168e09eac4f6b0b86fb29ebe3860c/flink-yarn/src/main/java/org/apache/flink/yarn/cli/FlinkYarnSessionCli.java#L874].
+
+The question here is whether adding an output line here will have some unintended consequences. The code is directly used by the FLINK Yarn session CLI, so if anybody is already parsing the output this may have adverse effects. Also, if we change it here, we may also want to touch other tests that make use of the same code.
+
+Alternative approaches that only touch the tests are:
+ * move the current println statement further down in the code (see [PR19852|https://github.com/apache/flink/pull/19852])
+ * add a (one second?) delay before the job submission
+
+However, both of these solutions only reduce the chance that the test instability will appear.
+
+[PR19852|https://github.com/apache/flink/pull/19852] implements the partial solution.
+
+I have tested the partial solution in this [azure pipeline|https://dev.azure.com/NiklasFlink/NiklasFlink/_build/results?buildId=121&view=logs&j=f3dc9b18-b77a-55c1-591e-264c46fe44d1&t=2d3cd81e-1c37-5c31-0ee4-f5d5cdb9324d]. After four hours of running the same test, we still don't see any instabiliity.
+
+In contrast, when we don't use the PR we see a failure in [this azure pipeline|https://dev.azure.com/NiklasFlink/NiklasFlink/_build/results?buildId=122&view=logs&j=f3dc9b18-b77a-55c1-591e-264c46fe44d1&t=2d3cd81e-1c37-5c31-0ee4-f5d5cdb9324d] after 45 minutes.
+
+The alternative but more heavy weight change is [PR19863|https://github.com/apache/flink/pull/19863].
+
+After a discussion with [~mapohl], a different solution for the problem around stdin is to replace the use of stdin on the test path with a different stream.
+
+Together with the reordering of the print statement and write yarn properties file command described above, this would remove the synchronization problem
+
+[~mapohl] potentially [~ferenc-csaky] can also help out if needed, he will also look into the other YARN test stability problem FLINK-27667 this week 
+
+Thanks for looking into it [~nsemmler] and your thorough review. Of the two proposed PRs, I'd go with [PR #19852|https://github.com/apache/flink/pull/19852/files], because it doesn't touch the production code. Essentially, we're moving the {{*.properties}} creation into the waiting period before proceeding with the job submission to avoid it to take too long before the interactive cli logic (including the BufferedReader initialization around {{{}System.in{}}}) is started.
+
+[PR #19863|https://github.com/apache/flink/pull/19863] touches production code which I am hesitant to do. The test runs in AzureCI indicate already that it might help reducing the flakiness. We might want to tackle the race condition you described above, still.
+
+I merged PR #19863 and related backports:
+master - 6fe543bc8568015bc64eed558817d680a7fce85f
+1.15 - 96c400cf909a4af941a54fa663758d73bb0f9679
+1.14 - 5275206fcb891d67153e108f2e81b3e2734b4784
+
+I'm going to keep this ticket open to cover the race condition and to observe the frequency of still happening build failures. [~ferenc-csaky] feel free to pick this issue up.
+
+[~mapohl] What's the current status of this ticket? 
+
+[~nsemmler] provided a workaround where we hope that it reduces the frequency of the error. Fixing it properly requires a bigger change (making the {{PrintStream}} instances configurable instead of using {{System.out}} and {{System.err}} in a hard-coded fashion) which is not implemented, yet. That's why I left the ticket open...
+
+Are we OK with downgrading this to a Major instead of Critical?
+
+Yes, I guess, that makes sense. Thanks for doing so...
+
+Considering it as fixed.
+

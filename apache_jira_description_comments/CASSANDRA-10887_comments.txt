@@ -1,0 +1,154 @@
+Ran a repro on 2.0.16 based on the description
+
+(1)
+
+create keyspace ks1 WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1':3}
+
+(2)
+
+CREATE TABLE ks1.users (
+  login varchar,
+  email varchar,
+  name varchar,
+  login_count int,
+  PRIMARY KEY (login));
+
+(3)
+
+INSERT INTO ks1.users (login, email, name, login_count) VALUES ('jdoe', 'jdoe@abc.com', 'Jane Doe', 1) IF NOT EXISTS;
+
+(4)
+
+#Run a simple lwt in a loop
+
+cat lwtloop.sh
+
+#!/bin/bash
+
+#loop $1 times 
+
+for (( a=1; a<=$1; a++ ))
+do
+ cqlsh -e "UPDATE ks1.users SET email = 'janedoe@abc.com' WHERE login = 'jdoe' IF email = 'jdoe@abc.com';"
+ echo count: $a
+done
+
+./lwtloop.sh 1000
+
+This outputs the following with a count
+
+ [applied] | email
+-----------+-----------------
+     False | janedoe@abc.com
+
+count: 304
+
+(5) Initiate a nodetool move command
+
+ nodetool -h 1.2.3.4 move -- \\-634023222112864484
+
+(6) kill node running move against
+
+sudo kill -9 <cassandra pid>
+
+(7) lwtloop.sh script reports
+
+<stdin>:1:Request did not complete within rpc_timeout.
+count: 305
+
+followed by
+
+<stdin>:1:Unable to complete request: one or more nodes were unavailable.
+count: 322
+
+(8) Bring node back online
+
+sudo cassandra
+
+lwtloop.sh script now continues
+
+[applied] | email
+-----------+-----------------
+     False | janedoe@abc.com
+
+count: 587
+
+
+
+Ping [~slebresne]
+
+I can confirm that having a node both a natural endpoint and pending is bad (it's possible for node moving to have some of his range stay after the move, but in that case, these ranges shouldn't be added as pending). This would totally trigger CASSANDRA-10423 and is thus likely the culprit.
+
+Not an expert in our pending range calculations though and not sure who is our expert there. [~blambov], you've worked on pseudo-related problems lately (token assignment), would you have some time to have a look? 
+
+[~cdaw] would you have someone to turn [~sashley]'s reproduction step above into a dtest in parallel?
+
+I've written up a dtest here: https://github.com/riptano/cassandra-dtest/pull/717 and pinged Branimir about it. I can't reproduce manually with Simon's steps or with my test on 2.1, 2.2, or 3.0. I've asked [~mambocab] to take a look as well.
+
+I did also run against 2.0.16, to be clear.
+
+Is your key 'jdoe' stored on node1?
+
+I have added a patch along with many unit tests. Looks like the issue with moves is there since the feature was added in CASSANDRA-1427. 
+This patch fixes the following issues
+1) It will add the correct endpoints to the pending range not just the endpoint which is moving. 
+2) It will remove the ranges which the endpoint is already getting. Eg: If an endpoint is getting range 10-20 before the move and needs range say 15-20 after the move, it will only add 15-20. 
+
+I think 2) will solve the problem of duplicate endpoints in pending endpoint and natural endpoint. Thought I have not tested this part. 
+
+Most of the patch is unit tests which simulate many types of moves. We should see if there is any case of move which is missing. 
+
+PS: I have not tested this patch apart from the unit test :)
+
+The patch is against 2.0
+
+Logic and code looks good (nit: it's missing some whitespace to conform to the style).
+
+{{RangeTest.testSubtractAll}} needs wrap-around interval tests (wrap-around source and wrap-around subtrahend).
+
+The new MoveTests are very flaky, I don't seem to be able to get a clean run for all of them at the same time (see [utests|http://cassci.datastax.com/job/blambov-kohlisankalp-10887-testall/lastCompletedBuild/testReport/]). Looks like the problem is stale data.
+
+Racks (or vnodes in a node) make range assignment behave very differently. It would be great to see a test that checks what happens when moving a node around others from the same rack.
+
+Thanks for the review. Will add and clean the tests. 
+
+Attaching v2...
+1) Added the test for wrap-around interval tests
+2) Other tests were not passing since they were not expecting a NetworkTopology. Fixed that. Also I was giving my own custom tokens which was causing others to fail. Changed the test to default tokens(0,10,20...)
+
+Will add tests for rack during first week of Jan. 
+
+Attached v3 with rack aware tests. 
+
+cc [~blambov]
+
+Patch looks good, [utests|http://cassci.datastax.com/job/blambov-kohlisankalp-10887-testall/3/] look good. I couldn't make sense of the [dtests|http://cassci.datastax.com/job/blambov-kohlisankalp-10887-dtest/3/] though.
+I pushed a 2.1 version [here|https://github.com/blambov/cassandra/tree/kohlisankalp/10887-2.1] to run more stable dtests, and the results there ([utest|http://cassci.datastax.com/job/blambov-kohlisankalp-10887-testall/3/], [dtest|http://cassci.datastax.com/job/blambov-kohlisankalp-10887-2.1-dtest/1/]) appear fine.
+
+The patch is ready to commit, but does not apply cleanly to later versions, could you make patches for 2.2 (and 3.0 if necessary)?
+
+Let me get the patches for 2.2,3.0 and trunk
+
+While working on 2.2 patch, I found that CASSANDRA-9258 which was committed yesterday is using a List instead of a Set in PendingRangeMaps. Previously, we use to use to create it like this
+Multimap<Range<Token>, InetAddress> pendingRanges = HashMultimap.create();
+
+This caused my tests to fail as same endpoint is added multiple times. These duplicate endpoints are dedup correctly in pendingEndpointsFor. 
+
+I can work around it in my tests but why are we not using a set? 
+
+I have uploaded patches for 2.2 and 3.0. This is a major bug and should go in every branch/release possible. 
+
+Let me know if you need a patch for any other branch
+
+Pushed all branches to github to run tests:
+|[2.0|https://github.com/blambov/cassandra/tree/kohlisankalp/10887]|[utests|http://cassci.datastax.com/view/Dev/view/blambov/job/blambov-kohlisankalp-10887-testall/]|[dtests|http://cassci.datastax.com/view/Dev/view/blambov/job/blambov-kohlisankalp-10887-dtest/]|
+|[2.1|https://github.com/blambov/cassandra/tree/kohlisankalp/10887-2.1]|[utests|http://cassci.datastax.com/view/Dev/view/blambov/job/blambov-kohlisankalp-10887-2.1-testall/]|[dtests|http://cassci.datastax.com/view/Dev/view/blambov/job/blambov-kohlisankalp-10887-2.1-dtest/]|
+|[2.2|https://github.com/blambov/cassandra/tree/kohlisankalp/10887-2.2]|[utests|http://cassci.datastax.com/view/Dev/view/blambov/job/blambov-kohlisankalp-10887-2.2-testall/]|[dtests|http://cassci.datastax.com/view/Dev/view/blambov/job/blambov-kohlisankalp-10887-2.2-dtest/]|
+|[3.0|https://github.com/blambov/cassandra/tree/kohlisankalp/10887-3.0]|[utests|http://cassci.datastax.com/view/Dev/view/blambov/job/blambov-kohlisankalp-10887-3.0-testall/]|[dtests|http://cassci.datastax.com/view/Dev/view/blambov/job/blambov-kohlisankalp-10887-3.0-dtest/]|
+
+3.0 tests are quite unstable, but eventually got a clean enough run. Ready to commit.
+
+Committed, thanks.
+
+Updated the since version to 0.8 
+

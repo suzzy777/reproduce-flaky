@@ -1,0 +1,347 @@
+[~aljoscha], this shouldn't be release-blocking, right? (SplittableDoFn is not ready yet, anyhow.)
+
+Yes, that seems ok.
+
+First, {{SplittableParDo}} should not wrap {{StatefulDoFnRunner}}.
+
+Second, {{SplittableParDo}} use {{PROCESSING_TIME}} to continue processing. And it also sets watermark holds which will affect the sending of the output watermark. (see {{DoFnOperator.processWatermark1()}}).
+When {{BoundedSourceWrapper}} is over, it will emit a Long.MAX_VALUE watermark, but the {{SplittableParDo}} may be not over yet. (depends on system time) So no one can send watermark to the downstream.
+
+Last, {{StreamTask}} will shutdown when there are no inputs and invoke {{timerService.quiesceAndAwaitPending}}. (see {{StreamTask.invoke()}} in Flink)
+It will shutdown TimeService and invoke all task in TimeService and reject the new registration. So it will break the continue processing of {{SplittableParDo}}.
+
+[~aljoscha] Is that right? Please correct me if I wrong.
+
+I think this is mostly right, yes. 😃
+
+1. Why should it not wrap {{StatefulDoFnRunner}}? I think it's the easiest way to get timers and state that expires.
+2. Yes, I think this is a problem.
+3. Also a problem, so when we shut down we should check whether we have any outstanding processing-time timers and process them.
+
+I'm assuming you read the little analysis I did on Aviem's PR, pasting just in case:
+{quote}
+@jkff SplittableDoFnTest.testOutputAfterCheckpoint() fails on the Flink Runner. If you instrument the test (with a little sysout printing in a ParDo) you see that the SDF only emits elements up to 12344. If, in BoundedSourceWrapper (which executes the Create.of("foo") on Flink), you replace the end of the run() method by
+{code}
+    // emit final Long.MAX_VALUE watermark, just to be sure
+    // ctx.emitWatermark(new Watermark(Long.MAX_VALUE));
+
+    while (isRunning) {
+      Thread.sleep(500);
+    }
+{code}
+you see all values correctly emitted but the test never stops because the source is now unbounded. (Interestingly, if you replace that one line by ctx.emitWatermark(new Watermark(BoundedWindow.TIMESTAMP_MAX_VALUE.getMillis())); you get values up to 34567)
+
+The problem seems to be that the code running the SDF sees the high watermarks and then doesn't emit stuff anymore. Do you have an idea what could be going on there? If not we'll probably have to delve deeper into the code.
+{quote}
+
+So fiddling with the watermarks in {{BoundedSourceWrapper}} also seems to affect what is getting processed/emitted by the splittable DoFn (SDF).
+
+1. {{SplittableParDo}} will clear its State, in {{SplittableParDo.ProcessFn.processElement()}}
+{code}
+    if (result.getResidualRestriction() == null) {
+        // All work for this element/restriction is completed. Clear state and release hold.
+        elementState.clear();
+        restrictionState.clear();
+        holdState.clear();
+        return;
+      }
+{code}
+
+I got values up to 12344 in intellij debug mode while got values up to 34567 in intellij run mode.(No matter what outputWatermark of {{BoundedSourceWrapper}}) 
+So I think the processing of SDF has nothing to do with inputWatermark, and ProcessTimeService only related. 
+
+This question should be caused by the second and third points.
+
+Aljoscha - SDF code does not inspect watermarks.
+Here's what should happen really, when you apply an SDF to a BoundedSource that contains exactly 1 element (with more elements, it'll be more of the same).
+
+1. We read an element from the source, and as it goes through the SDF expansion, it ends up in ProcessFn.
+2. ProcessFn processes this element and its restriction, and if there's a residual restriction (checkpoint), then it sets a watermark hold and sets a timer to continue the processing.
+3. The BoundedSource is done, so its watermark progresses to infinity - but this is fine. The input watermark of ProcessFn does NOT progress to infinity just yet, because it has set a watermark hold! (if it didn't set the hold, then its input watermark would also progress to infinity, and the timer would be late-data and hence dropped)
+4. The timer set by ProcessFn fires, and it processes (calls ProcessElement) some more; again possibly setting a watermark hold and setting another timer to continue the processing. And so on.
+5. Eventually the ProcessElement call finishes without producing a residual restriction. In that case, ProcessFn a) clears the watermark hold b) does NOT set a continuation timer.
+6. After that, watermark of ProcessFn itself progresses to infinity (because there's no hold anymore) and the pipeline terminates.
+
+I suspect that in the Flink implementation, something is going wrong between steps 3 and 4. E.g. maybe the watermark hold isn't working (i.e. isn't preventing the watermark of ProcessFn from progressing to infinity); or maybe somehow the processing-time timer gets dropped for a different reason.
+
+[~lzljs3620320]/[~jkff] I looked into this again and I think I finally found all the issues:
+
+1. Processing-time timers are in fact dropped but I'm wondering whether this is actually "working as intended". Consider a stateful {{DoFn}} that sets a processing-time timer for some time in the future. Before this timer fires the sources terminate (they send the +Inf watermark and the runner can shut down, although I think this is questionable). The Runner still has that pending processing-time timer, should it block shutting down until that timer is fired? Or fire it right away? Or drop it? (Flink currently shuts down, thereby dropping that pending timer). Maybe [~kenn] also has an opinion on this since it is about stateful/timely {{DoFn}} in general.
+
+2. {{SplittableParDoViaKeyedWorkItems.ProcessFn}} doesn't behave as a stateful/timely {{DoFn}} should. It uses {{TimerInternals}} and instead of having an {{@OnTimer}} method it expects firing timers to come in the form of a {{KeyedWorkIterm}}. This messes with {{DoFnRunner.onTimer()}} (because it circumvents it) which is especially bad for {{StatefulDoFnRunner}} which has extra logic in {{onTimer()}}. It also leads to this somewhat awkward code in the Flink Runner where I manually filter out an event-time timer because the {{ProcessFn}} is not expecting that: https://github.com/apache/beam/blob/c10c4da9ab1bdbfb2530aa5d5f3ddb0670594397/runners/flink/src/main/java/org/apache/beam/runners/flink/translation/wrappers/streaming/SplittableDoFnOperator.java#L155-L155
+
+What do you think?
+
+I have a branch that "fixes" it by manually waiting in the {{BoundedSourceWrapper}} to give the processing-time timers enough time to fire: https://github.com/aljoscha/beam/tree/fix-flink-splittable-dofn.
+
+Dropping the processing-time timer is the intended behavior when it comes in for an expired window.
+
+On 1: the timer should not be dropped because ProcessFn is setting a watermark hold (bullet 3 in my previous comment here).
+
+On 2: correct, it uses the low-level state/timer APIs - partially because it was written before the high-level APIs were available; partially because the high-level APIs don't support watermark holds; partially because we didn't want to tie the availability of one complex feature in a runner to the availability of another complex feature.
+
+A watermark hold constrains the output watermark, not the input watermark.
+
+There is an open need to be able to set a timer with an associated _output_ watermark hold, which may be related. This has come up in conversation with [~reuvenlax].
+
+For a processing time timer, it would be like {{timer.withOutputTime(new Instant(...)).setRelative(...)}} and for an event time timer, it would look similarly like {{timer.withOutputTime(new Instant(...)).set(...))}}. These permit the {{@OnTimer}} callback to output elements with that timestamp. Both also manifest as output watermark holds.
+
+It sounds like you want to set an event time timer if you want it to be fired on the input watermark going to +inf.
+
+On 1: If the decision whether the window expired is output watermark hold,(Uh. I always thought it was input watermark) it does not end, need to continue processing ProcessTimer. 
+
+[~lzljs3620320] you are correct - the decision about whether a window is expired is based on the input watermark. That is why it does not continue processing processing time timers.
+
+To quickly summarise what's happening: The input watermark of the ProcessFn goes to {{+Inf}}, the processing-time timer is dropped as late and we don't process some data because of this. 
+
+ * [~jkff] is operating under the assumption that a watermark hold holds the input watermark and therefore should keep the ProcessFn from being shut down until the processing-time timer fires
+ * [~kenn] is operating under the assumption that a watermark holds the output watermark. An incoming +Inf watermark therefore causes an operation to shutdown (because future timers and events can be considered late and dropped). 
+
+The splittable DoFn implementation in Flink (seemingly) works, except in this edge case. It seems we have to re-consider what is considered late and how watermark holds work to resolve this. What do you think?
+
+The proposal of registering timers with an output watermark hold is essentially what the ProcessFn is doing manually, i.e. it's registering a timer and adding a watermark hold.
+
+I agree that the proposal of registering timers with an output watermark hold is essentially the same and won't help.
+
+Taking a step back, I don't feel strongly that it needs to be possible to implement SDF via StateInternals + TimerInternals, without any further runner awareness. If the natural semantics for state and timers don't fit, we shouldn't make them unnatural for this case. They are used for triggers and it has taken some time to mature the design, so changing their semantics has real risks. But these _are_ just internals, so we should also feel free to adjust them if we come up with a strong new design.
+
+I considered for a long time what should happen with processing time triggers as far as window expiry. We spent quite some time coming up with the semantics at https://s.apache.org/beam-lateness#heading=h.hot1g47sz45s, long before Beam. I don't claim it is perfect (it is way too complex, for one) but it represents a lot of thought by lots of people. I think actually it does give some choices.
+
+* an input being droppable does not necessarily mean you are required to drop it (some transforms may falter on droppable inputs, but that is specific to the transform)
+* input timestamp and output timestamp are decoupled, so you can reason about whether to ignore input based on whether the resulting output would be droppable
+
+Some possibilities for SDF:
+
+*Treat processing time timers as inputs with some timestamp at EOW or some such*
+
+The theme that timers are inputs is basically valid. We gain clarity by not conflating them in APIs and discussions. But how they interact with watermarks, etc, should be basically compatible. Currently processing time timers are treated as inputs with a timestamp equal to the input watermark at the moment of their arrival. So this change would cause an input hold because there is a known upcoming element that just hasn't arrived.
+
+In streaming: this holds things up too much. It also makes repeatedly firing after processing time cause an infinite loops, versus what happens today where it naturally goes through window expiry and GC.
+
+In batch: this breaks the unified model for processing historical data in a batch mode. With the semantics as they exist today, the way that batch "runs" triggers and processing time timers (by ignoring them) is completely compatible with the semantics. So any user who writes a correct transform has good assurances they it will work in both modes. If processing time timers held watermarks like this they would need to be processed in batch mode, yet they are contradictory with the whole point of it.
+
+We can omit unbounded SDFs from this unification issue, probably, but a bounded-per-element SDF should certainly work on streamed unbounded input as well as bounded input.
+
+*Decide whether to drop a processing time timer not based on the input watermark but based on whether its output would be droppable*
+
+This lets the input watermark advance, but still does not allow infinitely repeating processing time timers to terminate with window expiry automatically, and it still breaks the unified model. We could alleviate both issues by refusing to set new timers that would already be expired. I think this is just a rabbit hole of unnatural corner cases so we should avoid it.
+
+*In addition to the processing time timers that ProcessFn sets, also set a GC timer*
+
+This seems straightforward and a simple and good idea. These timers are also still run in batch mode for historical reprocessing.
+
+Can you clarify how it does not work? Is it because you need to create a "loop" that continues to fire until the residual is gone? Currently, there is simply no way to make a perpetual loop with timers because of the commentary below.
+
+*Treat event time timers as inputs with their given timestamp*
+
+This would combine the GC timer idea and let you make a looping structure. This currently cannot work because timers fire only when the input watermark is strictly greater than their timestamp. The semantics of "on time" and "final GC" panes depends on this, so we'd have a lot of work to do. But I think there might be a consistent world where event time timers are treated as elements, and fire when the watermark arrives at their timestamp. {{@OnWindowExpiration}} is then absolutely required and cannot be simulated by a timer.
+
+I need to look into things a bit but I think your comment about needing a "loop" is right: at the end of the {{@ProcessElement}} method a processing-time timer is set for the current processing time. This is expected to "re-awake" the {{@ProcessElement}} method, thereby creating a loop that runs until we have no more residual restriction to process. (Or, as is the case now, until the watermark on the input goes to +Inf, thereby missing some processing.)
+
+As a side node, the timers that {{SplittableDoFnOperator}} currently hands to {{ProcessFn}} (via {{StatefulDoFnRunner}}, which does late data dropping, i.e. also timer dropping) are wrapped in a {{WindowedValue}} with a global window and this global window is used for determining if the timer is late, which is only the case if the watermark went to +Inf. This is more by chance than by any conscious decision. 
+
+Okay, I see that I misunderstood what the watermark hold does, and now I'm not sure how anything works at all (i.e. why timers set by SDF are not constantly dropped) - in direct and dataflow runner :-|
+
+For SDF specifically, I think it would make sense to *advance the watermark of the input same as if the DoFn was not splittable* - i.e. consider the input element "consumed" only when the ProcessElement call terminates with no residual restriction. In other words, I guess, set an "input watermark hold" (in addition to output watermark hold)? Is such a thing possible? Does it make equal sense for non-splittable DoFn's that use timers?
+
+Ah, it is true that the input element is still pending. That is a very helpful perspective. So view it as a sort of NACK of the element as a whole, while saving the restriction to state. However, we can't advance the watermark as though it was non-splittable in the unbounded case; that would freeze the input watermark forever. (in the bounded case, I presume it is still the -inf to +inf story for all the same reasons as bounded sources)
+
+Instead, perhaps the "amount consumed" of this element is measured by the watermark reporting done during processing of the element by the SDF. So the input watermark can move forward to that point. This would subsume output watermark holds, which seems nice.
+
+I doubt think this kind of hold makes sense outside of SDF. Maybe, with revised semantics as per my final section above, but I don't think we should take on the additional challenge of designing this in a safe user-facing way in order to push SDF forwards.
+
+On the internal side you do need a way to manage the watermarks in the underlying engine. We should note that {{ProcessFn}} already is treated specially via a {{ProcessFnRunner}} within a Flink {{SplittableDoFnOperator}}. So we are assuming explicit runner support and we are talking about how the {{SplittableDoFnOperator}} communicates with Flink. I would actually suggest a "partial NACK with new watermark" style of API (just like ProcessContinuation) so that it is tightly coupled with the fact that the element should be re-delivered. I would focus a lot on making stuck pipelines impossible, since they are hard to debug.
+
+_we can't advance the watermark as though it was non-splittable in the unbounded case_ - why is that / why is it a bad thing that the watermark of the PCollection being fed into the SDF would not advance? E.g. imagine it's a Create.of(pubsub topic name) + ParDo(read pubsub forever) - is it important to advance the watermark of the Create.of()?
+
+Alternatively, imagine it's: read filepatterns from pubsub + TextIO.readAll().watchForNewFiles().watchFilesForNewEntries(), which has several SDFs in this. Would there be a problem with advancing the watermark of the PCollection of filepatterns only after the watch termination conditions of TextIO.readAll() are hit and this filepattern is no longer watched?
+
+Alternatively - worst case I guess: read Pubsub topic names from Kafka, and read each topic forever. I'd assume that the user would be interested in advancement of the watermark of the PCollection of pubsub records rather than the PCollection of Pubsub topic names? I'm not sure the Pubsub topic names in Kafka would even need to have meaningful timestamps (rather than infinite past).
+
+...Or is the problem that the watermark of the output PCollection has to be smaller than watermark of the input, so if input doesn't advance then output can't advance either?
+
+Working backwards from that, in the "read Pubsub topic names from Kafka" case: let "topicsPC" be the PCollection of topic names, and "recordsPC" be the PCollection of records read from these topics.
+
+We want the watermark of "recordsPC" to be a lower bound on timestamps of new records that will ever be read from any of the current or future topics.
+Currently known elements of topicsPC already provide this bound for their records via the watermark hold, but for elements of recordsPC that will be produced from future elements of topicsPC, the only information we have is the watermark of topicsPC.
+
+So, the ideal observable watermark behavior is as follows:
+- elements in topicsPC have timestamps, and timestamp of an element in topicsPC is a reasonable starting watermark for elements produced from this topic into recordsPC.
+- watermark of recordsPC should be min(current watermark holds set by currently pending element/restriction pairs from topicsPC, watermark of topicsPC itself) - the first term describes what records can arrive from currently read topics, the second term, from future topics, due to bullet 1.
+- in the special case where topicsPC is bounded (e.g. Create.of()) and its watermark has advanced to infinity, this reduces to just the current watermark holds, which is correct.
+
+Now, our problem is that if watermark of topicsPC advances to infinity (e.g. because it was bounded and we've processed the initial ProcessElement calls for its element/restriction pairs), the runner thinks that it's a promise that "likely nothing new will appear in this PCollection" which is not true of the processing-time timer set by SDF.
+
+On the other hand, if we hold the watermark of topicsPC at the original ancient timestamp of the element/restriction pair, the runner will interpret it as "I can only promise you that new elements/timers in topicsPC will have a timestamp later than this ancient timestamp" which is unnecessarily restrictive - in reality, new elements/timers in topicsPC will either come from the transform that produces topicsPC, or from new processing-time timers scheduled by the currently read topics, and watermark should be min(these).
+
+How do we make a promise about future event-time timestamps of processing-time timers? You say "Currently processing time timers are treated as inputs with a timestamp equal to the input watermark at the moment of their arrival" - which would be the current watermark of "topicsPC" I suppose? I think that would be consistent with the desired behavior above.
+
+(clearly more thought is needed, but thought I'd dump this anyway)
+
+Yes, your last comment is the reason. If the watermark of the Create doesn't advance past _n_, then as far as ParDo(read forever) knows, it could receive a topic timestamped _n_ that will result in pulling elements from pubsub timestamped _n_. So you have a stuck pipeline. This highlights the issue we've discussed that a per-PCollection watermark is not really ideal for SDF, but I think that scope is too big for this ticket.
+
+I think to unblock this we have to move the SplittableDoFn implementation (in Flink, I don't know about Dataflow) to a custom implementation that doesn't use {{ProcessFn}} because stateful/timely DoFns are not a perfect fit right now. I did this in this branch: https://github.com/aljoscha/beam/tree/fix-flink-splittable-dofn-squashed It works because we're now using Flink's processing-time timer facility directly, which doesn't drop timers if they're late. This still has the issue of processing-time timers being simply dropped when the pipeline shuts down (which happens when the bounded source shuts down).
+
+About the more thorny issues regarding watermarks and splittable DoFn I feel we have to at least bring the discussion to the ML and somehow design us out of the situation. 😃 What do you think?
+
+Ok, I also fixed the issue of dropped timers by exhausting the restriction in a "last resort" +Inf event-time timer.
+
+OK. We also came up with a new thought that affect timers in general. TL;DR: every timer gets an event time timestamp independent of its firing spec, and those timestamps flow in a feedback loop that gets a watermark.
+
+I have written up the details at BEAM-2535, which should track making it available for user timers. But doing the "under the hood work" to get SDF up and running can be done more quickly. I believe we can implement it using the kinds of state we have available today since the side channel watermark is simply the same value as the output watermark hold.
+
+Cool, so for the side channel to affect things we just have to change the places where we determine lateness (for example {{StatefulDoFnRunner.isLate()}}) to include that, correct?
+
+Yea. I think if timers are set with an event time timestamp, then we hold for that time and use the min of the hold and the input watermark to govern GC.
+
+So, to elaborate on what Kenn said. We dug a bit deeper into this yesterday and came up with the following conclusions.
+
+1) The reason that this stuff works in Dataflow and Direct runner is that, for running SDF, they use a code path that simply _does not drop late data/timers or GC state_. These happen in LateDataDroppingRunner and ReduceFnRunner and StatefulDoFnRunner - and the path for running ProcessFn does not involve any of these. Aljoscha, maybe you can see why your current codepaths for running ProcessFn in Flink involve dropping of late data / late timers, and make them not involve it? :) (I'm not sure where this dropping happens in Flink)
+2) As a consequence, however, state doesn't get GC'd. In practice this means that, if you apply an SDF to input that is in many windows (e.g. to input windowed by fixed or sliding windows), it will slowly leak state. However, in practice this is likely not a huge concern because SDFs are expected to mostly be used when the amount of input is not super large (at least compared to output), and it is usually globally windowed. Especially in streaming use cases. I.e. it can be treated as a "Known issue" rather than "SDF does not work at all". *I would recommend proceeding to implement it in Flink runner with this same known issue*, and then solving the issue uniformly across all runners.
+
+Posting this comment for now and writing another on how to do it without state leakage.
+
+Conceptually, watermarks are for PCollections - lower bound on timestamps of new elements that may get added to the collection.
+However, at the implementation level, watermarks are assigned to transforms: they have an "input watermark" and "output watermark" (I suppose, per input and per output).
+The difference between the output watermark of a transform producing PC and the input watermark of a transform consuming PC is as follows: the input watermark is held by "pending elements", that we know need to be processed, but yet haven't.
+The input watermark is also held by the event-time of pending timers set by the transform. In other words, logically the transform's input is (output of the producer of the input) + (timers set by the transform itself), and the input watermark is held by both of these.
+
+Currently the input watermark of a transform is held only by _event-time_ timers; however, it makes sense to hold it also by _processing-time_ timers. For that we need to assign them an event-time timestamp. Currently this isn't happening at all (except assigning an "effective timestamp" to output from the timer firing, when it fires - it is assigned from the current input watermark). The suggestion in case of SDF is to use the ProcessContinuation's output watermark as the event-time for the residual timer.
+
+We also discussed handling of processing-time timers in batch. Coming from the point of view that things should work exactly the same way in batch - setting a processing-time timer in batch for firing in 5 minutes should actually fire it after 5 minutes, including possibly delaying the bundle until processing-time timers quiesce. Motivating use case is, say, using an SDF-based polling continuous glob expander in a batch pipeline - it should process the same set of files it would in a streaming pipeline.
+
+A few questions I still do not understand:
+- Where exactly do the processing-timers get dropped, and on what condition? Kenn says that event-time timers don't get dropped: we just forbid setting them if they would be already "late". 
+- When can an input to the SDF, or a timer set by the SDF be late at all; and should the SDF drop them? Technically a runner is free to drop late data at any point in the pipeline, but in practice it happens after GBKs; and semantically an SDF need not involve a GBK, so it should be allowed to just not drop anything late, no? - like a regular DoFn would (as long as it doesn't leak state)
+
+Seems like we also should file JIRAs for the following:
+- state leakage
+- handling processing-time timers in batch properly
+- holding watermark by processing-time timers
+- allowing the timer API (internals or the user-facing one) to specifying event-time of processing-time timers
+- more?
+
+Yea, as you say SDF can play by its own rules, so you can certainly just choose to not drop any timers, and you can clean up stored element+restriction pairs when your input watermark is far enough along and there are no more timers pending for that window. Seems likely that in the SDF implementation you might find an even simpler way to just look at the residual restriction, notice it is empty, and clear the state.
+
+I don't think an SDF should wait at all in a batch pipeline. In the unified model, this means bounded-to-bounded SDFs. It doesn't really make sense to even use timers to implement so I think the discussion is moot.
+
+Yep, in the Flink Runner the processing path for {{ProcessFn}} contains {{StatefulDoFnRunner}}, that's why timers were dropped once the input watermark went to +Inf. I fixed this in the branch I posted earlier by changing {{SplittableDoFnOperator}} to not use that code path anymore but instead use completely custom code for processing a splittable DoFn: https://github.com/apache/beam/blob/10b1b598100541ff37734a04850ada45fc362b99/runners/flink/src/main/java/org/apache/beam/runners/flink/translation/wrappers/streaming/SplittableDoFnOperator.java#L73-L73. This fixed the problem of dropped processing-time timers.
+
+The other problem (in the Flink Runner) was that processing-time timers are simply dropped if the pipeline is shutting down. I'm getting around this by setting a "last resort" event-time timer that fires when the watermark goes to +Inf. There I'm processing the remaining restrictions until they're exhausted. Splittable DoFn processing in the {{SplittableDoFnOperator}} is now split (hehe) into three methods:
+ * {{processElement()}}: seed state and process restriction once, set next processing-time timer and set last resort event-time timer
+ * {{onProcessingTime()}}: process restriction once and set next processing-time timer, cleanup all state if restriction is exhausted
+ * {{onEventTime()}}: process restriction until exhausted, cleanup all state
+
+There is no way of getting around Flink dropping processing-time timers so if we want to get the Flink Runner to directly use {{ProcessFn}} we should add this "last resort" timer there as well. I think it makes sense to have this in general anyways. [~jkff] what do you think about this?
+
+Regarding state leakage: AFAIK a splittable DoFn is not allowed to have any custom state or timers, right? And {{ProcessFn}} makes sure to cleanup the element state and restriction state when a restriction is exhausted so there should be no state leakage, right?
+
+[~jkff] You mentioned that "the input watermark is held by "pending elements"". Is this true? I thought that only the output watermark is held by pending elements.
+
+GitHub user aljoscha opened a pull request:
+
+    https://github.com/apache/beam/pull/3480
+
+    [BEAM-2140] Execute Splittable DoFn directly in Flink Runner
+
+    Before, we were using ProcessFn. This was causing problems with the
+    Flink Runner for two reasons:
+    
+    1. StatefulDoFnRunner is in the processing path, which means
+    processing-time timers are being dropped when the watermark reaches +Inf
+    
+    2. When a pipeline shuts down (for example, when bounded sources shut
+    down) Flink will drop any outstanding processing-time timers, meaning
+    that that any remaining Restrictions will not be processed.
+    
+    The fix for 1. is to execute the splittable DoFn directly, thereby
+    bypassing the late data/timer dropping logic.
+    
+    The fix for 2. builds on the fix for 1. and also introduces a "last
+    resort" even-time timer that fires at +Inf and makes sure that any
+    remaining restrictions are being exhausted.
+    
+    R: @jkff Not sure if we wan't to fix it like this or maybe adapt `ProcessFn` and remove `StatefulDoFnRunner` from the processing path.
+
+
+You can merge this pull request into a Git repository by running:
+
+    $ git pull https://github.com/aljoscha/beam fix-flink-splittable-dofn-squashed
+
+Alternatively you can review and apply these changes as the patch at:
+
+    https://github.com/apache/beam/pull/3480.patch
+
+To close this pull request, make a commit to your master/trunk branch
+with (at least) the following in the commit message:
+
+    This closes #3480
+    
+----
+commit e30efe70bdafbbcc5bc1082f980867e58684c351
+Author: Aljoscha Krettek <aljoscha.krettek@gmail.com>
+Date:   2017-06-26T10:10:18Z
+
+    [BEAM-2140] Execute Splittable DoFn directly in Flink Runner
+    
+    Before, we were using ProcessFn. This was causing problems with the
+    Flink Runner for two reasons:
+    
+    1. StatefulDoFnRunner is in the processing path, which means
+    processing-time timers are being dropped when the watermark reaches +Inf
+    
+    2. When a pipeline shuts down (for example, when bounded sources shut
+    down) Flink will drop any outstanding processing-time timers, meaning
+    that that any remaining Restrictions will not be processed.
+    
+    The fix for 1. is to execute the splittable DoFn directly, thereby
+    bypassing the late data/timer dropping logic.
+    
+    The fix for 2. builds on the fix for 1. and also introduces a "last
+    resort" even-time timer that fires at +Inf and makes sure that any
+    remaining restrictions are being exhausted.
+
+----
+
+
+ [~jkff] [~kenn] [~lzljs3620320] Returning to this after a bit of a break. I did a simpler implementation that does not duplicate the {{ProcessFn}} code but instead blocks shutdown in the {{DoFnOperator}} while there are pending processing-time timers.
+
+This solution works but is still flaky in tests (and in edge cases in the real world). The reason is still that processing-time timers don't hold back any watermark (neither the input nor the output watermark, if I'm correct). The situation is this (in the basic tests): we have a {{Create}}, a {{SDF}}, and a validating {{PAssert}}
+{{code}}
+Create -> SDF -> PAssert
+{{code}}
+
+In failure cases this happens: 1) {{Create}} emits some elements, 2) the {{SDF}} processes some elements, then yields and a processing-time timer is set for processing the remainder of the restriction, 3) {{Create}} finishes, the watermark goes to +Inf 4) the watermark "passes" (un-held) thought the SDF, 4) the watermark triggers computation at the {{PAssert}} and this notices that we didn't receive all expected data.
+
+How does this work in the Dataflow runner if processing-time timers don't hold back the watermark. Or is there a custom implementation for SDF in the Dataflow runner?
+
+Sorry for the delayed response. The output watermark should be held by the watermark hold set by the SDF: https://github.com/apache/beam/blob/master/runners/core-java/src/main/java/org/apache/beam/runners/core/SplittableParDoViaKeyedWorkItems.java#L378 - does your implementation support output watermark holds?
+
+Github user aljoscha closed the pull request at:
+
+    https://github.com/apache/beam/pull/3480
+
+
+As I commented on the PR, I have a solution that is simpler but also doesn't work because there is currently no way of getting around the fact that Flink will shutdown the timer service before calling close() on an operator. Meaning that there is no way of blocking on "in-flight" timers. I'll try and get such a feature in Flink, only then can we fix this issue.
+
+Thanks Aljoscha! It would be awesome to get this working in Flink, since we now have very useful IO capabilities built on top of SDF (specifically FileIO.match().continuously(), the lower-level Watch transform and the higher-level TextIO.watchForNewFiles() etc) and it would be great if these worked in more runners. They will also provide examples to test on that are far more realistic than the SDF unit tests. Let me know if there's any way I can help.
+
+Also note that this support is critical for portable streaming pipelines, because SDF is *the only* API capable of expressing unbounded sources in the portability framework.
+
+aljoscha opened a new pull request #4348: [BEAM-2140] Fix SplittableDoFn ValidatesRunner tests in Flink Runner
+URL: https://github.com/apache/beam/pull/4348
+ 
+ 
+   I managed to sneak a change into Flink 1.4.0 that allows blocking on pending process-time timers. Now we can finally fix those tests for the Flink Runner. 😃 
+   
+   Most of these changes are pretty straightforward, the only controversial change is using the output WM instead of the input WM for determining lateness in `StateFulDoFnRunner`. This is there to make sure that timers (which are elements to the `ProcessFn`) are not dropped when the input watermark goes to `+Inf`. I tried changing `FlinkTimerInternals.currentInputWatermarkTime()` to be held back by the watermark hold but that doesn't work because windows and stuff will then never fire.
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on GitHub and use the
+URL above to go to the specific comment.
+ 
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+

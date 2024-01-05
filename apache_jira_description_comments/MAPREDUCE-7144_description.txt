@@ -1,0 +1,68 @@
+In our internal build environment, we observed that the test case {{TestMRIntermediateDataEncryption#testMultipleReducers}} was flaky and failed randomly on multiple branches.
+
+After a long investigation, it turned out that the problems were caused by speculative execution and timing issues around it.
+
+Detailed explanation:
+
+1. AppMaster speculatively starts two reducers:
+
+{noformat}
+2018-09-19 04:09:31,022 INFO [AsyncDispatcher event handler] org.apache.hadoop.mapreduce.v2.app.speculate.DefaultSpeculator: ATTEMPT_START task_1537355349087_0001_r_000001
+...
+2018-09-19 04:09:31,025 INFO [AsyncDispatcher event handler] org.apache.hadoop.mapreduce.v2.app.speculate.DefaultSpeculator: ATTEMPT_START task_1537355349087_0001_r_000000
+{noformat}
+
+2. Both attempts are scheduled and run in parallel:
+
+{noformat}
+2018-09-19 04:09:31,025 INFO [AsyncDispatcher event handler] org.apache.hadoop.mapreduce.v2.app.job.impl.TaskAttemptImpl: attempt_1537355349087_0001_r_000000_0 TaskAttempt Transitioned from ASSIGNED to RUNNING
+...
+2018-09-19 04:09:46,036 INFO [AsyncDispatcher event handler] org.apache.hadoop.mapreduce.v2.app.job.impl.TaskAttemptImpl: attempt_1537355349087_0001_r_000000_1 TaskAttempt Transitioned from ASSIGNED to RUNNING
+{noformat}
+
+3.  attempt_1537355349087_0001_r_000000_1 is finished earlier and reached progress of 1.0
+{noformat}
+2018-09-19 04:10:05,747 INFO [IPC Server handler 3 on 36796] org.apache.hadoop.mapred.TaskAttemptListenerImpl: Progress of TaskAttempt attempt_1537355349087_0001_r_000000_1 is : 1.0
+2018-09-19 04:10:05,751 INFO [IPC Server handler 2 on 36796] org.apache.hadoop.mapred.TaskAttemptListenerImpl: Done acknowledgement from attempt_1537355349087_0001_r_000000_1
+{noformat}
+
+4. There's no need for attempt_1537355349087_0001_r_000000_0, so the AppMaster decides to kill it:
+{noformat}
+2018-09-19 04:10:05,755 INFO [AsyncDispatcher event handler] org.apache.hadoop.mapreduce.v2.app.job.impl.TaskImpl: Issuing kill to other attempt attempt_1537355349087_0001_r_000000_0
+{noformat}
+
+5.  Right after this, the MapReduce job transitions to COMMITTING phase, which involves moving files on HDFS, deleting the temporary directory and creating a file named _SUCCESS:
+{noformat}
+2018-09-19 04:10:05,836 DEBUG [IPC Server handler 3 on 45026] hdfs.StateChange (FSNamesystem.java:deleteInt(4181)) - DIR* NameSystem.delete: /test/output/_temporary
+2018-09-19 04:10:05,836 DEBUG [IPC Server handler 3 on 45026] hdfs.StateChange (FSDirectory.java:delete(1334)) - DIR* FSDirectory.delete: /test/output/_temporary
+2018-09-19 04:10:05,837 DEBUG [IPC Server handler 3 on 45026] hdfs.StateChange (FSDirectory.java:unprotectedDelete(1480)) - DIR* FSDirectory.unprotectedDelete: _temporary is removed
+2018-09-19 04:10:05,837 DEBUG [IPC Server handler 3 on 45026] hdfs.StateChange (FSNamesystem.java:deleteInternal(4251)) - DIR* Namesystem.delete: /test/output/_temporary is removed
+2018-09-19 04:10:05,837 INFO  [IPC Server handler 3 on 45026] FSNamesystem.audit (FSNamesystem.java:logAuditMessage(9826)) - allowed=true	ugi=jenkins (auth:SIMPLE)	ip=/127.0.0.1	cmd=delete	src=/test/output/_temporary	dst=null	perm=null	proto=rpc
+2018-09-19 04:10:05,837 DEBUG [IPC Server handler 3 on 45026] metrics.TopMetrics (TopMetrics.java:report(122)) - a metric is reported: cmd: delete user: jenkins (auth:SIMPLE)
+2018-09-19 04:10:05,837 DEBUG [IPC Server handler 3 on 45026] top.TopAuditLogger (TopAuditLogger.java:logAuditEvent(78)) - ------------------- logged event for top service: allowed=true	ugi=jenkins (auth:SIMPLE)	ip=/127.0.0.1	cmd=delete	src=/test/output/_temporary	dst=null	perm=null
+2018-09-19 04:10:05,839 DEBUG [IPC Server handler 2 on 45026] hdfs.StateChange (NameNodeRpcServer.java:create(596)) - *DIR* NameNode.create: file /test/output/_SUCCESS for DFSClient_NONMAPREDUCE_-188083900_1 at 127.0.0.1
+2018-09-19 04:10:05,839 DEBUG [IPC Server handler 2 on 45026] hdfs.StateChange (FSNamesystem.java:startFileInt(2748)) - DIR* NameSystem.startFile: src=/test/output/_SUCCESS, holder=DFSClient_NONMAPREDUCE_-188083900_1, clientMachine=127.0.0.1, createParent=true, replication=2, createFlag=[CREATE, OVERWRITE], blockSize=134217728, supportedVersions=[CryptoProtocolVersion{description='Encryption zones', version=2, unknownValue=null}]
+2018-09-19 04:10:05,839 DEBUG [IPC Server handler 2 on 45026] namenode.FSDirectory (FSDirectory.java:copyINodeDefaultAcl(2272)) - child: _SUCCESS, posixAclInheritanceEnabled: false, modes: { masked: rw-rw-rw-, unmasked: rw-rw-rw- }
+2018-09-19 04:10:05,839 DEBUG [IPC Server handler 2 on 45026] hdfs.StateChange (FSDirectory.java:addFile(400)) - DIR* addFile: /test/output/_SUCCESS is added
+2018-09-19 04:10:05,840 DEBUG [IPC Server handler 2 on 45026] hdfs.StateChange (FSNamesystem.java:startFileInternal(2973)) - DIR* NameSystem.startFile: added /test/output/_SUCCESS inode 16425 holder DFSClient_NONMAPREDUCE_-188083900_1
+{noformat}
+
+6. However, the reducer attempt_1537355349087_0001_r_000000_0 is not killed instantly. In fact, it was still running at this point and re-created the temporary directory:
+{noformat}
+2018-09-19 04:10:06,357 DEBUG [IPC Server handler 6 on 45026] hdfs.StateChange (NameNodeRpcServer.java:create(596)) - *DIR* NameNode.create: file /test/output/_temporary/1/_temporary/attempt_1537355349087_0001_r_000000_0/part-00000 for DFSClient_attempt_1537355349087_0001_r_000000_0_-603230467_1 at 127.0.0.1
+2018-09-19 04:10:06,358 DEBUG [IPC Server handler 6 on 45026] hdfs.StateChange (FSNamesystem.java:startFileInt(2748)) - DIR* NameSystem.startFile: src=/test/output/_temporary/1/_temporary/attempt_1537355349087_0001_r_000000_0/part-00000, holder=DFSClient_attempt_1537355349087_0001_r_000000_0_-603230467_1, clientMachine=127.0.0.1, createParent=true, replication=2, createFlag=[CREATE, OVERWRITE], blockSize=134217728, supportedVersions=[CryptoProtocolVersion{description='Encryption zones', version=2, unknownValue=null}]
+2018-09-19 04:10:06,358 DEBUG [IPC Server handler 6 on 45026] namenode.FSDirectory (FSDirectory.java:copyINodeDefaultAcl(2272)) - child: _temporary, posixAclInheritanceEnabled: false, modes: rwxrwxrwx
+2018-09-19 04:10:06,358 DEBUG [IPC Server handler 6 on 45026] hdfs.StateChange (FSNamesystem.java:mkdirsRecursively(4614)) - mkdirs: created directory /test/output/_temporary
+2018-09-19 04:10:06,358 DEBUG [IPC Server handler 6 on 45026] namenode.FSDirectory (FSDirectory.java:copyINodeDefaultAcl(2272)) - child: 1, posixAclInheritanceEnabled: false, modes: rwxrwxrwx
+2018-09-19 04:10:06,359 DEBUG [IPC Server handler 6 on 45026] hdfs.StateChange (FSNamesystem.java:mkdirsRecursively(4614)) - mkdirs: created directory /test/output/_temporary/1
+2018-09-19 04:10:06,359 DEBUG [IPC Server handler 6 on 45026] namenode.FSDirectory (FSDirectory.java:copyINodeDefaultAcl(2272)) - child: _temporary, posixAclInheritanceEnabled: false, modes: rwxrwxrwx
+2018-09-19 04:10:06,359 DEBUG [IPC Server handler 6 on 45026] hdfs.StateChange (FSNamesystem.java:mkdirsRecursively(4614)) - mkdirs: created directory /test/output/_temporary/1/_temporary
+2018-09-19 04:10:06,359 DEBUG [IPC Server handler 6 on 45026] namenode.FSDirectory (FSDirectory.java:copyINodeDefaultAcl(2272)) - child: attempt_1537355349087_0001_r_000000_0, posixAclInheritanceEnabled: false, modes: rwxrwxrwx
+2018-09-19 04:10:06,359 DEBUG [IPC Server handler 6 on 45026] hdfs.StateChange (FSNamesystem.java:mkdirsRecursively(4614)) - mkdirs: created directory /test/output/_temporary/1/_temporary/attempt_1537355349087_0001_r_000000_0
+{noformat}
+
+So what happens is that the AppMaster deleted the temporary directory {{/user/test/_temporary}} at 04:10:05,837, the reducer created it again a second later at 04:10:06,358. Eventually the reducer attempt attempt_1537355349087_0001_r_000000_0 was terminated.
+
+The solution is to wait until all reducers have been killed and only then proceed to the committing phase.
+
+The bug itself is probably not severe, because the MR job itself succeeds.

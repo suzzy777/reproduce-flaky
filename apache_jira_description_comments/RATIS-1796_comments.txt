@@ -1,0 +1,161 @@
+The old leader should have stepped down first.  No?
+
+{quote}The old leader should have stepped down first. No?{quote}
+
+When transferee receives startLeaderElection, it's term should be increased.
+The old leader's appendEntries should be in previous term, isn't it?
+
+[~szetszwo] I think I have found the problem:
+ # Transferee received startLeaderElection (RaftServerImpl#startLeaderElection:1700 -> RaftServerImpl#changeToCandidate:649 -> RoleInfo#startLeaderElection:121 -> start new thread LeaderElection)
+ # Transferee received appendEntries (stack trace in the log above), and become follower.
+ # LeaderElection thread in step 1 is running, found the CandidateState is already CLOSED by step 2.
+
+The term of transferee is expected to be increased in step 3 (LeaderElection#run:238 -> LeaderElection#askForVotes:304 -> ServerState#initElection:221 -> currentTerm.incrementAndGet).
+But in this case, step 2 is executed before step 3 when the term hasn't been increased.
+
+[~szetszwo] How about refactoring the LeaderElection to this?
+
+On election timeout:
+ # Asynchronously run LeaderElection(PreVote)
+ # Synchronously increase term in CandidateState if step 1 passed
+ # Asynchronously run LeaderElection(Vote)
+
+On startLeaderElection:
+ # Synchronously increase term in CandidateState
+ # Asynchronously run LeaderElection(Vote)
+
+{quote}The old leader should have stepped down first. No?{quote}
+
+The old leader will not step down first, the step down is caused by RequestVote from the transferee. Quotes from Raft dissertation: 
+
+{quote}Once the target server receives the TimeoutNow request, it is highly likely to start an election before any other server and become leader in the next term. Its next message to the prior leader will include its new term number, causing the prior leader to step down. At this point, leadership transfer is complete.{quote}
+
+In Ratis implementation,  {{stepDownLeaderAsync}} is only called when {{newLeader}} is {{null}}.
+
+{code:java}
+  CompletableFuture<RaftClientReply> transferLeadershipAsync(TransferLeadershipRequest request)
+      throws IOException {
+    if (request.getNewLeader() == null) {
+      return stepDownLeaderAsync(request);
+    }
+{code}
+
+This is a special case for the TransferLeadership rpc.
+Alternatively, it could be interpreted as transfer leadership to any other peer, so we can reduce the downtime.
+
+----
+
+For the problem in this Jira,
+
+{quote}I think I have found the problem:
+
+Transferee received startLeaderElection (RaftServerImpl#startLeaderElection:1700 -> RaftServerImpl#changeToCandidate:649 -> RoleInfo#startLeaderElection:121 -> start new thread LeaderElection)
+Transferee received appendEntries (stack trace in the log above), and become follower.
+LeaderElection thread in step 1 is running, found the CandidateState is already CLOSED by step 2.
+The term of transferee is expected to be increased in step 3 (LeaderElection#run:238 -> LeaderElection#askForVotes:304 -> ServerState#initElection:221 -> currentTerm.incrementAndGet).
+But in this case, step 2 is executed before step 3 when the term hasn't been increased.{quote}
+
+Maybe we can introduce a Pre-Candidate state along with the Candidate state.
+And increase the term when a peer becomes Candidate instead of in LeaderElection.
+
+Reference: https://github.com/etcd-io/raft/blob/main/raft.go#L839-L866
+
+[~szetszwo] what do you think?
+
+
+
+{quote}Maybe we can introduce a Pre-Candidate state along with the Candidate state.
+And increase the term when a peer becomes Candidate instead of in LeaderElection.
+{quote}
+-I have create a draft PR for this change, the transfer leadership test is no longer flaky,-
+-but the leader election is not mature enough and need another look:-
+
+[-https://github.com/apache/ratis/pull/843-]
+
+ 
+
+Let's focus on addressing the problem in this Jira first, new pull request submitted:
+
+https://github.com/apache/ratis/pull/844
+
+bq. ... How about refactoring the LeaderElection to this?  ...
+
+You mean skilling PreVote?  Yes, it is a good idea.
+
+bq. Maybe we can introduce a Pre-Candidate state along with the Candidate state.
+
+But Pre-Candidate seems not helping in this problem.  It would become follower if it receives appendEntries.
+
+bq. You mean skilling PreVote? Yes, it is a good idea.
+
+We are already skipping PreVote.  You actually mean to increase the term synchronously in the startLeaderElection(..) call.
+
+[~ckj], There is a race between leader election and committing new logs.  Yes, we can increase the term early to avoid changing back to follower by appendEntries.  However, the old leader and the other follower won't vote for it since they have committed new log.
+
+The question is -- do we support transfer leadership when the group is busy?  If yes, we need to step down the leader first.  We may provide an option to "force" transfer leadership.
+
+{quote} There is a race between leader election and committing new logs. Yes, we can increase the term early to avoid changing back to follower by appendEntries. However, the old leader and the other follower won't vote for it since they have committed new log.{quote}
+
+We have already blocked client requests during transfer leadership, so the old leader shouldn't get new logs.
+And we only send startElection to the transferee when it's up-to-date.
+So the appendEntries here is actually heartbeat.
+
+{quote}The question is – do we support transfer leadership when the group is busy? If yes, we need to step down the leader first. We may provide an option to "force" transfer leadership.{quote}
+
+We don't need to step down the leader first, it will step down when the transferee increased its term.
+We just need to block client request on the old leader to make sure the log doesn't grow anymore.
+
+Currently, yield leadership to higher priority peer doesn't block client request, I have some idea to change it.
+When the old leader detects a peer with higher priority, it will start a TransferLeadership (blocking) *iff* the peer is up-to-date.
+
+[~szetszwo] I have confirmed it's (EDIT: mostly) caused by heartbeat (see new logs in description) and updated the title of this Jira.
+You can see more logs in artifacts of this CI: [https://github.com/kaijchen/ratis/actions/runs/4349993784]
+{quote}Currently, yield leadership to higher priority peer doesn't block client request, I have some idea to change it.
+When the old leader detects a peer with higher priority, it will start a TransferLeadership (blocking) *iff* the peer is up-to-date.
+{quote}
+I have updated RATIS-1770 and submitted a new PR for it:
+[https://github.com/apache/ratis/pull/845]
+
+Let's resolve RATIS-1770 before this Jira (if we want to increase the term early).
+
+{quote}I have confirmed it's caused by heartbeat (see new logs in description) and updated the title of this Jira.
+You can see more logs in artifacts of this CI: [https://github.com/kaijchen/ratis/actions/runs/4349993784]
+{quote}
+Searching for {{isHeartbeat}} in the logs, there are a few cases which are not caused by heartbeat (2/13).
+
+I'll look into it later. 
+{code:java}
+$ grep isHeartbeat unit-*/iteration*/ratis-test/*-output.txt
+unit-1/iteration3/ratis-test/org.apache.ratis.grpc.cli.TestElectionCommandIntegrationWithGrpc-output.txt:2023-03-07 02:28:54,806 [s1-server-thread4] INFO  impl.RoleInfo (RoleInfo.java:startFollowerState(104)) - s1: startFollowerState reason:appendEntries: s0, term: 1, isHeartbeat: true, trace:
+unit-1/iteration9/ratis-test/org.apache.ratis.grpc.cli.TestElectionCommandIntegrationWithGrpc-output.txt:2023-03-07 02:30:57,180 [s0-server-thread3] INFO  impl.RoleInfo (RoleInfo.java:startFollowerState(104)) - s0: startFollowerState reason:appendEntries: s1, term: 1, isHeartbeat: true, trace:
+unit-3/iteration4/ratis-test/org.apache.ratis.grpc.cli.TestElectionCommandIntegrationWithGrpc-output.txt:2023-03-07 02:29:15,824 [s1-server-thread3] INFO  impl.RoleInfo (RoleInfo.java:startFollowerState(104)) - s1: startFollowerState reason:appendEntries: s0, term: 2, isHeartbeat: true, trace:
+unit-6/iteration2/ratis-test/org.apache.ratis.grpc.cli.TestElectionCommandIntegrationWithGrpc-output.txt:2023-03-07 02:28:41,616 [s1-server-thread1] INFO  impl.RoleInfo (RoleInfo.java:startFollowerState(104)) - s1: startFollowerState reason:appendEntries: s0, term: 1, isHeartbeat: false, trace:
+unit-6/iteration2/ratis-test/org.apache.ratis.grpc.cli.TestElectionCommandIntegrationWithGrpc-output.txt:2023-03-07 02:28:41,634 [s2-server-thread1] INFO  impl.RoleInfo (RoleInfo.java:startFollowerState(104)) - s2: startFollowerState reason:appendEntries: s0, term: 1, isHeartbeat: true, trace:
+unit-6/iteration2/ratis-test/org.apache.ratis.grpc.cli.TestElectionCommandIntegrationWithGrpc-output.txt:2023-03-07 02:28:42,402 [s1-server-thread3] INFO  impl.RoleInfo (RoleInfo.java:startFollowerState(104)) - s1: startFollowerState reason:appendEntries: s0, term: 1, isHeartbeat: true, trace:
+unit-6/iteration3/ratis-test/org.apache.ratis.grpc.cli.TestElectionCommandIntegrationWithGrpc-output.txt:2023-03-07 02:29:07,262 [s1-server-thread3] INFO  impl.RoleInfo (RoleInfo.java:startFollowerState(104)) - s1: startFollowerState reason:appendEntries: s0, term: 1, isHeartbeat: true, trace:
+unit-6/iteration6/ratis-test/org.apache.ratis.grpc.cli.TestElectionCommandIntegrationWithGrpc-output.txt:2023-03-07 02:30:23,908 [s0-server-thread1] INFO  impl.RoleInfo (RoleInfo.java:startFollowerState(104)) - s0: startFollowerState reason:appendEntries: s1, term: 1, isHeartbeat: true, trace:
+unit-6/iteration6/ratis-test/org.apache.ratis.grpc.cli.TestElectionCommandIntegrationWithGrpc-output.txt:2023-03-07 02:30:25,947 [s0-server-thread3] INFO  impl.RoleInfo (RoleInfo.java:startFollowerState(104)) - s0: startFollowerState reason:appendEntries: s1, term: 1, isHeartbeat: true, trace:
+unit-6/iteration7/ratis-test/org.apache.ratis.grpc.cli.TestElectionCommandIntegrationWithGrpc-output.txt:2023-03-07 02:30:55,072 [s0-server-thread1] INFO  impl.RoleInfo (RoleInfo.java:startFollowerState(104)) - s0: startFollowerState reason:appendEntries: s1, term: 1, isHeartbeat: true, trace:
+unit-7/iteration10/ratis-test/org.apache.ratis.grpc.cli.TestElectionCommandIntegrationWithGrpc-output.txt:2023-03-07 02:32:05,381 [s0-server-thread1] INFO  impl.RoleInfo (RoleInfo.java:startFollowerState(104)) - s0: startFollowerState reason:appendEntries: s1, term: 1, isHeartbeat: false, trace:
+unit-7/iteration10/ratis-test/org.apache.ratis.grpc.cli.TestElectionCommandIntegrationWithGrpc-output.txt:2023-03-07 02:32:08,909 [s0-server-thread2] INFO  impl.RoleInfo (RoleInfo.java:startFollowerState(104)) - s0: startFollowerState reason:appendEntries: s1, term: 1, isHeartbeat: true, trace:
+unit-9/iteration7/ratis-test/org.apache.ratis.grpc.cli.TestElectionCommandIntegrationWithGrpc-output.txt:2023-03-07 02:30:15,609 [s0-server-thread2] INFO  impl.RoleInfo (RoleInfo.java:startFollowerState(104)) - s0: startFollowerState reason:appendEntries: s1, term: 1, isHeartbeat: true, trace:
+{code}
+
+{quote}Searching for {{isHeartbeat}} in the logs, there are a few cases which are not caused by heartbeat (2/13).
+{quote}
+
+It's weird that I cannot reproduce this later (when I need more logs),
+repeated 1000x in this CI: https://github.com/kaijchen/ratis/actions/runs/4361533795/jobs/7625505610
+
+{code:java}
+$ grep "isHeartbeat: false" unit-*/iteration*/ratis-test/*-output.txt
+$ grep "isHeartbeat: true" unit-*/iteration*/ratis-test/*-output.txt | wc -l
+     128
+$ grep "isHeartbeat: false" unit-*/iteration*/ratis-test/*-output.txt
+$ grep "isHeartbeat" unit-*/iteration*/ratis-test/*-output.txt | wc -l
+     128
+{code}
+
+
+The pull request is now merged.  Thanks, [~ckj]!
+

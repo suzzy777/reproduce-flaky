@@ -1,0 +1,94 @@
+Investigation of cause showed that the failure is not related to IGNITE-10799
+Here is stack trace that is the cause of transaction hanging:
+
+{noformat}
+java.lang.AssertionError:
+	at org.apache.ignite.internal.processors.cache.transactions.IgniteTxLocalAdapter.calculatePartitionUpdateCounters(IgniteTxLocalAdapter.java:498)
+	at org.apache.ignite.internal.processors.cache.transactions.IgniteTxLocalAdapter.userPrepare(IgniteTxLocalAdapter.java:438)
+	at org.apache.ignite.internal.processors.cache.distributed.dht.GridDhtTxLocal.prepareAsync(GridDhtTxLocal.java:403)
+	at org.apache.ignite.internal.processors.cache.transactions.IgniteTxHandler.prepareNearTx(IgniteTxHandler.java:570)
+	at org.apache.ignite.internal.processors.cache.transactions.IgniteTxHandler.prepareNearTx(IgniteTxHandler.java:367)
+	at org.apache.ignite.internal.processors.cache.transactions.IgniteTxHandler.processNearTxPrepareRequest0(IgniteTxHandler.java:178)
+	at org.apache.ignite.internal.processors.cache.transactions.IgniteTxHandler.processNearTxPrepareRequest(IgniteTxHandler.java:156)
+	at org.apache.ignite.internal.processors.cache.transactions.IgniteTxHandler.access$000(IgniteTxHandler.java:118)
+	at org.apache.ignite.internal.processors.cache.transactions.IgniteTxHandler$1.apply(IgniteTxHandler.java:198)
+	at org.apache.ignite.internal.processors.cache.transactions.IgniteTxHandler$1.apply(IgniteTxHandler.java:196)
+	at org.apache.ignite.internal.processors.cache.GridCacheIoManager.processMessage(GridCacheIoManager.java:1141)
+	at org.apache.ignite.internal.processors.cache.GridCacheIoManager.onMessage0(GridCacheIoManager.java:591)
+	at org.apache.ignite.internal.processors.cache.GridCacheIoManager.handleMessage(GridCacheIoManager.java:392)
+	at org.apache.ignite.internal.processors.cache.GridCacheIoManager.handleMessage(GridCacheIoManager.java:318)
+	at org.apache.ignite.internal.processors.cache.GridCacheIoManager.access$100(GridCacheIoManager.java:109)
+	at org.apache.ignite.internal.processors.cache.GridCacheIoManager$1.onMessage(GridCacheIoManager.java:308)
+	at org.apache.ignite.internal.managers.communication.GridIoManager.invokeListener(GridIoManager.java:1561)
+	at org.apache.ignite.internal.managers.communication.GridIoManager.processRegularMessage0(GridIoManager.java:1189)
+	at org.apache.ignite.internal.managers.communication.GridIoManager.access$4200(GridIoManager.java:127)
+	at org.apache.ignite.internal.managers.communication.GridIoManager$8.run(GridIoManager.java:1086)
+	at org.apache.ignite.internal.util.StripedExecutor$Stripe.body(StripedExecutor.java:550)
+	at org.apache.ignite.internal.util.worker.GridWorker.run(GridWorker.java:120)
+{noformat}
+
+It means that our transaction is mapped to the primary node with a partition in MOVING state which is generally impossible.
+How we can move into such situation? Here is scenario:
+
+Environment:
+Cache with 1 backup, In-memory mode, Partition lost policy is IGNORE.
+Nodes: Crd, Node1, Node2.
+
+1. Partition has the following state:
+Node1 (OWNING) [Primary], Node2(MOVING)
+Node2 is currently rebalancing data from Node1
+
+2. Node1 is left from topology, rebalancing is canceled.
+
+3. Crd node assigned this partition by affinity and created it in MOVING state here:
+Method:
+{code:java}
+org.apache.ignite.internal.processors.cache.distributed.dht.preloader.GridDhtPartitionsExchangeFuture#finishExchangeOnCoordinator
+{code}
+Section:
+{code:java}
+doInParallel(
+                    parallelismLvl,
+                    cctx.kernalContext().getSystemExecutorService(),
+                    cctx.affinity().cacheGroups().values(),
+                    desc -> {
+                        if (desc.config().getCacheMode() == CacheMode.LOCAL)
+                            return null;
+
+                        CacheGroupContext grp = cctx.cache().cacheGroup(desc.groupId());
+
+                        GridDhtPartitionTopology top = grp != null ? grp.topology() :
+                            cctx.exchange().clientTopology(desc.groupId(), events().discoveryCache());
+
+                        top.beforeExchange(this, true, true);
+
+                        return null;
+                    });
+{code}
+
+4. After that partition has following state:
+Node2 (MOVING) [Primary], Crd (MOVING)
+
+5. This partition is immediately owned on the coordinator node due to lost policy in the following code block:
+{code:java}
+                if (exchCtx.events().hasServerLeft())
+                    detectLostPartitions(resTopVer);
+{code}
+
+6. FullMap with OWNED partition is sent to Node2.
+
+7. Node2 can't mark this partition as LOST, because it sees one OWNER which is coordinator node.
+
+8. Exchange is finished. Node2 started to rebalance that partition from Crd node.
+
+9. A transaction is mapped to Node2 MOVING partition and fails with assertion above.
+
+Correct behavior:
+We should provide correct information to Node2 about LOST partition that was immediately owned after step. 5
+We should either send MOVING for that partition in FullMap to give a possibility to detect such partition as LOST independently on Node2.
+or we should explicitly send information in FullMap that this partition is marked as lost and Node2 should mark it as lost without fake rebalancing.
+
+
+Moved to the next release due to inactivity. Please, feel free to move it back if you will be able to complete the ticket by 2.8 code freeze date, December 2, 2019.
+
+

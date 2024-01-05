@@ -1,0 +1,201 @@
+[~apurtell@yahoo.com]  [~vjasani]  [~busbey]  [~bharathv]  Any thoughts  ? 
+
+Anyway we can wait till WAL is closed before append and sync? Maybe we can register to WAL Action listener? Speaking of which, we seem to have logCloseRequested() for listener but don't have post closed action for listener? Or how about using a listener for postLogRoll() which can perform append, is that possible? I am yet to explore.
+
+[~vjasani] Thank you for the feedback. Are you suggesting the above changes only for the test case or in actual production code.
+
+I meant test case only since we can't be sure about wait time required for WAL to close.
+
+But what the EOF exceptions that we might encounter in production environment. _uncleanlyClosedWAL_ metric will be incremented everytime we encounter this issue. I don't think this is a test only issue. Maybe I am missing something.
+
+Hmm, let me take a detailed look tomorrow. Btw if you revert reading wal size in ProtobufLogReader, test case in branch-2+ would fail 100% of time, and by keeping the changes, test becomes flaky, correct?
+
+> Btw if you revert reading wal size in ProtobufLogReader, test case in branch-2+ would fail 100% of time, and by keeping the changes, test becomes flaky, correct?
+
+It fails 100% of the time even without ProtobufLogReader related changes.
+
+{code:java}
+if (!isFirst) {
+  // Re-compute the file length.
+  this.fileLength = fs.getFileStatus(path).getLen();
+}
+
+{code}
+When I tried locally with above changes in place on master branch, the test has not yet failed for me. Only when I remove above change (i.e make change to yesterday's committed code), it fails, which is expected.
+
+Were you able to repro premature EOF with yesterday's committed change on master branch in your local?
+
+When I looked at nightlies, I could find test failure [here|https://ci-hadoop.apache.org/job/HBase/job/HBase%20Nightly/job/master/306/testReport/junit/org.apache.hadoop.hbase.replication.regionserver/TestWALEntryStream/health_checks___yetus_jdk11_hadoop3_checks___testCleanClosedWALs/]
+
+> When I tried locally with above changes in place on master branch, the test has not yet failed for me. 
+
+My bad. I should have been more clear earlier. This test fails as a part of whole test class TestWALEntryStream. It succeeds if you run individually.
+
+I have reopened HBASE-25924. We shouldn't have a consistently failing test checked in for long. If it's going to take a while to resolve this, better to revert HBASE-25924 until its ready. If it can be solved in a day or two, that's fine. 
+
+Yes, I agree there is a race with AsyncWAL implementation. Replication shipper thread checks the following..
+
+{noformat}
+ private void tryAdvanceEntry() throws IOException {
+    if (checkReader()) {
+      boolean beingWritten = readNextEntryAndRecordReaderPosition();
+{noformat}
+
+`beingWritten` semantics are not tight in the async wal implementation. We switch the currently active writer instance but we still write the trailer in the background and that makes this thread think that the file is not active anymore but sees that there `trailer` worth bytes pending to be read leading to a bump of this metric.. thinking of a proper way to fix this.. (with out breaking the "async"-ness guarantees of the WAL implementation)..
+
+Wrote a quick patch (attached) to test an approach and seems working, if that is acceptable, can polish it for a PR.
+
+{code:java}
+AsyncWriter temp = inflightWALClosures.get(path.getName());
+if (temp != null) {
+  // Trailer is still being written
+  return OptionalLong.of(temp.getSyncedLength());
+}
+{code}
+Hmm, it seems this should work ideally. And race conditions should be taken care of as we are using rollWriterLock. Yeah I think this should work.
+
+While closing WAL, AbstractProtobufLogWriter#writeWALTrailer uses writeWALTrailerAndMagic which would internally go to AsyncProtobufLogWriter#writeWALTrailerAndMagic and it is an async writer. For a while, got confused as it uses addListener from our FutureUtils on *_output.flush(false)_*, just realized that it is actually blocking on flush's CompletableFuture to retrieve acked length after flushing.
+
+ 
+{code:java}
+private long write(Consumer<CompletableFuture<Long>> action) throws IOException {
+  CompletableFuture<Long> future = new CompletableFuture<>();
+  action.accept(future);
+  try {
+    return future.get().longValue();  <=== blocking 
+  } catch (InterruptedException e) {
+    InterruptedIOException ioe = new InterruptedIOException();
+    ioe.initCause(e);
+    throw ioe;
+  } catch (ExecutionException e) {
+    Throwables.propagateIfPossible(e.getCause(), IOException.class);
+    throw new RuntimeException(e.getCause());
+  }
+}
+{code}
+I just wanted to ensure that at least _*writer.close()*_ is synchronous which is executed by closeExecutor.
+
+Looks safe to use inflightWALClosures map.
+
+However, with the patch, few test case might fail. For instance, testLogrollWhileStreaming() is consistently failing. It passes only when we wait on entryStream.next() to be non-null.
+
+Rough patch in local to resolve test failure:
+
+ 
+{code:java}
+diff --git a/hbase-server/src/test/java/org/apache/hadoop/hbase/replication/regionserver/TestWALEntryStream.java b/hbase-server/src/test/java/org/apache/hadoop/hbase/replication/regionserver/TestWALEntryStream.java
+index 5507972ab4..c67f5f143d 100644
+--- a/hbase-server/src/test/java/org/apache/hadoop/hbase/replication/regionserver/TestWALEntryStream.java
++++ b/hbase-server/src/test/java/org/apache/hadoop/hbase/replication/regionserver/TestWALEntryStream.java
+@@ -266,7 +266,14 @@ public class TestWALEntryStream {
+       assertEquals("2", getRow(entryStream.next()));
+       assertEquals(2, getQueue().size()); // we should not have dequeued yet since there's still an
+                                         // entry in first log
+-      assertEquals("3", getRow(entryStream.next())); // if implemented improperly, this would be 4
++      Entry entry;
++      while (true){
++        entry=entryStream.next();
++        if(entry!=null){
++          break;
++        }
++      }
++      assertEquals("3", getRow(entry)); // if implemented improperly, this would be 4
+                                                      // and 3 would be skipped
+       assertEquals("4", getRow(entryStream.next())); // 4
+{code}
+And it seems for test, it should be safe to wait on entryStream.next() to be non-null. Ultimately, same is followed by Replication source shipper.
+
+ 
+
+ 
+
+[~bharathv] Thank you for the rough patch. I think the approach is good and neat. Let me assign the Jira to you and you can provide a polished PR.
+
+Results for branch branch-2.4
+	[build #132 on builds.a.o|https://ci-hadoop.apache.org/job/HBase/job/HBase%20Nightly/job/branch-2.4/132/]: (/) *{color:green}+1 overall{color}*
+----
+details (if available):
+
+(/) {color:green}+1 general checks{color}
+-- For more information [see general report|https://ci-hadoop.apache.org/job/HBase/job/HBase%20Nightly/job/branch-2.4/132/General_20Nightly_20Build_20Report/]
+
+
+
+
+(/) {color:green}+1 jdk8 hadoop2 checks{color}
+-- For more information [see jdk8 (hadoop2) report|https://ci-hadoop.apache.org/job/HBase/job/HBase%20Nightly/job/branch-2.4/132/JDK8_20Nightly_20Build_20Report_20_28Hadoop2_29/]
+
+
+(/) {color:green}+1 jdk8 hadoop3 checks{color}
+-- For more information [see jdk8 (hadoop3) report|https://ci-hadoop.apache.org/job/HBase/job/HBase%20Nightly/job/branch-2.4/132/JDK8_20Nightly_20Build_20Report_20_28Hadoop3_29/]
+
+
+(/) {color:green}+1 jdk11 hadoop3 checks{color}
+-- For more information [see jdk11 report|https://ci-hadoop.apache.org/job/HBase/job/HBase%20Nightly/job/branch-2.4/132/JDK11_20Nightly_20Build_20Report_20_28Hadoop3_29/]
+
+
+(/) {color:green}+1 source release artifact{color}
+-- See build output for details.
+
+
+(/) {color:green}+1 client integration test{color}
+
+
+Results for branch master
+	[build #312 on builds.a.o|https://ci-hadoop.apache.org/job/HBase/job/HBase%20Nightly/job/master/312/]: (/) *{color:green}+1 overall{color}*
+----
+details (if available):
+
+(/) {color:green}+1 general checks{color}
+-- For more information [see general report|https://ci-hadoop.apache.org/job/HBase/job/HBase%20Nightly/job/master/312/General_20Nightly_20Build_20Report/]
+
+
+
+
+
+
+(/) {color:green}+1 jdk8 hadoop3 checks{color}
+-- For more information [see jdk8 (hadoop3) report|https://ci-hadoop.apache.org/job/HBase/job/HBase%20Nightly/job/master/312/JDK8_20Nightly_20Build_20Report_20_28Hadoop3_29/]
+
+
+(/) {color:green}+1 jdk11 hadoop3 checks{color}
+-- For more information [see jdk11 report|https://ci-hadoop.apache.org/job/HBase/job/HBase%20Nightly/job/master/312/JDK11_20Nightly_20Build_20Report_20_28Hadoop3_29/]
+
+
+(/) {color:green}+1 source release artifact{color}
+-- See build output for details.
+
+
+(/) {color:green}+1 client integration test{color}
+
+
+Results for branch branch-2
+	[build #267 on builds.a.o|https://ci-hadoop.apache.org/job/HBase/job/HBase%20Nightly/job/branch-2/267/]: (/) *{color:green}+1 overall{color}*
+----
+details (if available):
+
+(/) {color:green}+1 general checks{color}
+-- For more information [see general report|https://ci-hadoop.apache.org/job/HBase/job/HBase%20Nightly/job/branch-2/267/General_20Nightly_20Build_20Report/]
+
+
+
+
+(/) {color:green}+1 jdk8 hadoop2 checks{color}
+-- For more information [see jdk8 (hadoop2) report|https://ci-hadoop.apache.org/job/HBase/job/HBase%20Nightly/job/branch-2/267/JDK8_20Nightly_20Build_20Report_20_28Hadoop2_29/]
+
+
+(/) {color:green}+1 jdk8 hadoop3 checks{color}
+-- For more information [see jdk8 (hadoop3) report|https://ci-hadoop.apache.org/job/HBase/job/HBase%20Nightly/job/branch-2/267/JDK8_20Nightly_20Build_20Report_20_28Hadoop3_29/]
+
+
+(/) {color:green}+1 jdk11 hadoop3 checks{color}
+-- For more information [see jdk11 report|https://ci-hadoop.apache.org/job/HBase/job/HBase%20Nightly/job/branch-2/267/JDK11_20Nightly_20Build_20Report_20_28Hadoop3_29/]
+
+
+(/) {color:green}+1 source release artifact{color}
+-- See build output for details.
+
+
+(/) {color:green}+1 client integration test{color}
+
+

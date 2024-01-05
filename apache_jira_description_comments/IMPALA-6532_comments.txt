@@ -1,0 +1,175 @@
+cc [~tarmstrong@cloudera.com]
+Since you worked on this test before in https://issues.apache.org/jira/browse/IMPALA-6455
+
+Looks like a bug in Hive, but some basic searching of NullPointerException and HiveContextAwareRecordReader didn't turn up anything.
+
+[~joemcdonnell] [~philip] have you seen this error in your work on the Hive data load.
+
+[~tarmstrong] [~bikramjeet.vig] I haven't seen this particular error before.
+
+I'm going to ping some people who work on Hive to see if they have clues.
+
+[~stakiar_impala_496e] summoning you since you know a bit about Hive execution. Have you seen this NPE before?
+{noformat}
+Caused by: java.lang.NullPointerException
+at org.apache.hadoop.hive.ql.io.HiveContextAwareRecordReader.initIOContext(HiveContextAwareRecordReader.java:171)
+at org.apache.hadoop.hive.ql.io.HiveContextAwareRecordReader.initIOContext(HiveContextAwareRecordReader.java:208)
+at org.apache.hadoop.hive.ql.io.CombineHiveRecordReader.<init>(CombineHiveRecordReader.java:70)
+{noformat}
+
+Hey Tim, few questions
+
+* What version of Hive is this?
+* Does this happen consistently?
+
+The issue doesn't look familiar. Off the top of my head, I think it could be a race condition in Hive. It looks like its using {{LocalJobRunner}} as a substitute for an actual MR job, which probably runs all Hive tasks in separate threads, whereas Hive assumes Hive-on-MR runs all tasks in separate JVMs (thus no synchronization of tasks required). The {{IOContext}} class isn't thread safe for Hive-on-MR, which is probably the issue.
+
+This is a nightly build of CDH5.15, based on Hive 1.1. We are using LocalJobRunner here. I'm guess that's known to be flaky?
+
+I think we started seeing this after Joe updated our CDH dependencies two days ago.
+
+From what CDH version did you upgrade?
+
+From what I can tell from the code, I would think its known to be flaky. I haven't come across any flaky tests in Hive that fail due to this, but then again we have so many that no one would probably notice.
+
+[~joemcdonnell], can you help Sahil with those version details? You did the last upgrade of CDH components. 
+
+[~alex.behm] [~stakiar] This Jira predates the CDH components update. It's hard to know the actual history of this, because the older GVO runs expire relatively quickly. I don't know if the frequency of this changed.
+
+The previous CDH components update was on December 1st with cdh5-1.1.0. The new CDH components are from February 20th also with cdh5-1.1.0. Has CDH Hive changed during that time? Based on what I see, I don't think so.
+
+ 
+
+ 
+
+I wonder if the timing of our test runs changed so that more hive jobs are running concurrently. We saw a similar failure in this test crop up before that was related to the local runner's temporary dirs - IMPALA-6455. 
+
+Also seen in test_refresh_partition.py::TestRefreshPartition::()::test_add_data_and_refresh
+
+https://jenkins.impala.io/job/ubuntu-16.04-from-scratch/1438/
+
+[~joemcdonnell], I’m assigning this to you since you already have some context; feel free to find another person or assign back to me if you're swamped.
+
+
+Saw this again: https://jenkins.impala.io/job/ubuntu-16.04-from-scratch/1474/console
+
+(From: https://jenkins.impala.io/job/2.x-parallel-all-tests-nightly/44/)
+
+
+
+Some paths to investigate:
+ # It should be easy to reproduce this with concurrent Hive inserts in a loop
+ # Once this reproduces, there are other ways to populate the table. For example, rather than doing an insert, one could alter the table to add a partition, then do a load statement for that partition. Load is just an HDFS copy. This might avoid the buggy code.
+
+Some downstream test environments hit this recently.
+
+This was while loading TPCH during data load. The failure was in  {{INSERT OVERWRITE TABLE tpch_text_gzip.lineitem SELECT * FROM tpch.lineitem}} and the exception was
+{noformat}
+java.lang.Exception: java.lang.NullPointerException
+        at org.apache.hadoop.mapred.LocalJobRunner$Job.runTasks(LocalJobRunner.java:489)
+        at org.apache.hadoop.mapred.LocalJobRunner$Job.run(LocalJobRunner.java:549)
+Caused by: java.lang.NullPointerException
+        at org.apache.hadoop.hive.ql.io.HiveContextAwareRecordReader.initIOContext(HiveContextAwareRecordReader.java:171)
+        at org.apache.hadoop.hive.ql.io.HiveContextAwareRecordReader.initIOContext(HiveContextAwareRecordReader.java:208)
+        at org.apache.hadoop.hive.ql.io.HiveInputFormat.getRecordReader(HiveInputFormat.java:258)
+        at org.apache.hadoop.mapred.MapTask$TrackedRecordReader.<init>(MapTask.java:169)
+        at org.apache.hadoop.mapred.MapTask.runOldMapper(MapTask.java:438)
+        at org.apache.hadoop.mapred.MapTask.run(MapTask.java:343)
+        at org.apache.hadoop.mapred.LocalJobRunner$Job$MapTaskRunnable.run(LocalJobRunner.java:270)
+        at java.util.concurrent.Executors$RunnableAdapter.call(Executors.java:511)
+        at java.util.concurrent.FutureTask.run(FutureTask.java:266)
+        at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1142)
+        at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:617)
+        at java.lang.Thread.run(Thread.java:745)
+{noformat}
+
+Dataload started doing parallel Hive execution. This is running into problems in 2.x based jobs (Hive-1.1.0 CDH5.16). I haven't seen it on master (Hive-2.1.1).
+
+HiveContextAwareRecordReader.initIOContext() calls getIOContext()
+{code:java}
+private void initIOContext(long startPos, boolean isBlockPointer,
+Path inputPath) {
+  ioCxtRef = this.getIOContext();
+  ioCxtRef.setCurrentBlockStart(startPos); // NullPointerException here
+  ...
+}{code}
+getIOContext() calls IOContext.get(Configuration conf). This get() function signature is storing the IOContext in IOContext's inputNameIOContextMap. This map is not synchronized:
+{code:java}
+/**
+ * Tez and MR use this map but are single threaded per JVM thus no synchronization is required.
+ */
+private static final Map<String, IOContext> inputNameIOContextMap = new HashMap<String, IOContext>();
+{code}
+I believe LocalJobRunner breaks this assumption and can have multiple threads accessing this, so this should not be expected to work.
+
+Hive-2.1.1 contains a series of fixes adding synchronization to this structure:
+
+HIVE-9460 - reworked the code and this map became thread local
+
+HIVE-11146 - reword the code slightly (but doesn't seem to have modified the synchronization)
+
+HIVE-11015 - refactored the map into IOContextMap. Now uses a synchronized global map.
+
+Commit b126b2d1053bde6671701af3931c7424a646cd54 in impala's branch refs/heads/master from [~joemcdonnell]
+[ https://git-wip-us.apache.org/repos/asf?p=impala.git;h=b126b2d ]
+
+IMPALA-6972: Disable parallel dataload on MINICLUSTER_PROFILE=2
+
+There is a Hive bug in Hive 1.1.0 that can result
+in a NullPointerException when doing parallel Hive
+operations (see IMPALA-6532). Since dataload goes
+parallel on Hive loads starting with IMPALA-6372,
+dataload can hit this error on Hive 1.1.0 (i.e.
+IMPALA_MINICLUSTER_PROFILE=2). This is impacting
+builds on the 2.x branch.
+
+This disables parallel dataload for IMPALA_MINICLUSTER_PROFILE=2.
+
+IMPALA_MINICLUSTER_PROFILE=3 uses a newer version
+of Hive that has a fix for this, so this continues
+to use parallel dataload for that case.
+
+Parallelism can be reenabled when Hive 1.1.0 gets the
+fix from Hive 2.1.1.
+
+Change-Id: I90a0f2b3756d7192fa7db2958031b8c88eb606e6
+Reviewed-on: http://gerrit.cloudera.org:8080/10306
+Reviewed-by: Philip Zeyliger <philip@cloudera.com>
+Tested-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+
+
+Commit 3bfee642dd8a8134c173a2b622ac2b265d309027 in impala's branch refs/heads/2.x from [~joemcdonnell]
+[ https://git-wip-us.apache.org/repos/asf?p=impala.git;h=3bfee64 ]
+
+IMPALA-6972: Disable parallel dataload on MINICLUSTER_PROFILE=2
+
+There is a Hive bug in Hive 1.1.0 that can result
+in a NullPointerException when doing parallel Hive
+operations (see IMPALA-6532). Since dataload goes
+parallel on Hive loads starting with IMPALA-6372,
+dataload can hit this error on Hive 1.1.0 (i.e.
+IMPALA_MINICLUSTER_PROFILE=2). This is impacting
+builds on the 2.x branch.
+
+This disables parallel dataload for IMPALA_MINICLUSTER_PROFILE=2.
+
+IMPALA_MINICLUSTER_PROFILE=3 uses a newer version
+of Hive that has a fix for this, so this continues
+to use parallel dataload for that case.
+
+Parallelism can be reenabled when Hive 1.1.0 gets the
+fix from Hive 2.1.1.
+
+Change-Id: I90a0f2b3756d7192fa7db2958031b8c88eb606e6
+Reviewed-on: http://gerrit.cloudera.org:8080/10306
+Reviewed-by: Philip Zeyliger <philip@cloudera.com>
+Tested-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+Reviewed-on: http://gerrit.cloudera.org:8080/10367
+
+
+[~joemcdonnell] should this still be considered a broken build issue? If it's not breaking builds maybe we should remove the label.
+
+Created a change on 2.x that modifies tests that do run_stmt_in_hive() to be serial. I am running tests on this change.
+
+This is resolved through a change to Hive that fixes the race condition.
+

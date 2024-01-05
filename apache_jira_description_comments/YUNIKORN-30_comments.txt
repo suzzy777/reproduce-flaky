@@ -1,0 +1,76 @@
+I have gone over one failure case for {{TestBasicScheduler}} extensively and the behaviour we see is somewhat expected.
+
+We're scheduling on two nodes (100G each) one application (app-1) with three allocation asks:
+ * alloc-1 (10G, 2 repeats)
+ * alloc-2 (50G, 2 repeats)
+ * alloc-3 (100G, 2 repeats)
+
+The allocation asks are added in two steps, alloc-1 first. The two repeats get allocated on the nodes. Since we're using fair both nodes get 1 allocation. This works as expected. The next step is to add the two new allocation asks to the app, alloc-2 and alloc-3. Both are added in one update request. The cache is updated and an event triggered to update the scheduler. Event processing is not locked.
+
+The event is taken apart and each allocation ask is processed. This process will only lock the app when needed. Testing waits for the event processing to finish. Still all is OK at this point.
+
+We then trigger the scheduling cycle. The scheduling cycle will walk over the requests and process them.
+
+This is where the issue appears. The standard allocation processes each allocation ask serially. Even if there is more than one repeat it will only process the first repeat and then move to the next ask. In the failure case we see that the large allocation alloc-3 reserves a node before both the alloc-2 asks have been processed. If we have already allocated one of the ask repeats of alloc-2 this happens on the node that has only got the alloc-1 allocation ask (10G usage) due to the node fair spread. This takes out the whole of the node and prevents the 2nd repeat of alloc-2 to be processed.
+
+I see two ways forward for this case:
+ * allocate all repeats for an ask before moving to the next ask
+ * use reservations for the same app on a node if there are older asks still outstanding
+
+Both have their pros and cons specially when looking at priority scheduling and blocking nodes.
+
+There is however one strange thing: by default the scheduler should not make any reservation for an ask unless it is "aged". It has to be at least two seconds old. That does not happen in the failure case that is attached. That is probably why we also have issues reproducing this outside of github actions.
+
+Hi [~wilfreds]
+
+Would it be possible that it runs slower on github and unluckily exceeds 2s? Or maybe due to the time package we used here it behaves differently on a different arch machine? 
+
+If this is a timing issue, do you make sense we can change this to, instead of depending on the age (2s), we do record the missed opportunities and when it reaches a threshold, then mark it is reservable? 
+
+Further details:
+
+I have what I think is the root cause behind some of the failures. I described one of the cases above that I found but some others show a different failure type.
+ * Incorrect partition name: we seem to call normalise on the partition name twice during our testing.
+{code:java}
+2020-03-19T21:31:53.9142459Z 2020-03-19T21:31:41.042Z	INFO	cache/cluster_info.go:618	Failed to find partition for allocation proposal	{"partitionName": "[rm:123][rm:123]default"}
+{code}
+This should never be a problem and shows a bug in the code and we should be able to handle this. The fix is in the normalisation code to check if it is already normalised.
+
+ * Event handling: a generic underlying issue. During some local testing I noticed that we do not properly wait for the event handling to process all the events that are generated. In the case observed: allocation releases were still being processed while the end state check was performed. Those issues can be fixed by a proper wait in the test code.
+ * However in certain failures we see nothing. This could point to a problem with go routines not being scheduled. The logs for these cases show a blank period of about 1 sec (the max time we wait for things) between the normal processing and the wait timing out. I cannot really reproduce those yet.
+
+Working on a PR to fix at least the majority of what I have found.
+
+Not sure if this is just logging or showing the go routine scheduling at work which might be some of the impact that we have in the git workflows. The shutdown is logged before we process the last events:
+{code}
+2020-03-20T16:37:20.061+1100 DEBUG cache/partition_info.go:581 added allocation \{"partitionName": "[rm:123]default", "appID": "app-3", "allocationUid": "31467f7e-b7b6-4f39-b823-cc1a6536a766", "allocKey": "alloc-3"}
+2020-03-20T16:37:20.061+1100 DEBUG cache/partition_info.go:581 added allocation \{"partitionName": "[rm:123]default", "appID": "app-3", "allocationUid": "31467f7e-b7b6-4f39-b823-cc1a6536a766", "allocKey": "alloc-3"}
+2020-03-20T16:37:20.061+1100 INFO entrypoint/service_context.go:38 ServiceContext stop all services
+2020-03-20T16:37:20.061+1100 DEBUG scheduler/scheduler.go:176 enqueued event \{"eventType": "*schedulerevent.SchedulerAllocationUpdatesEvent", "event": {"RejectedAllocations":null,"AcceptedAllocations":[{"NodeID":"node-2","ApplicationID":"app-3","QueueName":"root.leaf-2","AllocatedResource":{"Resources":{"memory":5,"vcore":5}},"AllocationKey":"alloc-3","Tags":null,"Priority":null,"PartitionName":"[rm:123]default"}],"NewAsks":null,"ToReleases":null,"ExistingAllocations":null,"RMId":""}, "currentQueueSize": 0}
+2020-03-20T16:37:20.061+1100 DEBUG scheduler/scheduling_partition.go:434 allocation confirmation on partition \{"partition": "[rm:123]default", "appID": "app-3", "nodeID": "node-2", "allocKey": "alloc-3", "confirmation": true}
+--- PASS: TestReservationForTwoQueues (0.11s)
+{code}
+
+I have found the issue and have proof of the it finally:
+{code}
+2020-03-23T14:52:59.893+1100	DEBUG	scheduler/scheduling_application.go:529	app reservation check	{"allocationKey": "alloc-3", "createTime": "2020-03-23T14:52:59.880+1100", "askAge": "13.39217ms", "reservation delay": "10ms"}
+{code}
+This was logged in a failure case for {{TestBasicScheduler}}.
+
+This test does not set the reservation delay and it should still be set to the standard 2s. It seems to have picked up the setting from a previous run.
+
+I have attached a full log to show the whole run. If the test would set the delay we should have seen a line like this in the log:
+{code}
+2020-03-23T14:52:57.772+1100	DEBUG	scheduler/scheduling_application.go:65	Test override reservation delay	{"delay": "10ms"}
+{code}
+That line is nowhere in the logs.
+
+Hi [~wilfreds]
+
+This is great, basically, this issue only happens when we run all the tests together. And some of them got interferences from previous runs, correct? Do you have a fix for this now? 
+
+PR is open.
+The current fixed code has passed 5 out of 6 times in the github action. The one single failure was outside of smoke tests so it looks like I have got it now.
+
+PR is merged, closing
+

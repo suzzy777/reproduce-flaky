@@ -1,0 +1,181 @@
+attaching patch which split from HDFS-5274, including the crucial part for tracing data transfer protocol and some rebasing and refactoring.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12667134/HDFS-6880-0.patch
+  against trunk revision 0974f43.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-hdfs-project/hadoop-hdfs:
+
+                  org.apache.hadoop.hdfs.server.namenode.ha.TestPipelinesFailover
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/7946//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/7946//console
+
+This message is automatically generated.
+
+{code}
+@@ -355,6 +359,8 @@ public DatanodeInfo load(DatanodeInfo key) throws Exception {
+     /** Append on an existing block? */
+     private final boolean isAppend;
+ 
++    private Span traceSpan = null;
++
+{code}
+
+Should be final since it doesn't change over the lifetime of the DataStreamer
+
+{{Op#RELEASE_SHORT_CIRCUIT_FDS}} and {{Op#REQUEST_SHORT_CIRCUIT_SHM}} should also have tracing.
+
+{code}
++    Thread.sleep(100);
+{code}
+
+We should not sprinkle short sleeps in tests.  Tests should not be timing-dependent, because then they will be flaky.  If you want to wait until a condition is true, checking periodically up until a maximum timeout, use something like {{GenericTestUtils#waitFor}} (see TestCacheDirectives.java for an example of this)
+
+So, it looks like we don't have tracing inside DFSInputStream here.  Are you planning on adding that in a later JIRA, or should we do it in this one?
+
+So, one important issue here that we haven't discussed yet is the granularity of tracing.  The patch you've got here traces at the granularity of the client (either the client is tracing every request, or it's tracing no requests).  This is useful for certain applications (I can run a "test" {{hadoop get}} from the shell with tracing turned on and see what happens).  But imagine an application like Flume or HBase, which has a daemon (HDFS client) that lasts for a long time, potentially indefinitely.  We can't keep tracing on for every single thing Flume or HBase does in HDFS... that would be too much overhead.  Even tracing at a per-DFSOutputStream level is not granular enough.  Flume keeps open certain DFSOutputStream objects for a very long time (it has a write-ahead log, for example), while others may only last a very short time.
+
+We need to trace at a finer-grained level.  I think a trace span should be:
+
+* any namenode RPC that the DFSOutputStream makes ({{dfsClient.namenode.getAdditionalDatanode}}, for example).  Perhaps we could somehow use a wrapper class around the proxy to make this happen?  The trace span description should include the DFSOutputStream file name and the RPC name.
+
+* individual Packet objects sent to datanodes.  "Packet" is a bit of a misnomer since it's a few kilobytes in size (I think around 64kb is the default).  This will be broken down into a lot of actual ethernet packets.  The trace span description should include the DFSOutputStream file name and the offset within the file.
+
+* individual buffers of data read by DFSInputStream.  Typically DFSInputStream is reading a few kilobytes at a time via RemoteBlockReader2 or BlockReaderLocal, so those would be the places to instrument.  The trace span description should include the DFSInputStream file name and the offset within the file.
+
+This way, we could set tracing to affect 1% of all requests, start up our Flume + HDFS production cluster, and see where the performance bottlenecks were.  Like with the Dapper paper, we'd find that random sampling would give us a pretty good "bird's eye" view of the cluster.  For example, we might find that getAdditionalDatanode requests were taking a long time, and track that down to slow DNS servers.
+
+I'm going to talk to Todd a little more about this and see if he has ideas about where to add trace spans as well.
+
+Thanks again for working on this... it's very exciting to see it making progress :)
+
+Tracing is supposed to be controlled from the point of origin. The HTrace API provides sample rate selection. See the use of ProbabilitySampler in https://github.com/apache/hbase/blob/master/hbase-server/src/test/java/org/apache/hadoop/hbase/PerformanceEvaluation.java#L947
+
+bq. So, it looks like we don't have tracing inside DFSInputStream here. Are you planning on adding that in a later JIRA, or should we do it in this one?
+
+Because DFSInputStream does not use Thread in normal path as DFSOutputStream do, it is not crucial to add the code (for passing tracing infos between threads) in it. But it might be better if the code is symmetric for input and output. I will consider to add tracing span to DFSInputStream on updating the patch. 
+
+bq. Tracing is supposed to be controlled from the point of origin. The HTrace API provides sample rate selection. See the use of ProbabilitySampler in https://github.com/apache/hbase/blob/master/hbase-server/src/test/java/org/apache/hadoop/hbase/PerformanceEvaluation.java#L947
+
+I think we are all in agreement that "tracing is supposed to be controlled from the point of origin."  After all, this patch modifies DFSClient, which is the point of origin for HDFS, to create trace spans.  Nobody is proposing controlling tracing on the server.
+
+What I think is problematic here is that, if I understand correctly, the entire DFSOutputStream is being considered as a single trace span, which is continued with Trace.continueSpan whenever the stream does something.  I don't think this is the right way to do things in HDFS, since output streams can be open for hours, or days, at a time.  If we used something like {{Trace.startSpan("test stream span", traceSampler);}}, we could get 1% of all streams sampled, perhaps, but they might not be the 1% we want.  The HBase WAL stays open for days at a time... if it happens to be one of the streams that sampled, things will get really slow.  On the other hand, if it doesn't get sampled, we'll have no information about it in our trace data.
+
+We need finer granularity.  Does that make sense?
+
+A DFSOutputStream is more like an HBase *client* than like an HBase *row operation*.  You clearly would not want to have a single trace span for the whole hbase client, and I think you don't want a single trace span for the whole DFSOutputStream.
+
+bq. Because DFSInputStream does not use Thread in normal path as DFSOutputStream do, it is not crucial to add the code (for passing tracing infos between threads) in it. But it might be better if the code is symmetric for input and output. I will consider to add tracing span to DFSInputStream on updating the patch.
+
+I understand that in the special case of HBase (or another application that uses HTrace), the DFSClient may have already created a trace span.  But we should consider other clients, which haven't yet been instrumented with HTrace, that want to see input stream data show up.
+
+bq. We need finer granularity. Does that make sense?
+
+Yes, makes sense. Thanks for pointing this out.
+
+[~cmccabe] thanks for your comments! We need granularity as you say especially for tracing in daemons, in deployed cluster, without source code modification, by not only core developers but administrators and app developers.
+That should be the primary topic of HDFS-6881 and following up JIRAs. In this JIRA issue, I am just focusing on the fix to pass tracing info between clients and datanodes. By modifying client source code:) we can get any granularity at least with this.
+
+bq. Colin Patrick McCabe thanks for your comments! We need granularity as you say especially for tracing in daemons, in deployed cluster, without source code modification, by not only core developers but administrators and app developers.  That should be the primary topic of HDFS-6881 and following up JIRAs
+
+Sure.  I filed HDFS-7054 to make the tracing more fine-grained in DFSOutputStream.  Actually, this is something that I'd like to work on, if it makes sense to you guys.
+
+Similarly, I filed HDFS-7055 add tracing to DFSInputStream-- we don't have to do it all in this JIRA.
+
+So the remaining comments that I think we should address before committing this JRIA (HDFS-6880) are:
+* Op#RELEASE_SHORT_CIRCUIT_FDS and Op#REQUEST_SHORT_CIRCUIT_SHM should also have tracing.
+* Avoid adding the sleep to the test... instead, use GenericTestUtils#waitFor.
+
+I updated the patch.
+* added tracing and test for Op#RELEASE_SHORT_CIRCUIT_FDS and Op#REQUEST_SHORT_CIRCUIT_SHM
+* replaced Thread.sleep with GenericTestUtils.waitFor in tests
+* fixed thread safety of TestTracing#SetSpanReceiver
+* made traceSpan final in DFSOutputStream
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12668516/HDFS-6880-1.patch
+  against trunk revision a0ad975.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 2 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-hdfs-project/hadoop-hdfs:
+
+                  org.apache.hadoop.hdfs.web.TestWebHdfsFileSystemContract
+                  org.apache.hadoop.hdfs.server.namenode.ha.TestPipelinesFailover
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/8014//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/8014//console
+
+This message is automatically generated.
+
+Thanks, Masatake.  +1.
+
+We'll address the other stuff in follow-ons
+
+SUCCESS: Integrated in Hadoop-Yarn-trunk #683 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/683/])
+HDFS-6880. Adding tracing to DataNode data transfer protocol (iwasakims via cmccabe) (cmccabe: rev 56119fec96abbcc44c5dd82fdb694d2c3b53feb3)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/datatransfer/Sender.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/datatransfer/DataTransferProtoUtil.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/tracing/TestTracingShortCircuitLocalRead.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/tracing/TestTracing.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/datatransfer/Receiver.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/proto/datatransfer.proto
+
+
+FAILURE: Integrated in Hadoop-Mapreduce-trunk #1899 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/1899/])
+HDFS-6880. Adding tracing to DataNode data transfer protocol (iwasakims via cmccabe) (cmccabe: rev 56119fec96abbcc44c5dd82fdb694d2c3b53feb3)
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/datatransfer/Sender.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/tracing/TestTracingShortCircuitLocalRead.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/datatransfer/DataTransferProtoUtil.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/tracing/TestTracing.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/proto/datatransfer.proto
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/datatransfer/Receiver.java
+
+
+FAILURE: Integrated in Hadoop-Hdfs-trunk #1874 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/1874/])
+HDFS-6880. Adding tracing to DataNode data transfer protocol (iwasakims via cmccabe) (cmccabe: rev 56119fec96abbcc44c5dd82fdb694d2c3b53feb3)
+* hadoop-hdfs-project/hadoop-hdfs/src/main/proto/datatransfer.proto
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/tracing/TestTracing.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/datatransfer/Sender.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/datatransfer/Receiver.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSOutputStream.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/tracing/TestTracingShortCircuitLocalRead.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocol/datatransfer/DataTransferProtoUtil.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+
+

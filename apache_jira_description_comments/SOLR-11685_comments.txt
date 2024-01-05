@@ -1,0 +1,76 @@
+Attaching a failure of one such run.
+
+Analysis from jenkins_master_7045.log
+
+L20542: Test CollectionsAPIDistributedZkTest.testCollectionsAPI starts at line 20542
+Question: Why is halfcollectionblocker being deleted after this test has started and not before?
+L20563: create collection awhollynewcollection_0 with 4 shards and 1 replica
+L20746: ChaosMonkey monkey: stop jetty! 49379
+L20774: This shoes that the jetty that was shut down has core=awhollynewcollection_0_shard3_replica_n4
+L20781: ChaosMonkey monkey: starting jetty! 49379
+L20859: Exception causing close of session 0x1603371da360011 due to java.io.IOException: ZooKeeperServer not running/Watch limit violations ..
+Question : Why are we hitting a watcher limit?
+L20889: Restarting zookeeper
+L20915: An add request comes in "ClusterState says we are the leader, but locally we don't think so" for awhollynewcollection_0_shard3_replica_n4
+
+
+Presumably when CloudSolrClient sends the request awhollynewcollection_0_shard3_replica_n4 was the leader of shard3. After the restart it hasn't become leader yet but there are no other replicas. 
+
+CloudSolrClient should catch this exception as it's local cache might not be the most updated one, refresh it state and retry the add operation. Today CloudSolrClient retries in {{requestWithRetryOnStaleState}} when {{wasCommError}} is true . DistributedUpdateProcessor#doDefensiveChecks throws this as a SolrException . We should throw this as another exception on which we can retry the operation
+
+
+{code}
+    if ((isLeader && !localIsLeader) || (isSubShardLeader && !localIsLeader)) {
+      log.error("ClusterState says we are the leader, but locally we don't think so");
++      if (from == null) {
++        //if leader=null means the client sent the request. If we aren't the leader (the client has old info) return a exception which the client can +retry on
++      }
+      throw new SolrException(ErrorCode.SERVICE_UNAVAILABLE,
+          "ClusterState says we are the leader (" + zkController.getBaseUrl()
+              + "/" + req.getCore().getName() + "), but locally we don't think so. Request came from " + from);
+    }
+{code}
+
+Attaching solr_master*.log which was from some manual testing.
+
+I did some manual testing where I started the cloud example which creates a 2X2 collection
+Then I had a script running which indexes constantly . I then simulated a GC pause on node2 ( 7574 ) by running {{kill -STOP <node2_pid> && sleep 60 && kill -CONT <node2_pid>}} . 
+
+We hit two types of race conditions here:
+
+- node2 thinks it's the leader and rejects a request from node1 ( the actual leader at the time )
+- node1 forwards a request when it was a leader . node2 becomes the leader before the update reaches and rejects the request. 
+
+This is very easy to reproduce when you index constantly and then force a zookeeper connection timeout on the node which has the leader. 
+
+
+
+The easiest thing we could do is acknowledge that this race condition could happen , and {[doDefensiveChecks}} could throw a type of exception which the client can retry on? 
+
+This issue was created as specific to CollectionsAPIDistributedZkTest.testCollectionsAPI but nowadays, this test seems to fail only very rarely.  No failures in the last 30 days – can't see this at all on: [http://fucit.org/solr-jenkins-reports/failure-report.html|http://fucit.org/solr-jenkins-reports/failure-report.html].  Looking at build emails, it failed about 30 days ago.  There are no logs outside of the mail; I don't see the infamous "ClusterState says we are the leader".  When I search for that string in my email for other tests showing this, I see a more consistent track record of org.apache.solr.cloud.BasicDistributedZkTest.test throwing this, so maybe this JIRA issue could be generalized to this exception no matter which test or production/real-world scenario produces it?
+
+As it happens, I have a test in a fork of Solr that causes this failure half the time on a split shard test that is rather simple (notwithstanding inherent complexities of shard splits itself).  After debugging it, I came to a similar to conclusion -- this error should be caught and retried by the caller.  It turns out, this is as easy as changing the HTTP status code from SERVICE_UNAVAILABLE to INVALID_STATE.
+
+I see another problem based on my test.  A shard being split (a so-called parent shard) or that which recently completed (thus may have state INACTIVE) receives docs from a client (the test) and forwards to the sub-shards.  But a sub-shard fails for the error shown above, and it does *not* bubble this up to the client; it's swallowed as okay.  Changing the status code may fix for invalid state but wouldn't for other general errors (e.g. host went down suddenly).  The result is data loss.
+
+PR: https://github.com/apache/solr/pull/1484
+
+Commit 209ba014fb80e1fcf2de89ebb131ac556dc6d802 in solr's branch refs/heads/main from David Smiley
+[ https://gitbox.apache.org/repos/asf?p=solr.git;h=209ba014fb8 ]
+
+SOLR-11685: use HTTP INVALID_STATE for ZK state issues in DistributedZkUpdateProcessor (#1484)
+
+When SolrCloud shard leaders change while indexing updates arrive, Solr could fail and return
+  a HTTP 503 status. Switched to 510 so that CloudSolrClient will auto-retry it and probably succeed.
+
+Commit f60b75c36238c555c5d767d99f01debb3c4ee156 in solr's branch refs/heads/branch_9x from David Smiley
+[ https://gitbox.apache.org/repos/asf?p=solr.git;h=f60b75c3623 ]
+
+SOLR-11685: use HTTP INVALID_STATE for ZK state issues in DistributedZkUpdateProcessor (#1484)
+
+When SolrCloud shard leaders change while indexing updates arrive, Solr could fail and return
+  a HTTP 503 status. Switched to 510 so that CloudSolrClient will auto-retry it and probably succeed.
+
+
+Closing after the 9.4.0 release
+

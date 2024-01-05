@@ -1,0 +1,89 @@
+It appears that on my laptop, we fairly consistently lose the race here:
+
+{code}
+    // Do a write but ignore SIGPIPE so we can return an error when
+    // writing to a pipe or socket where the reading end is closed.
+    // TODO(benh): The 'suppress' macro failed to work on OS X as it
+    // appears that signal delivery was happening asynchronously.
+    // That is, the signal would not appear to be pending when the
+    // 'suppress' block was closed thus the destructor for
+    // 'Suppressor' was not waiting/removing the signal via 'sigwait'.
+    // It also appeared that the signal would be delivered to another
+    // thread even if it remained blocked in this thiread. The
+    // workaround here is to check explicitly for EPIPE and then do
+    // 'sigwait' regardless of what 'os::signals::pending' returns. We
+    // don't have that luxury with 'Suppressor' and arbitrary signals
+    // because we don't always have something like EPIPE to tell us
+    // that a signal is (or will soon be) pending.
+    bool pending = os::signals::pending(SIGPIPE);
+    bool unblock = !pending ? os::signals::block(SIGPIPE) : false;
+
+    ssize_t length = ::write(fd, data, size);
+
+    // Save the errno so we can restore it after doing sig* functions
+    // below.
+    int errno_ = errno;
+
+    // XXX: We receive EPIPE, but before we can call sigwait to capture it
+    // per the TODO above, SIPIPE is delivered to another thread.
+
+    if (length < 0 && errno == EPIPE && !pending) {
+      sigset_t mask;
+      sigemptyset(&mask);
+      sigaddset(&mask, SIGPIPE);
+
+      int result;
+      do {
+        int ignored;
+        // XXX: Too late!
+        result = sigwait(&mask, &ignored);
+      } while (result == -1 && errno == EINTR);
+    }
+
+    if (unblock) {
+      os::signals::unblock(SIGPIPE);
+    }
+{code}
+
+Chiming in without any context, but maybe the {{SO_NOSIGPIPE}} socket option would be helpful on OS X?
+
+This can be reproduced with:
+{code}
+$ ./3rdparty/libprocess/tests --gtest_filter=IOTest.Write --gtest_repeat=1000
+{code}
+
+I hacked in some code that checks {{F_GETNOSIGPIPE}} and sets {{F_SETNOSIGPIPE}} temporarily. This makes the test reliable on OS X. I think that this is a better solution than depending on signal delivery details that tend to be quite subtle.
+
+Once thing I noticed is that once I disable {{SIGPIPE}} delivery on the file descriptor, we block forever in {{sigwait(2)}} in the subsequent loop that attempts to consume the {{SIGPIPE}}. This makes sense since the error was delivered by the system call not the signal. I don't know the history of that, but I suspect it could be fixed by checking whether {{SIGPIPE}} is pending before entering the {{sigwait}}, or by using {{sigtimedwait(2)}} on platforms that support it. The latter won't fix OS X, though since OS X does not support that system call.
+
+[~bmahler] I can supply a patch if you can shepherd it.
+
+https://reviews.apache.org/r/39347/
+https://reviews.apache.org/r/39348/
+https://reviews.apache.org/r/39349/
+https://reviews.apache.org/r/39350/
+https://reviews.apache.org/r/39351/
+
+As per [~bmahler] on IRC, we should ignore {{SIGPIPE}} globally at lib process initialization and remove the various {{SIGPIPE}} suppression dances.
+
+These patches global ignore {{SIGPIPE}} during libprocess initialization, document {{SIGPIPE}} behavior a bit more, and remove various signal manipulations that were formerly necessary for disabling {{SIGPIPE}} delivery.
+
+https://reviews.apache.org/r/39938/
+https://reviews.apache.org/r/39940/
+https://reviews.apache.org/r/39941/
+
+
+{noformat}
+commit b0dcf4183a9125d0346688fa4f413658508aae68
+Author: James Peach <jpeach@apache.org>
+Date:   Thu Dec 3 18:54:41 2015 -0800
+
+    Globally ignore SIGPIPE in libprocess.
+
+    Reliably turning SIGPIPE into EPIPE while allowing the main executable
+    to still own SIGPIPE handling is complex and hard to make reliable
+    across platforms. Globally ignore SIPIPE when we start up libprocess.
+
+    Review: https://reviews.apache.org/r/39940
+{noformat}
+

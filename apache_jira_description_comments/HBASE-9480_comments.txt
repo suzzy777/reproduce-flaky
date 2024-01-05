@@ -1,0 +1,295 @@
+The code pattern is like the following:
+{code}
+        if (transitionInZK) {
+          // delete the node. if no node exists need not bother.
+          deleteClosingOrClosedNode(region);
+        }
+        if (state != null) {
+          regionOffline(region);
+        }
+{code}
+The deleteClosingOrClosedNode is fatal as it breaks AssignmentManager state transition loop by deleting the RIT ZNode.
+
+I think we should throw exception for current JIRA issues such as DeadServer or NotServicing.
+
+This is the patch that I have been working with.
+
+I think a proper fix should be aborting the region server at step 6.
+
+Hmm.. yeah the patch i uploaded was mostly to get me out of the woods. We should see what the right fix is.
+
+It's not ideal to abort here. Because the aborting is on master(Single Failure Point) which handles region assignment & SSH and may have other chain effects or master may keep aborting. 
+
+Since the issue is more caused by {code}deleteClosingOrClosedNode(region);{code} which stopped the assignment state machine, I think we can remove them(there are two places in this unassign function). 
+
+The longer term fix should allow unassign to throw exception to let different code paths handle differently and fast fail move region request(either by a user or balancer) before a region move or during a move.
+
+Jimmy I think meant aborting the RS in question.
+
+Oh, my bad I thought aborting master. Aborting RS may still not fully cover the issue because exception may triggered by current RS is in SSH already and outer retry loop still could delete RIT node and interfere with SSH handling. 
+[~jxiang] Any issue do you see if we remove the following two lines in function unassign? Thanks.
+{code}
+        if (transitionInZK) {
+          // delete the node. if no node exists need not bother.
+          deleteClosingOrClosedNode(region);
+        }
+        if (state != null) {
+          regionOffline(region);
+        }
+{code}
+
+
+Aborting the RS may not be a good solution. [~jeffreyz], you meant the patch [~devaraj] posted, right?  I think it is ok. +1.
+
+Yeah. In [~devaraj] patch, he only touched one place how about removing the similar one above in the same unassign function like the following and keep the "return" because there is no need to retry. Thanks.
+{code}
+     for (int i = 1; i <= this.maximumAttempts; i++) {
+       // ClosedRegionhandler can remove the server from this.regions
+       if (!serverManager.isServerOnline(server)) {
+-        if (transitionInZK) {
+-          // delete the node. if no node exists need not bother.
+-          deleteClosingOrClosedNode(region);
+-        }
+-        if (state != null) {
+-          regionOffline(region);
+-        }
++        // SSH will transition the region
+         return;
+       }
+       try {
+@@ -1772,12 +1766,8 @@ public class AssignmentManager extends ZooKeeperListener {
+         }
+         if (t instanceof NotServingRegionException
+             || t instanceof RegionServerStoppedException) {
+-          if (transitionInZK) {
+-            deleteClosingOrClosedNode(region);
+-          }
+-          if (state != null) {
+-            regionOffline(region);
+-          }
++          LOG.warn("sendRegionClose failed because " + region.getEncodedName() + " isn't on server"
++              + server, t);
+           return;
+{code}
+
+I knew the first one. I think we should keep it because a server is not online doesn't mean SSH is going to handle it. At least, we don't see the same problem as for the second one, do we?
+
+Realized that [~devaraj]'s patch removed the return too. No need to retry, right?
+
+{quote}
+At least, we don't see the same problem as for the second one, do we?
+{quote}
+We saw it in one test case where SSH was aborted and later a region move request come in to move the region to somewhere else. In reality this could happen though rarely. I'm fine to leave it as it is or cross check dead servers being processed by SSH before issuing deletes. 
+
+The "inconsistency" I see is that although the region's RIT znode is deleted and the region is offlined, the master will reenable it when the master is restarted. Kind of a no-op in that sense. It makes sense to not delete that znode at all..
+
+Let me think about to make the region server throw a region already in transition exception in this case, which is not accurate to throw a not serve region exception.  If a region is indeed not served in a region server, I think we should delete the znode.
+
+So, a subclass of NSRE, say, NotServingClosingRegionException, one that a client would treat as NSRE but that the master would wait on?  For pure NSRE, master would do as it currently does, delete the znode.
+
+Attached a patch to make sure the znode is not deleted in this case.  RS throws a region already in transition exception. Master moves the region to failed_to_close state once tries run out.  The region can still be closed and reassigned if it is eventually closed.
+
+Trying to add a test case now.
+
+{quote}
+If a region is indeed not served in a region server, I think we should delete the znode.
+{quote}
+The RIT zk node deletion here is on intermediate states(closing & closed) not the final state nodes. Deleting them stops state transition abruptly and causes region lost as there are multiple parties(master & region server) in state transition. We also see similar RIT premature deletion(hbase-9387) cause region lost. IMHO, it's better to keep RIT znodes and let region state machine proceed.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12602617/trunk-9480.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:red}-1 tests included{color}.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    {color:green}+1 hadoop1.0{color}.  The patch compiles against the hadoop 1.0 profile.
+
+    {color:green}+1 hadoop2.0{color}.  The patch compiles against the hadoop 2.0 profile.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 lineLengths{color}.  The patch does not introduce lines longer than 100
+
+    {color:red}-1 site{color}.  The patch appears to cause mvn site goal to fail.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in .
+
+Test results: https://builds.apache.org/job/PreCommit-HBASE-Build/7156//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7156//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-protocol.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7156//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-client.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7156//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-examples.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7156//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-hadoop1-compat.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7156//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-prefix-tree.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7156//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-common.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7156//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-server.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7156//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-hadoop-compat.html
+Console output: https://builds.apache.org/job/PreCommit-HBASE-Build/7156//console
+
+This message is automatically generated.
+
+I'd like to take this issue.
+
+I reviewed trunk-9480.patch. Since we have outer loop retries, the new retry could trigger NotServingRegionException if the region is closed at the RS or the RS just dies between retries {code}!serverManager.isServerOnline(server){code} would kick in. In addition, we still will have the issue depending on the time when region is closed at the hosting RS. [~jxiang] so you don't want remove the znode deletion part from unassign? Thanks.
+
+[~jeffreyz], thanks for reviewing it. I just attached v1.1 (not much changes, just added two test cases).
+bq. so you don't want remove the znode deletion part from unassign?
+If the region is not there, we should delete the znode and re-assign the region.  This is used by hbck/admin to fix some region stuck in transition. Now, since we throw region already in transition, we don't need to delete the znode any more, right?
+bq. new retry could trigger NotServingRegionException if the region is closed at the RS or the RS just dies between retries
+If rs dies in the middle, it's ok, the region is offline anyway. If the region is closed while we are unassigning it, the znode should be already deleted.
+
+The region isn't there could be the case that a region is in transition(or move). There are some time widow that a region is closed at the hosting RS(znode isn't deleted because the region is about to open in a different RS) and before the znode state changes to offline, the current retry loop or the timing we send the CLOSE RPC could still let us hit the origin code path.
+
+Even the region is closed, we still mark the region is closing in the region server (regionsInTransitionInRS).  Only after the znode is deleted, we remove it from the map. I will fix a minor issue in the patch and attach a new one.
+
+[~jeffreyz], how about version 1.2? If you still see some problem, can you show me how to reproduce it so that I can add a testcase to cover it?
+
+I think it funny how presumption of state keeps biting us (in this case, master thinking the RS 'gone' so does cleanup of znode so can give region elsewhere).
+
+Yes, we need to have a better way to do this, most likely after 0.98.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12602688/trunk-9480_v1.2.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 3 new or modified tests.
+
+    {color:green}+1 hadoop1.0{color}.  The patch compiles against the hadoop 1.0 profile.
+
+    {color:green}+1 hadoop2.0{color}.  The patch compiles against the hadoop 2.0 profile.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 lineLengths{color}.  The patch does not introduce lines longer than 100
+
+  {color:green}+1 site{color}.  The mvn site goal succeeds with this patch.
+
+     {color:red}-1 core tests{color}.  The patch failed these unit tests:
+                       org.apache.hadoop.hbase.master.TestAssignmentManagerOnCluster
+
+Test results: https://builds.apache.org/job/PreCommit-HBASE-Build/7165//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7165//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-prefix-tree.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7165//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-client.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7165//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-common.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7165//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-protocol.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7165//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-server.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7165//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-hadoop1-compat.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7165//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-examples.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7165//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-hadoop-compat.html
+Console output: https://builds.apache.org/job/PreCommit-HBASE-Build/7165//console
+
+This message is automatically generated.
+
+I reviewed the 1.2 patch. The newly introduced RegionAlreadyInTransition exception makes the TestAssignmentManagerOnCluster flaky. It depends on if the retry loop(once RegionAlreadyInTransition is raised) can hit the old code path. I think you can safely revert the code in HRegionServer because the newly added following code resumes region transition after zk node deletion. 
+
+The rest looks good to me though I'm wondering if it's possible that you can move the following code inside unsign itself immediately after {code}regionOffline(region);{code} so caller don't need call the following explicitly.
+
+{code}
++      if (regionStates.isRegionOffline(region)) {
++        new ClosedRegionHandler(server, this, region).process();
++      }
+{code}
+
+I am looking the flaky test, will fix it soon.
+
+bq.  I think you can safely revert the code in HRegionServer because the newly added following code resumes region transition after zk node deletion
+I really worried about double-assignment. That's why I want to make sure the region is closed before we start to assign it somewhere else. I think it is a right thing to differentiate not serving from still closing. We can fix new issues caused by this, right?
+
+bq.  I'm wondering if it's possible that you can move the following code inside unsign itself immediately after
+I thought about this too.  The reason I didn't do that is because sometimes we don't want to re-assign the region now. For example, inside handleRegion when an unexpected RS_ZK_REGION_OPENED is received.
+
+{quote}
+For example, inside handleRegion when an unexpected RS_ZK_REGION_OPENED is received.
+{quote}
+You might gave a wrong example. In the above case, ClosedRegionHandler won't be trigged because NULL is passed for RegionState. I'm fine you leave as it is to limit the impact. 
+
+You are right.  That's one doesn't apply. The force assign one should apply. Yes, I meant to limit the impact.
+
+Attached v2, now the test should not be flaky any more.
+
+Patch looks good to me on skim but [~jeffreyz] are you good w/ it? You have been paying attention.
+
+After talking w/ [~jxiang], this is not a blocker; state comes about because of outside intervention, not by normal operation (Yes, we need to make it so that outside intervention cannot put hbase into odd state but also need to allow administrators to do fixup -- TODO: Make it so only privileged user can do status threatening ops).
+
+[~saint.ack@gmail.com] v2 patch looks good to me.(+1) Thanks. We need to find a better way to simplify AM because it's not a good thing to have many edge cases to cover. 
+
+[~jeffreyz] Agreed.  There are too many corner cases and then there is amount of resources consumed getting this whole rube goldberg machine working reliably.  There are scaling issues too (see the flurry talk at the last hbase meetup).  We should have a chat about it -- post 0.96.0 rollout?  There are a few ideas floating about.  Should come up with a strawman at least while the pain is fresh in our minds.
+
+(Cc'ing [~fenghh] since he expressed interest in this area too as is [~jxiang] of course)
+
+Agreed. We need to make things much simpler. It is really nice to discuss with you, [~jeffreyz]. Thanks everyone. I will commit it tomorrow.
+
+Integrated into 0.96 and trunk. Thanks.
+
+FAILURE: Integrated in hbase-0.96 #48 (See [https://builds.apache.org/job/hbase-0.96/48/])
+HBASE-9480 Regions are unexpectedly made offline in certain failure conditions (jxiang: rev 1523308)
+* /hbase/branches/0.96/hbase-client/src/main/java/org/apache/hadoop/hbase/master/RegionState.java
+* /hbase/branches/0.96/hbase-server/src/main/java/org/apache/hadoop/hbase/master/AssignmentManager.java
+* /hbase/branches/0.96/hbase-server/src/main/java/org/apache/hadoop/hbase/master/RegionStates.java
+* /hbase/branches/0.96/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+* /hbase/branches/0.96/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/handler/OpenRegionHandler.java
+* /hbase/branches/0.96/hbase-server/src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java
+* /hbase/branches/0.96/hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestAssignmentManagerOnCluster.java
+
+
+SUCCESS: Integrated in HBase-TRUNK #4507 (See [https://builds.apache.org/job/HBase-TRUNK/4507/])
+HBASE-9480 Regions are unexpectedly made offline in certain failure conditions (jxiang: rev 1523303)
+* /hbase/trunk/hbase-client/src/main/java/org/apache/hadoop/hbase/master/RegionState.java
+* /hbase/trunk/hbase-server/src/main/java/org/apache/hadoop/hbase/master/AssignmentManager.java
+* /hbase/trunk/hbase-server/src/main/java/org/apache/hadoop/hbase/master/RegionStates.java
+* /hbase/trunk/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+* /hbase/trunk/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/handler/OpenRegionHandler.java
+* /hbase/trunk/hbase-server/src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java
+* /hbase/trunk/hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestAssignmentManagerOnCluster.java
+
+
+FAILURE: Integrated in hbase-0.96-hadoop2 #27 (See [https://builds.apache.org/job/hbase-0.96-hadoop2/27/])
+HBASE-9480 Regions are unexpectedly made offline in certain failure conditions (jxiang: rev 1523308)
+* /hbase/branches/0.96/hbase-client/src/main/java/org/apache/hadoop/hbase/master/RegionState.java
+* /hbase/branches/0.96/hbase-server/src/main/java/org/apache/hadoop/hbase/master/AssignmentManager.java
+* /hbase/branches/0.96/hbase-server/src/main/java/org/apache/hadoop/hbase/master/RegionStates.java
+* /hbase/branches/0.96/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+* /hbase/branches/0.96/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/handler/OpenRegionHandler.java
+* /hbase/branches/0.96/hbase-server/src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java
+* /hbase/branches/0.96/hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestAssignmentManagerOnCluster.java
+
+
+SUCCESS: Integrated in HBase-TRUNK-on-Hadoop-2.0.0 #729 (See [https://builds.apache.org/job/HBase-TRUNK-on-Hadoop-2.0.0/729/])
+HBASE-9480 Regions are unexpectedly made offline in certain failure conditions (jxiang: rev 1523303)
+* /hbase/trunk/hbase-client/src/main/java/org/apache/hadoop/hbase/master/RegionState.java
+* /hbase/trunk/hbase-server/src/main/java/org/apache/hadoop/hbase/master/AssignmentManager.java
+* /hbase/trunk/hbase-server/src/main/java/org/apache/hadoop/hbase/master/RegionStates.java
+* /hbase/trunk/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+* /hbase/trunk/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/handler/OpenRegionHandler.java
+* /hbase/trunk/hbase-server/src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java
+* /hbase/trunk/hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestAssignmentManagerOnCluster.java
+
+
+[~jxiang], is this an issue in 0.94 as well?
+
+0.94 doesn't have the same issue since RS#closeRegion already throws RegionAlreadyInTransitionException in this case.
+
+bq.(Cc'ing Feng Honghua since he expressed interest in this area too as is Jimmy Xiang of course)
+Yes. Seems current master/zk/RS's main communication pattern (RS updates zk node, master watches change of zk node), together with the asynchronous and 'one-time' nature of zk watch, result in too many corner cases for assignment manager(and region split). I'm making a proposal for new master/zk/RS's communcation pattern. The main theme is master sends request to RS, RS responses the progress back to master, master persists the request progress in another system table(like meta table), why not zk is for better throughput/performance for huge table with big number of regions... [~stack] / [~jxiang]
+
+[~fenghh] Sounds great.  Make new issue and we'll pile on.
+
+This issue was closed as part of a bulk closing operation on 2015-11-20. All issues that have been resolved and where all fixVersions have been released have been closed (following discussions on the mailing list).
+

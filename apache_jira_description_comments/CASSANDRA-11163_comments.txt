@@ -1,0 +1,131 @@
+Also, the bloom filter is rebuilt on load(), but the rebuild (corrected) filter isn't persisted to disk (could make the argument that rebuilding the BF is right, but if you're going to take the time to do that, should also persist it to disk in the same way index summary is persisted).
+
+
+
+FWIW - this is causing startup on nodes in our cluster to take in excess of 15mins. We do have roughly 1.5TB on disk. We're on a patched version of 3.9.
+
+What I don't quite understand is why this behavior persists past the first restart of the BF FP?
+
+It persists until all sstables are rewritten - the bloom filter is recalculated on startup but not persisted to disk until compaction runs. You can force the bloom filter to be rewritten without waiting dircompaction or this bug to be fixed by running "nodetool upgradesstables -a" to rewrite all of the sstables (note that this can be IO intensive and impact your latencies)
+
+[~KurtG] when you're patch available on this, ping me, I'll review and commit it for you.
+
+Also marking as 3.0+ because it's a legit bug and not a feature; if you don't plan on doing a 3.0 patch, let me know and I'll adjust.
+
+ 
+
+ 
+
+I'll have a patch up soon (next few days). Just need to write some tests. Will likely also solve CASSANDRA-14166
+
+Patches for each branch below. So far I've only got a green test run for trunk. Failures for 3.0 and 3.11 seem flaky/unrelated so will keep trying.
+|[trunk|https://github.com/apache/cassandra/compare/trunk...kgreav:14166-trunk]|[3.11|https://github.com/apache/cassandra/compare/cassandra-3.11...kgreav:14166-3.11]|[3.0|https://github.com/apache/cassandra/compare/cassandra-3.0...kgreav:14166-3.0]|
+|[utests|https://circleci.com/gh/kgreav/cassandra/66]|
+
+This patch also solves CASSANDRA-14166. Basically I've completely stopped regeneration of Summaries on startup (if BFFP is changed), and also stopped the behaviour implemented in CASSANDRA-5015 which would also regenerate the bloomfilters on startup.
+There's definitely no reason to regenerate Summaries in this case, and as previously mentioned it's not great regenerating the bloomfilter unless you're going to persist it. I have added persistence for the bloomfilter (when it is regenerated), however I think it's a bad idea to do this on startup as it will likely be more time consuming than regenerating the summaries.
+
+If an operator chooses to these can be regenerated through {{upgradesstables -a}}. Albeit that's not super efficient if you're just updating the bloomfilter, however I think it's good enough for the moment and a potential follow up ticket would be to add a nodetool command to regenerate bloomfilter/summaries/index/etc.
+
+The new behaviour would be to:
+# Never recreate Summary or bloomfilter when using an offline tool. Note that if the summary doesn't exist the tool will still create it in memory, but it won't persist it to disk (solving CASSANDRA-14166)
+# Only regenerate the summary when it can't be loaded, OR when we've said to recreate the bloomfilter. However we only save the summary if we've been explicitly told to (which should be always EXCEPT for offline tools).
+# Only regenerate and persist the bloomfilter when it's missing - not when it has changed. This means we rely on compactions/upgradesstables to update the bloomfilter. 
+
+I've updated {{org.apache.cassandra.io.sstable.SSTableReaderTest#testOpeningSSTable}} to hopefully test all of these cases.
+
+* In {{load(ValidationMetadata validation, boolean isOffline)}} everywhere your calling {{load( bool , true )}} you can instead call \{{ load( bool, !isOffline) }} since you never want to save the summary in those other situations either. This will break your test but IMHO thats checking that the wrong case occurs. If the summary file is not there, it should not create it. Tools and such may be running with a different user, if someone runs this on a data directory and this occurs it will create a file that C* would be unable to delete, causing compaction threads to die and backup etc. I think, in offline mode the tools should _never_ delete, touch or create unnecessary files, especially the summary/bf files since they are mostly there to speed up startup and not necessary for the reader to work anyway. You can also make the "recreateBloomFilter" always false in offline mode (whenever its true, instead put !isOffline) since it will then just use whats there. With one exception of where the FILTER component is missing, where you can just put AlwaysPresent bf and skip so that code that uses it doesn't NPE.
+
+ * In unit tests, is the 1000ms sleep necessary? the lastModified is in ms so I thought it may be ok to set lower
+
+ * Just checking it out and running it over and over, the unit tests fails occasionally (rarely) (line 407 check {{assertNotEquals(bloomModified, bloomFile.lastModified());}} is the same)
+
+ * NP: I think you can reuse the last option (track hotness) since its only false currently in situations where we dont want or need to recreate currently. If rename it to like "allowChanges". That way we are not adding additional booleans to end of that load function.
+
+Thanks for the review Chris. Made changes according to your comments and updated the branches.
+# That works. It also didn't break tests because there was that initial catchall isOfflline at the top which covered all those cases. Note that ATM the only way the summary is recreated is by online operations (using open, rather than openNoValidation).
+# No it wasn't, assumed in Java we only had access to second precision which is not true in Java 8, as long as you use {{Files}}. I've updated the test to use 10ms sleeps with ms precision and it seems to be much more reliable. 99% sure the rare failures before were just because the second precision of {{lastModified()}}
+# I've updated to just use {{isOffline}}. It seemed to make more sense than {{allowChanges}} to me, in that "we don't track hotness or touch files if we're offline". I'll note that this changed the behaviour of {{org.apache.cassandra.db.ColumnFamilyStore#getSnapshotSSTableReader}} to be "offline", however I think that makes sense in this case, as we shouldn't be regenerating summaries/BF's for snapshots anyway.
+
+|[3.0|https://github.com/apache/cassandra/compare/cassandra-3.0...kgreav:14166-3.0]|[3.11|https://github.com/apache/cassandra/compare/cassandra-3.11...kgreav:14166-3.11]|[trunk|https://github.com/apache/cassandra/compare/trunk...kgreav:14166-trunk]|
+
+
+Doesnt this now miss case where under normal (not offline) run and they change bf ratio it no longer recreates them? {{(validation.bloomFilterFPChance != metadata().params.bloomFilterFpChance)}}. With this it will just load the old bf so theres no way to change it.
+
+Correct. As I noted previously 
+
+bq. Only regenerate and persist the bloomfilter when it's missing - not when it has changed. This means we rely on compactions/upgradesstables to update the bloomfilter.
+bq. There's definitely no reason to regenerate Summaries in this case, and as previously mentioned it's not great regenerating the bloomfilter unless you're going to persist it. I have added persistence for the bloomfilter (when it is regenerated), however I think it's a bad idea to do this on startup as it will likely be more time consuming than regenerating the summaries.
+
+So the previous behaviour was to regenerate the BF in this case but *not* persist it on the next startup (this meant it would happen on every startup until compactions/upgrades had occured). The summaries would be regenerated and persisted on the next startup (pointlessly). Both of these things would slow startup time pretty significantly depending on how much data you had.
+
+The new behaviour would be to avoid regenerating BF/Summaries at all on startup and instead rely on upgradesstables/compactions to update them. Summaries would only be recreated when necessary (when not loaded/corrupt/missing).
+
+In trunk it might make sense to also add a nodetool command that will allow us to regenerate the bloomfilters/summaries/etc without re-writing the whole data file.
+
+gotcha +1 on patch from me
+
+I like idea of a {{nodetool recreatecomponent}} or something but that would be a different jira.
+
+Thanks for the review [~cnlwsu]. Created CASSANDRA-14291 as a follow up.
+
+||branch||testall||dtest||
+|[14166-3.0|https://github.com/kgreav/cassandra/tree/14166-3.0]|[testall|https://circleci.com/gh/kgreav/cassandra/tree/14166-3.0]|[dtest|https://builds.apache.org/view/A-D/view/Cassandra/job/Cassandra-devbranch-dtest/506/]|
+|[14166-3.11|https://github.com/kgreav/cassandra/tree/14166-3.11]|[testall|https://circleci.com/gh/kgreav/cassandra/tree/14166-3.11]|[dtest|https://builds.apache.org/view/A-D/view/Cassandra/job/Cassandra-devbranch-dtest/507]|
+|[14166-trunk|https://github.com/kgreav/cassandra/tree/14166-trunk]|[testall|https://circleci.com/gh/kgreav/cassandra/tree/14166-trunk]|[dtest|https://builds.apache.org/view/A-D/view/Cassandra/job/Cassandra-devbranch-dtest/508]|
+
+EDIT: i had [troubles|https://builds.apache.org/view/A-D/view/Cassandra/job/Cassandra-devbranch-dtest/510/] getting the trunk patch dtests to run. As upstream trunk dtests appear to now be [working|https://builds.apache.org/view/A-D/view/Cassandra/job/Cassandra-trunk-dtest/462/], I, off a [thelastpickle|https://github.com/thelastpickle/cassandra/tree/14166-trunk] fork, rebased that patch off trunk and am running the dtests [again|https://builds.apache.org/view/A-D/view/Cassandra/job/Cassandra-devbranch-dtest/511/]…
+
+Rebased trunk patch run the dtests. 
+
+I don't believe the failed test has anything to do with this ticket: [repair_tests.repair_test.TestRepair.test_dc_parallel_repair|https://builds.apache.org/view/A-D/view/Cassandra/job/Cassandra-devbranch-dtest/511/testReport/junit/repair_tests.repair_test/TestRepair/test_dc_parallel_repair/]
+
+Committed.
+
+This commit broke 3.0 unit tests (maybe 3.11 too, haven't checked).
+
+See https://builds.apache.org/view/A-D/view/Cassandra/job/Cassandra-3.0-test-all/lastCompletedBuild/testReport/org.apache.cassandra.io.sstable/SSTableReaderTest/testOpeningSSTable/history/ and https://builds.apache.org/view/A-D/view/Cassandra/job/Cassandra-3.0-test-all/248/changes. It's also failing locally and I'm pretty sure will be failing [here|https://circleci.com/gh/iamaleksey/cassandra/234] too.
+
+We should be more careful about committing things. But in the meantime, [~mck] can you please fix this or revert this until there is a fix? Cheers.
+
+thought this was fixed in https://issues.apache.org/jira/browse/CASSANDRA-14387 ? time resolution being different on causing it to fail on some systems.
+
+Yeah. As you (and Marcus, offline) mentioned, CASSANDRA-14387 was only committed to trunk, so 3.0 tests are still failing elsewhere (incl. Jenkins, but not Circle). We just need to commit 14387 to 3.0 and 3.11.
+
+{quote}Cherry-plicked into 3.0 as [e16f0ed0698c5cb47ab2bb0a0b04966d5bdbcde0|https://github.com/apache/cassandra/commit/e16f0ed0698c5cb47ab2bb0a0b04966d5bdbcde0] and merged upwards
+{quote}
+Thanks [~iamaleksey] for fixing this.
+{quote}We should be more careful about committing things.
+{quote}
+Yes, I should have noticed that {{SSTableReaderTest}} was a new failure in  [https://builds.apache.org/view/A-D/view/Cassandra/job/Cassandra-3.0-test-all/248/#showFailuresLink] 
+
+Up until now I've only been using circleci unit test reports, as illustrated in the "branch|testall|dtest" comment above, which reported it all green.
+
+As CircleCI hasn't failed on this test, what's the difference here? 
+Aleksey's circleci build #234 [passed SSTableReaderTest|https://circleci.com/gh/iamaleksey/cassandra/234#tests/containers/2] , as did Kurt's [here|https://circleci.com/gh/kgreav/cassandra/116#tests/containers/1]
+
+ 
+
+If CircleCi and Jenkins can both identify failures separately then "test-all" column should be split into two, to link to each.
+
+Otherwise, does Jenkins have any form of alerting or reporting on tests that go from stable to flakey? Would have been ideal to have automatically have receive the breakage information before it affected you [~iamaleksey]
+
+the granularity of the file timestamp depends on the filesystem
+
+[~cnlwsu], oh! not os but filesystem, and circleci and jenkins differ there. Ouch. 
+How should we test against that?
+
+Hm, sorry about that. Originally started with second delays but changed it to speed up the test. Thought ms would be safe in this day and age. 2018 and all that.
+
+{quote}How should we test against that?
+{quote}
+We don't, just have to go with the lowest resolution which will hopefully be seconds. No point putting workarounds in to speed up a test by a few seconds on _some_ platforms. Having said that, what filesystem is jenkins running? Seems odd it'd only have second precision. But then again it's probably an ancient server.
+
+There isn't a clean or standard way to determine if a file system supports sub-second date/time resolution for file modifications.
+
+bq. Yes, I should have noticed that SSTableReaderTest was a new failure in  https://builds.apache.org/view/A-D/view/Cassandra/job/Cassandra-3.0-test-all/248/#showFailuresLink 
+
+Realistically, you shouldn't have. Looking at Circle should be sufficient enough. I just assumed that it would break on Circle just like it broke in our internal CI and Jenkins, and that was wrong. My apologies for the somewhat passive-aggressive righteous tone.
+
+If Circle is green, we should be free to commit, and we should be checking with ASF Jenkins from time to time, but it should not be required for every commit.
+

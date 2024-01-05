@@ -1,0 +1,208 @@
+Looking at {{testCreateCollectionAddReplica}} first.  I'm still in the early stages of looking into this, but I think I see some things pointing to this being a sim-framework issue, as opposed to being a production problem.  I'm not super familiar with the sim-framework though, so I'll try and give some detail here in case anyone with more context can correct me and save me from a potential red-herring.
+
+*TL;DR* I believe this to be a test-framework bug related to how the SimClusterStateProvider caches clusterstate values.
+
+The test starts by creating a collection using a specific policy.  Maybe 1 time in 10 it'll fail in a {{CloudTestUtils.waitForState}} call.  On these failures, this {{waitForState}} call fails because the collection (supposedly) doesn't have a leader:
+{code}
+ last coll state: DocCollection(testCreateCollectionAddReplica//clusterstate.json/5)={
+  "replicationFactor":"1",
+  "pullReplicas":"0",
+  "router":{"name":"compositeId"},
+  "maxShardsPerNode":"1",
+  "autoAddReplicas":"false",
+  "nrtReplicas":"1",
+  "tlogReplicas":"0",
+  "autoCreated":"true",
+  "policy":"c1",
+  "shards":{"shard1":{
+      "replicas":{"core_node1":{
+          "core":"testCreateCollectionAddReplica_shard1_replica_n1",
+          "SEARCHER.searcher.maxDoc":0,
+          "SEARCHER.searcher.deletedDocs":0,
+          "INDEX.sizeInBytes":10240,
+          "node_name":"127.0.0.1:10068_solr",
+          "state":"active",
+          "type":"NRT",
+          "INDEX.sizeInGB":9.5367431640625E-6,
+          "SEARCHER.searcher.numDocs":0}},
+      "range":"80000000-7fffffff",
+      "state":"active"}}}
+{code}
+
+But other statements in the logs indicate that this collection *does* have a leader.  We get this series of messages right as the test ends:
+{code}
+14445 INFO  (TEST-TestSimPolicyCloud.testCreateCollectionAddReplica-seed#[6FE5447E15D3DD6F]) [    ] o.a.s.SolrTestCaseJ4 ###Ending testCreateCollectionAddReplica
+14446 DEBUG (TEST-TestSimPolicyCloud.testCreateCollectionAddReplica-seed#[6FE5447E15D3DD6F]) [    ] o.a.s.c.a.s.SimClusterStateProvider ** creating new collection states, currentVersion=6
+14446 INFO  (TEST-TestSimPolicyCloud.testCreateCollectionAddReplica-seed#[6FE5447E15D3DD6F]) [    ] o.a.s.c.a.s.SimClusterStateProvider JEGERLOW: Saving clusterstate
+14446 DEBUG (TEST-TestSimPolicyCloud.testCreateCollectionAddReplica-seed#[6FE5447E15D3DD6F]) [    ] o.a.s.c.a.s.SimClusterStateProvider ** saved cluster state version 6
+14446 INFO  (TEST-TestSimPolicyCloud.testCreateCollectionAddReplica-seed#[6FE5447E15D3DD6F]) [    ] o.a.s.c.a.s.SimSolrCloudTestCase #######################################
+############ CLUSTER STATE ############
+#######################################
+## Live nodes:		2
+## Empty nodes:	1
+## Dead nodes:		0
+## Collections:
+##  * testCreateCollectionAddReplica
+##    shardsTotal	1
+##    shardsState	{active=1}
+##      shardsWithoutLeader	0
+{code}
+
+One thing that stands out to me are the different clusterstate versions in play here.  The log snippets above show information from {{/clusterstate.json/5}}, and {{/clusterstate.json/6}} respectively.
+
+I looked into {{SimClusterStateProvider}} and noticed that it caches the cluster state locally (see [here|https://github.com/apache/lucene-solr/blob/75b183196798232aa6f2dcaaaab117f309119053/solr/core/src/test/org/apache/solr/cloud/autoscaling/sim/SimClusterStateProvider.java#L2086]) and warns readers that the cache must be explicitly cleared before new changes become visible.  With this caching temporarily disabled the test failure disappeared.  (Or at least, I couldn't trigger it in 2000 runs).  I suspect that the test failure is caused by either (1) some codepath not properly clearing/resetting this clusterstate cache, or (2) a subtler synchronization bug in how this cache is locked down.
+
+I believe I found the race condition causing these failures. It looks like an issue between the {{waitForState}} polling, which occurs in the main test thread, and the leader-election execution, which occurs in a {{Future}} submitted to {{SimCloudManager}}'s ExecutorService.
+
+The {{waitForState}} thread repeatedly asks for the cluster state, which looks a bit like this:
+ * [return cached value, if any. Otherwise continue|https://github.com/apache/lucene-solr/blob/75b183196798232aa6f2dcaaaab117f309119053/solr/core/src/test/org/apache/solr/cloud/autoscaling/sim/SimClusterStateProvider.java#L2090]
+ * [Grab lock|https://github.com/apache/lucene-solr/blob/75b183196798232aa6f2dcaaaab117f309119053/solr/core/src/test/org/apache/solr/cloud/autoscaling/sim/SimClusterStateProvider.java#L2093]
+ * [Clear cache|https://github.com/apache/lucene-solr/blob/75b183196798232aa6f2dcaaaab117f309119053/solr/core/src/test/org/apache/solr/cloud/autoscaling/sim/SimClusterStateProvider.java#L2094]
+ * [Build Map to store in cache|https://github.com/apache/lucene-solr/blob/75b183196798232aa6f2dcaaaab117f309119053/solr/core/src/test/org/apache/solr/cloud/autoscaling/sim/SimClusterStateProvider.java#L2126]
+ * [Set cache with Map|https://github.com/apache/lucene-solr/blob/75b183196798232aa6f2dcaaaab117f309119053/solr/core/src/test/org/apache/solr/cloud/autoscaling/sim/SimClusterStateProvider.java#L2141]
+ * [Release lock|https://github.com/apache/lucene-solr/blob/75b183196798232aa6f2dcaaaab117f309119053/solr/core/src/test/org/apache/solr/cloud/autoscaling/sim/SimClusterStateProvider.java#L2144]
+
+The Leader Election Future looks a bit like this:
+ * [Give a ReplicaInfo "leader=true"|https://github.com/apache/lucene-solr/blob/75b183196798232aa6f2dcaaaab117f309119053/solr/core/src/test/org/apache/solr/cloud/autoscaling/sim/SimClusterStateProvider.java#L756]
+ * [Clear cache|https://github.com/apache/lucene-solr/blob/75b183196798232aa6f2dcaaaab117f309119053/solr/core/src/test/org/apache/solr/cloud/autoscaling/sim/SimClusterStateProvider.java#L766]
+
+Note that the leader election Future does this without acquiring the lock. Now imagine the following interleaving of these two threads:
+ * [Thread-Test] Grab lock
+ * [Thread-Test] Clear cache
+ * [Thread-Test] Build Map to store in cache
+ * [Thread-LeaderElection] Give ReplicaInfo "leader=true"
+ * [Thread-LeaderElection] Clear cache
+ * [Thread-Test] Set cache with Map
+
+At the end of this interleaving the cache has a value that's missing the latest "leader=true" changes, and nothing will ever clear it. So the {{waitForState}} polling will go on to fail.
+
+We should be able to fix this by having the leader election code use the same Lock used elsewhere. I've actually got this change staged locally and am running tests on it currently. If all looks well I should have this uploaded soon. One thing I'll be curious to see is whether this affects any of the other TestSim* failures we've seen recently. If we're lucky we may get 2 (or more) birds with this one stone.
+
+I've attached a proposed fix for this.  With this, all tests in {{TestSimPolicyCloud}} looked good.  Ran them ~5000 times.  Gonna do some beast runs to trigger things that way, but otherwise things look good here.
+
+I found another bug where SimCloudManager was setting the "nodeRole" property as a single-valued-Set, instead of just giving it a String value.  This causes things to blow up later when a cast to {{String}} fails.  Attached patch includes a small fix for that.
+
++1 to commit this fix - let's see how it affects other sim* tests!
+
+Commit f89f109ec1d1b9a19034d17345d41d3dd2c34852 in lucene-solr's branch refs/heads/master from [~gerlowskija]
+[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=f89f109 ]
+
+SOLR-13045: Harden TestSimPolicyCloud
+
+This commit fixes a race condition in SimClusterStateProvider, fixing
+several fails in TestSimPolicyCloud.
+
+
+Commit 830e5b75c96e54282af4608a1215e9de1c7c3bf6 in lucene-solr's branch refs/heads/branch_7x from [~gerlowskija]
+[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=830e5b7 ]
+
+SOLR-13045: Harden TestSimPolicyCloud
+
+This commit fixes a race condition in SimClusterStateProvider, fixing
+several fails in TestSimPolicyCloud.
+
+
+Commit f89f109ec1d1b9a19034d17345d41d3dd2c34852 in lucene-solr's branch refs/heads/jira/http2 from [~gerlowskija]
+[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=f89f109 ]
+
+SOLR-13045: Harden TestSimPolicyCloud
+
+This commit fixes a race condition in SimClusterStateProvider, fixing
+several fails in TestSimPolicyCloud.
+
+
+Committed this fix to master and branch_7x.  In testing, it looked like it also cleared up issues in TestSimExtremeIndexing.  So maybe we'll get a fix there for 'free'.  I'll keep this open for the next week to check for failures, but I'll close it if things looks good after that.
+
+Checking back in a week later.  The work above has cut down the failure rate from 5% to maybe 1-2%, but there's still issues with this test.  Attaching a jenkins log containing a current failure from 2 days ago.  (Don't want to lose the log when it cycles out of fucit).
+
+At first glance, the failure looks like it happens because a replica is created on the wrong node (contrary to a specified policy).  Starting to look into things now.
+
+One of the remaining failures for in TestSimPolicyCloud occurs in {{testCreateCollectionAddShardUsingPolicy}} when the initial collection creation (and subsequent shard creation) seem to violate a policy which specifies that all replicas should be created on the same node.  After looking closer, it looks like this comes down to a race condition of sorts between two threads attempting to set the autoscaling.json "ZK" node.
+
+Two different threads touch the autoscaling config node in this test: the OverseerTriggerThread tries to set the default nodeAdded trigger, and the test code tries to set a policy that the test relies on.  These threads rely on optimistic concurrency versioning to ensure that updates don't clobber one another.  But SimDistribStateManager has a bug which prevents this from working correctly all the time.  The initial node version in the sim framework is -1, which is also the flag used to indicate "I don't care about concurrency, just overwrite the node".  (For comparison, ZkDistribStateManager has node versions start at 0).  Depending on timing, this causes the default nodeAdded trigger to clobber the policy that our test relies on, causing it to fail.
+
+So one fix that'll make this test (and probably others in the sim framework) more reliable is to ensure that SimDistribStateManager's node-versioning lines up better with ZkDistribStateManager's.  Or at least that it avoids this -1 edge case.  I've been testing variations of a patch to accomplish this, and will upload my results shortly.
+
+Commit 272178eff5c414e9df76e5cd4bd5bfbcf0e74249 in lucene-solr's branch refs/heads/master from Jason Gerlowski
+[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=272178e ]
+
+SOLR-13045: Allow SimDistribStateManager to create top-level data nodes
+
+While working on a related issue in SimDistribStateManager, I noticed
+that `createData()` only worked successfully on nodes nested more than
+one level under root.  (i.e. `createData("/foo", someData, mode)` would
+fail, while the same with "/foo/bar" wouldn't).  This was due to an edge
+case in SimDistribStateManager's path building logic.  This commit fixes
+this issue.
+
+
+Commit 3e87020031ec67513b442f7b99f3f41e451f2653 in lucene-solr's branch refs/heads/branch_7x from Jason Gerlowski
+[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=3e870200 ]
+
+SOLR-13045: Allow SimDistribStateManager to create top-level data nodes
+
+While working on a related issue in SimDistribStateManager, I noticed
+that `createData()` only worked successfully on nodes nested more than
+one level under root.  (i.e. `createData("/foo", someData, mode)` would
+fail, while the same with "/foo/bar" wouldn't).  This was due to an edge
+case in SimDistribStateManager's path building logic.  This commit fixes
+this issue.
+
+
+Commit 207b3f4453e6f4fafe50faee094b96b3c7e4600b in lucene-solr's branch refs/heads/master from Jason Gerlowski
+[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=207b3f4 ]
+
+SOLR-13045: Sim node versioning should start at 0
+
+Prior to this commit, new ZK nodes being simulated by the sim framework
+were started with a version of -1.  This causes problems, since -1 is
+also coincidentally the flag value used to ignore optimistic concurrency
+locking and force overwrite values.
+
+
+Commit ba514dd7ccd0ed275ac914aa0cb7f866cf874233 in lucene-solr's branch refs/heads/branch_7x from Jason Gerlowski
+[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=ba514dd ]
+
+SOLR-13045: Sim node versioning should start at 0
+
+Prior to this commit, new ZK nodes being simulated by the sim framework
+were started with a version of -1.  This causes problems, since -1 is
+also coincidentally the flag value used to ignore optimistic concurrency
+locking and force overwrite values.
+
+
+fucit.org reports zero failures in the past week, so I think we can call this done.  I'm going to backport the fixes to branch_7_6 tonight, in case there's interest in a 7.6.1 at some point, and then I'll be closing this out.
+
+Commit 7a0b0590a0db5def3886ac85b80f2aee4fae85bc in lucene-solr's branch refs/heads/branch_7_6 from Jason Gerlowski
+[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=7a0b059 ]
+
+SOLR-13045: Harden TestSimPolicyCloud
+
+This commit fixes a race condition in SimClusterStateProvider, fixing
+several fails in TestSimPolicyCloud.
+
+
+Commit dcc09411a09d0addf972ade9da3db01c7f510232 in lucene-solr's branch refs/heads/branch_7_6 from Jason Gerlowski
+[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=dcc0941 ]
+
+SOLR-13045: Allow SimDistribStateManager to create top-level data nodes
+
+While working on a related issue in SimDistribStateManager, I noticed
+that `createData()` only worked successfully on nodes nested more than
+one level under root.  (i.e. `createData("/foo", someData, mode)` would
+fail, while the same with "/foo/bar" wouldn't).  This was due to an edge
+case in SimDistribStateManager's path building logic.  This commit fixes
+this issue.
+
+
+Commit 34d82ed033cccd8120431b73e93554b85b24a278 in lucene-solr's branch refs/heads/branch_7_6 from Jason Gerlowski
+[ https://git-wip-us.apache.org/repos/asf?p=lucene-solr.git;h=34d82ed ]
+
+SOLR-13045: Sim node versioning should start at 0
+
+Prior to this commit, new ZK nodes being simulated by the sim framework
+were started with a version of -1.  This causes problems, since -1 is
+also coincidentally the flag value used to ignore optimistic concurrency
+locking and force overwrite values.
+
+

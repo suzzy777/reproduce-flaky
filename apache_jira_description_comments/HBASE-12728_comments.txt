@@ -1,0 +1,1763 @@
+I believe [HTableMultiplexer|https://hbase.apache.org/apidocs/org/apache/hadoop/hbase/client/HTableMultiplexer.html] is meant to stand in for HTablePool for buffered writing. 
+
+Andrew Purtell on the thread mentioned HTableMultiplexer on the mailing list thread, and it does seem like this would handle write buffers correctly. He asked me to repost this comment:
+It kind of seems like HTable should then (if autoFlush == false) send writes to the multiplexer, rather than setting it in its own, short-lived writeBuffer. If nothing else, it's still super confusing that HTableInterface exposes setAutoFlush() and setWriteBufferSize(), given that the writeBuffer won't meaningfully buffer anything if all tables are short-lived.
+
+It seems like we would want to push HTable's aswyncWriteBuffer down into the connection, we'd have one for each unique table name. I'm not sure where AP responsible for actually sending edits would sit -- its executor is managed by the table at the moment. Connection teardown would also need to check the buffers and send any pending data.
+
+I do not quite follow the argument here. One can (a) hang on to any HTable instance as long as one wants or (b) buffer in a List<Put> and pass that to HTable.put(List).
+I never liked the autoFlush huh hah, as it would flush at essentially random times and the client has no knowledge (easily at least) of what happened with the edits.
+
+
+I like the [~lhofhansl] take (with implication that the Table manages any write buffer and not Connection)
+
+There is though a 'gap' (as has been noted up on the mailing list) as to how folks get from [~abeppu]'s predicament of many threads writing a table up on to Lars' world; would a thread-safe Table implementation or an updated pool that does new style Interfaces? (no close on add back to the pool)
+
+I agree that autoFlush aught to be removed from the Table API.  Like [~lhofhansl] says, it has some major issues.  The Table bulk operations for put and delete already exist for a separate mechanism to build an RPC buffering functionality.
+
+There are various use cases for buffering that may need slightly different behavior.  
+- A servlet that takes in requests might need different behavior than a batch map/reduce.  For example, a servlet might need periodic flushing for low traffic times.
+- There might be cases where there needs to be bulk deletes in addition to bulk puts.  
+
+Neither Connection nor Table seem to be the appropriate abstraction for the buffering behavior.  java.util.Writer/BufferedWriter decorator approach seems like a good inspiration for the type of work.  Since Table is both a reader and a writer, decorator not a perfect approach in its current form.   I propose that we split Table into TableWriter and TableReader interfaces and move buffering functionality into a new implementation of TableWriter.
+
+Thoughts?
+
+There is no limitation that Table objects cannot be long lived. Just that short lived Table objects are possible. Table is already a BufferedWriter equivalent IMO. 
+It seems that for this use case, some kind of pooling is desired to share the buffers between contextes (and threads). HTablePool is gone, but a TablePool for pooling Table objects, or a multi threaded Table wrapper can still be developed on top of Table objects.  
+
+bq. A servlet that takes in requests might need different behavior than a batch map/reduce. For example, a servlet might need periodic flushing for low traffic times.
+
+For a servlet, we could checkout from a pool that is instantiated on servlet init?  When the servlet finishes the request, check the Table back into the pool (w/o flush or close).  The pool would have autoflush true set flushing at a size threshold or on a period (we'd have to add the periodicity as a Table intrinsic or have it done by the threadpool internally).
+
+If we let TableWriter float free, we'd have to have a pool of TableWriters for the servlet scenario? (Or TableWriter would have to be threadsafe)?
+
+
+
+
+
+bq. A servlet that takes in requests might need different behavior than a batch map/reduce. For example, a servlet might need periodic flushing for low traffic times.
+
+I still find that a bit dubious. You're saying you have a servlet thread that is writing something to an HTable, but you do not really care whether those changes actually makes it into HBase? (that's what you're doing, if you're Put'ing, but not flushing the commits)
+
+
+[~lhofhansl] and [~stack]: I guess you're right.  Online systems would probably not benefit not need to use buffered writing.  They'd also want generally confirmation that the write worked.  So in the online case, it sounds like the there would need to be a way to read or write to a table without incurring the cost of establishing a connection.  To borrow a construct from the sql world, maybe the right tool there is a ConnectionPool.  Pooling Connections would give the user more flexibility than pooling Tables but with the same performance benefits.  Bulk writes can still happen through the table.put(List<>) and table.delete(List<>) methods.
+
+The ConnectionPool concept used to be available in the form of managed connections.  Managed connections have been deprecated, and I don't think that there is a recommended alternative.  I think that topic might benefit from a separate thread. 
+
+So back to buffering writes.  FWIW, my thoughts here are more about thinking out loud about the nature of the problem than offering guidance.  I don't understand the problem well enough, and I'm hoping to learn more about the nature of the need with more discussion.
+
+It sounds like one reason for buffered writes is in map/reduces into a single Table.  Specifically, map-reduces where the content of the per key is not ideal for batching through the Table.put(List<>) method.  In such a case, a single table with auto-flush turned on makes perfect sense.  TableOutputFormatBase does that, so most reduce cases are covered.  (FYI, I just checkout out Import and noticed that it does not seem to use auto-flush for some reason.)
+
+Is m/r the main reason for autoFlush?  Are there other good cases?
+
+bq. FWIW, my thoughts here are more about thinking out loud about the nature of the problem than offering guidance.
+
+Pardon us if our reaction appeared to not understand that this was the case.  Your 'outside' perspective has been refreshing up to this. Please do not suppress your 'thoughts' because our response on occasion is basic.
+
+bq. Is m/r the main reason for autoFlush? Are there other good cases?
+
+Stating the obvious, autoflush makes sense anytime the writes are small and many; it especially makes sense when there is no natural flush point. In the m/r case, when-to-flush could be done inside the m/r externally as opposed to the autoFlush intrinsic, but it gets a little more complicated in your servlet case. Presuming many small writes by many threads, it makes sense that the Table instance figures when to flush (size or period).  Could create a (thread-safe) Table on servlet init (or a pool) and on destroy, do a flush/close of the Table instance (or pool).
+
+I don't think the ConnectionPool concept from sql-world maps well to ours where many servers are involved rather than one. Or, in our world, a ClusterConnection sort of equates to ConnectionPool since the ClusterConnection will put up and cache a Connection per server in the cluster (true, we might get more throughput if more than one connection per server in the cluster but that I think an implementation detail rather than a modeling item).
+
+I suggest that to answer the problem raised by [~abeppu], that we add back a TablePool ([~lhofhansl] -- you think this a regression?) and a thread-safe version of Table with the Table instance responsible for write buffer (we could add flushing on a period to the pool and as an option on the thread-safe Table in another issue)? I can work on this if agreement.
+
+
+
+[~stack] In the servlet case, does it simply make sense to create a new Table for every request?  Is Table creation cheap once the Connection is created?  If creating Tables is expensive, then TablePool makes sense; if not, then it's probably easier to simply create a new Table for each request.
+
+[~abeppu] What's the use case that you're trying to solve?  Is it an online system or a batch system?  I'm trying to wrap my head around the need for both a TablePool and autoflush simultaneously.
+
+bq. In the servlet case, does it simply make sense to create a new Table for every request?
+
+Not when Table owns the write buffer because then a new Table per request will mean a flush/rpc per request when we close the Table when request processing is done.
+
+So I've been back and forth on this and have come to the same conclusion as [~lhofhansl].  I’ll even be a little more blunt and assert that auto-flush is categorically bad.  It leads to an illusion of free speed gains when, in fact, you sacrifice durability guarantees, a basic tenet of a database.
+
+If a user makes a decision to sacrifice durability for speed, that can be done without help from the HBase client.  Create a thread-safe object wrapping two lists, one for buffering, and one for updating.  That object manages a thread that gets triggered with the collection reaches a certain length or when a timeout expires, at which point it moves the buffered list into the update list and submits the batch.
+
+If this is a common enough use case, then HBase could even package this as a utility for those who need it.  Something like this:
+
+{code:java}
+public class PutBuffer {
+    public PutBuffer(ConnectionFactory connectionFactory) {…}
+    public void setFlushTimeout(int millis) {…}
+    public int getFlushTimeout() {…}
+    public void addPut(TableName table, Put put) {…}
+    public void flush() {…}
+}
+{code}
+ 
+But putting this as first-class functionality baked into the client itself is inherently confusing (“where did my writes go when the servlet crashed?”) and adds a lot of unnecessary complexity to the critical write path.  It's a complex-enough system already.  Keep it simple wherever possible.
+
+My $0.02.
+
+
+If my previous comment seems a little heavy-handed, a less radical approach may be the earlier suggestion of a buffered delegator.  [~enis] points out above that the client is already buffered, but my argument is 1) that's not the best place for this relatively heavy logic, and 2) Java's polymorphism makes it quite easy to extend the core behavior without baking it into a single mega-class.  The new interfaces actually make this fairly simple.  And most importantly, a user won't need to change any code except at instantiation.
+
+We could create a class called BufferedTable that implements Table and delegates to an underlying Table instance.  We surface the buffer-related methods from the core client here.  Something like this:
+
+{code:java}
+/**
+ * Javadoc here warning about the possibility of losing writes on client crash.
+ *
+ * Also, emphasize the need to always close, probably inside a finally{}.
+ **/
+public class BufferedTable implements Table {
+    // This constructor will be familiar for people who know BufferedWriter
+    pubic BufferedTable(Table table) {...}  
+
+    // All methods except Put pass through.  Put calls a singleton that handles buffering.
+    ...
+
+    // Remove setAutoFlush and isAutoFlush since that's implicit in using this class.
+    /* snip */
+
+    // Change these to statics since they need to talk to an underlying singleton.
+    public static void flushCommits() {...}
+    public static void setWriteBufferSize(long writeBufferSize) {...}
+
+    // Maybe use reference counting here to force a flush on the last close.
+    public void close();
+}
+{code}
+
+
+bq. It leads to an illusion of free speed gains when, in fact, you sacrifice durability guarantees, a basic tenet of a database.
+
+Yeah it does that. We should put this in flashing lights in the autoFlush javadoc.  Folks will still want to buffer up writes though, in spite of the dangers.
+
+bq. If this is a common enough use case, then HBase could even package this as a utility for those who need it. 
+
+It is a common use case and yes, we should have it as utillity.  Up to this the utility has been in the Table implementation but the suggestion is that doing it this way "..is inherently confusing ".
+
+For your PutBuffer strawman, in a multithreaded context -- e.g. servlet -- where each thread does small writes, PutBuffer would have to be threadsafe.  You'd create it at the start of your map task or if a servlet, on servlet init, and keep it around until the map task was done, or servlet destroyed?
+
+You like it because it makes the buffering distinct, apart from Table? This could work.
+
+On your less radical BufferedTable, again, we'd need it threadsafe -- or a threadsafe version -- or else a pool of BufferedTables.  This could work also; would be closer to what we currently have.
+
+For both proposals, it sounds like Table would change to immediately flush any puts; it would no longer keep any running buffer.
+
+I do apologize if came across as not understanding. It's that we're using HBase a lot in batch and non-batch scenarios, and I never find autoflush helpful. We always build up a list of puts - that would be the write buffer, and write that list to HBase and continue when that is successful.
+
+The only useful case for autoflush I can think off is the scenario stack outlines above: You have a large body of data to write to HBase in a restartable way. In that case you want trickle data to HBase in chunks most optimal for HBase. So you "stream" the data to an HTable instance, and force a flush only in the end. If anything goes wrong you restart the entire job.
+So, yeah, I'd say that M/R is one of the few usecases for this, and even there it's mostly for API convenience.
+
+It's quite possible that I am biased, it was me who suggested the API change, which let's us manage a connection to a cluster as a durable thing, and uses HTable as cheap proxies to tables only.
+
+I was just going to suggest a special implementation of HTable that does the buffering in a threadsafe way and remove any buffering form the current implementations... And saw that [~carterpage] beat me to it.
+
+
+[~sduskis] Sorry, was offline for the holidays. Our use case is an online system. Our clients send us a steady stream of data points, which drive our ML system. Because our clients mostly benefit from the aggregate experience of our ML system, it's acceptable to us if some small minority of writes are lost, though naturally we'd prefer that loss to be zero or negligible. So currently each individual handler uses the HTablePool to acquire a table, and "writes" to it, and we set autoflush to false such that only a minority of those "writes" actually triggers a flush.
+
+Honestly, I could be convinced that this choice on our part was misguided, but I would hasten to point out that there exists "blessed" documentation [1] which explicitly advises setting autoflush to false when handling a large write volume.
+
+It would certainly be possible for us to manage our own write buffer. Similarly, it would be possible for us to manage our own table pool. In either case, in our migration (from 0.94 to 0.98.6), we're replicating some functionality which was previously part of hbase-client.
+
+[1] SS 14.8.4 http://hbase.apache.org/book/perf.writing.html 
+
+We probably don't want to remove write buffering wholesale from HBase, since some users understand the trade-offs and still count on it.
+
+[~abeppu], if we provided a BufferedTable with signatures as I described above, would that work for you?  Some details around lifecycle management for the underlying buffer still need to be worked out, but functionally you would be able to invoke it like a normal Table.
+
+
+A BufferedTable implementation seems to me to imply a change in the Table interface.  If the buffering logic is an implementation detail for some implementation of Table, does that imply that the Table interface should not have any autoflush related methods on it?
+
+[~carterpage] Yes, a BufferedTable, with the signatures you described above, and either of the properties that [~stack] described would work for us.
+
+If we do not want an API change for the existing interface we can invent a "LightweightTable" or "UnbufferedTable". But I'd prefer BufferedTable as a new interface.
+Too late for 1.0? [~enis].
+
+My 0.02, it shouldn't be too late for 1.0. Table is a fundamental API and we should get it right for a 1.0 release. Let things slip if need be IMHO
+
+FWIW, I recently rewrote the YCSB client for HBase because it was setting auto flush to off and using large write buffers to collect puts. Unfortunately although producing 'excellent' write latency measurements this lead to multiple threads flushing deep buffers more or less at the same time, resulting in long periods of write unavailability. I'm sure that was an unintended consequence. I believe that YCSB client code was written by HBase devs. An earlier era in any case, but my point is devs very familiar with the API can get into trouble never mind newcomers. Removing buffering from Table and moving it into BufferedTable with suitable advice in javadoc there sounds like a good idea to me. 
+
+Is HTableMultiplexer a good existing solution to replace the functionality of HTable without autoflush?
+
+[~sduskis] and I have been discussing this offline for a couple of days and have come up with the following proposal.  It will require a few JIRA sub-tasks, but it's probably only a week's worth of work, plus reviews.  In a nutshell:
+
+# Deprecate autoFlush methods (ie Put buffering) in {{HTable}}
+# Remove all autoFlush methods from {{Table}}
+# Create {{BufferedTable}} (outlined below), which will buffer Puts using {{HTableMultiplexer}}
+# Create {{BufferedConnection}} as a new factory class
+# Have {{HTableMultiplexer}} implement {{Closeable}} (just fixing bad behavior)
+# _Behavior change_: {{HTableMultiplexer}} flushes Puts by having {{FlushWorker}} threads...
+#* _OLD_: implement low-level logic against {{AsyncProcess}}
+#* _NEW_: call {{Table#put<List<Put>>}}, thus removing duplicate code and improving encapsulation
+# _Behavior change_: When its queue is full, {{HTableMultiplexer}}...
+#* _OLD_: immediately rejects all Puts
+#* _NEW_: blocks for a configurable time in ms (can be 0) before rejecting Puts
+# _Behavior change_: When an async Put fails...
+#* _OLD_: the exception is thrown during a unrelated future Put operation (confusing)
+#* _NEW_: an exception is sent to the a listener provided by the client, following the Observer pattern
+
+These are the new classes:
+
+{code:java}
+public class BufferedConnection implements Connection {
+    private Connection c;
+    private HTableMultiplexer htm;
+
+    /* If listener is null, will log but won't notify an async exceptions */
+    public BufferedConnection(Connection c, ExceptionListener l) {
+        this.c = c;
+        this.htm = new HTableMultiplexer(..., c, l);
+    }
+    public BufferedTable getTable(TableName tn) {
+        return new BufferedTable(c.getTable(tn), htm);
+    }
+
+    /* getAdmin() and getRegionLocator(...) methods delegate to Connection */
+}
+
+public class BufferedTable implements Table {
+    private Table t;
+    private HTableMultiplexer htm;
+
+    public BufferedTable(Table t, HTableMultiplexer htm) { ... }
+
+    /* Puts go to htm.doPut(...), all methods delegate to t */
+}
+
+public interface ExceptionListener {
+    public void onException(RetriesExhaustedWithDetailsException e);
+}
+{code}
+
+From a user standpoint it looks like this:
+
+*Before*
+{code:java}
+Connection conn = ConnectionFactory.createConnection();
+Table t = conn.getTable(TableName.valueOf("mytable"));
+t.setAutoFlushTo(false);
+
+/* do stuff */
+
+t.close();
+conn.close();
+{code}
+
+*After*
+{code:java}
+Connection conn = new BufferedConnection(ConnectionFactory.createConnection());
+Table t = conn.getTable(TableName.valueOf("mytable"));
+
+/* do stuff */
+
+t.close();
+conn.close();
+{code}
+
+In essence, a few new classes, a moderate amount of work in HTableMultiplexer, and a few deprecation annotations in HTable.  Let us know if this looks acceptable and we'll create some subtasks and make it so.
+
+
+A few comments:
+
+Its *pretty* the way it acts the way you add buffering to io classes.
+
+HTableMultiplexer should no longer be first-class object?  You would change its nature (and besides, it doesn't work w/ the new Connection/Table idiom).  Deprecate it so can make it package private?  Or deprecate and do a new version of HTM and call it something else?  TM?
+
+An HTM also allows you write any table -- you pass table name when you do the put -- but in your implementation this would not be so.
+
+When I call t.close, what happens?  Do we flush the buffer?  Or we don't flush till connection.close is called?
+
+Thread-safe putting?
+
+Why expose, make public, BufferedTable at all?  That new constructor which takes table a HTM and a Table is only for BufferedConnection to use?
+
+How will configuration be done (sizing of buffers and when to flush?)
+
+Thanks for doing this lads.  It looks great.
+
+
+[~abeppu], the 'customer', it would be cool if you had a sec to chime in on the lads nice proposal. Thanks.
+
+bq.Is HTableMultiplexer a good existing solution to replace the functionality of HTable without autoflush?
+
+No. It was first used to speed up puts across multiple connections and multiple tcp streams for things that value speed over correctness. There's no way to check on which puts fail and which succeed.
+
+IMO it shouldn't be recommended. I would even go so far as to say that it's use should be discouraged.
+
+I've asked multiple times; I don't think HTableMultiplexer is in common use and should be deprecated/discarded.
+
+I like [~carterpage]'s outline from the user's perspective. It follows [~enis]/[~sduskis]'s idea of a decorator/wrapper to explicitly handle buffering. My two critiques:
+# don't depend on HTableMultiplexer; implement the buffering for a single table and give us a chance to offer better default semantics around buffer capacity.
+# is a BufferedConnection really necessary? The connection isn't buffering, it's just handing back the same BufferedTable instance to each caller, correct? That makes for little/no code change for a consumer to convert to the buffered implementation, but I think that isn't idea. Better to have the decorator accept the Table instance (or TableName + Connection instance?) and allow for setting up buffers/queues/&c for async flushing.
+
+{code}
+Connection conn = ConnectionFactory.createConnection();
+BufferedTable t = new BufferedTable(conn, TableName.valueOf("myTable"));
+{code}
+
+or 
+
+{code}
+ExecutorService pool = Executors.newFixedThreadPool(poolSize);
+Queue<Put> workQueue = new ArrayBlockingQueue(100);
+BufferedTable t = new BufferedTable(conn, TableName.valueOf("myTable"), pool, workQueue);
+{code}
+
+I like the API exposed to the user of having a BufferedConnection + BufferedTable that can be swapped in so easily.
+
+The tricky part that I as a user would be cautious of is that since HTableMultiplexer maintains a different buffer for each region server, the timing at which flushes happen, and the age of writes by the time they get flushed will be slightly more complicated to reason about than with the buffer-per-table model.
+
+Here are example differences that I would bear in mind while auditing our use of buffered writes to predict the impacts of migrating to this idiom:
+
+1. With the buffer-per-table model, the time-in-buffer for a given write was roughly just HTablePoolSize * writeBufferSize / (writes per second). With the buffer-per-regionserver model used by HTM, if writes aren't uniformly distributed over the region servers for whatever reason, writes going to "cold" regionservers will live in buffer for longer than writes going to "hot" region servers.
+
+2. With the buffer-per-table model, time-in-buffer for writes to table A was independent of stuff happening on table B (so long as we don't totally overwhelm the cluster or something). With the HTM model, a decrease in write volume to table B can increase my time-in-buffer for table A. We may choose to have separate BufferedConnections with separate HTM instances specifically to avoid this.
+
+3. Even if I just want to migrate my system onto this idiom without changing the number or size of flushes then I'd want to pick HTableMultiplexer.perRegionServerBufferQueueSize such that 
+perRegionServerBufferQueueSize * (# of region servers) ~= HTable.writeBufferSize * (average size of HTablePool)
+The only thing that's weird about that is that (# of region servers) changes over time. I.e. if today I pick reasonable buffer sizes for HTM, then in 6 months, if the incoming write rate is unchanged but the cluster is larger due to data growth, my time-in-buffer will have increased.
+
+From just the API described, I think the proposal above looks really clean. From the perspective of someone operating a system where using HTablePool + buffered writes was a calculated risk, the HTM-driven buffering sounds workable, but it opens the door for a range of new variables to influence our system's core write pathways, and for that reason I'd be cautious adopting it.
+
+
+bq. Too late for 1.0?
+No, the 1.0.0RC0 already sank for a different reason. I was planning on doing the next RC after new years, but agreed that we can wait for getting it right before 1.0. 
+
+bq. 2. is a BufferedConnection really necessary? The connection isn't buffering, it's just handing back the same BufferedTable instance to each caller, correct? That makes for little/no code change for a consumer to convert to the buffered implementation, but I think that isn't idea. Better to have the decorator accept the Table instance (or TableName + Connection instance?) and allow for setting up buffers/queues/&c for async flushing.
+
+Are HTable.delete(), .batch(), coprocessorService() and others thread-safe?  If not, then in the multithreaded case, we likely need to create new (or a pooled) BufferredTable per thread.  The "BufferredConnection" would perform that functionality.  We could implement it as a group of BufferTables that use the same underlying write buffer.
+
+Okay, here's another pass, scratching out the HTableMultiplexer idea.  Instead we'll create a new class called {{AsyncPutter}}. (Not a huge fan of the name, so if you have a better one, please share.)
+
+First off, here are our basic requirements in this refactor:
+# Handle the M/R case where a user wants to batch and flush in a single thread
+# Handle the case Aaron described where we batch across multiple threads
+# Provide a way to do this through the new Table interface for convenience
+# Buffering/batching limits based on size in bytes, not queue length
+# Move towards [~lhofhansl]'s suggestion of "HTable as cheap proxies to tables only"
+# While durability can't be guaranteed in case of a crash, avoid losing data otherwise.
+
+So here are our classes:
+
+{code:java}
+// BufferedTable is lightweight and single-threaded.  Many of them can share a single AsyncPutter.
+public class BufferedTable implements Table {
+    public BufferedTable(Table t, AsyncPutter ap);
+    public void flush();
+}
+
+// Thread-safe handler of puts for one or more BufferedTable instances.
+public class AsyncPutter implements Closeable {
+    public AsyncPutter(Connection c, ExecutorService pool, ExceptionListener e, PutBuffer pb);
+    public synchronized add(Put put);  // Synchronization adds nanoseconds in the single-threaded case.  No biggie.
+    public synchronized flush();
+    public synchronized close();
+}
+
+// Simple single-threaded data holder.
+public class PutBuffer {
+    public PutBuffer(long maxBufferSize);  // In bytes.  This makes more sense than queue length for memory management.
+    // maxBufferSize = totalBufferMem / numberOfExecutorPoolThreads
+    public void add(Put p);
+    public boolean isBatchAvailable();
+    public List<Put> removeBatch();
+}
+
+// To make sure exceptions don't get swallowed.
+public interface ExceptionListener {
+    void onException(RetriesExhaustedWithDetailsException e);
+}
+{code}
+
+We also proposed a {{BufferedConnection}} factory, simply to make it easier to switch between Table and BufferTable implementations without much refactoring.  When used, it would own the AsyncPutter.  Pros/cons for this idea?  It's not essential.
+
+Asynchronous exception handling takes place through an {{ExceptionListener}} observer provided by the user.  This means that exceptions are not thrown for simple put failures; they are passed to the listener.  The thought here is I find the current behavior non-deterministic:
+
+{code:java}
+table.put(put1);  // This put causes an exception
+table.put(put2);  // But we don't see the exception until we get here ...
+table.put(put3);  // ... or maybe(?) here.  put3 succeeded, but I got an exception thrown.  That's counter-intuitive.
+{code}
+
+An ExceptionListener is a pretty standard pattern for asynchronous error handling.  M/R or other cases might rely on an exception being thrown synchronously to rollback appropriately, but it's easy enough to mimic that behavior with the listener approach.
+
+{{BufferedTable#close}} does not flush since we need to support batching across multiple threads.  {{AsyncPutter#close}} does flush.  (Will JavaDoc this.)  If we decide to provide a BufferedConnection, then closing that would also flush, since it owns the AsyncPutter.
+
+Do we need a timeout-based flush?  I don't see one in the current HTable implementation, but if it's important we could add it to the AsyncPutter.  Seems a good way to limit lost mutations during slow periods of writes into a big buffer.
+
+
+Issue HBASE-12728 seems to suggest that setAutoFlushTo(), flushCommits() and etc. should be removed from Table.  HBASE-12802 cleans up some currently unnecessary calls to flushCommits() which is a precursor to a new buffering solution.
+
+For AsyncPutter, please consider adding:
+{code}
+    public synchronized add(List<Put> puts);
+{code}
+
+I think for BufferedHTable is essential that the buffering is thread safe to avoid confusing. (unbuffered) HTable then should naturally be thread safe as it does not need to maintain any internal state, right?
+
+
+I think API wise, what Carter proposes above makes sense with a couple of comments. 
+
+ - I think {{BufferedTable}} should be an interface still with {{flush()}} or {{flushCommits()}} method. 
+ - {{ExceptionListener}} should also get the original {{Put}} so that it can learn about which operation has failed (not just the exception). 
+ - Do we want AsyncPutter, etc to be client-public API at all? I like the {{BufferedConnection}} route where we can have getBufferedTable() method to construct this and not worry about any class. However do we want to address doing puts() with flush and doing async flush by the same client? Does the client maintain two Connection objects? 
+ - Should the interfaces be {{Put}} based or {{Mutation}} based? We can make it generic in case of we add Delete's later on, but may not be worth the extra cost. 
+
+bq. BufferedTable#close does not flush since we need to support batching across multiple threads. AsyncPutter#close does flush. 
+Seems a bit unintuitive. If we do the BufferedConnection route, the only way to flush everything is to 
+
+bq. Do we need a timeout-based flush?
+It makes sense, but this can be added later I say. 
+
+I agree with [~enis] that hiding AsyncPutter and PutBuffer behind BufferedConnection makes better sense. Also that BufferedTable should be an interface, and that all these API's should accept Mutation as the argument, not Put.
+
+[~lhofhansl]'s question is interesting. Is your meaning for BufferedTable's to be lightweight like Tables? Or does BufferedTable become the shared object, like the current Connection is? I think we want the former, not the latter.
+
+AsyncPutter looks a lot like HTable's internal AsyncProcess. How are these classes related/shared? Re-implementing all this work seems a waste, though AsyncProcess jumps through some hoops to maintain some semblance of backward compatibility with 0.94 semantics.
+
+Calling BufferedTable.flush() forces a flush of the contents of the PutBuffer, does it block the calling thread, or is it asynchronous?
+
+In the event of a BufferedTable that does not share it's PutBuffer with any other instances, can it just defer back to the current implementation in HTable?
+
+Isn't PutBuffer just an implementation detail for communication between the BufferedTableImpls and AsyncPutter? Shouldn't it be a BlockingQueue or some such, that can be drained in the background and allow some rate-limiting?
+
+Feedback.
+
+On AsyncPutter, will we ever want to buffer Increments or Appends or Deletes (Increments we might want to aggregate client-side but that is something different from AsyncPutter i suppose); if so, AsyncMutator instead? (An uglier name!).
+
+Async is probably good to have in the name since it conveys detachment between invocation and when the op actually happens but on other hand, we could just call it Buffer<Put> or recast the PutBuffer you have above and do away with an extra moving part?
+
+Ditto, do we even need to expose BufferedTable? Just add to Connection a #getTable(TableName, PutBuffer) that takes a PutBuffer -- the implementation behind the scenes would use the passed PutBuffer. I suppose this would mean you'd have to ask Connection for a PutBuffer instance (Connection#getPutBuffer(maxsize, executor) or maybe this is just where your BufferedConnection comes in; it adds these methods.
+
+Having the PutBuffer detached from Table is clean but what is to prevent me adding a Put for TableA to TableB's PutBuffer?  There'd be no protection against this? (That'd probably be fine)
+
+The flush on BufferedTable is a noop, right?
+
+BufferedTable shouldn't have a close if its not going to do anything?
+
+The ExceptionListener seems good but should it supply more info than just the exception? For example, where we are in the processing of the buffer -- what edits have succeeded and which have failed (or would that just be TMI?)
+
+Good stuff [~carterpage]
+
+bq. Is your meaning for BufferedTable's to be lightweight like Tables? Or does BufferedTable become the shared object, like the current Connection is? I think we want the former, not the latter.
+
+I think I meant the latter. The discussion started by saying that we need some kind of shared space to buffer edits across threads of a web container.
+It's possible I misunderstood, and in any case we can say the caller is responsible for thread safety.
+
+bq. The flush on BufferedTable is a noop, right?
+
+Why? I was thinking BufferedTable would be essentially what HTable is now. And HTable would have all buffering, autoflushing, and related huh-hah removed.
+
+Personally I'd favor an API where the have Connection and BufferedConnection. Both would have just a getTable(name) method. Connection.getTable(...) returns an instance of HTable, BufferedConnection.getTable(...) an instance of BufferedTable... I do not feel strongly about this, though. :)
+
+bq. I was thinking BufferedTable would be essentially what HTable is now. [snip] Personally I'd favor an API where the have Connection and BufferedConnection.
+
+If BufferedTable is doing all the buffering that HTable currently does, but it designed to be consumed from multiple threads, what is BufferedConnection doing? It sounds like BufferedTable is pretty self-contained. Just add a Connection.getBufferedTable method.
+
+BufferedConnection would just return BufferedTables as opposed to HTables.
+
+bq. Why? [The flush on BufferedTable is a noop, right?]
+
+Because in the proposal, the BufferedTable is not the owner of the put buffer; it is sharing it with other BufferedTable instances.
+
+bq.  I was thinking BufferedTable would be essentially what HTable is now.
+
+We could do that. Its where we started. Only the BufferedTable would have to be threadsafe (which HTable is not) or we'd need to add back a pool that gave out these BufferedTables. BufferedTable would not be lightweight; each would be carrying a fat buffer at least.
+
+The latest suggestion has us taking buffering out of Table and explicitly managing it separately.  Cleaner and clearer as to what is going on.
+
+bq. BufferedConnection would just return BufferedTables as opposed to HTables.
+
+If multiple threads, they'd all share the one, thread-safe instance?  Could only flush the buffer when size/time limits broached or when BufferedConnection#close was called (or add BufferedConnection#flush); calls to BufferedTable#flush would have to be ignored. What happens when a thread calls #close on a shared instance? We don't want one behavior if a Table instance (i.e. create and close when done) and another when BufferedTable (don't close it!)
+
+Lots of great comments/questions.  Solomon can dig into some of the grittier implementation trade-offs, as this is largely his design.  I can answer some initial questions to keep the ball rolling:
+
+{quote}
+{{ExceptionListener}} should also get the original {{Put}}
+{quote}
+
+We were planning to return {{RetriesExhaustedWithDetailsException}} whenever possible, which contains the Put.  That’s more consistent with calling Put synchronously.
+
+{quote}
+all these API's should accept Mutation as the argument
+{quote}
+
+Figuring that’s where we should head eventually, but doesn’t seem we need to be there immediately, right?  Probably makes sense to follow Stack’s idea and make a more general name, e.g. s/AsyncPutter/AsyncMutator/
+
+{quote}
+AsyncPutter looks a lot like HTable's internal AsyncProcess
+{quote}
+
+Yeah, worth making sure we’re not reinventing the wheel, but also don’t want to inherit unnecessary complexity.  I'll leave this one to Solomon, and maybe it can be debated further in a patch review.
+
+{quote}
+does BufferedTable.flush() block the calling thread?
+{quote}
+
+Absolutely.  It’s a way to guarantee that previous writes are persisted, when such confidence is needed.
+
+{quote}
+Isn't PutBuffer just an implementation detail…
+{quote}
+
+PutBuffer is an implementation detail, and it’s probably confusing that I surfaced it in the last straw man.  Just disregard it and focus on the AsyncPutter, which is the long-lived owner of the buffered mutation mechanism and all that entails.
+
+{quote}
+In the event of a BufferedTable that does not share it's PutBuffer with any other instances, can it just defer back to the current implementation in HTable?
+{quote}
+
+If it makes sense to have a different AsyncPutter for single-threaded situations than multi-threaded, then I’d suggest another implementation rather than trying to make it guess for itself.  But why do you think we should have multiple implementations?  Synchronization locks should be insignificant compared to even very fast wire latencies.
+
+{quote}
+On AsyncPutter, will we ever want to buffer Increments or Appends or Deletes?
+{quote}
+
+I think deletes make sense.  Appends make me nervous because we’re already breaking sequence guarantees.  I think if we do a solution which supports puts, and can be extended to any other mutation, then we can decide at another time.  Using {[AsyncMutator}} as a name would hint at such extensibility.
+
+{quote}
+do we even need to expose BufferedTable?
+{quote}
+
+Yes, need it for flush(), which I described more above.
+
+Re: stack’s concern on ExceptionListener, returning RetriesExhaustedWithDetailsException should provide enough info, no?
+
+{quote}
+BufferedTable shouldn't have a close
+{quote}
+
+I agree, but if it implements Table, then it has to have a nop close.
+
+We’re generally still in alignment with Lars’ comments.  Table implementations become lightweight.  BufferedConnection might be a bit of a misnomer, since it’s more a factory than a “buffered connection”.  But it seems easier for a developer to understand rather than minting a new factory concept.
+
+{quote}
+Just add a Connection.getBufferedTable
+{quote}
+
+But Connection is an interface.  BufferedConnection is intended as an implementation of that interface, something like:
+
+{code:java}
+public class BufferedConnection implements Connection {
+    public BufferedConnection(Connection conn, ExceptionListener l);
+}
+{code}
+
+The idea is that given any implementation of conn, BufferedConnection will wrap the encapsulated tables that are created with buffering logic.  If we put it in Connection, then we make buffering first-class functionality again, rather than extended functionality.
+
+{quote}
+Because in the proposal, the BufferedTable is not the owner of the put buffer
+{quote}
+
+BufferedTable#flush would be a synchronous pass-through to AsyncPutter#flush.  It doesn't need to own it to do so.
+
+Some more comments...
+
+Was not planning to have BufferedTable to be heavy or thread safe.  Doing that makes it less interchangeable with HTable — which is not thread safe, and would be lighter after this refactor.
+
+Basically the lifecycle revolves around the {{AsyncMutator}}, which is the only heavy thing here.  BufferedConnection constructs and owns it, and injects the mutator into new BufferedTable objects, which will be cheap to construct.  Calling BufferedConnection#close would close AsyncMutator, which in turn would flush its buffers and shutdown its worker threads.  (And throw IllegalStateException if any other operations come through, except for another close, which should be idempotent.)
+
+There was also a question about the need for two Connection objects.  There only needs to be one Connection object, which BufferedConnection would wrap.  All operations, synchronous and asynchronous would go through it.
+
+
+I like having a separate interface for bulk writing that's accessible from a new method on Connection.  
+
+At this point, I'm rethinking the AsyncPutter / BufferedTable approach.  Bulk writing asynchronously is geared to a couple of very specific cases.   Table currently has 37 methods on it, most of which will not be implemented any differently in the asynchronous use cases.  Given those two complexities, I would think that a Separation of Concerns and Keep It Simple might be best.  
+
+A BulkWriter (or BulkMutator) interface with a limited number of methods on it might work better than extending Table.  Perhaps a simplified API like this might work:
+
+{code}
+public interface BulkWriter {
+  void put(Put p);
+  void delete(Delete);
+  flush();
+  close();
+}
+
+public interface Connection {
+  ...
+  BulkWriter getBulkWriter(int maxBufferSize [, some other configuration parameters]);
+}
+{code}
+
+Thoughts?
+
+After reviewing comments and talking this through with [~enis], I thought I'd try working up a bare-bones patch so that we could get a feel for the user-perspective on the API. This patch (vs. branch-1.0) follows the idea of a BufferedConnection that owns the write buffers for multiple BufferedTables. BufferedTable is a lightweight, disposable class, just like Table. The implementation is messy, turning enough of HTable inside-out so as to expose the AsyncProcess and write buffer. It deviates slightly from [~carterpage]'s API in some minor details.
+
+I pursued this approach rather than [~lhofhansl]'s suggestion of a heavy-weight, concurrency-safe BufferedTable instance because I think trying to turn an HTable into a concurrency-safe implementation will be wrought with subtle bugs. However, maybe someone wants to take a stab at such an approach?
+
+Seems the consensus is to keep the buffer at the connection level. All good with me :)
+
+
+My last proposal was to keep the buffering logic in a long lived, thread-safe object that only deals with bulk/bufferred mutations.  If a user wants buffering, then they get an instance of that object from Connection and share it across all of their requests.  This new buffered mutator should only do one thing and do it as well as possible.
+
+It would be ideal to have a clean interface that keeps HTable as it is and does not expose either the AsyncProcess or write buffer implementation details.  I think that we can get a much cleaner implementation regarding keeping internals using the BulkMutator interface I posted above.
+
+If it's ok, Can we try both the approach [~ndimiduk] is describing above and the BulkMutator approach and weigh the pros and cons with actual implementations?
+
+bq. A BulkWriter (or BulkMutator) interface with a limited number of methods on it might work better than extending Table. Will {{HTable}} implement BulkWriter in case setAutoFlush() is set for backwards compat? 
+I agree with Solomon on this one. Simpler interface surface seems much better. BufferedWriter/BulkWriter can live in the same level as Table/Admin, but unlike those, we can have the BufferedWriter be thread safe. Every Connection can return a bulk writer or it can just return a Table with no-op flush() which will not do the buffering. 
+
+Should we have base-interfaces for {{put()}} and {{delete()}} so that Table and BulkWriter will share them. May not be needed. 
+
+I like Nick's changes in Table and HTable as well as the example. The final patch should have an example usage like this committed.
+
+I think we can break up the work, by first committing the new API without the changes in Table (since it will make the patch much bigger with test changes). Then do a second patch to remove Table methods and fix internal usage? 
+
+bq. But why do you think we should have multiple implementations? Synchronization locks should be insignificant compared to even very fast wire latencies.
+
+I'm thinking in terms of minimizing code duplication. We have to maintain support for the deprecated HTable implementation, which already implements the single-thread buffer. Following the implementation in the attached patch, maybe we have
+{noformat}
+public BufferedTable getBufferedTable(TableName table, UsageContext ctx, ...) {
+  switch (ctx) {
+    case SINGLE_THREAD {
+      return new HTable(...);
+    }
+    case MULTI_THREAD {
+      return new BufferedTableImpl(...);
+    }
+  }
+}
+{noformat}
+
+[~sduskis]
+
+bq. If it's ok, Can we try both the approach Nick Dimiduk is describing above and the BulkMutator approach and weigh the pros and cons with actual implementations?
+
+I have no issue with the BulkMutator implementation. That would be a good iteration on the patch I posted. My major concern was with maintaining BC for users of HTableInterface. I think you could isolate the goodness in BulkMutator, have HTable extend it, and be headed in the right direction.
+
+I like the BulkWriter/BulkMutator suggestion.  Seems cleanest suggestion so far (You'd need to pass tablename when getting BulkWriter since we need one per Table I believer -- see how [~ndimiduk] does it in his patch).
+
+On the [~ndimiduk] direction (thanks for working up a patch boss), a few comments:
+
++ In the multithreaded case, which thread calls the BufferedTable#flush? If all do, no buffering is going on. Is flush then called after a 'big' put? How's that going to work when many threads? Better if flush is done internally at size/time/shutdown thresholds. It doesn't seem like a function that belongs in the BufferedTable instance.
++ Ditto ExceptionListener in BufferedTable. Its awkward, right?  If I register a listener on BufferedTable, internally I'll need to pass this interest to the exception handler and then remove interest when the BufferedTable goes away.
++ If you buy the above two points, then need for a special BufferedTable Interface goes away....but then how to listen on exceptions and how to flush? (See the last [~sduskis] suggestion?)
++ I like AsyncMutator being an internal 'detail'.
++ We need a BufferedConnection?  Can't we just add the few methods to Connection?  It is new in 1.0 so we'd be breaking no one (though there is the issue of being able to specify an executor, at least optionally, which I see you doing in BufferedConnection constructor in the factory).
++ The flush on the BufferedConnection is a bit odd, yeah.  Flushes all tables?  Or there'd be an override that allowed passing which table to flush?
+
+
+
+This is what I had in mind for BulkMutator.  I basically moved the put functionality out of HTable and into HBulkMutator.  HTable now has-a HBulkMutator to which it delegates puts.
+
+Please note the use of Lock in HBulkMutator for synchronization purposes as well as the DoNothingLock used in HTable which is assumed to be thread-safe.  Java's Lock interface allows us to have more control over synchronization than the "synchronized" key word.
+
+I like this approach.  Rather than transparent switching of core behavior and durability/consistency guarantees based on configuration, it's explicit in the code.
+
+Not sure what others think, but I'm not fond of the name BulkMutator.  I'd suggest renaming it, for example, to BufferedMutator or AsyncMutator.  It's not clear at a naive glance that the class is asynchronous, or why something like batch() shouldn't be in a "BulkMutator".
+
+
+Thanks for having a look [~stack]
+
+bq. In the multithreaded case, which thread calls the BufferedTable#flush? If all do, no buffering is going on. Is flush then called after a 'big' put? How's that going to work when many threads? Better if flush is done internally at size/time/shutdown thresholds. It doesn't seem like a function that belongs in the BufferedTable instance.
+
+I thought about this a bit, but maybe [~abeppu] has other ideas. My thinking is that after a large batch of puts, before a thread exists, it wants to call BufferedTable#flush() to ensure all of it's stuff is done. In this case, it's a flush of all threads' pending edits. Similar in concept to writes to our own WAL, where we have thread "flush" and wait for their seqNum to come up before proceeding. I think this is no incompatible with flushes happening on their own, based on size/time. Shutdown is a separate matter (flush everything and exit).
+
+bq. Ditto ExceptionListener in BufferedTable. Its awkward, right? If I register a listener on BufferedTable, internally I'll need to pass this interest to the exception handler and then remove interest when the BufferedTable goes away.
+
+This is true. My patch doesn't do proper accounting for ExceptionListener OR the AsyncMutator. These need address in a "real" implementation. I think you'd want any EL's registered by a BatchTable instance to expire when that table is closed.
+
+bq. If you buy the above two points, then need for a special BufferedTable Interface goes away....but then how to listen on exceptions and how to flush?
+
+*nod*
+
+bq. We need a BufferedConnection? Can't we just add the few methods to Connection? It is new in 1.0 so we'd be breaking no one (though there is the issue of being able to specify an executor, at least optionally, which I see you doing in BufferedConnection constructor in the factory).
+
+Nope, we could just as easily add these methods to Connection, but that means putting their implementation down in ConnectionManager#HConnectionImplementation, or some other implementation that wraps CM#HCI in the same way that I've done. I have a separate interface because that's what was discussed earlier in the thread. The patch was to provoke API design discussion, so mission accomplished ::smile::
+
+bq. The flush on the BufferedConnection is a bit odd, yeah. Flushes all tables? Or there'd be an override that allowed passing which table to flush?
+
+Right, it would need to be flush all tables. See the comment I left in BufferedConnectionImpl#close():
+
+{noformat}
+  @Override
+  public void close() throws IOException {
+    assert aps.isEmpty() : "Leaking resources";
+    /* TODO: instead of assert, something like
+    for (TableName t : aps.keySet()) {
+      try (BufferedTable table = getBufferedTable(t)) {
+        table.flush();
+      }
+    }
+     */
+    delegate.close();
+  }
+{noformat}
+
+Originally I implemented BC#flush() in this way, but decided to pull it and see if anyone brought it up in discussion. Given that we have this new object that is explicitly buffering, I think we owe it to the interface to provide a means for explicitly flushing the buffers. I can't think off hand of know why a user would want it, but I think it should be there.
+
+BufferedMutator or AsyncMutator seems better yes.
+
+Is this intended; i.e. that we will flush after each Put or List<Put>? Isn't point that we do not flush unless this method is called?
+
+82	  /**
+83	   * Executes all the buffered {@link Put} operations.
+84	   * <p>
+85	   * This method gets called once automatically for every {@link Put} or batch
+86	   * of {@link Put}s (when <code>put(List<Put>)</code> is used) when
+87	   * @throws IOException if a remote or network exception occurs.
+88	   */
+89	  void flushCommits() throws IOException;
+
+I'd say remove this from Interface:
+
+100	  /**
+101	   * Sets the size of the buffer in bytes.
+102	   * <p>
+103	   * If the new size is less than the current amount of data in the
+104	   * write buffer, the buffer gets flushed.
+105	   * @param writeBufferSize The new write buffer size, in bytes.
+106	   * @throws IOException if a remote or network exception occurs.
+107	   */
+108	  void setWriteBufferSize(long writeBufferSize) throws IOException;
+
+Get a new instance if you want to change buffer size post-construction.
+
+This should not be public, right? i.e. the constructor... needs to be shut down because you get one from Connection?
+
+64	  public HBulkMutator(TableName tableName,
+
+Skimmed the rest. Some of the changes seem a little gratuitous (refactoring by your IDE?) so unnecessarily bloats your patch.
+
+That is great that you move HTable on to the new stuff.
+
+On the DoNothingLock, its for testing? Put it in test package?
+
+Nice.
+
+bq. but that means putting their implementation down in ConnectionManager#HConnectionImplementation, or ...
+
+Disregard that bit; I was barking up the wrong class hierarchy.
+
++1 for BufferedMutator (over the rest). I don't think of this as "asynchronous" as much as "batching".
+
++1 for doing away with changing the buffer size after construction.
+
+We're working to get away from the H-prefix in class names. How about BufferedMutatorImpl? Can the ExceptionListener be a nested interface under it's parent?
+
+Nice work in pulling the write path up out of HTable. Much better than my inside-out refactoring.
+
+nit: BufferedMutator#flushCommits can be just flush(); since HTable is delegating, BufferedMutator is not bound to the old API.
+
+Is there any place where a Lock implementation other than your DoNothingLock would be used? All paths I read are using this no-op implementation... which means they can only be used by a single thread? If I want to share a BufferedMutator across threads, I just pass in a real Lock implementation? I guess that would come it for a "BufferedTable".
+
+Agreed on locking down the BulkMutator constructor. I'm also not a fan of exposing this class to the user API. I prefer the BufferedTable interface discussed previously. Wrap it up nice and tidy like with new ConnectionFactory methods.
+
+Can you add some example code so we can see how a use case like [~abeppu]'s would be addressed?
+
+bq. We're working to get away from the H-prefix in class names. How about BufferedMutatorImpl? Can the ExceptionListener be a nested interface under it's parent?
+
+OK and will do
+
+bq. nit: BufferedMutator#flushCommits can be just flush(); since HTable is delegating, BufferedMutator is not bound to the old API.
+
+OK
+
+bq. Is there any place where a Lock implementation other than your DoNothingLock would be used? All paths I read are using this no-op implementation... which means they can only be used by a single thread? If I want to share a BufferedMutator across threads, I just pass in a real Lock implementation? I guess that would come it for a "BufferedTable".
+
+It sounds like you have the gist of it.  I'll show it in code in the example you asked for.
+
+bq. Agreed on locking down the BulkMutator constructor. I'm also not a fan of exposing this class to the user API. I prefer the BufferedTable interface discussed previously. Wrap it up nice and tidy like with new ConnectionFactory methods.
+
+Agreed and will do
+
+bq. Can you add some example code so we can see how a use case like Aaron Beppu's would be addressed?
+
+Here's what I was thinking
+
+{code}
+public MyServlet implements Servlet {
+
+  private Connection connection;
+  private BulkMutator mutator;
+
+  public void init(ServletConfig config) {
+     connection = ...;
+     mutator = connection.getBulkMutator(tableName, new ReentrantLock(), myExecutorService, myListener);
+  }
+  public void service(ServletRequest req, ServletResponse res) {
+     ...
+     if (doDelete) {
+        try (Table table = connection.getTable(...)) {
+           table.delete(..);
+        }
+     } else {
+        mutator.put(..);
+     }
+  }
+}
+{code}
+
+
+Can I help out on this one?
+
+I implemented BulkMutator, and removed autoflush from Table.
+
+There's more to do in terms of documentation, but I figured that this is good enough for further review.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12692039/HBASE-12728.patch
+  against master branch at commit 4ac457a7bc909cc92e0a1a0cab21ed0ce6bae893.
+  ATTACHMENT ID: 12692039
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 102 new or modified tests.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:red}-1 javadoc{color}.  The javadoc tool appears to have generated 13 warning messages.
+
+                {color:red}-1 checkstyle{color}.  The applied patch generated 2080 checkstyle errors (more than the master's current 2075 errors).
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 1 new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 lineLengths{color}.  The patch does not introduce lines longer than 100
+
+  {color:green}+1 site{color}.  The mvn site goal succeeds with this patch.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in .
+
+Test results: https://builds.apache.org/job/PreCommit-HBASE-Build/12449//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12449//artifact/patchprocess/newPatchFindbugsWarningshbase-rest.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12449//artifact/patchprocess/newPatchFindbugsWarningshbase-hadoop-compat.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12449//artifact/patchprocess/newPatchFindbugsWarningshbase-annotations.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12449//artifact/patchprocess/newPatchFindbugsWarningshbase-protocol.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12449//artifact/patchprocess/newPatchFindbugsWarningshbase-common.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12449//artifact/patchprocess/newPatchFindbugsWarningshbase-thrift.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12449//artifact/patchprocess/newPatchFindbugsWarningshbase-hadoop2-compat.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12449//artifact/patchprocess/newPatchFindbugsWarningshbase-server.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12449//artifact/patchprocess/newPatchFindbugsWarningshbase-examples.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12449//artifact/patchprocess/newPatchFindbugsWarningshbase-prefix-tree.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12449//artifact/patchprocess/newPatchFindbugsWarningshbase-client.html
+Checkstyle Errors: https://builds.apache.org/job/PreCommit-HBASE-Build/12449//artifact/patchprocess/checkstyle-aggregate.html
+
+                Javadoc warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12449//artifact/patchprocess/patchJavadocWarnings.txt
+Console output: https://builds.apache.org/job/PreCommit-HBASE-Build/12449//console
+
+This message is automatically generated.
+
+Great patch. 
+BulkMutator looks good except I would also prefer BufferedMutator. Table already does bulk puts via put(List<Put>) interface. This is more like buffered/async puts. 
+
+Shouldn't this get the BulkMutator (the interface) instead of the implementation class?
+{code}
+public void onException(RetriesExhaustedWithDetailsException exception, HBulkMutator hBulkMutator)
+{code}
+
+BulkMutatorParameters -> BulkMutatorConfig(uration). We usually suffix these kind of objects with Config (look at TableConfiguration). Also can we do builder-style on setXXX() methods. This class is only for passing args to the method it seems. Do we really need it?
+
+Why are we exposing Lock to users. Should this be a boolean whether you want thread-safe or not. 
+
+Table.close -> BulkMutator.close() below:
+{code}
++   * The caller is responsible for calling {@link Table#close()} on the returned bulkMutator
+{code}
+
+HBulkMutator -> H prefix is old school. Let's use Impl suffix. 
+
+
+
+I think I addressed all of [~enis]'s comments.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12692239/HBASE-12728-2.patch
+  against master branch at commit 1a21c1684c5d68cb2d1da8ed33500993b0965f8a.
+  ATTACHMENT ID: 12692239
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 96 new or modified tests.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:red}-1 javadoc{color}.  The javadoc tool appears to have generated 14 warning messages.
+
+                {color:red}-1 checkstyle{color}.  The applied patch generated 2081 checkstyle errors (more than the master's current 2074 errors).
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:red}-1 release audit{color}.  The applied patch generated 2 release audit warnings (more than the master's current 0 warnings).
+
+    {color:red}-1 lineLengths{color}.  The patch introduces the following lines longer than 100:
+    + * An implementation of {@link Lock} that doesn't actually lock anything. {@link BufferedMutatorImpl} uses
++  public static void loadData(final HBaseTestingUtility util, final BufferedMutator mutator, int rows,
+
+    {color:red}-1 site{color}.  The patch appears to cause mvn site goal to fail.
+
+     {color:red}-1 core tests{color}.  The patch failed these unit tests:
+     
+
+Test results: https://builds.apache.org/job/PreCommit-HBASE-Build/12460//testReport/
+Release audit warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12460//artifact/patchprocess/patchReleaseAuditWarnings.txt
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12460//artifact/patchprocess/newPatchFindbugsWarningshbase-rest.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12460//artifact/patchprocess/newPatchFindbugsWarningshbase-common.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12460//artifact/patchprocess/newPatchFindbugsWarningshbase-client.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12460//artifact/patchprocess/newPatchFindbugsWarningshbase-annotations.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12460//artifact/patchprocess/newPatchFindbugsWarningshbase-hadoop-compat.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12460//artifact/patchprocess/newPatchFindbugsWarningshbase-server.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12460//artifact/patchprocess/newPatchFindbugsWarningshbase-prefix-tree.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12460//artifact/patchprocess/newPatchFindbugsWarningshbase-protocol.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12460//artifact/patchprocess/newPatchFindbugsWarningshbase-thrift.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12460//artifact/patchprocess/newPatchFindbugsWarningshbase-examples.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12460//artifact/patchprocess/newPatchFindbugsWarningshbase-hadoop2-compat.html
+Checkstyle Errors: https://builds.apache.org/job/PreCommit-HBASE-Build/12460//artifact/patchprocess/checkstyle-aggregate.html
+
+                Javadoc warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12460//artifact/patchprocess/patchJavadocWarnings.txt
+Console output: https://builds.apache.org/job/PreCommit-HBASE-Build/12460//console
+
+This message is automatically generated.
+
+Nice doc on BufferedMutator.
+
+This bit of doc is incomplete:
+
+100	   * This method gets called once automatically for every {@link Put} or batch
+101	   * of {@link Put}s (when <code>put(List<Put>)</code> is used) when
+
+And we don't want the above either? Right? It was from asyncflush?
+
+s/instantiating/instantiating/
+
+We need to expose threadsafe as an option?  Why not just threadsafe all the time?  One less thing for the user to worry about (Minor cost when uncontended crossing of synchronization barrier)
+
+The config class has wrong tab sizing.
+
+This class is a bit of an odd bird (particularly so because all the rest of your changes are elegant). Let me read the rest of the patch.... OK.  Back again.  I see how it is intended to be used.  Yeah, what Enis says, can we do Builder... and perhaps Fluent pattern (e.g. http://jlordiales.me/2012/12/13/the-builder-pattern-in-practice/) so instead of a method name thatIsMultithreaded, it'd be multhreaded and instead of withPool, it'd be just pool.  Not a deal-breaker. Just a suggestion.
+
+Public constructor on BufferedMutatorImpl needs to be shutdown... private.
+
+This is interesting:
+
+164	    // This behavior is highly non-intuitive... it does not protect us against
+165	    // 94-incompatible behavior, which is a timing issue because hasError, the below code
+166	    // and setter of hasError are not synchronized. Perhaps it should be removed.
+
+
+I got a little lost (because it non-intuitive I suppose -- smile) We are flushing out writes that were buffered before the error showed up?
+
+Can the lock be an internal detail rather than passed on construction? (the less options the user has the better)
+
+s/CachingConnection/BufferingConnection/ to highlight the connection between BufferedMutator and this new Connection type?
+
+Is user supposed to be able to create their own CachingConnection?  Should this be package protected to force folks via the ConnectionFactory?
+
+The redo of HTable to use the new stuff and the changes in Interfaces look great.
+
+Very nice work [~sduskis]
+
+
+
+
+
+
+
+
+
+
+bq. This bit of doc is incomplete: ...
+
+I'll update the comments .  I wanted to get the code out for review.  The documentation can definitely use more work
+
+b1. We need to expose threadsafe as an option? Why not just threadsafe all the time? One less thing for the user to worry about (Minor cost when uncontended crossing of synchronization barrier)
+
+I'm fine either way.  I'll make it all synchronized.
+
+{quote}
+This class is a bit of an odd bird (particularly so because all the rest of your changes are elegant). Let me read the rest of the patch.... OK. Back again. I see how it is intended to be used. Yeah, what Enis says, can we do Builder... and perhaps Fluent pattern (e.g. http://jlordiales.me/2012/12/13/the-builder-pattern-in-practice/) so instead of a method name thatIsMultithreaded, it'd be multhreaded and instead of withPool, it'd be just pool. Not a deal-breaker. Just a suggestion.
+{quote}
+
+I'll defer to the wisdom of the crowd here.  I added in a lot of options which could result in a proliferation of Connection.getBufferedMutator() methods.  I'll remove the Config, since we're removing the number of optiosn.
+
+bq. Public constructor on BufferedMutatorImpl needs to be shutdown... private.
+
+OK.
+
+{quote}
+This is interesting:
+164	// This behavior is highly non-intuitive... it does not protect us against
+165	// 94-incompatible behavior, which is a timing issue because hasError, the below code
+166	// and setter of hasError are not synchronized. Perhaps it should be removed.
+I got a little lost (because it non-intuitive I suppose – smile) We are flushing out writes that were buffered before the error showed up?
+{quote}
+
+That bit was copied directly from HTable.  I'm impartial about the correct algorithm in this case, I just didn't want to rock the boat.  This issue is definitely worth a discussion, but I'd ask that if we want to change the algorithm, we do it in another JIRA issue.  
+
+bq. Can the lock be an internal detail rather than passed on construction? (the less options the user has the better)
+
+If everything is synchronized, then sure.  We can even rely on plain old synchronized methods instead of fancy Lock objects.
+
+{quote}
+s/CachingConnection/BufferingConnection/ to highlight the connection between BufferedMutator and this new Connection type?
+Is user supposed to be able to create their own CachingConnection? Should this be package protected to force folks via the ConnectionFactory?
+{quote}
+
+I got a bit fancy for the sake of MultiTableOutputFormat which puts Tables into a Map<String, Table>.  I needed to add a Map<String, BufferedMutator> so I moved that functionality into a separate class for potential reusability.  It looks like it would be better to KISS and move the CachingConnection functionality back into MultiTableOutputFormat.
+
+{quote}
+The redo of HTable to use the new stuff and the changes in Interfaces look great.
+Very nice work Solomon Duskis
+{quote}
+
+:)
+
+All synchronized in a new class seems good to me till someone turns up a perf problem -- especially if it means simplification.
+
+Yeah, if not enough options to justify the conf class, axe it for now?
+
+Agree this issue is about the new Interfaces and new class only -- fixing non-intuitives are for another issue.
+
+Good on you [~sduskis]
+
+
+
+
+
+The patch is looking really good. I have no major issues to add to previous reviewers'. I do prefer a {{BufferedTable}} interface, that extends {{Table}}, over separating out the buffered functionality into {{BufferedMutator}}. I think bringing along the Table implementation will make it easier for folks to sub in. However, no one else is raising the point, so maybe I'm in the minority.
+
+For future reference, you may want to post larger patches to reviews.apache.org so it's easier to keep track of reviewer comments. It's no gerrit, but it's better than nothing.
+
+throughout javadocs and exception strings: s/HTable/Table/, s/BulkMutator/BatchMutator/
+
+nit: throughout, theres on value in empty @param or @throws javadocs. Usually at least param names are obvious and this javadoc can be omitted.
+
+on the docs for BatchMutator#put(List<Put>), it should be pointed out that this list of edits will not necessarily be sent in the same batch (i think this is an omission in our current doc strings too).
+
+re: BufferedMutatorConfig, I think you're following the TableConfiguration convention. This isn't common within the HBase code; we tend to use builders or "context" objects instead.
+
+Looks like tabs in BufferedMutatorExceptionListener as well. If you're using Eclipse or IntelliJ, we have formatting config file in dev-support/hbase_eclipse_formatter.xml
+
+s/prodcution/production/
+
+formatting of ASF header in CachingConnection is mangled, I think this will set off the apache-rat-plugin license check at release time.
+
+this doc on Connection#getBufferedMutator(TableName, BufferedMutatorConfig) is incomplete "  * provided Lock object. This object can be used for long lived <br>"
+
+Better to move this default value decision from getBufferedMutator down into the BufferedMutatorConfig so it's contained there.
+
+{noformat}
+      Lock lock = config.isMultithreaded() ? new ReentrantLock() : new DoNothingLock();
+{noformat}
+
+bq. I do prefer a {{BufferedTable}} interface, that extends {{Table}}, over separating out the buffered functionality into {{BufferedMutator}}. I think bringing along the Table implementation will make it easier for folks to sub in. However, no one else is raising the point, so maybe I'm in the minority.
+
+I raised the point, and I agree :)
+
+bq. I do prefer a BufferedTable interface, that extends Table, over separating out the buffered functionality into BufferedMutator. I think bringing along the Table implementation will make it easier for folks to sub in. However, no one else is raising the point, so maybe I'm in the minority.
+
+We can add setAutoFlushTo() back into the Table interface, and all would be well as far as single threaded uses cases go since HTable defers to a BufferedMutator in my patch.  Frankly, the only case where BufferedMutator makes sense by itself is in a multi-threaded case like Aaron Beppu's multi-threaded case.
+
+Do we want to keep the autoflush functionality on Table()?  If so most of the changes that I made can be reverted.  The only thing we'd have to change is introduce BufferedMutator, BufferedMutatorImpl and a method on Connection to create a BufferedMutator.  We'd also keep some form of async exception listener.  All of the other changes to the Table interface and the cascading changes to the 40ish classes would go away...  
+
+Thoughts?
+
+I really like the idea of removing autoFlush from HTable. It really shows the users that the difference. Additionally I think that it mirrors BufferedReader/BufferedWriter from java pretty well, so users should be used to different classes providing buffered implementations.
+
+After this last exchange I've thoroughly convinced myself that HTable is mostly fine as it is.  The problem that the original poster presented is a case where I think that HBase ought not provide a coded solution, since the use cases require a lot of knowledge about the nuances of the situation.  The problem [~abeppu] is trying to solve for is for a long lived service that wants to use asynchronous puts across a lot of requests.  The assumption is that Tables are by short lived objects.  From what I see, the only limitation of short-lived-ness is conceptual.  There's nothing in the HTable codebase that I see any reason to not keep it around for the lifecycle of the service.  Here's my preferred implementation:
+
+{code}
+public class MyService {
+  private HTableInterface table;
+  private ExecutorService executor;
+
+  ...
+
+  public void initialize(..) {
+     table = storedConnection.getTable(tableName);
+     Runnable r = new Runnable() {
+        public void run() {
+           synchronize(table) {
+             try {
+                table.flushCommits();
+             } ...
+           }
+        }
+     }
+     // somehow use the executor to invoke r every 100 ms. or so
+  }
+
+  private void writeBuffered(Put somePut) throws IOException {
+     synchronize(table) {
+       table.put(somePut); 
+     }
+  }
+
+  public void close() throws IOException {
+     table.close()
+  }
+}
+{code}
+
+I've come to the conclusion that the problem is in the documentation, not the implementation.  All of my work in the patch should be thrown away and I'll consider it a learning experience.
+
+It could be that my analysis about short-lived-ness is way off base, but if it is, then my implementation of BufferedMutator will have the same problems as HTable.
+
+There still is the problem of exception handling, and an async exception listener would be a good idea, but one for a different JIRA ticket.
+
+I feel like I could have missed something critical in my analysis... Thoughts on this?
+
+bq. The assumption is that Tables are by short lived objects. From what I see, the only limitation of short-lived-ness is conceptual. There's nothing in the HTable codebase that I see any reason to not keep it around for the lifecycle of the service.
+Agreed. 
+bq. There still is the problem of exception handling, and an async exception listener would be a good idea, but one for a different JIRA ticket.
+I see no point of having an API in Table (or elsewhere) where you can do async puts, but no way to learn about the status of the results. So I think async puts and setting Listener goes hand-in-hand. That might still be reason to create a separate interface or change Table.setAutoFlushTo() to have a ExceptionListener parameter at least. 
+
+The reason there is such a thing called HTablePool in my opinion is that HTable is not thread safe. Having a thread safe buffered writer as in your patch solves the use case in this issue as well as MR use case. When we remove BufferedMutator out of HTable, if HTable can be made thread safe cheaply as well, then there is still no need to have a ref-counting pool. Rather a user can simply have a TableName -> Table map of objects as it's own pool. 
+
+
+[~sduskis]
+
+bq. The problem that the original poster presented is a case where I think that HBase ought not provide a coded solution, since the use cases require a lot of knowledge about the nuances of the situation.
+
+Right or wrong, we have been steering the likes of the original poster awry by providing a 'solution' up to this with table pool and an HTable having a write buffer. We could add your suggestion to the doc for those trying to figure what to do now pool has been deprecated/removed (though it would be better if the synchronization and background writing was done for them internal to HTable rather than have every user implement the background thread anew), but what for those up on the new Interfaces who would do buffered mutating?  Here, don't we want your nice, new, clean BufferedMutator with listening for errors, etc?
+
+bq. ...but if it is, then my implementation of BufferedMutator will have the same problems as HTable.
+
+Which problems? Is it that BM won't have "...a lot of knowledge about the nuances of the situation"?
+
+BM is synchronized. HT is not.
+BM has listener for exceptions. HT does not.
+With BM the intent is plain. HT is a bucket.
+BM nicely compliments the new Table Interface.  HT is amorphous legacy.
+
+Thanks [~sduskis]
+
+{quote}
+I see no point of having an API in Table (or elsewhere) where you can do async puts, but no way to learn about the status of the results. So I think async puts and setting Listener goes hand-in-hand. That might still be reason to create a separate interface or change Table.setAutoFlushTo() to have a ExceptionListener parameter at least.
+{quote}
+
++1.  The exception listener seems to be important regardless of whether we have a separate interface for mutations.
+
+{quote}
+The reason there is such a thing called HTablePool in my opinion is that HTable is not thread safe. Having a thread safe buffered writer as in your patch solves the use case in this issue as well as MR use case. When we remove BufferedMutator out of HTable, if HTable can be made thread safe cheaply as well, then there is still no need to have a ref-counting pool. 
+{quote}
+
+We're assuming that thread safety is negligible for BufferedMutator.  Let's make the same assumption for Table, or even better test out the assumption.  If synchronization is relatively cheap, or seen as an option we want to give users for mutations, why not add the synchronization option directly to Table or document some simple rules to ensure that they can do the synchronization themselves? 
+
+bq. Rather a user can simply have a TableName -> Table map of objects as it's own pool.
+
+if they need to write to multiple Tables, that would be a simple solution for their needs. 
+
+{quote}
+We could add your suggestion to the doc for those trying to figure what to do now pool has been deprecated/removed (though it would be better if the synchronization and background writing was done for them internal to HTable rather than have every user implement the background thread anew),
+{quote}
+
+There already is Async writing in a background thread HTable.  That happens through AsyncProcess.  The only hitch in the current implementation of HTable is problems around multiple threads changing the in memory {{List<Row> writeAsyncBuffer}} at the same time.  if we synchronize the {{backgroundFlushCommits()}} and {{doPuts}} methods, then Table puts should be thread-safe.
+
+{{quote}}
+BM is synchronized. HT is not.
+BM has listener for exceptions. HT does not.
+{{quote}
+
+We can fix that in HT.
+
+{{quote}}
+BM nicely compliments the new Table Interface. HT is amorphous legacy.
+With BM the intent is plain. HT is a bucket.
+{{quote}}
+
+Is the Table interface enough or does it need to be split up into components like BM?
+
+[~sduskis] How to move forward on this issue?
+
+bq. if we synchronize the backgroundFlushCommits() and doPuts methods, then Table puts should be thread-safe.
+
+Yes. But HTable is going underground, right? And Table is what users are left with?  HTable constructors are deprecated. It is becoming an internalized implementation. Whats a fella who wants to do buffering or "short-lived-ness" to do going forward?
+
+Thanks.
+
+
+bq. Yes. But HTable is going underground, right? And Table is what users are left with? HTable constructors are deprecated. It is becoming an internalized implementation. Whats a fella who wants to do buffering or "short-lived-ness" to do going forward?
+
+In terms of buffering, why not simply keep autoflush and suggest synchronization on a Table in a multi-threaded environment?  That would solve the user's original issue.
+
+In all of this discussion, it feels like there isn't consensus about separating Table from BM functionality.  Some want to remove Table.autoflush and some want to keep it.  I don't have a strong view either way at this point.  I'll be glad to continue to help, but I don't want to invest too much more time in implementation details until a consensus exists for a more coherent strategy.  If BM is a Good Thing (tm) because it's a coherent unit and HT (and maybe Table even) is amorphous legacy, then perhaps it's more worthwhile taking a look at segmenting Table as a whole into coherent units rather than focusing on BM alone.
+
+bq. In terms of buffering, why not simply keep autoflush and suggest synchronization on a Table in a multi-threaded environment?
+
+We could. It would be better if we did the safe access for the user rather than have them have to do it everywhere (and possibly get it wrong or forget to).
+
+It'd also be a pity dropping on the ground the nice cleanup that you've done up in your last patch untangling buffering from Table (and providing the user utility so they don't have to do said synchronizations).
+
+I'd be up for carrying [~sduskis] last patch past the finish line if Solomon doesn't want to. Thanks for the work so far [~sduskis].
+
+I'm certainly not against you doing the work.  I'm not against picking up the work again myself either.  What would be nice at this point is to have a clear notion of whether Table ought to extend BufferedMutator or not.
+
+bq. What would be nice at this point is to have a clear notion of whether Table ought to extend BufferedMutator or not.
+
+Makes sense [~sduskis] Agreed.
+
+Opinions?  I'm for driving how the last posted patch (Buffering taken out of Table done in a dedicated utility class).
+
+I think it's better to cover the multi-threaded coordination on behalf of the user than expect them to do the synchronizing themselves. The train rolling here is a good one -- it's nice cleanup, it's consistent with previous behaviors, and it makes things more obvious for users. Accompany this with thoughtful javadoc review and a fat example that we can dump into the online book and this will be a fine resolution.
+
+I still like better having a {{Table}},{{BufferedTable}} instead of {{Table}},{{BufferedMutator}}. I think having a drop-in buffering option will make the most sense for a usable API. I hear the argument of maybe it's not the place of our client out-of-the-box, but we have a solution to this today that some folks depend on, so I think it's irresponsible to omit it for 1.0. If [~sduskis] is truly fed up with us ( ::smile:: ) I'm happy to pick up the patch in this direction.
+
+I also think splitting the {{Table}} concept into a reader and a writer is something worth exploring, but not for 1.0. I'm hoping by 2.0 we'll have a valid story for an async (or [reactive|http://www.reactivemanifesto.org]?) client and maybe even something that operates on top of a C/native implementation so we can close the gap for folks who aren't on the JVM. For now, let's get 1.0 release unblocked.
+
+BM IMO is a step beyond BT in terms of API cleanup but if a step too far, I'd be fine w/ BT for 1.0. I like the way you characterize what has been going on here as a 'train' [~ndimiduk] and that we were going to a better place.
+
+b1. If Solomon Duskis is truly fed up with us ( ::smile:: ) I'm happy to pick up the patch in this direction.
+
+The HBase community is a wonderful crew and I'm happy to be part of it.  That said, I think that it would be a load off my shoulders to humbly pass this along to you so that the results are as you'd like them to be.
+
+Here's a patch that continues on [~sduskis]'s good work. I think I've addressed all reviewer feedback. It retains BufferedMutation as part of the public API, an instance that supports concurrent access and is managed explicitly by the user. Let's see what BuildBot has to say.
+
+I experimented with the BufferedTable approach but decided the complexities for resource and setting management were too confusing. If anyone wants to explore that option in more detail, I'm happy to discuss.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12693172/HBASE-12728-3.patch
+  against master branch at commit 53815afc1023a624d6b6069f4111692951a78848.
+  ATTACHMENT ID: 12693172
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 99 new or modified tests.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:red}-1 javadoc{color}.  The javadoc tool appears to have generated 3 warning messages.
+
+                {color:red}-1 checkstyle{color}.  The applied patch generated 2084 checkstyle errors (more than the master's current 2073 errors).
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 lineLengths{color}.  The patch introduces the following lines longer than 100:
+    + * <p>BufferedMutator can also be used on more exotic circumstances. Map/Reduce batch jobs will have a
++ * single BufferedMutator per thread. A single BufferedMutator can also be effectively used in high volume
++  private void doMutate(Mutation m) throws InterruptedIOException, RetriesExhaustedWithDetailsException {
++   * This is used for legacy purposes in {@link HTable} only. This ought not be called for production
++ * An implementation of {@link Lock} that doesn't actually lock anything. {@link BufferedMutatorImpl} uses
++  public static void loadData(final HBaseTestingUtility util, final BufferedMutator mutator, int rows,
+
+  {color:green}+1 site{color}.  The mvn site goal succeeds with this patch.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in .
+
+Test results: https://builds.apache.org/job/PreCommit-HBASE-Build/12512//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12512//artifact/patchprocess/newPatchFindbugsWarningshbase-rest.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12512//artifact/patchprocess/newPatchFindbugsWarningshbase-common.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12512//artifact/patchprocess/newPatchFindbugsWarningshbase-client.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12512//artifact/patchprocess/newPatchFindbugsWarningshbase-annotations.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12512//artifact/patchprocess/newPatchFindbugsWarningshbase-hadoop-compat.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12512//artifact/patchprocess/newPatchFindbugsWarningshbase-server.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12512//artifact/patchprocess/newPatchFindbugsWarningshbase-prefix-tree.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12512//artifact/patchprocess/newPatchFindbugsWarningshbase-protocol.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12512//artifact/patchprocess/newPatchFindbugsWarningshbase-thrift.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12512//artifact/patchprocess/newPatchFindbugsWarningshbase-examples.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12512//artifact/patchprocess/newPatchFindbugsWarningshbase-hadoop2-compat.html
+Checkstyle Errors: https://builds.apache.org/job/PreCommit-HBASE-Build/12512//artifact/patchprocess/checkstyle-aggregate.html
+
+                Javadoc warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12512//artifact/patchprocess/patchJavadocWarnings.txt
+Console output: https://builds.apache.org/job/PreCommit-HBASE-Build/12512//console
+
+This message is automatically generated.
+
+Let me track down these hygiene issues.
+
+Running locally, I'm seeing these two tests are being flaky, I'm surprised to see Jenkins pass them
+{noformat}
+TestFastFail.testFastFail
+TestFromClientSide.testCheckAndDeleteWithCompareOp
+{noformat}
+
+Cleanup style errors, remove unused class DoNothingLock.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12693458/HBASE-12728-4.patch
+  against master branch at commit 9bdb81f0a1db308a8a452379455b6bbfe70ea20d.
+  ATTACHMENT ID: 12693458
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 99 new or modified tests.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:red}-1 javadoc{color}.  The javadoc tool appears to have generated 2 warning messages.
+
+    {color:green}+1 checkstyle{color}.  The applied patch does not increase the total number of checkstyle errors
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 lineLengths{color}.  The patch does not introduce lines longer than 100
+
+  {color:green}+1 site{color}.  The mvn site goal succeeds with this patch.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in .
+
+Test results: https://builds.apache.org/job/PreCommit-HBASE-Build/12523//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12523//artifact/patchprocess/newPatchFindbugsWarningshbase-protocol.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12523//artifact/patchprocess/newPatchFindbugsWarningshbase-hadoop-compat.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12523//artifact/patchprocess/newPatchFindbugsWarningshbase-thrift.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12523//artifact/patchprocess/newPatchFindbugsWarningshbase-server.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12523//artifact/patchprocess/newPatchFindbugsWarningshbase-common.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12523//artifact/patchprocess/newPatchFindbugsWarningshbase-hadoop2-compat.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12523//artifact/patchprocess/newPatchFindbugsWarningshbase-rest.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12523//artifact/patchprocess/newPatchFindbugsWarningshbase-examples.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12523//artifact/patchprocess/newPatchFindbugsWarningshbase-client.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12523//artifact/patchprocess/newPatchFindbugsWarningshbase-prefix-tree.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12523//artifact/patchprocess/newPatchFindbugsWarningshbase-annotations.html
+Checkstyle Errors: https://builds.apache.org/job/PreCommit-HBASE-Build/12523//artifact/patchprocess/checkstyle-aggregate.html
+
+  Javadoc warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12523//artifact/patchprocess/patchJavadocWarnings.txt
+Console output: https://builds.apache.org/job/PreCommit-HBASE-Build/12523//console
+
+This message is automatically generated.
+
+Addresses all reviewer feedback except for the question of what we do with the BufferedMutatorBuilder.
+
+I like the builder as it is. We don't have any explicit builders in our client API, and I think this sets a nice example. Closest thing is the fluent setters on Scan, &c.
+
+Fix javadoc on commit.
+
+I commented on rb on builder issue.  I think we have to go your route.
+
+[~sduskis] would be great to get your blessing on the final patch :)
+
+I checked javadoc and check style locally on patch v5 before attaching, should be good to go. Do look once more at the use of synchronized keyword in BufferedMutatorImpl, I used it a bit more aggressively in the latest patch, the idea being to lock down concurrent changes to the writeBuffer.
+
+[~enis], [~stack] I have your +1's over on RB, mind carrying them here for the book keeping.
+
+[~lhofhansl], [~eclark], [~abeppu], [~carterpage] anything else to add?
+
+FYI, I moved the BufferedTable idea over into HBASE-12895.
+
+{color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12693688/HBASE-12728-5.patch
+  against master branch at commit 9bdb81f0a1db308a8a452379455b6bbfe70ea20d.
+  ATTACHMENT ID: 12693688
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 99 new or modified tests.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 checkstyle{color}.  The applied patch does not increase the total number of checkstyle errors
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 lineLengths{color}.  The patch does not introduce lines longer than 100
+
+  {color:green}+1 site{color}.  The mvn site goal succeeds with this patch.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in .
+
+Test results: https://builds.apache.org/job/PreCommit-HBASE-Build/12527//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12527//artifact/patchprocess/newPatchFindbugsWarningshbase-rest.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12527//artifact/patchprocess/newPatchFindbugsWarningshbase-common.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12527//artifact/patchprocess/newPatchFindbugsWarningshbase-client.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12527//artifact/patchprocess/newPatchFindbugsWarningshbase-annotations.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12527//artifact/patchprocess/newPatchFindbugsWarningshbase-hadoop-compat.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12527//artifact/patchprocess/newPatchFindbugsWarningshbase-server.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12527//artifact/patchprocess/newPatchFindbugsWarningshbase-prefix-tree.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12527//artifact/patchprocess/newPatchFindbugsWarningshbase-protocol.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12527//artifact/patchprocess/newPatchFindbugsWarningshbase-thrift.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12527//artifact/patchprocess/newPatchFindbugsWarningshbase-examples.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12527//artifact/patchprocess/newPatchFindbugsWarningshbase-hadoop2-compat.html
+Checkstyle Errors: https://builds.apache.org/job/PreCommit-HBASE-Build/12527//artifact/patchprocess/checkstyle-aggregate.html
+
+  Console output: https://builds.apache.org/job/PreCommit-HBASE-Build/12527//console
+
+This message is automatically generated.
+
+Forwarding my +1 from RB. 
+
+Also forwarding +1 from RB. Nice release  note.
+
+This work for you [~abeppu] ? 
+
+Yeah, LGTM.
+
+Yeah, LGTM.
+
+Yeah, LGTM.
+
+Yeah, LGTM.
+
+Yeah, LGTM.
+
+Sorry, connection was being janky, and I thought my replies weren't going through. Ugh. Will attempt to delete repeats.
+
+I like the change to mutate() rather than put().  I'm also very grateful for someone else having taken over this critical work.  I do have a couple of preferences:
+
+1) I'm guessing that Delete objects won't be as big as Puts as far as heapSize is concerned.  It might not be appropriate to use the currentWriteBufferSize to track Deletes like it is for Puts.  Perhaps something more like a deleteCount would be appropriate?
+
+2) Since BufferedMutatorBuilder is passed into the Connection object, I'd prefer that it doesn't have any references to internal classes such as ClusterConnection, RpcRetryingCallerFactory and RpcControllerFactory.  I'd also prefer that it doesn't return a BufferedMutatorImpl, and that the Connection would be responsible for the initialization.  
+
+bq. 1) I'm guessing that Delete objects won't be as big as Puts as far as heapSize is concerned. It might not be appropriate to use the currentWriteBufferSize to track Deletes like it is for Puts. Perhaps something more like a deleteCount would be appropriate?
+
+Interesting idea. How would we surface this to the user? Flush when writeBuffer gets to N size OR when number of deletes reaches X? Maybe we leave this as part of the existing caveat of "buffer at your own risk"?
+
+bq. 2) Since BufferedMutatorBuilder is passed into the Connection object, I'd prefer that it doesn't have any references to internal classes such as ClusterConnection, RpcRetryingCallerFactory and RpcControllerFactory. I'd also prefer that it doesn't return a BufferedMutatorImpl, and that the Connection would be responsible for the initialization.
+
+I see what you're saying. BMB is straddling two worlds right now, both Interface and Implementation. I included those non-public setters as a convenience for passing the necessary pieces around between responsible parties. Because they're all in the same namespace, I figured it wouldn't hurt anything.
+
+Maybe build() should be a package-protected method -- it's not really intended to be called by the user anyway as they don't have all the setters they need to create a usable BufferedMutator instance. Or do you mean remove the build method entirely and just use it as a grab-bag of properties?
+
+Attaching patches back ported to branch-1 and branch-1.0, based on the latest patch from master. I'm spinning them both through tests locally.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12693966/HBASE-12728.05-branch-1.patch
+  against master branch at commit 319f9bb7918af8cfe7e65f97b654f37f0d5983f3.
+  ATTACHMENT ID: 12693966
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 144 new or modified tests.
+
+    {color:red}-1 patch{color}.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-HBASE-Build/12554//console
+
+This message is automatically generated.
+
+Addressing [~sduskis]'s (and others') concerns about the builder thingy. Now it's a params thingy with no build and no details beyond its public getter/setters. Connection is now responsible for call the BufferedMutatorImpl constructor and providing the necessary additional parameters.
+
+Patches for branch-1.0 and branch-1.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12694008/HBASE-12728.06-branch-1.patch
+  against master branch at commit e370baf8a50adb0533bf6cae78f7b7986bdd2714.
+  ATTACHMENT ID: 12694008
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 144 new or modified tests.
+
+    {color:red}-1 patch{color}.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-HBASE-Build/12561//console
+
+This message is automatically generated.
+
+[~sduskis] you good with the latest? 
+
+BuildBot seems out to lunch. Rebased, reattached.
+
+{color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12694075/HBASE-12728-6.patch
+  against master branch at commit 5fbf80ee5ecb288804d2d2d042199dcd834ae848.
+  ATTACHMENT ID: 12694075
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 126 new or modified tests.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 checkstyle{color}.  The applied patch does not increase the total number of checkstyle errors
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 lineLengths{color}.  The patch does not introduce lines longer than 100
+
+  {color:green}+1 site{color}.  The mvn site goal succeeds with this patch.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in .
+
+Test results: https://builds.apache.org/job/PreCommit-HBASE-Build/12564//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12564//artifact/patchprocess/newPatchFindbugsWarningshbase-hadoop2-compat.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12564//artifact/patchprocess/newPatchFindbugsWarningshbase-prefix-tree.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12564//artifact/patchprocess/newPatchFindbugsWarningshbase-annotations.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12564//artifact/patchprocess/newPatchFindbugsWarningshbase-server.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12564//artifact/patchprocess/newPatchFindbugsWarningshbase-client.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12564//artifact/patchprocess/newPatchFindbugsWarningshbase-rest.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12564//artifact/patchprocess/newPatchFindbugsWarningshbase-protocol.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12564//artifact/patchprocess/newPatchFindbugsWarningshbase-hadoop-compat.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12564//artifact/patchprocess/newPatchFindbugsWarningshbase-examples.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12564//artifact/patchprocess/newPatchFindbugsWarningshbase-common.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/12564//artifact/patchprocess/newPatchFindbugsWarningshbase-thrift.html
+Checkstyle Errors: https://builds.apache.org/job/PreCommit-HBASE-Build/12564//artifact/patchprocess/checkstyle-aggregate.html
+
+  Console output: https://builds.apache.org/job/PreCommit-HBASE-Build/12564//console
+
+This message is automatically generated.
+
+Pushed to branch-1.0+. Thanks a lot to [~sduskis] for taking this one on, and everyone for the reviews.
+
+FAILURE: Integrated in HBase-1.1 #101 (See [https://builds.apache.org/job/HBase-1.1/101/])
+HBASE-12728 buffered writes substantially less useful after removal of HTablePool (Solomon Duskis and Nick Dimiduk) (ndimiduk: rev 8556e2598e6885b15ce44843aa52589e53d2e601)
+* hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestRegionServerMetrics.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/BufferedMutatorImpl.java
+* hbase-it/src/test/java/org/apache/hadoop/hbase/test/IntegrationTestLoadAndVerify.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/mapred/TableOutputFormat.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestCloneSnapshotFromClient.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/HTableInterface.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/client/HTableWrapper.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/mapreduce/MultiTableOutputFormat.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/PerformanceEvaluation.java
+* hbase-rest/src/main/java/org/apache/hadoop/hbase/rest/RowResource.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestEndToEndSplitTransaction.java
+* hbase-it/src/test/java/org/apache/hadoop/hbase/test/IntegrationTestBigLinkedList.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/replication/TestReplicationSmallTests.java
+* hbase-examples/src/main/java/org/apache/hadoop/hbase/client/example/BufferedMutatorExample.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestRegionFavoredNodes.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestMultiParallel.java
+* hbase-rest/src/test/java/org/apache/hadoop/hbase/rest/PerformanceEvaluation.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLabelsReplication.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/HTable.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/BufferedMutator.java
+* hbase-rest/src/test/java/org/apache/hadoop/hbase/rest/client/TestRemoteTable.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestDistributedLogSplitting.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/snapshot/TestRestoreFlushSnapshotFromClient.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/Table.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestMaster.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/mapreduce/TableOutputFormat.java
+* hbase-it/src/test/java/org/apache/hadoop/hbase/test/IntegrationTestWithCellVisibilityLoadAndVerify.java
+* hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestAsyncProcess.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/ConnectionAdapter.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestScannerWithBulkload.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestLogRolling.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestClientPushback.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/coprocessor/TestHTableWrapper.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/Connection.java
+* hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestClientNoCluster.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/snapshot/TestFlushSnapshotFromClient.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/snapshot/SnapshotTestingUtils.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/BufferedMutatorParams.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/replication/TestReplicationWithTags.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestFromClientSide.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestFSErrorsExposed.java
+* hbase-it/src/test/java/org/apache/hadoop/hbase/trace/IntegrationTestSendTraceRequests.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/TableConfiguration.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/ConnectionManager.java
+* hbase-it/src/test/java/org/apache/hadoop/hbase/test/IntegrationTestBigLinkedListWithVisibility.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/replication/TestReplicationChangingPeerRegionservers.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestRpcControllerFactory.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestRestoreSnapshotFromClient.java
+
+
+FAILURE: Integrated in HBase-1.0 #678 (See [https://builds.apache.org/job/HBase-1.0/678/])
+HBASE-12728 buffered writes substantially less useful after removal of HTablePool (Solomon Duskis and Nick Dimiduk) (ndimiduk: rev 7bbbaaeb53295d3a50b9d863f3c01801df0a78b4)
+* hbase-server/src/main/java/org/apache/hadoop/hbase/client/HTableWrapper.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/PerformanceEvaluation.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestRegionFavoredNodes.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/TableConfiguration.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/replication/TestReplicationChangingPeerRegionservers.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestMaster.java
+* hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestClientNoCluster.java
+* hbase-rest/src/test/java/org/apache/hadoop/hbase/rest/client/TestRemoteTable.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/replication/TestReplicationWithTags.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestScannerWithBulkload.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestFSErrorsExposed.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/replication/TestReplicationSmallTests.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/ConnectionAdapter.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestRestoreSnapshotFromClient.java
+* hbase-rest/src/main/java/org/apache/hadoop/hbase/rest/RowResource.java
+* hbase-it/src/test/java/org/apache/hadoop/hbase/trace/IntegrationTestSendTraceRequests.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/HTableInterface.java
+* hbase-it/src/test/java/org/apache/hadoop/hbase/test/IntegrationTestBigLinkedListWithVisibility.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestEndToEndSplitTransaction.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestMultiParallel.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestClientPushback.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/HTable.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestCloneSnapshotFromClient.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/Connection.java
+* hbase-examples/src/main/java/org/apache/hadoop/hbase/client/example/BufferedMutatorExample.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestFromClientSide.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestDistributedLogSplitting.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/ConnectionManager.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/BufferedMutatorParams.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/BufferedMutatorImpl.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/snapshot/TestFlushSnapshotFromClient.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/snapshot/TestRestoreFlushSnapshotFromClient.java
+* hbase-it/src/test/java/org/apache/hadoop/hbase/test/IntegrationTestWithCellVisibilityLoadAndVerify.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/Table.java
+* hbase-rest/src/test/java/org/apache/hadoop/hbase/rest/PerformanceEvaluation.java
+* hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestAsyncProcess.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/snapshot/SnapshotTestingUtils.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/BufferedMutator.java
+* hbase-it/src/test/java/org/apache/hadoop/hbase/test/IntegrationTestBigLinkedList.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/mapreduce/TableOutputFormat.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/mapreduce/MultiTableOutputFormat.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/coprocessor/TestHTableWrapper.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestRpcControllerFactory.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestRegionServerMetrics.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/mapred/TableOutputFormat.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLabelsReplication.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestLogRolling.java
+* hbase-it/src/test/java/org/apache/hadoop/hbase/test/IntegrationTestLoadAndVerify.java
+
+
+FAILURE: Integrated in HBase-TRUNK #6049 (See [https://builds.apache.org/job/HBase-TRUNK/6049/])
+HBASE-12728 buffered writes substantially less useful after removal of HTablePool (Solomon Duskis and Nick Dimiduk) (ndimiduk: rev ab18158e6001a7f15a35679ca8fc7ff772f90e25)
+* hbase-server/src/test/java/org/apache/hadoop/hbase/coprocessor/TestHTableWrapper.java
+* hbase-rest/src/test/java/org/apache/hadoop/hbase/rest/PerformanceEvaluation.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/BufferedMutatorImpl.java
+* hbase-it/src/test/java/org/apache/hadoop/hbase/test/IntegrationTestWithCellVisibilityLoadAndVerify.java
+* hbase-it/src/test/java/org/apache/hadoop/hbase/test/IntegrationTestBigLinkedList.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/security/visibility/TestVisibilityLabelsReplication.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/ConnectionManager.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/mapred/TableOutputFormat.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/ConnectionAdapter.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/replication/TestReplicationChangingPeerRegionservers.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/Connection.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestFromClientSide.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestClientPushback.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestDistributedLogSplitting.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/Table.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestFSErrorsExposed.java
+* hbase-it/src/test/java/org/apache/hadoop/hbase/test/IntegrationTestLoadAndVerify.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/HTable.java
+* hbase-examples/src/main/java/org/apache/hadoop/hbase/client/example/BufferedMutatorExample.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestLogRolling.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestScannerWithBulkload.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/PerformanceEvaluation.java
+* hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestAsyncProcess.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/TestMultiVersions.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestRegionFavoredNodes.java
+* hbase-it/src/test/java/org/apache/hadoop/hbase/trace/IntegrationTestSendTraceRequests.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/BufferedMutator.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/snapshot/TestFlushSnapshotFromClient.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestMaster.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/mapreduce/TableOutputFormat.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestMultiParallel.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestRestoreSnapshotFromClient.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/client/HTableWrapper.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/replication/TestReplicationWithTags.java
+* hbase-it/src/test/java/org/apache/hadoop/hbase/test/IntegrationTestBigLinkedListWithVisibility.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestRpcControllerFactory.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestEndToEndSplitTransaction.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/snapshot/SnapshotTestingUtils.java
+* hbase-server/src/main/java/org/apache/hadoop/hbase/mapreduce/MultiTableOutputFormat.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/HTableInterface.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestCloneSnapshotFromClient.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/BufferedMutatorParams.java
+* hbase-rest/src/test/java/org/apache/hadoop/hbase/rest/client/TestRemoteTable.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/snapshot/TestRestoreFlushSnapshotFromClient.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/replication/TestReplicationSmallTests.java
+* hbase-rest/src/main/java/org/apache/hadoop/hbase/rest/RowResource.java
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/TableConfiguration.java
+* hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestRegionServerMetrics.java
+* hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestClientNoCluster.java
+
+
+Great! Thanks for the work everyone. 
+
+Some of these failures look related. Let me cleanup.
+
+Agreed, this looks related : https://builds.apache.org/view/All/job/HBase-1.0/678/
+
+Sorry for the delay. This fixes the failing TestAssignmentManager.
+
+I'm not sure about TestFSErrorsExposed.testFullSystemBubblesFSErrors
+
+SUCCESS: Integrated in HBase-TRUNK #6050 (See [https://builds.apache.org/job/HBase-TRUNK/6050/])
+HBASE-12728 buffered writes substantially less useful after removal of HTablePool (addendum) (ndimiduk: rev 588b43b06ba9a3434dc2178b5b014283cc959d62)
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/HTable.java
+
+
+FAILURE: Integrated in HBase-1.1 #103 (See [https://builds.apache.org/job/HBase-1.1/103/])
+HBASE-12728 buffered writes substantially less useful after removal of HTablePool (addendum) (ndimiduk: rev 4b9eaf585124094f02db41cc4f84805e936417b3)
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/HTable.java
+
+
+Addendum for 1.0 allows TestFSErrorsExposed to pass.
+
+FAILURE: Integrated in HBase-1.0 #680 (See [https://builds.apache.org/job/HBase-1.0/680/])
+HBASE-12728 buffered writes substantially less useful after removal of HTablePool (addendum) (ndimiduk: rev baf879967a41151293e780bc32092046a3aa7af2)
+* hbase-client/src/main/java/org/apache/hadoop/hbase/client/HTable.java
+
+
+bq. Addendum for 1.0 allows TestFSErrorsExposed to pass
+
+That's extremely subtle; I'd have thought those lines equivalent. Why does it allow the test to pass?
+
+addendum2 doesn't resolve this issue for me on branch-1.0. branch-1 appears to not have the problem.
+
+After doing a clean build, the test doesn't pass with addendum 2.
+Though there're a lot of exceptions:
+{code}
+2015-01-23 18:56:53,209 WARN  [PriorityRpcServer.handler=2,queue=0,port=52379] hdfs.DFSInputStream(1078): Connection failure: Failed to connect to /127.0.0.1:52369 for file /    user/tyu/test-data/58b7b2ea-9919-4535-baf5-c3ed27fce466/data/hbase/meta/1588230740/info/517adf8439d34234bf13b9c98d8ebdfd for block BP-1225607801-192.168.0.19-1422068063192:      blk_1073741838_1014:java.net.ConnectException: Connection refused
+java.net.ConnectException: Connection refused
+  at sun.nio.ch.SocketChannelImpl.checkConnect(Native Method)
+  at sun.nio.ch.SocketChannelImpl.finishConnect(SocketChannelImpl.java:739)
+...
+  at org.apache.hadoop.hbase.regionserver.HRegion.getScanner(HRegion.java:2118)
+  at org.apache.hadoop.hbase.regionserver.RSRpcServices.scan(RSRpcServices.java:2033)
+{code}
+the exceptions are not bubbled up to caller.
+Debugging.
+
+Placing a breakpoint on the following line in StoreFileScanner :
+{code}
+      throw new IOException("Could not seek " + this + " to key " + key, ioe);
+{code}
+I found that it was in hbase:meta scanning where the above breakpoint got hit.
+However, this IOE was not delivered to TestFSErrorsExposed.
+
+I think the problem is that, because of the retries in branch-1.0 is done 3 times for the region lookup, where each lookup does 3 retries of its own from DFSInputStream causing a timeout on the original scan RPC so causing a SocketTimeout (60 sec) instead of IOException as expected from the test. 
+
+Notice that we set the retries number in 2 places in the test: 
+{code}
+      // We set it not to run or it will trigger server shutdown while sync'ing
+      // because all the datanodes are bad
+      util.getConfiguration().setInt(HConstants.HBASE_CLIENT_RETRIES_NUMBER, 3);
+     ...
+      util.getConfiguration().setInt(HConstants.HBASE_CLIENT_RETRIES_NUMBER, 1);
+{code}
+
+Notice that the Connection in util is created before the second set, so it gets the retries number from the initial set, which is 3. That is why the test fails in branch-1.0. In branch-1 and master, the connection still have retries of 3, but due to HBASE-12761, the scanner initialization have changed, making the first try throw the exception. 
+
+Attached patch fixes the problem. We can commit it to all 3 branches (it does not affect branch-1 and master but good to have). 
+
+I was thinking of making the same change.
++1
+
+Wondering why the original test sets retry count twice.
+
+I think addendum 3 should only be applied to branch-1.0 - due to the limitation cited above.
+
+For branch-1 and master, let's keep the current test code - when TestFSErrorsExposed#testFullSystemBubblesFSErrors times out, we know there is a regression.
+
+bq. Wondering why the original test sets retry count twice.
+
+I don't think this was intentional.
+
++1 for addendum 3 for branch-1.0+, the test passes with this change on all 3 branches. Looks like good cleanup of the test.
+
+Thanks [~tedyu] and [~enis] for investigating.
+
+I've pushed the addendum to all three branches. Thanks Ted and Nick. 
+
+SUCCESS: Integrated in HBase-TRUNK #6052 (See [https://builds.apache.org/job/HBase-TRUNK/6052/])
+HBASE-12728 buffered writes substantially less useful after removal of HTablePool (addendum for failing test in branch-1.0) (enis: rev e05341d01d3d1a5bac08359babfdd9cfad05052e)
+* hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestFSErrorsExposed.java
+
+
+SUCCESS: Integrated in HBase-1.1 #104 (See [https://builds.apache.org/job/HBase-1.1/104/])
+HBASE-12728 buffered writes substantially less useful after removal of HTablePool (addendum for failing test in branch-1.0) (enis: rev e180f0bdd1534910a20da0b02894249537628a7a)
+* hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestFSErrorsExposed.java
+
+
+SUCCESS: Integrated in HBase-1.0 #681 (See [https://builds.apache.org/job/HBase-1.0/681/])
+HBASE-12728 buffered writes substantially less useful after removal of HTablePool (addendum for failing test in branch-1.0) (enis: rev 1f0eb701dfc2794654c130f600a1614572155f17)
+* hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestFSErrorsExposed.java
+
+
+Closing this issue after 1.0.0 release.
+

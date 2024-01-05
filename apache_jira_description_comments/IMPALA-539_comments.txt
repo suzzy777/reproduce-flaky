@@ -1,0 +1,86 @@
+Ideally, we should always wait for all backend completion even in the case of cancellation below. Of course, this may be problematic if a backend is unresponsive for whatever reason so we can wait with a timeout once the cancellation RPCs have been issued.
+{noformat}
+void Coordinator::HandleExecStateTransition(
+    const ExecState old_state, const ExecState new_state) {
+  static const unordered_map<ExecState, const char *> exec_state_to_event{
+    {ExecState::EXECUTING,        "Executing"},
+    {ExecState::RETURNED_RESULTS, "Last row fetched"},
+    {ExecState::CANCELLED,        "Execution cancelled"},
+    {ExecState::ERROR,            "Execution error"}};
+  if (old_state == new_state) return;
+  // Once we enter a terminal state, we stay there, guaranteeing this code runs only once.
+  DCHECK_EQ(old_state, ExecState::EXECUTING);
+  // Should never transition to the initial state.
+  DCHECK_NE(new_state, ExecState::EXECUTING);
+  // Can't transition until the exec RPCs are no longer in progress. Otherwise, a
+  // cancel RPC could be missed, and resources freed before a backend has had a chance
+  // to take a resource reference.
+  DCHECK(exec_rpcs_complete_barrier_ != nullptr &&
+      exec_rpcs_complete_barrier_->pending() <= 0) << "exec rpcs not completed";
+
+  query_events_->MarkEvent(exec_state_to_event.at(new_state));
+  // This thread won the race to transitioning into a terminal state - terminate
+  // execution and release resources.
+  ReleaseExecResources();
+  if (new_state == ExecState::RETURNED_RESULTS) {
+    // TODO: IMPALA-6984: cancel all backends in this case too.
+    WaitForBackends(); <<-----
+  } else {
+    CancelBackends();  <<----- should wait for backend completion too in this case.
+  }
+  ReleaseAdmissionControlResources();
+  // Can compute summary only after we stop accepting reports from the backends. Both
+  // WaitForBackends() and CancelBackends() ensures that.
+  // TODO: should move this off of the query execution path?
+  ComputeQuerySummary();
+{noformat}
+
+Given that we probably need a timeout for response of the cancellation RPC issued by the coordinator, we probably need to think through what the relationship it may have with IMPALA-2990. In IMPALA-2990, a query will be cancelled if a particular backend hasn't reported any status for a certain  timeout period. If fixing this Jira means waiting for backends to reply during cancellation, this may lengthen the overall timeout of hung queries due to unresponsive backends.
+
+Commit d4019be2a259b6f5bc14da3261fac36e07f771ad in impala's branch refs/heads/master from Michael Ho
+[ https://git-wip-us.apache.org/repos/asf?p=impala.git;h=d4019be ]
+
+IMPALA-7852: Fix some flakiness in test_hash_join_timer.py
+
+test_hash_join_timer.py aims to verify the timers in the
+join nodes are functioning correctly. It does so by parsing
+the query profile for certain patterns after the query has
+finished.
+
+Before IMPALA-4063, each individual fragment instance will
+post its profile to the coordinator upon completion. After
+IMPALA-4063, the profiles of all fragment instances are sent
+together periodically and the final profile is sent once all
+fragment instances on a backend are done.
+
+The problem with the existing implementation of the test is
+that it doesn't actually fetch results before closing the
+query. As a result of it, the coordinator fragment never gets
+a chance to complete as it will block forever when inserting
+into the plan root sink. The lack of completion of the
+coordinator fragment causes the final profiles of fragment
+instances on the coordinator to be not sent before the query
+is closed. As a result, the profile of a fragment instance
+on the coordinator could be stale if it completes between
+two periodic updates, leading to random test failure.
+
+This change fixes the flankiness by always fetching results
+before closing the query. Ideally, if we fix IMPALA-539 and
+wait for all backends' final profiles before completing query
+unregistration, we should get the final profile from the
+coordinator fragment too.
+
+Change-Id: I851824dffb78c7731e60793d90f1e57050c54955
+Reviewed-on: http://gerrit.cloudera.org:8080/11964
+Reviewed-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+Tested-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+
+
+IMPALA-9756 may fix some weirdness where the fragment profile tree is not linked into the main profile tree if fragment startup fails somehow. See here how it's only included on the happy path - https://github.com/apache/impala/blob/bd4d01a/be/src/service/client-request-state.cc#L573
+
+I'm not convinced the broader problem of trying to wait around for status reports to come in is a good one to solve. It probably also entails waiting at least 5-10s after the query has failed to see if straggling reports come in, and I think it will add significant complexity because of the need to gracefully handle cases where fragments cannot successfully report (communication errors, etc).
+
+
+
+See previous comment
+

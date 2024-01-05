@@ -1,0 +1,107 @@
+I suspect it's some bug in Resources. Investigating... 
+
+[~xujyan] Is this assigned to you or in progress? I'm seeing fail locally as well.
+
+[~bmahler] I am still looking but haven't made much progress. Will spend some more time today. Assigning to myself.
+
+So... I haven't fixed this bug but here are my findings:
+
+The CHECK failure occurred in [RepeatedPtrFieldBase::Get(int index)|https://code.google.com/p/protobuf/source/browse/tags/2.5.0/src/google/protobuf/repeated_field.h#824].
+
+The sequence of events:
+# A slave 'slave1' in the test with resources {{cpus(role1):1; mem(role1):200; cpus(role2):2; mem(role2):600; cpus\(\*):1; mem\(\*):200; disk\(\*):0; ports\(\*):\[31000-32000]}} is [added by the master|https://github.com/apache/mesos/blob/81a63ee53932c2fc372b7ba0d881596cd44a2850/src/tests/allocator_tests.cpp#L536].
+# Master [adds it to the allocator|https://github.com/apache/mesos/blob/81a63ee53932c2fc372b7ba0d881596cd44a2850/src/master/master.cpp#L3308] with no 'used' resources.
+# Allocator first [creates a Slave object|https://github.com/apache/mesos/blob/81a63ee53932c2fc372b7ba0d881596cd44a2850/src/master/hierarchical_allocator_process.hpp#L423] and copies {{slaveInfo.resources()}} to its 'available' field.
+# Allocator then adds the slave's resources already used by frameworks, which are none so this is a no-op.
+# It then [assigns the unused resources back to 'available'|https://github.com/apache/mesos/blob/81a63ee53932c2fc372b7ba0d881596cd44a2850/src/master/hierarchical_allocator_process.hpp#L443]. 'unused' should be identical to 'available' before the assignment because they both come from (are copies of) {{slaveInfo.resources()}} and there is no mutation.
+# The assignment uses a [MergeFrom|https://github.com/apache/mesos/blob/81a63ee53932c2fc372b7ba0d881596cd44a2850/include/mesos/resources.hpp#L95], which does a {{Get\(i)}} and tripped over the the CHECK failure.
+
+Given that the code does check the index before using it and it's only flaky
+{code}
+for (int i = 0; i < other.current_size_; i++) {
+  TypeHandler::Merge(other.template Get<TypeHandler>(i), Add<TypeHandler>());
+}
+{code}
+It appears that something has modified {{current_size_}} after the check.
+In fact, I modified the CHECK to print the values {{i}} and {{current_size_}}:
+{code}
+GOOGLE_DCHECK_LT(index, size()) << "index: " << index << "; size: " << size();
+{code}
+and it prints
+{noformat}
+[libprotobuf FATAL ../3rdparty/libprocess/3rdparty/protobuf-2.5.0/src/google/protobuf/repeated_field.h:825] CHECK failed: (index) < (size()): index: 7; size: 0
+{noformat}
+
+{{size: 0}}?
+
+I don't understand how it is possible because the two Resources objects on the two sides of the [assignment|https://github.com/apache/mesos/blob/81a63ee53932c2fc372b7ba0d881596cd44a2850/src/master/hierarchical_allocator_process.hpp#L443] are both copied from slaveInfo.resources() within the same libprocess Process method [slaveAdded|https://github.com/apache/mesos/blob/81a63ee53932c2fc372b7ba0d881596cd44a2850/src/master/hierarchical_allocator_process.hpp#L414] so there should be no thread safety issue here.
+
+And the flakiness is tricky in that when too many log lines around the statements are printed and gdb conditional break points are set it just stopped recurring...
+
+I may come back to this some time later but have stopped working on this right now since the "flakiness level" isn't all that high... in the meantime I welcome others to take a look and it might provide fresh perspectives.
+
+Just hit this today accompanied by a segfault on the Mesosphere buildbot. Definitely doesn't seem to be frequent.
+
+{noformat:title=Check}
+[libprotobuf FATAL ../3rdparty/libprocess/3rdparty/protobuf-2.5.0/src/google/protobuf/repeated_field.h:824] CHECK failed: (index) < (size()): 
+../../src/tests/allocator_tests.cpp:753: Failure
+Actual function call count doesn't match EXPECT_CALL(allocator, slaveAdded(_, _, _))...
+         Expected: to be called twice
+           Actual: called once - unsatisfied and active
+unknown file: Failure
+C++ exception with description "CHECK failed: (index) < (size()): " thrown in the test body.
+{noformat}
+
+{noformat:title=Log}
+[ RUN      ] ReservationAllocatorTest.ResourcesReturned
+[libprotobuf FATAL ../3rdparty/libprocess/3rdparty/protobuf-2.5.0/src/google/protobuf/repeated_field.h:824] CHECK failed: (index) < (size()): 
+../../src/tests/allocator_tests.cpp:753: Failure
+Actual function call count doesn't match EXPECT_CALL(allocator, slaveAdded(_, _, _))...
+         Expected: to be called twice
+           Actual: called once - unsatisfied and active
+unknown file: Failure
+C++ exception with description "CHECK failed: (index) < (size()): " thrown in the test body.
+*** Aborted at 1414800164 (unix time) try "date -d @1414800164" if you are using GNU date ***
+PC: @     0x2b1ec26c05c8 (unknown)
+*** SIGSEGV (@0x0) received by PID 28529 (TID 0x2b1ebd74e100) from PID 0; stack trace: ***
+    @     0x2b1ec2e35340 (unknown)
+    @     0x2b1ec26c05c8 (unknown)
+    @           0x8fffe3 process::UPID::UPID()
+    @           0x902ebe process::ProcessBase::self()
+    @           0x90303f process::terminate()
+    @           0x90b127 mesos::internal::master::allocator::Allocator::~Allocator()
+    @           0x90b1aa mesos::internal::master::allocator::Allocator::~Allocator()
+    @           0xe0fdcc process::Owned<>::Data::~Data()
+    @           0xe13dfc std::_Sp_counted_ptr<>::_M_dispose()
+    @           0x935a1a std::_Sp_counted_base<>::_M_release()
+    @           0x916e5b std::__shared_count<>::~__shared_count()
+    @           0x90f8f6 std::__shared_ptr<>::~__shared_ptr()
+    @           0x90f910 std::shared_ptr<>::~shared_ptr()
+    @           0x90f92a process::Owned<>::~Owned()
+    @           0x91010c mesos::internal::tests::Cluster::Masters::Master::~Master()
+    @           0x980eb8 std::pair<>::~pair()
+    @           0x980ee2 std::_Rb_tree_node<>::~_Rb_tree_node()
+    @           0x980f00 __gnu_cxx::new_allocator<>::destroy<>()
+    @           0x9687a1 std::_Rb_tree<>::_M_destroy_node()
+    @           0x943d21 std::_Rb_tree<>::_M_erase()
+    @           0x92555c std::_Rb_tree<>::~_Rb_tree()
+    @           0x90fdea std::map<>::~map()
+    @           0x910047 mesos::internal::tests::Cluster::Masters::shutdown()
+    @           0xdf3eaa mesos::internal::tests::MesosTest::ShutdownMasters()
+    @           0xdf3e73 mesos::internal::tests::MesosTest::Shutdown()
+    @           0xdf16ad mesos::internal::tests::MesosTest::TearDown()
+    @          0x10d4d04 testing::internal::HandleSehExceptionsInMethodIfSupported<>()
+    @          0x10cfe5a testing::internal::HandleExceptionsInMethodIfSupported<>()
+    @          0x10b81b4 testing::Test::Run()
+    @          0x10b888e testing::TestInfo::Run()
+    @          0x10b8e16 testing::TestCase::Run()
+    @          0x10bdae0 testing::internal::UnitTestImpl::RunAllTests()
+make[4]: *** [check-local] Segmentation fault (core dumped)
+{noformat}
+
+Hi, I started to take a look at this bug but can't find the test case source in V0.22.1.  Checking the history it looks like this test case was in tests/allocator_tests.cpp which was removed on 12/11/14: https://git-wip-us.apache.org/repos/asf?p=mesos.git;a=commitdiff;h=6cf1b016dae90292759dc2dc182fc25a39c58f91.
+
+In addition, I couldn't find an equivalent scenario in any of the new test cases (HierarchicalAllocatorTest and MasterAllocatorTest) added in the same change on 12/11.  Any suggestions on how to proceed?
+
+Closing since it looks like this test has been removed in favor of a unit test.
+

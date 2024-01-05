@@ -1,0 +1,126 @@
+Attached test failure log in case it's removed from Jenkins later.
+
+bq. a) 0.94 handle notifications in async way which may lead to handle notifications out of order of the events happened
+
+Do you mean the events generated on one same znode?
+
+bq. b) In trunk, we handle ZK notifications synchronously which slows down other components such as SSH, LogSplitting etc. because we have a single notification queue
+
+Which patch is in 0.94, but not in trunk to make this difference?
+
+{quote}
+Do you mean the events generated on one same znode?
+{quote}
+Yes, on the same unsigned region znode and the znode data has the ZK same version for the two notification events on failed_open. I also confirmed that we don't have two AM listeners at the same time(by added more trace and reproed the issue)
+
+{quote}
+Which patch is in 0.94, but not in trunk to make this difference?
+{quote}
+Since trunk handle notifications synchronously, that's why we don't see the issue in trunk. I saw there was a patch(changing to sync way) before 0.95 module changes But I don't have much history on that.
+
+
+
+As to assignment related ZK notifications, in 0.94, it is very likely because different entities (assignment manager, timeout monitor, open/close region handlers) race against each other.
+
+In trunk, as to the assignment related ZK events processing, a separated thread pool is used, so other components should not be slowed down.
+
+{quote}
+In trunk, as to the assignment related ZK events processing, a separated thread pool is used, so other components should not be slowed down
+{quote}
+You're right. I think we can do better to generalize this strategy into ZooKeeperWatcher to all listeners so that listeners won't interfere with each other. I've some suggestions documented in HBASE-8368. 
+
+I went thro the logs once again. One thing that is surprising is How did two nodeDataChangedEvent occur for FAILED_OPEN.
+
+
+Is it like when the znode got changed to OPENING twice and then to FAILED_OPEN for each change we got one event and by the time it tried to process the first two times the data it got was FAILED_OPEN but the third time it was OPENING due to some other latest assign opeartion?
+
+Thanks.  
+
+
+If i recollect from what i have debugged is that the nodeDataChangeEvent only will give the latest data because it will not be able to read the old data.
+I may be wrong here.
+
+{quote}
+nodeDataChangeEvent only will give the latest data because it will not be able to read the old data
+{quote}
+ZooKeeper intentionally only sends out notifications without passing the original state which triggers the notification. It relies on clients to fetch the latest state. In addition, ZooKeeper watcher is one-time trigger which means it only fire once and client need re-setup watcher on the same znode to get next notification.
+
+In our case, from the log, the related updates with watcher set on the region are: 1) opening->opening 2) opening->failed_open 3) failed_open->offline 4) offline->opening
+
+The first notification(when we got FAILED_OPEN) is triggered by the update of opening->opening. When Master got the notification and znode was already changed to failed_open, that's the first trace nodeDataChange. 
+
+The thing puzzles me is that ZooKeeper watcher will reset up on failed_open state after receiving the first failed_open and should only get more notifications when failed_open state changes. While we still get one more failed_open later from the same znode and data has the same version as we received the first notification. I guess we may trigger ZK client reads stale cache data when the node state changes from failed_open -> offline OR race conditions in ZK side to cause the dup notifications.
+ 
+ 
+  
+
+
+
+Recently I have also observed duplicated zk notifications. FYI attaching logs. These also may useful for analysis. I have tried to debug but not able to reproduce.
+{code}
+2013-04-07 12:14:50,735 INFO  [hbase-am-zkevent-worker-pool-20-thread-7] master.RegionStates(264): Region {NAME => 'testLogSplittingAfterMasterRecoveryDueToZKExpiry,,1365336889784.fb4182aef4ce07f011871ae0a083aee0.', STARTKEY => '', ENDKEY => '1', ENCODED => fb4182aef4ce07f011871ae0a083aee0,} transitioned from {testLogSplittingAfterMasterRecoveryDueToZKExpiry,,1365336889784.fb4182aef4ce07f011871ae0a083aee0. state=OPENING, ts=1365336890719, server=asf001.sp2.ygridcore.net,60884,1365336878389} to {testLogSplittingAfterMasterRecoveryDueToZKExpiry,,1365336889784.fb4182aef4ce07f011871ae0a083aee0. state=OPEN, ts=1365336890735, server=asf001.sp2.ygridcore.net,60884,1365336878389}
+2013-04-07 12:14:50,735 DEBUG [hbase-am-zkevent-worker-pool-2-thread-20] master.AssignmentManager(740): Handling transition=RS_ZK_REGION_OPENED, server=asf001.sp2.ygridcore.net,60884,1365336878389, region=fb4182aef4ce07f011871ae0a083aee0, current state from region state map ={testLogSplittingAfterMasterRecoveryDueToZKExpiry,,1365336889784.fb4182aef4ce07f011871ae0a083aee0. state=OPEN, ts=1365336890727, server=asf001.sp2.ygridcore.net,60884,1365336878389}
+2013-04-07 12:14:50,736 WARN  [hbase-am-zkevent-worker-pool-2-thread-20] master.AssignmentManager(934): Received OPENED for region fb4182aef4ce07f011871ae0a083aee0 from server asf001.sp2.ygridcore.net,60884,1365336878389 but region was in the state {testLogSplittingAfterMasterRecoveryDueToZKExpiry,,1365336889784.fb4182aef4ce07f011871ae0a083aee0. state=OPEN, ts=1365336890727, server=asf001.sp2.ygridcore.net,60884,1365336878389} and not in expected PENDING_OPEN or OPENING states, or not on the expected server
+{code}
+
+As an interim measure, can we maintain the tuples (znode path, data, version) from zk notifications so that we can detect duplicate notification ?
+The tuples would expire after configurable period of time.
+
+Pls let me know if we can solve this with something like this,
+Have an Atomic Integer that is assocaited with every state in handle region.  
+Create a map with regionName and this atomic integer.
+
+Assume OPENING - 1, FAILED_OPEN -2 and OPENED - 3.
+When OPENING handleRegion() gets called since the value is not 1 we go and set the atomic integer in the map to 1.
+Next if FAILED_OPEN update the same to 2.
+
+Now as in this case if two times FAILED_OPEN comes we don't set this and avoid handleRegion from processing.  
+As Jeff also pointed out, the notification happens but it is left to the listener to read the data.  So this means that we are going to work on the latest data only. And so what ever handleREgion() operation we are doing is for the latest data.
+
+After OPENED is done we need to clear this map also like we clear RIT and onlineRegions map.
+
+Cons:
+Another map and need to handle synchronization issues.  
+
+What do you suggest?  Is it possible to do like this?
+
+I think both Ram & Ted's suggestion should work assuming the duplicated notifications come in together. 
+
+The third option is to use trunk AssignmentManager way to handle assignment notifications in a separate thread pool, proces notifications in the order of receiving and act upon almost up to date data. It seems the code isn't that much to copy over.
+
+
+[~jeffreyz]
+But taking up the third option will have an impact on performance on the assignments?
+I can take this up and implement either third or any of the suggestion made above?
+
+
+{quote}
+But taking up the third option will have an impact on performance on the assignments?
+{quote}
+The 0.96 AM ZK notification handling does a very good job. It basically handles same region synchronously while still keep parallelism for different regions. The main difference between option3 and option2 is that option3 can guarantee to handle ZK notifications in the receiving order.
+
+Please take it over otherwise I can pick it up next week. Thanks.
+
+Let me try working on the backport this week.
+
+I will prepare the backport patch and also one of the suggestions above.
+
+So if i go with backport only the ZkEventworkers and the runnable things need to be backported?  In trunk there are also these Locking mechanisms also.
+What others feel? 
+
+If we backport then we need to backport ZkEventworkers, interface RegionRunnable and two other data structures: zkEventWorkerWaitingList and regionsInProgress. 
+
+This maybe a little bit too much for 0.94, I think you can go with other options listed above for simplifications. The cons are just that we may still possibly handle ZK notifications not in receiving order.
+
+bq. interface RegionRunnable and two other data structures: zkEventWorkerWaitingList and regionsInProgress.
+These are simple changes and basically things work on introducing these stuff. But only the locking mechanism seems to be a big change.
+Ok will anyway try out the other options also and post here.
+
+[~jeffreyz]
+I think though the trunk handles the notifications in order there is chance that the duplicate notification may happen at a later point of time?
+So whatever happened in the above logs could happen in trunk also right?  Just asking to confirm so that can think of solving this in both trunk and 0.94.
+
+[~ram_krish] Actually it's very unlikely to cause any issue in trunk(Zookeeper may still generate dup notifications). Because trunk Assignment Manager code handle one region at one time and only re-register watcher right before AM handling a notification. Let's say in trunk we firstly get a "failed_open" ZK notification, we only re-register a watcher right before the handling starts. In other words, the time window between we received a notification and we process the notification, we won't receive any ZK notification. 
+
+In 0.94, because of the async(executorService.submit) nature, we immediately reregister watcher on a region which triggered the notification while actual handling may happen later at some time. In addition, there is no sync control, multiple sources could touch same region concurrently. It creates the possibility that two handlers to handle same notification in 0.94.
+

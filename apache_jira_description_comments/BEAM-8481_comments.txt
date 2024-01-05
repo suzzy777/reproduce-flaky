@@ -1,0 +1,134 @@
+I see the PR is merged. Does this need more followup or is that the scope of this ticket?
+
+Despite increasing the timeout all the way up to 2h30m, this suite is still mostly timing out. Runs that terminate seem to take only around 50m.
+
+[https://builds.apache.org/job/beam_PostCommit_Python37/buildTimeTrend]
+
+I looked at a couple of the aborted jobs and saw that workers are failing to start up with the error "ModuleNotFoundError: No module named 'endpoints_pb2'". Not sure what the root cause is, but that error has appeared many times in the past (e.g. BEAM-7527).
+
+Thanks for looking into this. In your last message, do you refer to Dataflow workers or Jenkins workers?
+
+Dataflow workers.
+
+Looking at the traceback, it says:
+{code}
+I 2019-11-26T20:08:04.683754Z   File "/usr/local/lib/python3.7/site-packages/apache_beam/portability/api/beam_runner_api_pb2.py", line 16, in <module> 
+I 2019-11-26T20:08:04.683774Z     import endpoints_pb2 as endpoints__pb2 
+I 2019-11-26T20:08:04.683784Z ModuleNotFoundError: No module named 'endpoints_pb2' 
+{code}
+
+however, the version generated on my workstation has an absolute import style:
+{code}
+from . import endpoints_pb2 as endpoints__pb2
+{code}
+
+It seems that using a beam_runner_api_pb2.py file generated for Py2.7 will not work on Py3.7 (absolute imports required).
+
+
+Starting looking into this failure. Thanks for taking a look, [~udim]. Futurization step[1] should take care of converting the generated stubs to Python3-compatible syntax. It is possible that a recent change[2] introduced some subtle failure mode here. Looking further.
+
+ [1] [https://github.com/apache/beam/blob/f86d1ffa41437d97d90de7293679528197666b95/sdks/python/gen_protos.py#L152]
+
+[2]  [https://github.com/apache/beam/pull/9572]
+
+Since we are staging Beam SDK to GCS, we should compare the SDK tarball in a passing vs failing jobs. It may offer some clues on whether generated protos were properly futurized. 
+
+Confirmed that in runs that are timing out, generated protos are not futurized,  then Dataflow workers fail to install Beam SDK, whereas on passing runs, the generated protos are futurized:
+
+Looked at apache_beam/portability/api/beam_runner_api_pb2.py 
+
+Bad run ([https://builds.apache.org/job/beam_PostCommit_Python37/1000/console,] [https://console.cloud.google.com/dataflow/jobsDetail/locations/us-central1/jobs/2019-11-24_10_05_54-6500780864095669452?project=apache-beam-testing], gs://temp-storage-for-end-to-end-tests/staging-it/beamapp-jenkins-1124180539-774412.1574618739.774621/dataflow_python_sdk.tar):
+{noformat}
+import endpoints_pb2 as endpoints__pb2
+{noformat}
+ 
+
+Good run ([https://builds.apache.org/job/beam_PostCommit_Python37/1024/console], [https://console.cloud.google.com/dataflow/jobsDetail/locations/us-central1/jobs/2019-11-27_17_56_02-3837996942992637611?project=apache-beam-testing], gs://temp-storage-for-end-to-end-tests/staging-it/beamapp-jenkins-1128015551-757858.1574906151.757993/dataflow_python_sdk.tar):
+{noformat}
+from . import endpoints_pb2 as endpoints__pb2{noformat}
+
+Looked up [https://s.apache.org/beam-community-metrics] -> Post-commit test reliability  -> Post-commit job duration -> Click on the dashboard name -> More -> Enable legend -> Filter view for  Python37 job. 
+
+The increase in execution time starts happening on 2019-08-08 (which is before [https://github.com/apache/beam/pull/9572)|https://github.com/apache/beam/pull/9572]
+
+Another increase in execution time happens around end of October, when we start to mitigate the problem by increasing postcommit duration. We should revert these changes since they increase the execution time, but a mere increase will not help here, instead we will just hold up a slot in Jenkins worker for a longer period.
+
+I'm guessing that the removal of the extra futurize calls in #9572 (cc: [~chadrik]) may be the culprit here.
+These extra calls were hiding an underlying issue (race?) that I don't quite understand.
+
+
++1 for reducing the timeout back to what it was.
+
+[~udim], see my previous message, the error started happening earlier than #9572. After reviewing [1], I think https://github.com/apache/beam/pull/9277 is the culprit. cc: [~markflyhigh].
+
+https://github.com/apache/beam/pull/10257 is out to restore the timeout. 
+
+[1] https://github.com/apache/beam/pulls?q=is%3Apr%20is%3Aclosed+merged%3A2019-08-07..2019-08-09+base%3Amaster+sort%3Aupdated-desc.
+
+Following up on a conversion with Valentyn.
+Assuming that setup.py sdist creates the same tarball regardless of Python version (i.e. futurize is called and converts the aforementioned relative import of endpoints_pb2 to absolute),
+the underlying issue seems to be a concurrency issue with running setup.py.
+Assuming that nothing else but setup.py generates endpoints_pb2, perhaps we should prevent setup.py from running in parallel with itself.
+What I'm proposing is for setup.py to create and acquire a file lock (in the CWD for instance), to prevent multiple instances from stepping over each other.
+
+See also this bug which clearly spells out that setuptools is not thread or multi-process safe: https://github.com/pypa/setuptools/issues/1222
+
+I mean ideally we should only be running sdist once per copy of the sources, and I'm 80% sure we do that.
+Except that according to the above setuptools issue, it seems that the same tmp directory is still used for each of these sdist invocations.
+(this claim needs to be verified)
+
+I can reproduce the issue locally as follows:
+{noformat}
+ * replace run_integration_tests.sh with a code that simply copies the SDK tarball into a local folder, but does not launch any pipelines
+ * simplify other gradle subtask to reduce feedback loop by cutting off inessential operations  
+ * run: $ for i in {1..10}; do gradlew clean ; rm -rf sdks/python/apache_beam/portability/api/*pb2* ; gradlew :python37PostCommit; done
+{noformat}
+
+Half of the time the produced SDK tarball is broken.
+
+By broken you mean the file is not fully readable or ?
+
+I don't know why exactly, but replacing installGcpTest with `dependsOn ':sdks:python:sdist'` and `dependsOn 'setupVirtualenv'` fixes the issue for me.
+
+
+By broken I meant that protobuf stubs in generated tarball are not futurized.
+
+This is what happens.
+
+There is a race between tasks :sdks:python:sdist and :some:python:project:installGcpTest task. installGcpTest is a gradle-generated task that is added to build files that call applyPythonNature() and is defined in beamModulePlugin[2]
+
+sdist command runs python setup.py -q sdist [3].
+
+installGcpTest runs activates a new virtual environment and runs 
+ python -e \{pathToSdkInJeniknsWorkspace} [gcp,test], [4].
+
+There seems to be an intent [5] that installGcpTest should run after sdist, after tarball is generated, however this is not happening, I have verified that installGcpTest occasionally starts running before sdist.
+
+installGcpTest and sdist commands introduce side effects to the only copy sdk of sources, which is cloned into Jenkins workspace. These commands call python setup.py egg_info, which generates [6][7] protocol buffer stubs, and futurizes [8] them. There is some caching[9] in proto generation logic: if stubs are already generated, re-generation may be skipped.
+
+In the following scenario, sdist produces a tarball where stubs are are not futurized:
+
+[installGcpTest called]
+ [proto stubs are generated as part of installGcpTest, but not yet futurized] 
+ [sdist is called]
+ [proto stubs are already generated, so regeneration is skipped]
+ [sdist finishes and prouduces sdk tarball, with stubs not futurized]
+ [proto stubs are futurized as part of installGcpTest]
+ [installGcpTest finishes]
+
+Following may be possible fixes of the issue:
+ - Establish dependency relationship: 'installGcpTest' must-run-after ':sdks:python:sdist' that actually works
+ - Don't install sdk in a develop mode (that points virtualenv directory to a shared source folder), instead install sdk into virtualenv from a tarball.
+
+[1] [https://github.com/apache/beam/blob/c7f7da602adc146806f04eb9f6b2070bab745d3d/sdks/python/test-suites/dataflow/py37/build.gradle#L20]
+ [2] [https://github.com/apache/beam/blob/c7f7da602adc146806f04eb9f6b2070bab745d3d/buildSrc/src/main/groovy/org/apache/beam/gradle/BeamModulePlugin.groovy#L1808]
+ [3] [https://github.com/apache/beam/blob/c7f7da602adc146806f04eb9f6b2070bab745d3d/sdks/python/build.gradle#L48]
+ [4] [https://github.com/apache/beam/blob/c7f7da602adc146806f04eb9f6b2070bab745d3d/buildSrc/src/main/groovy/org/apache/beam/gradle/BeamModulePlugin.groovy#L1812]
+ [5] [https://github.com/apache/beam/blob/c7f7da602adc146806f04eb9f6b2070bab745d3d/buildSrc/src/main/groovy/org/apache/beam/gradle/BeamModulePlugin.groovy#L1816]
+ [6] [https://github.com/apache/beam/blob/c7f7da602adc146806f04eb9f6b2070bab745d3d/sdks/python/setup.py#L293]
+ [7] [https://github.com/apache/beam/blob/c7f7da602adc146806f04eb9f6b2070bab745d3d/sdks/python/gen_protos.py#L140]
+ [8] [https://github.com/apache/beam/blob/c7f7da602adc146806f04eb9f6b2070bab745d3d/sdks/python/gen_protos.py#L155]
+ [9] [https://github.com/apache/beam/blob/c7f7da602adc146806f04eb9f6b2070bab745d3d/sdks/python/gen_protos.py#L102]
+
+This should be fixed now, let's reopen if we see these errors again.
+

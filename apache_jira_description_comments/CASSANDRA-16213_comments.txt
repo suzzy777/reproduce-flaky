@@ -1,0 +1,261 @@
+This affects all versions since the inception of replacement.  If you shutdown the entire ring in non-rolling fashion then it is no surprise that any gossip state not persisted (and specific to an existing live node, which will repopulate it) will be lost.  You can no longer replace as a consequence. A node injecting states that don't belong to itself is generally forbidden as it is dangerous, with the except that proves the rule be assassinate (which also sleeps to careful.)  No node should need to know about any dead states upon a full ring restart,  with the exception of replacement.
+
+
+
+Thanks for the replay [~brandon.williams]!
+
+bq. If you shutdown the entire ring in non-rolling fashion then it is no surprise
+
+We see this in rolling fashion as well, full cluster was easier to reproduce; so the issue isn't isolated to full cluster outage.
+
+bq. You can no longer replace as a consequence
+
+What is the recommendation in these cases?
+
+bq. A node injecting states that don't belong to itself is generally forbidden as it is dangerous
+
+In the case I call out we don't add the node to the ring, but we do add it to gossip, see https://github.com/apache/cassandra/blob/699a1f74fcc1da1952da6b2b0309c9e2474c67f4/src/java/org/apache/cassandra/gms/Gossiper.java#L1754-L1780.
+
+We will try to evict it from gossip (see https://github.com/apache/cassandra/blob/699a1f74fcc1da1952da6b2b0309c9e2474c67f4/src/java/org/apache/cassandra/gms/Gossiper.java#L960-L969), but we also see in the wild that this eviction doesn't happen and it stays there forever; here is a sample from gossipinfo on a real cluster
+
+{code}
+/<ip>
+  generation:0
+  heartbeat:0
+  TOKENS: not present
+{code}
+
+
+
+Sorry, I misspoke, on startup we do add it back into the ring, see https://github.com/apache/cassandra/blob/699a1f74fcc1da1952da6b2b0309c9e2474c67f4/src/java/org/apache/cassandra/service/StorageService.java#L604-L617.
+
+So currently, each node will add it back into the ring, and will add it back into gossip.
+
+[~paulo]. Brandon told me in slack you would be a good person to review as well, would you be able to?
+
+Overall I like the proposed approach, I would just limit propagating state about the downed host *only* during shadow gossip response (and *not* during normal gossip) to limit the potential surface area of this change. I think we should extract the shadow gossip response from {{examineGossiper}} to make this cleaner.
+
+A natural consequence of this is that we will never need to handle the state "UNKNOWN" on {{StorageService.onChange}} so it would be nice to add an assertion there if we ever get a notification about this change on a live node.
+
+I like the tests but I'm not very familiar with in-jvm dtest infrastructure so it would be nice to get a pair of eyes on that to make sure the framework changes look good.
+
+
+Thanks for the review [~paulo]
+
+bq.  I would just limit propagating state about the downed host only during shadow gossip response
+
+I will test this out
+
+bq. I'm not very familiar with in-jvm dtest infrastructure so it would be nice to get a pair of eyes on that to make sure the framework changes look good.
+
+Agree.  Jvm-dtest forked a lot of CassandraDaemon so took a while to make sure the logic matched, this was a good chunk of this patch =(.
+
+Started down the path of only modifying shadow round and hitting a wall.
+
+When we are starting a fresh host, we do not have anything in the peers table, so we do not populate TokenMetadata and rely on gossip, but we only rely on normal gossip and not shadow gossip for this.  I tried notifying StorageService about the shadow round but it fails as it polls Gossiper for endpointStateMap, which won't have this data.  I can try to refactor storage service, or populate endpointStateMap when shadow round completes...
+
+[~paulo] is this what you had in mind?  Seeing that shadow round is mostly ignored, so would need to change this in order to isolate to that.
+
+
+
+I made the changes pass in https://github.com/dcapwell/cassandra/commit/e7af378ce4b491d0126b6d9f67b746e2d62ff19a, but not a fan of this change
+
+* storage service registers early
+* we apply the shadow round state to the gossip state
+* removed 'unknown'
+
+Thanks, added some comments to the commit. Please let me know what do you think.
+
+[~paulo] and I chatted in GH and slack, dumping a summary here.
+
+1) shadow round will now return these "empty" states, but these states do NOT have the status state defined
+2) the receiver side will now see these empty states and check a flag to see if it should handle this case or fall back to previous state
+3) if true, then apply just the endpoint state to gossip then call org.apache.cassandra.service.StorageService#handleStateNormal
+4) added logic to reject nodes with specific gossip states from being replaced, and added flags to alter and/or disable this behavior
+5) when gossiping, the "empty" states will be filtered out and not sent around (to match previous logic).
+
+the empty state is defined as the following
+{code}
+heartbeat version = -1
+applicationState does NOT contain STATUS_WITH_PORT or STATUS
+{code}
+
+I have cleaned up the code and made the changes; code is ready to review again.
+
+I left a few small comments/questions on the CASSANDRA_RELEVANT_PROPERTIES' new methods, as per request. I see you already have two reviewers committers but let me know if you want me to do a review of the full ticket. 
+
+Thanks for the update [~dcapwell]. I think 5) is not required as endpoint states with heartbeat version -1 need not be sent by {{examineGossiper}}, just by {{examineShadowState}} where all states are sent. I made this update [on this commit|https://github.com/dcapwell/cassandra/pull/1/commits/35802d68c6fa195a93b92e7bc779d3d8c94f07e6].
+
+I don't think we need the property {{cassandra.allow_non_normal_replace_address}} is needed since we can achieve this via the property {{cassandra.replacement_allowed_gossip_statuses}}, so I removed it [on this commit|https://github.com/dcapwell/cassandra/pull/1/commits/8f23a70948ef020dba222cfb80a21e2d5322c672].
+
+I opened [this PR|https://github.com/dcapwell/cassandra/pull/1] to your branch with these suggestions and some other minor nits.
+
+As far as I understood {{HostReplacementOfDowedClusterTest.hostReplacementOfDeadNode}} tests an orderly shutdown, that is, when the node announces it's going to leave the cluster by broadcasting the shutdown state. Can we maybe also test with an abrupt shutdown, that is when the shutdown state is not broadcast and the node to be replaced is on NORMAL state?
+
+Other than that, this patch looks good to me.
+
+Thanks for the feedback
+
+bq. not required as endpoint states with heartbeat version -1 need not be sent by examineGossiper
+
+I think that was important for assassinate, so will try to look closer at your patch and how it works with assassinate
+
+bq. HostReplacementOfDowedClusterTest.hostReplacementOfDeadNode tests an orderly shutdown, ... Can we maybe also test with an abrupt shutdown, that is when the shutdown state is not broadcast and the node to be replaced is on NORMAL state?
+
+Makes a lot of sense, I can try working on this test (I assume I can just block gossip messages as I can't kill -9 in jvm-dtest).
+
+I have been working on the test but its flaky; half the time it passes, the other half it acts like an infinite loop waiting on schema during bootstrap...  trying to figure out what's going on there, though it does look unrelated to the patch (all the nodes expected in gossip are present).
+
+Found the issue, it was caused by CASSANDRA-15158 where it creates a config of milliseconds, calls a delay which takes milliseconds, but converts the mills as if they were seconds, causing a much longer delay than expected.
+
+Once I fix that I then hit the next issue, we now block waiting on schema which will fail since it has a downed node.
+
+{code}
+case SCHEMA:
+                        SystemKeyspace.updatePeerInfo(endpoint, "schema_version", UUID.fromString(value.value));
+                        MigrationCoordinator.instance.reportEndpointVersion(endpoint, UUID.fromString(value.value));
+                        break;
+{code}
+
+{code}
+boolean schemasReceived = MigrationCoordinator.instance.awaitSchemaRequests(SCHEMA_DELAY_MILLIS);
+
+        if (schemasReceived)
+            return;
+
+        logger.warn(String.format("There are nodes in the cluster with a different schema version than us we did not merged schemas from, " +
+                                  "our version : (%s), outstanding versions -> endpoints : %s",
+                                  Schema.instance.getVersion(),
+                                  MigrationCoordinator.instance.outstandingVersions()));
+
+        if (REQUIRE_SCHEMAS)
+            throw new RuntimeException("Didn't receive schemas for all known versions within the timeout");
+{code}
+
+when we get the gossip info from the peers it will have node2 (the node that crashed abruptly) and wait until it gets the schema, but this won't happen since node2 is down and we are replacing it.
+
+This looks unrelated to this patch, but also is a bad condition as any schema change with a downed node will cause nodes to fail to start up...
+
+I plan to fix the schema wait logic in https://issues.apache.org/jira/browse/CASSANDRA-15158?page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel&focusedCommentId=17231757#comment-17231757 to keep this patch clean of it, but for the moment the logic is in this branch to get a stable test.
+
+[~paulo] added the test and rebased to latest trunk as 2 recent commits impact this logic.
+
+ 
+
+I am going to run the tests in a loop to make sure they are not flaky, if they are will split the class files or change the bootstrap schema properties.
+
+ 
+
+The last thing on my plate is to validate assassinate; forgot to do this.
+
+Finished assassinate and made sure to flesh out the different cases I could see.  org.apache.cassandra.gms.EndpointState#isEmpty does need to check for status in order for assassinate with this patch.
+
+If you stop all nodes and bring up all but the host to remove, then assassinate the node to remove, it will still be "empty" based off version, but will have a status.  If we do not check the status when we check for empty, we would then treat this endpoint as normal and move on, which isn't correct as its in the LEFT state.
+
+ 
+
+[~paulo] I added org.apache.cassandra.distributed.test.hostreplacement.AssassinatedEmptyNodeTest to flesh this case out if you want to take a closer look. EndpointState.isEmpty is only use in one spot now since we removed the filter, so feel its still best to check the state to make sure it is this specific case.
+
+[~brandon.williams] [~paulo] [~samt] the patch should be ready to review again.
+
+Thanks! I'll take another look this week.
+
+Sorry I'm a bit late to the party here.
+
+I think the general approach of using the shadow round to learn persisted peer info about a down host is sound, but I believe this implementation is a bit overcomplicated. I don't think we need to modify the behaviour of assassinate or make any changes regarding which {{STATUS}} we can replace.
+
+I've pushed a simplified version here: [https://github.com/beobal/cassandra/tree/beobal/16213-trunk] (I kept all your tests, but removed the fix from the first commit).
+ It doesn't currently pass your new dtests, but I think that's mostly to do with the expectations being specific to your implementation. I've checked that all the scenarios your tests cover work as expected using ccm clusters. Also, aside from the fix for replacing down nodes, all other behaviour is the same as current trunk wrt assasinate, eviction of fat clients etc.
+
+I'll try and dig into the dtests this week and update them.
+
+I really like the alternative implementation and descriptive comments. I'd just extract the shadow round response logic to its own method (ie. {{replyShadowRound}} vs {{examineGossiper)}} as done in the previous implementation since they don't have a lot in common. Maybe add debug logs when gossip state is injected during replace or returned during shadow round response to make it easier to debug this if someone run into issues. Also, make sure to remove the new properties added to {{CassandraRelevantProperties}} in the previous implementation.
+
+Thanks sam for the review, ill try to look closer at your changes as the original logic is no longer fresh in my head, will try to replay later today, if not then tomorrow.
+
+I left comments on the commit https://github.com/beobal/cassandra/commit/b33d3aaf01326e49bacda2410c0fa6fc17677ae5
+
+To summarize I think these are the following changes
+
+1) size of the patch
+2) avoid injecting the host_id + token on startup, but keep the "empty" node in gossip as is.  On shadow round, query table to repopulate this in order to reply
+3) removed the allowed state logic
+
+For #1 it looks like this is only done by removing the explicit "empty" flags and replaced access with logic which tries to detect it based off symptoms (generation and version == 0, absents from gossip, etc.).  I personally feel this logic is justifiable as it makes it easy to see how/where we handle the logic, by scattering the handling it gets harder to see how its handled.
+
+For #2 I am not sure why, would love to hear from you on what you are thinking.  I do love the extra comments but it isn't clear the motivation between the two versions.
+
+[~samt] thanks for the review.  If it helps we can chat on slack tomorrow (or when you are free) and can summaries here after.
+
+booo... rebased and now getting 
+{code}
+Exception: java.lang.OutOfMemoryError thrown from the UncaughtExceptionHandler in thread "node2_COMMIT-LOG-WRITER"
+{code}
+
+
+Looks like CASSANDRA-16212 isn't fixed yet so will need to disable metaspace cleaning when running the test (CI does this but not IntelliJ)
+
+[~samt] pushed changes based off your version.  I made a few changes (we spoke in slack about them)
+1) rather than modify the block which checks the downed host is "old enough", we inject the node while doing prepare; this keeps the logic centralized
+2) keep the isEmpty logic and flag to enable/disable this feature.  If feature is disabled then this patch has no affect (outside of shadow round sending empty).
+
+[~paulo] would be good to get your eyes as well!
+
+To keep history clear for review, I split each change into different commits
+
+* removed blocking replace on state: https://github.com/apache/cassandra/pull/780/commits/ebc844428d928789835f2a839ebbe1230aed68fd
+* load token/host_id lazy during shadow round rather than startup: https://github.com/apache/cassandra/pull/780/commits/748d437028843de50b0e271cdacec4dfd27af2df
+* host replacement no longer injects a "normal" state transition, but updates token metadata and gossip state explicitly: https://github.com/apache/cassandra/pull/780/commits/650a3541da65a367cbce8a623e040c2f4776f23f
+
+rebased to trunk, which fixed some of the test failures.  ATM the build is clean (minus the streaming test, but that is known)
+
+Posted a review.
+
+I'm chasing down a second related issue if multiple nodes are starting up with {{replace_address_first_boot}} at the same time and one of the replacement nodes is also marked as a seed for the others.  Seems to be the root cause of CASSANDRA-16159 so will handle on that ticket.
+
+Thanks for addressing nits.  +1 from me.
+
+Finally got this all straight in my head again (I think.) LGTM, +1.
+
+Thanks for the review [~brandon.williams] and [~jmeredithco]!
+
++1 from me too, thanks for incorporating my suggestions.
+
+Nit typo: {{HostReplacementOfDowedClusterTest}}
+
+Thanks [~samt]!
+
+Will wait for [~paulo] to review.
+
+Just a heads up that I'll take a final look at this tomorrow.
+
+Sorry for the delay. Approved PR with one minor nit.
+
+One last thing I wanted to discuss before we commit is if we need the {{cassandra.allow_empty_replace_address}} property defaulting to false, now that we have the collision check in place. I think it should be pretty safe to have this enabled by default, or even remove this knob altogether, since it's the correct behavior and I don't see where it can be useful to have it disabled.
+
+Thanks for the review [~paulo].
+
+bq.  I think it should be pretty safe to have this enabled by default
+
+For our environment, the plan is to default to true, so I am ok with this. Another option is to default this to false for now and after "some time" we change the default to true... the hard part is when "some time" is as this is super edge case-y (small number of times within a year).
+
+Ill leave this open for now, give time for [~samt] to comment as well.
+
+bq. or even remove this knob altogether
+
+I am a fan of feature flags, so rather keep it to revert back if there is ever seen a reason to.
+
+
++1 to keeping the flag and defaulting it to true.
+
+Thanks for the feedback, ill keep the flag and switch to true.
+
+Starting commit
+
+CI Results (pending):
+||Branch||Source||Circle CI||Jenkins||
+|trunk|[branch|https://github.com/dcapwell/cassandra/tree/commit_remote_branch/CASSANDRA-16213-trunk-699BF5AE-697A-4899-A74F-38E44BCB85C7]|[build|https://app.circleci.com/pipelines/github/dcapwell/cassandra?branch=commit_remote_branch%2FCASSANDRA-16213-trunk-699BF5AE-697A-4899-A74F-38E44BCB85C7]|[build|https://ci-cassandra.apache.org/job/Cassandra-devbranch/269/]|
+
+
+Thanks all for the review!
+

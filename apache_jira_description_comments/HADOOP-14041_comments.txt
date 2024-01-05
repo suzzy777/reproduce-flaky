@@ -1,0 +1,759 @@
+Attaching a patch that adds prune(timestamp) to the MetadataStore interface and existing implementations, a CLI tool, and tests for all of that. prune() takes a UTC timestamp as returned by System.currentTimeMillis() and should trim everything with a modification time older than that. The CLI tool determines the timestamp by taking the current time and subtracting various lengths of time. One tricky thing is you can specify minutes with -M, and all the time ranges are in caps so that doesn't clash with -m for specifying the metastore URL.
+
+One thing that probably needs more work is what to do about directories. The local implementation will delete its record of a directory if all the files it tracks in that directory get pruned. I should at least do the equivalent for the DynamoDB implementation, but since there's been some special consideration for handling empty directories that may warrant some more thought. I know [~fabbri]'s been thinking about the nuances of empty directories - any thoughts on that?
+
+All tests pass except as currently documented in other JIRAs. I did for a time have a lot of tests fail at the assertion of type S3AFileStatus in PathMetadataDynamoDBTranslation.pathMetadataToItem. Indeed, we do have a lot of instances of FileStatus (S3AFileStatus' parent class) flying around S3Guard, so I'm surprised I don't get it consistently, but today all the tests are passing. I can't see how anything I've changed while working on this patch would impact it. So just throwing this out there in case others have seen it or have any insight.
+
+Been thinking about it some more and cleaning up directories is very tricky. One problem is that since we don't put a mod_time on directories (presumably just because S3 doesn't?) so it's impossible to distinguish between a directory that has existed for a long time and has had all of it's contents pruned, vs. a directory that was just created recently and had no contents to prune (yet). Putting a mod_time on a directory could be done in 2 days: we could just use that as a creation time, or a time when it's list of children changed. If it's only used for deciding when to prune old metadata, using it as creation time allows us to clean very old directories that don't have more recent children without the overhead of updating it every time we add or modify a child. But that might be a bit of a departure from the meaning expressed by "modification time".
+
+I'm thinking a couple of things:
+
+1) For now, I think I'll just prune directories that did have contents, but are now completely empty post-prune. Later, maybe we can add mod_time for directories and clean up directories that are old enough to be pruned and are empty, even though they didn't have children removed in the prune. The more I think about it, the more I think that will be rare and not worth adding mod_time to all directories just to clean it up more nicely.
+
+2) Having thought about the gap between identifying files to prune and which directories to prune, it's probably better to do this in very small batches. It's okay for this prune command to take a longer time to run because we're making many round trips. The benefit of that is we minimize the window in which files can get created in a directory that is being cleaned up and might be considered empty. It also minimized impact on other workloads.
+
+So ultimately I'm thinking the best way to do this is to clean up directories that did have children but had them all pruned (and THEIR parents if the same is now true of the parent directory), and to do this in very small batches or even individually. The more I think about it, it's probably not worth adding mod_time to directories to handle this any more completely. Would love to hear others' input, though.
+
+Attaching a patch that has added documentation, and better handling of directories. The behavior is that if a directory's contents gets pruned and is now empty, we will also prune that directory (and so on, for its parents, as long as they're empty). Added tests to cover those considerations. Tested against us-east-1.
+
+Not sure if I've mentioned these already, but I'm seeing failures in the tests of the table versioning. Pretty certain it's not related, so just calling it out. I'll file a JIRA about it.
+{code}
+TestDynamoDBMetadataStore.testTableVersionMismatch:382->verifyTableInitialized:487 » ResourceNotFound
+TestDynamoDBMetadataStore.testTableVersionRequired:367->verifyTableInitialized:487 » ResourceNotFound
+{code}
+
+Thanks for the hard work on this [~mackrorysd].  Will try to get you a review by mid-day Monday.
+
+I also saw that error.  Do you have a table name defined in your src/test/resources core-site.xml/auth-keys.xml?  If so it may be that the table name that the test overrides that config with is getting set too late.  I think it went away when I removed the table name from my config.  
+
+A couple of thoughts on this patch:
+
+1. I think prune() should be optional for implementations.   prune() is an offline algorithm for evicting old metadata from the metadata store.  Some implementations (i.e. LocalMetadataStore) probably want to do this as an online algorithm.  When I get around to doing HADOOP-13649, I would probably remove the prune() function there and do eviction as we go from the clients' accesses.
+
+2. I think the work here should be broken up into batches, and there should be a sleep parameter to the prune function "batchSleepMsec" which is the number of milliseconds the implementation should sleep between pruning batches.  This is a simple way to have a tunable "niceness" parameter for the process.  This allows users to minimize impact to production jobs by making it much less likely that provisioned capacity will be exceeded.
+
+3. The directory pruning has a couple of issues.  I'm wondering if we should omit directory pruning from the v1 of this.   Currently it builds a set of all directories in the whole metadata store, in memory, then checks each one if it is empty, and prunes it if so.  This could be optimized some, but the problems of having everything in memory, and of potentially breaking the "all paths to root are stored" invariant of the DDB data remains.
+
+Let me share a variation on this algorithm I'm thinking of:
+
+*Phase 1*: prune files.
+{noformat}
+while (number_pruned > 0) :
+    paths = table_scan(mod_time < x && is_dir==false, limit=BATCH_SIZE)
+    do_batched_delete(paths)
+    number_pruned = paths.size()
+    sleep(batchSleepMsecs)
+{noformat}
+
+*Phase 2*: directory pruning
+Change meaning of mod_time for directories in DDB: it is create time.
+{noformat}
+while (number_pruned > 0) :
+   paths = table_scan(mod_time < x && is_dir==true, limit=BATCH_SIZE)
+   emptyOldDirs = paths.filter(isEmptyDir(x))
+   do_batched_delete(emptyOldDirs)
+{noformat}
+
+Phase 2 is still subject to races where a file is placed into a directory right after we evaluate isEmptyDir(path).  Solving this with DDB doesn't seem trivial.  For now we could expose an option for prune() where the caller can select to prune just files, or to prune files and directories, with the caveat that directory pruning should not happen if there are other clients actively modifying the filesystem?
+
+
+Okay - let's punt on directory pruning for now. Adding mod_time to directories or addressing the other concerns you've raised would be a big enough deal to be a separate issue, I think. So I'll file JIRAs to address that if we go with the approach I just attached.
+
+In this patch I remove the directory logic, but add back a test to confirm that directories are not getting removed yet (with a comment about why we check for that behavior).
+
+I also got a request to make the default age configurable (e.g. in .xml files) so individual commands don't need to specify it. I think that's a good idea, but I'm not sure if there's a precedent / established naming convention for that in CLI commands. I think it makes a lot of sense to do that, especially since if you don't specify things like the metastore table / endpoint it does fall back on what's configured. I still have it so you can override with "-H 12", for instance, on the command-line.
+
+Thank you for the patch.  Overall it looks pretty good.  A couple of things need addressing.  The core-default and the InterruptedException are the important ones.
+
+{noformat}
++  @InterfaceStability.Unstable
++  public static final String S3GUARD_CLI_PRUNE_AGE =
++      "fs.s3a.s3guard.cli.prune.age";
+{noformat}
+
+Probably want a snippet in core-default.xml.
+
+{noformat}
++  @InterfaceStability.Unstable
++  public static final String S3GUARD_DDB_BATCH_SLEEP_MSEC_KEY =
++      "fs.s3a.s3guard.ddb.batch.sleep";
++  public static final int S3GUARD_DDB_BATCH_SLEEP_MSEC_DEFAULT = 25;
+{noformat}
+
+Same here.  Also wondering if we should call this "...ddb.prune.batch.sleep" as to not cause confusion with stuff like HADOOP-13904.  I think prune is going to remain a special case since it is a background priority job.  We could also call it "...ddb.background.sleep" to future-proof it for other background tasks (e.g. if we introduced an background scrubber or integrity checker?
+
+{noformat}
++    deletionBatch.add(path);
++          if (deletionBatch.size() == S3GUARD_DDB_BATCH_WRITE_REQUEST_LIMIT) {
++            Thread.sleep(delay);
++            processBatchWriteRequest(pathToKey(deletionBatch), new Item[0]);
++          }
++        } catch (IOException e) {
++          LOG.error(e.getMessage());
++        }
++        if (deletionBatch.size() > 0) {
++          Thread.sleep(delay);
++          processBatchWriteRequest(pathToKey(deletionBatch), new Item[0]);
++        }
+{noformat}
+
+Minor nit: I would make sleep happen between batches (not before the first).  e.g. 
+
+{noformat}
+long batchCount = 0;
+...
+deletionBatch.add(path);
+if (deletionBatch.size() == S3GUARD_DDB_BATCH_WRITE_REQUEST_LIMIT) {
+    if (batchCount++ > 0) {    // don't sleep before first batch
+        Thread.sleep(delay); 
+    }
+    processBatchWriteRequest(pathToKey(deletionBatch), new Item[0]);
+...
+{noformat}
+
+You could also use that for an interesting log message {{LOG.debug("Finished processing {} batches", batchCount);}}
+
+{noformat}
++    } catch (InterruptedException e) {
++      LOG.warn("Pruning operation was interrupted!");
++    }
+{noformat}
+You need to propagate this exception, or set the threads' interrupt status.
+
+
+
+
+
+
+{quote}Minor nit: I would make sleep happen between batches (not before the first).{quote}
+
+I went with this because the first batch immediately follows a large request, so it would be appropriate to pause for a breath anyway.
+
+The 25ms delay is entirely arbitrary - if other folks have opinions on a better default, I'd love to have some reasoning for what we go with. If anything I suspect it should probably be longer.
+
+Attaching a patch that address all other feedback from [~fabbri]
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 16s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 4 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  1m 58s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 12m 43s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 12m 47s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 32s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 29s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 42s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m  1s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 11s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 16s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 59s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 11m 18s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 11m 18s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 34s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 33s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 44s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} xml {color} | {color:green}  0m  2s{color} | {color:green} The patch has no ill-formed XML file. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 23s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} javadoc {color} | {color:red}  0m 25s{color} | {color:red} hadoop-tools_hadoop-aws generated 1 new + 0 unchanged - 0 fixed = 1 total (was 0) {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}  8m 14s{color} | {color:red} hadoop-common in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}  0m 45s{color} | {color:red} hadoop-aws in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 39s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 89m  3s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.security.TestKDiag |
+|   | hadoop.fs.s3a.s3guard.TestDynamoDBMetadataStore |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:a9ad5d6 |
+| JIRA Issue | HADOOP-14041 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12852602/HADOOP-14041-HADOOP-13345.004.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  xml  findbugs  checkstyle  |
+| uname | Linux c658e2598be4 3.13.0-106-generic #153-Ubuntu SMP Tue Dec 6 15:44:32 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | HADOOP-13345 / 2c3f575 |
+| Default Java | 1.8.0_121 |
+| findbugs | v3.0.0 |
+| javadoc | https://builds.apache.org/job/PreCommit-HADOOP-Build/11624/artifact/patchprocess/diff-javadoc-javadoc-hadoop-tools_hadoop-aws.txt |
+| unit | https://builds.apache.org/job/PreCommit-HADOOP-Build/11624/artifact/patchprocess/patch-unit-hadoop-common-project_hadoop-common.txt |
+| unit | https://builds.apache.org/job/PreCommit-HADOOP-Build/11624/artifact/patchprocess/patch-unit-hadoop-tools_hadoop-aws.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/11624/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common hadoop-tools/hadoop-aws U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/11624/console |
+| Powered by | Apache Yetus 0.5.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+I missed the javadoc issue locally. The hadoop-common failures are not related. The hadoop-aws failure is something I've seen a lot locally and have mentioned elsewhere but it seems no one else was seeing it and occasionally I don't see it (no idea how - we use FileStatus all over S3Guard). Removing the assertion and not casting to S3AFileStatus in that function makes everything work nicely. Has no one else seen this failure?
+
+I'll upload a new patch that addresses the javadoc oversight.
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 15s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 4 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  1m 57s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 12m 44s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 12m 35s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 31s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 27s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 41s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m  1s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 12s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 17s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 59s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 11m  1s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 11m  1s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 34s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 33s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 44s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} xml {color} | {color:green}  0m  1s{color} | {color:green} The patch has no ill-formed XML file. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 24s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 17s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}  8m 12s{color} | {color:red} hadoop-common in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}  0m 45s{color} | {color:red} hadoop-aws in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 38s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 88m 28s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.security.TestKDiag |
+|   | hadoop.fs.s3a.s3guard.TestDynamoDBMetadataStore |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:a9ad5d6 |
+| JIRA Issue | HADOOP-14041 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12852640/HADOOP-14041-HADOOP-13345.005.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  xml  findbugs  checkstyle  |
+| uname | Linux 8a2f8aebbd12 3.13.0-106-generic #153-Ubuntu SMP Tue Dec 6 15:44:32 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | HADOOP-13345 / 2c3f575 |
+| Default Java | 1.8.0_121 |
+| findbugs | v3.0.0 |
+| unit | https://builds.apache.org/job/PreCommit-HADOOP-Build/11625/artifact/patchprocess/patch-unit-hadoop-common-project_hadoop-common.txt |
+| unit | https://builds.apache.org/job/PreCommit-HADOOP-Build/11625/artifact/patchprocess/patch-unit-hadoop-tools_hadoop-aws.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/11625/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common hadoop-tools/hadoop-aws U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/11625/console |
+| Powered by | Apache Yetus 0.5.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+[~mackrorysd] Any idea what is up with the jenkins unit failures here?
+
+[~fabbri] Oh you know what? That's what I'm talking about here: https://issues.apache.org/jira/browse/HADOOP-13736
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 13s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 4 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 14s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 12m 58s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 13m 50s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  2m  4s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 46s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 36s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 13s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 11s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 18s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m 14s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 12m 30s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 12m 30s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 37s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 34s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 45s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} xml {color} | {color:green}  0m  1s{color} | {color:green} The patch has no ill-formed XML file. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 29s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 20s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}  8m 59s{color} | {color:red} hadoop-common in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 50s{color} | {color:green} hadoop-aws in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 36s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 91m 30s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.security.TestKDiag |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:a9ad5d6 |
+| JIRA Issue | HADOOP-14041 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12852640/HADOOP-14041-HADOOP-13345.005.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  xml  findbugs  checkstyle  |
+| uname | Linux 38d5fc14a83e 3.13.0-106-generic #153-Ubuntu SMP Tue Dec 6 15:44:32 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | HADOOP-13345 / 94287ce |
+| Default Java | 1.8.0_121 |
+| findbugs | v3.0.0 |
+| unit | https://builds.apache.org/job/PreCommit-HADOOP-Build/11638/artifact/patchprocess/patch-unit-hadoop-common-project_hadoop-common.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/11638/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common hadoop-tools/hadoop-aws U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/11638/console |
+| Powered by | Apache Yetus 0.5.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Your latest patch looks good to me, +1.
+
+I'm fine with the default sleep value.  It is at least tunable now, which is great.  Some folks may want it to go fast, others will want to minimize impact to DDB provisioned IO for other live workloads.
+
+Yetus looks clean except for TestKDiag stuff which I believe is unrelated (HADOOP-14030).
+
+I will do some testing and commit this if all looks good.
+
+
+
+Just recording results from my test runs last night:
+mvn clean verify -Ds3guard -Ddynamo -Dscale
+Tests run: 366, Failures: 3, Errors: 2, Skipped: 70
+
+{noformat}
+Failed tests:
+(1)  ITestS3AContractRootDir>AbstractContractRootDirectoryTest.testRecursiveRootListing:222->Assert.assertTrue:41->Assert.fail:88 files mismatch:   "s3a://fabbri-dev/user/fabbri/test/file"  "s3a://fabbri-dev/user/fabbri/test/parentdir/child"
+(2)  ITestS3AContractRootDir>AbstractContractRootDirectoryTest.testRmEmptyRootDirNonRecursive:95->Assert.fail:88 After 1 attempts: listing after rm /* not empty
+final [00] S3AFileStatus{path=s3a://fabbri-dev/Users; isDirectory=true; modification_time=0; access_time=0; owner=fabbri; group=fabbri; permission=rwxrwxrwx; isSymlink=false} isEmptyDirectory=false
+(3)  ITestS3AContractRootDir.testListEmptyRootDirectory:63->AbstractContractRootDirectoryTest.testListEmptyRootDirectory:186->Assert.fail:88 Deleted file: unexpectedly found s3a://fabbri-dev/user as  S3AFileStatus{path=s3a://fabbri-dev/user; isDirectory=true; modification_time=0; access_time=0; owner=fabbri; group=fabbri; permission=rwxrwxrwx; isSymlink=false} isEmptyDirectory=false
+
+Tests in error:
+(4)  ITestS3ACredentialsInURL.testInstantiateFromURL:86 » InterruptedIO initTable: ...
+(5)  ITestS3GuardToolDynamoDB.testDestroyDynamoDBMetadataStore:145 » IO S3Guard tab...
+{noformat}
+
+1-3 are root directory test failures which have been flaky.. one is leftover files from FileSystemContractBaseTest, the other two are something creating a user/ directory while test is running? 
+
+4 is expected: s3guard will not use URI credentials.  (We should skip this if we don't already do that in pending patch)
+5 is this: S3Guard table lacks version marker. Table: destroyDynamoDBMetadataStore-1546206104
+        at org.apache.hadoop.fs.s3a.s3guard.DynamoDBMetadataStore.verifyVersionCompatibility(DynamoDBMetadataStore.java:667)
+        at org.apache.hadoop.fs.s3a.s3guard.DynamoDBMetadataStore.initTable(DynamoDBMetadataStore.java:630)
+        at org.apache.hadoop.fs.s3a.s3guard.DynamoDBMetadataStore.initialize(DynamoDBMetadataStore.java:288)
+
+I don't think any of these are related, except maybe the last one?
+
+As for testing the prune command itself, the first thing I notice is that it behaves a bit differently than, say, diff.  Diff appears to use bucket name as table name if one is not set, but prune requires setting the table name.
+
+{noformat}
+$ hadoop s3a prune -H 1 s3a://fabbri-bucket
+No DynamoDB table name configured!
+{noformat}
+
+
+Also, shouldn't this work?
+
+{noformat}
+$ hadoop s3a -Dfs.s3a.s3guard.ddb.table=fabbri-bucket prune -H 1 s3a://fabbri-bucket
+Usage: hadoop s3a [init|destroy|import|diff|prune] [OPTIONS] [ARGUMENTS]
+        perform metadata store administrative commands for s3a filesystem.
+{noformat}
+
+Test failure #5 is addressed by HADOOP-14046. The version marker patch went in after I had last run that tests when cleaning up the original S3GuardTool tests and it breaks.
+
+I'll make the change required to have an S3 path provide that instead. I'm really surprised your last example behaves differently. I don't like the logic for determining how the CLI tools connect to the metastore and it's been an issue a couple of times now. What if we drop the "-m dynamodb:// " notion entirely and just use configuration + optional S3 path to connect?
+
+
+
+[~mackrorysd] I'm also fine with doing a followup "S3guard CLI improvements" JIRA.. there are multiple related issues I'd like to tackle.. So I'm fine with committing this patch (once I finish my testing) and then filing new JIRA.
+
+This usage also doesn't work:
+
+{noformat}
+$ hadoop s3a prune -H 2 -m dynamodb://fabbri-bucket s3a://fabbri-bucket
+2017-02-16 14:02:26,320 INFO s3guard.S3GuardTool: create metadata store: dynamodb://fabbri-dev scheme: dynamodb
+2017-02-16 14:02:26,456 WARN util.NativeCodeLoader: Unable to load native-hadoop library for your platform... using builtin-java classes where applicable
+2017-02-16 14:02:27,191 ERROR s3guard.DynamoDBClientFactory: Incorrect DynamoDB endpoint: null
+java.lang.IllegalArgumentException: endpoint cannot be null
+        at com.amazonaws.util.RuntimeHttpUtils.toUri(RuntimeHttpUtils.java:147)
+        at com.amazonaws.AmazonWebServiceClient.toURI(AmazonWebServiceClient.java:224)
+{noformat}
+
+Similar error doing {{hadoop s3a prune -H 2 -m dynamodb://fabbri-bucket -e dynamodb.us-west-2.amazonaws.com}}
+
+why in {{DynamoDBMetadataStore}} line 584 IOE .getMessage() logged, but not details and not rethrown.
+
+if the IOEs really are to be swallowed, then it should be a full log.warn. Though I think it should actually just throw up the IOE to the caller. Why? for tests to show something failed, for management tools calling it direct to detect the same, and for CLI tools to report and return an error code. Something has gone wrong
+
+Thanks for the reviews, all - good stuff.
+
+The problems [~fabbri] saw boil down to 2 things, one of which I fixed: I had not tested this with anything being inferred from an S3 path, and I wasn't trying to parse and use that like the other commands. That is now fixed and added to the tests. The other thing is that it appears to not be parsing generic options (which does indeed seem wrong - according to the docs, if you implement Tool you should get that for free - and we do), but the behavior wouldn't be what you expect anyway because it will set the table config based on the -m flag or the S3 path you provide. I think the CLI behavior is badly defined here in general, so I've filed HADOOP-14094 to really rethink what options are exposed and how.
+
+I like [~stevel@apache.org]'s recommendation to just throw the IOException. I think what I was thinking was that if there's an issue deleting one row, we can keep retrying the others. But I think an exception that affects one row but not subsequent others is probably unlikely, so it's worth bubbling that up so we know about the problem. Also, removing that block highlighted that my batching logic was bad: instead of processing complete batches inside the loop and processing whatever is left over afterwards, I was effectively always processing whatever contents the batch had at the end of each iteration. That's been fixed, and I tested the number of events was correct with several hundred objects getting pruned.
+
+On a related note, I also changed the log message to INFO and had it count items and report batch size rather than just the number of batches. Without that the last message you get out-of-the-box on the CLI is that the metastore has been initialized, which is misleading. It will now log when the metadatastore connection has been initialized and then finish off by logging how many items were deleted and what he batch size was. I think that's more friendly: and probably something we want to do more of for the other commands if / when we rethink the interface.
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 22s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 4 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 19s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 15m 10s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 13m  0s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 31s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 31s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 47s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m  2s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 13s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 16s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m  1s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 11m 46s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 11m 46s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 37s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 36s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 45s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} xml {color} | {color:green}  0m  3s{color} | {color:green} The patch has no ill-formed XML file. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  7m 53s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 18s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}  8m 37s{color} | {color:red} hadoop-common in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 47s{color} | {color:green} hadoop-aws in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 42s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 97m 12s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.fs.sftp.TestSFTPFileSystem |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:a9ad5d6 |
+| JIRA Issue | HADOOP-14041 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12853293/HADOOP-14041-HADOOP-13345.006.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  xml  findbugs  checkstyle  |
+| uname | Linux a931b4ee63e0 3.13.0-107-generic #154-Ubuntu SMP Tue Dec 20 09:57:27 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | HADOOP-13345 / 8b37b6a |
+| Default Java | 1.8.0_121 |
+| findbugs | v3.0.0 |
+| unit | https://builds.apache.org/job/PreCommit-HADOOP-Build/11653/artifact/patchprocess/patch-unit-hadoop-common-project_hadoop-common.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/11653/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common hadoop-tools/hadoop-aws U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/11653/console |
+| Powered by | Apache Yetus 0.5.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Thanks for the follow-up patch [~mackrorysd].  Looks good.. Of the comments below, I think the important ones are the prune() method prototype, and errors going to stderr.
+
+{noformat}
++  public void testPruneDirs() throws Exception {
++    // This test does not necessarily define required behavior: directories
++    // that become empty after a prune operation could be cleaned up, but
++    // currently they don't because if a file was created in that directory
++    // mid-prune, it would violate the invariant that all ancestors of a file
+{noformat}
+
+Tiny nit: this invariant is an implementation detail of the dynamo MS.  Not a MetadataStore invariant per se.  Could mention the word dynamo here.
+
+{noformat}
++    // exist in the metastore. If an implementation could satisfy this, it
++    // would be okay for this test not to pass.
++    Assume.assumeFalse(ms instanceof NullMetadataStore);
++    createNewDirs("/pruneDirs/dir");
+{noformat}
+
+Did you mean to change this Assume to call {{supportsPruning()}}?
+Technically, seems like you should use that, and maybe {{allowMissing()}}?  Basically, when allowMissing() returns true, the metadata store may not return results you just put into it (like a cache where something got evicted before you asked for it again).
+
+{noformat}
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStore.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStore.java
+@@ -165,4 +165,15 @@ void move(Collection<Path> pathsToDelete, Collection<PathMetadata>
+    * @throws IOException if there is an error
+    */
+   void destroy() throws IOException;
++
++  /**
++   * Clear any metadata older than a specified time from the repository. Note
++   * that modification times should be in UTC, as returned by System
++   * .currentTimeMillis at the time of modification.
++   *
++   * @param modTime Oldest modification time to allow
++   * @throws IOException if there is an error
++   * @throws InterruptedException if the process is interrupted
++   */
++  void prune(long modTime) throws InterruptedException, IOException;
+ }
+{noformat}
+Couple of things:
+1. We should mention here that implementations:  *must* clear any file metadata older than modTime, *may* clear any directory metadata older than modTime, and throw an UnsupportedOperationException(*) otherwise?
+2. Instead of declaring a checked exception (InterruptedException), IMO, that should always be wrapped in an IOException.. So this should only be throws IOException.
+
+(*) [~stevel@apache.org] is this the idiomatic thing to do here in Hadoop?
+
+{noformat}
+--- a/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/NullMetadataStore.java
++++ b/hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/NullMetadataStore.java
+@@ -87,6 +87,10 @@ public void destroy() throws IOException {
+   }
+  
+   @Override
++  public void prune(long modTime) throws IOException {
++  }
++
+{noformat}
+Love the algorithm here.   Classic no-op, my fave.
+
+{noformat}
++      if (confDelta <= 0 && cliDelta <= 0) {
++        System.out.println(
++            "You must specify a positive age for metadata to prune.");
++      }
++
+{noformat}
+I think this should go to stderr (search for "stderr" [here|https://hadoop.apache.org/docs/current/hadoop-project-dist/hadoop-common/FileSystemShell.html]).
+
+{noformat}
+--- a/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestNullMetadataStore.java
++++ b/hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestNullMetadataStore.java
+@@ -51,6 +51,12 @@ public boolean allowMissing() {
+     return true;
+   }
+  
++  /** This MetadataStore won't store anything, so there's nothing to prune. */
++  @Override
++  public boolean supportsPruning() {
++    return false;
++  }
+{noformat}
+
+This part of the change could be left out, I think?  NullMetadataStore always prunes!  Where prune is defined as removing anything older than X.. always true for empty set.  :-)
+
+{quote}This part of the change could be left out, I think? NullMetadataStore always prunes! Where prune is defined as removing anything older than X.. always true for empty set. {quote}
+
+Trouble is that to make this testable pruning has to be defined as ONLY pruning what it should. NullMetadataStore tends to get a little carried away at that part. So like you said - may be closely linked with allowMissing. Will rev the patch on all the other input...
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 18s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 4 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  1m 50s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 12m 35s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 12m 44s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 29s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 28s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 38s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m  1s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 12s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 16s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 59s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 11m 28s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 11m 28s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 34s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 34s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 45s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} xml {color} | {color:green}  0m  1s{color} | {color:green} The patch has no ill-formed XML file. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 23s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 18s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}  8m 13s{color} | {color:red} hadoop-common in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 47s{color} | {color:green} hadoop-aws in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 38s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 88m 51s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.security.TestKDiag |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:a9ad5d6 |
+| JIRA Issue | HADOOP-14041 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12853440/HADOOP-14041-HADOOP-13345.007.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  xml  findbugs  checkstyle  |
+| uname | Linux de9cbbe3214b 3.13.0-106-generic #153-Ubuntu SMP Tue Dec 6 15:44:32 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | HADOOP-13345 / 8b37b6a |
+| Default Java | 1.8.0_121 |
+| findbugs | v3.0.0 |
+| unit | https://builds.apache.org/job/PreCommit-HADOOP-Build/11655/artifact/patchprocess/patch-unit-hadoop-common-project_hadoop-common.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/11655/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common hadoop-tools/hadoop-aws U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/11655/console |
+| Powered by | Apache Yetus 0.5.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Current convention w.r.t interrupts tends to be one of
+
+* call {{Thread.interrupt()}} to mark the thread as interrupted again.
+* throw an {{InterruptedIOException}}, wrapping the inner InterruptedException
+* some classes which don't declare "throws IOE" wrap it in a generic RuntimeException (bad).
+
+I don't know which is better, I'm sure in decades to come people will curse our decision whatever it is.
+
+Thanks for the folow-up patch [~mackrorysd].  This is looking good. I'm generally +1 on this but am  attaching a patch that makes a couple of minor changes.  
+
+- Remove a whitespace change.
+- NullMetadataStore does support prune(), it is a no-op (matching with the rest of that class).
+- MetadataStoreTestBase tests the contract semantics (any files older than X are removed), not the specific DynamoDBMetadataStore behavior of leaving directories (that could be added in the TestDynamoDBMetadataStore subclass).
+- Use allowMissing() in a finer-grained manner: we can still run the test and assertNotCached() when allowMissing().
+
+I tested the three MetadataStore integration tests in US West 2.
+
+
+Looks good - +1
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 19s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 3 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  1m 55s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 14m 31s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 14m 43s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 48s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 45s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 39s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m  0s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 12s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 16s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m  0s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 10m 22s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 10m 22s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 34s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 32s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 45s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} xml {color} | {color:green}  0m  2s{color} | {color:green} The patch has no ill-formed XML file. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 22s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 17s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}  8m 13s{color} | {color:red} hadoop-common in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 48s{color} | {color:green} hadoop-aws in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 38s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 92m 23s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.security.TestKDiag |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:a9ad5d6 |
+| JIRA Issue | HADOOP-14041 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12853594/HADOOP-14041-HADOOP-13345.008.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  xml  findbugs  checkstyle  |
+| uname | Linux 5fa7b54ece64 3.13.0-106-generic #153-Ubuntu SMP Tue Dec 6 15:44:32 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | HADOOP-13345 / 8b37b6a |
+| Default Java | 1.8.0_121 |
+| findbugs | v3.0.0 |
+| unit | https://builds.apache.org/job/PreCommit-HADOOP-Build/11659/artifact/patchprocess/patch-unit-hadoop-common-project_hadoop-common.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/11659/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common hadoop-tools/hadoop-aws U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/11659/console |
+| Powered by | Apache Yetus 0.5.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+v9 patch..
+
+- Rebase on latest feature branch after DDB throttling and listStatus fix were committed.
+- Change IOException to InterruptedIOException in DDB prune().
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 21s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 3 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 44s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 12m 31s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 11m 55s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 30s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 28s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 39s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m  3s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 11s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 16s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m  1s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 10m 37s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 10m 37s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 35s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 33s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 45s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} xml {color} | {color:green}  0m  2s{color} | {color:green} The patch has no ill-formed XML file. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 21s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 18s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}  8m 14s{color} | {color:red} hadoop-common in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 47s{color} | {color:green} hadoop-aws in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 39s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 86m 17s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.security.TestKDiag |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:a9ad5d6 |
+| JIRA Issue | HADOOP-14041 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12853616/HADOOP-14041-HADOOP-13345.009.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  xml  findbugs  checkstyle  |
+| uname | Linux b8aa84dfe4bf 3.13.0-106-generic #153-Ubuntu SMP Tue Dec 6 15:44:32 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | HADOOP-13345 / 7a1bce5 |
+| Default Java | 1.8.0_121 |
+| findbugs | v3.0.0 |
+| unit | https://builds.apache.org/job/PreCommit-HADOOP-Build/11664/artifact/patchprocess/patch-unit-hadoop-common-project_hadoop-common.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/11664/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common hadoop-tools/hadoop-aws U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/11664/console |
+| Powered by | Apache Yetus 0.5.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Committed to HADOOP-13345 feature branch.
+
+Thank you for the great work on this [~mackrorysd] and thanks [~stevel@apache.org] for the feedback on exceptions.
+

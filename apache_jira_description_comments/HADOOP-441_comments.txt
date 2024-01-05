@@ -1,0 +1,193 @@
+The constructors should probably take class instances rather than class names.  Codecs should be based on DeflaterOutputStream and InflaterInputStream, but it would be best to write just one name to the file.  So we might add a compressor factory interface like:
+
+public interface CompressionCodec extends Configurable {
+  DeflaterOutputStream createDeflaterOutputStream(OutputStream out);
+  InflaterInputStream createInflaterInputStream(InputStream in);
+}
+
+Then the constructors would take an instance of this interface and write the name of that class into the file.  Implementations would be required to provide a public default constructor.
+
+We might also add methods like the following to this interface:
+
+  void writeVersion(DataOutputStream out);
+  void readVersion(DataInputStream in) throws VersionMismatchException;
+
+That would permit folks to safely revise a codec without having to use a new class name.
+
+Doug,
+
+  Conceptually this makes sense, I'm all for it.
+  
+  There is one irritant with the create methods for DeflaterOutputStream/InflaterInputStream in CompressionCodec... it's got to do with the Deflater/Inflater fields for streams respectively. Specifically the issue is we need to pass in our own Deflater/Inflater objects in order to be able to 'reset' the internal compressor/decompressor of the respective streams; this ability to 'reset' is otherwise absent (since we can't access those 'protected' fields) as is crucial for SequenceFile's block compression (in the case where next(key,val) is followed by next(key) and block boundary is hit). We probably need to define our own interface for compressor/decompressor streams or atleast have the CompressionCodec work with an extended class of DeflaterOutputStream/InflaterInputStream (which will have the 'reset' functionality we need).
+
+ Thoughts?
+
+I like the idea, but DeflaterOutputStream and InflaterInputStream are zlib specific.
+
+How about three interfaces in hadoop.io:
+
+public interface CompressionOutputStream {
+...
+}
+
+public interface CompressionInputStream {
+...
+}
+
+public interface CompressionCodec {
+  CompressionOutputStream createOutputStream(OutputStream out);
+  CompressionInputStream createInputStream(InputStream in);
+}
+
+I guess it would also be nice if the codec class had a default extension:
+
+interface CompressionCodec {
+  ... previous stuff
+  // return the default filename extension
+  String getDefaultExtension();
+}
+
+Another option is to live without 'reset':
+
+public interface CompressionCodec extends Configurable {
+  DataOutputStream getDeflater(OutputStream out);
+  DataInputStream getInflater(InputStream in);
+  String getDefaultExtension(); 
+} 
+
+A new output stream can be created for each compressed block.  With block compression, this should not be so frequent that performance is significantly affected.  If compressor setup time is significant, then codec could pool compressors as an optimization.  When a stream is closed then the compressor can be reset and returned to a pool for re-use.  Simpler yet, the codec could save the last stream closed, and, if a new call has the same parameters, reset and return the entire stream.  This way there would be no new object allocation per block.
+
+
+Doug,
+
+  If I'm not missing something here... we can reuse the compressor by having one 'Deflater/Inflater' object per Writer/Reader instead of the pool right? Even then creating the stream with the above compressor will probably be quite significant for RecordCompressWriter where we would need to do this per record? Appreciate any further details on this one.
+
+ Also, I'm concerned this solution will be quite gzip specific, which be unsuitable for a generic 'custom' compressor... thoughts?
+
+Wrt to the new Compression{Input|Output}Stream interfaces proposed by Owen, here are some thoughts and alternatives...
+
+(Since then a new idea is to have the the above 'compression streams' implement the Data{Input|Output} interfaces, so that they can be passed along to the write/readFields methods of Writable objects i.e. bridge a 'stream' with Data{Input|Output})
+
+a) 
+
+public abstract class CompressionOutputStream extends DataOutputStream {
+  public abstract int write();
+  public abstract int write(byte[], int, int);
+  public abstract void resetCompressionState(); // 'reset'
+  public abstract void finish(); // Finishes writing compressed data to the output stream without closing the underlying stream.
+}
+
+Here we let DataOutputStream's other public methods (writeBoolean, writeInt etc.) be as-is, based on assumption that they all _will_ internally call the two abstract 'write' methods which correctly 'compress'. (Valid assumption on all jvms and on all platforms across versions?)
+
+Since DataInputStream's 'read' is marked 'final':
+public abstract class CompressionInputStream implements DataInput {
+  public abstract int read();
+  public abstract int read(byte[], int, int);
+  public abstract void resetCompressionState(); // 'reset'
+
+  // Other interfaces of DataInput are provided concrete implementations
+}
+
+
+b) 
+
+Same CompressionInputStream but get CompressionOutputStream to implement DataOutput instead of DataOutputStream to maintain symmetry - this approach has the drawback that we will need to provide concrete implementations of other public interfaces of DataOutput; only maintaining symmetry.
+
+
+c)
+
+ To provide a 'true bridge' between streams and Writables we can create other classes:
+
+public abstract class WritableOutputStream implements DataOutput (extends DataOutputStream) {
+}
+
+public abstract class WritableInputStream implements DataInput {
+}
+
+public class CompressionOutputStream extends  WritableOutputStream {
+}
+
+public class CompressionInputStream extends DataInput WritableInputStream {
+}
+
+ Thus it will provide a more general bridge between streams and Writables and enable other {In|Out}putStream implementations in future. (This can also be a separate issue...)
+
+
+Thoughts?
+
+This patch is just the codec interfaces that are shared between this issue and HADOOP-474. It basically creates an interface for compression codecs that can create input and output streams. The output stream extends DataOutputStream, so that it can be used for Writable. The input stream just extends the FilteredInputStream because DataInputStream declares read(byte[], int, int) to be final.
+
+Ok, we want to change the parent class of CompressOutputStream to be FilteredOutputStream instead of DataOutputStream to be symmetric with the input stream.
+
+We also should add a "finish" method on the output stream to finish the compression without closing the underlying stream.
+
+
+Overall this looks good.
+
+On CompressionInputStream and CompressionOutputStream, the methods of FilterInputStream and FilterOutputStream should not repeated as abstract method.  That's overly paranoid and clutters the code, making it hard to see how this differs from a normal stream.  These should have only an abstract resetState() method and a ctor.  It seems FilterInputStream isn't buying much, perhaps it would be simpler to extend InputStream and OutputStream directly: that would give you most of what you're trying to defeat in the Filter classes.
+
+
+The FilterInputStream & FilterOutputStream are saving a little code since they keep the field and handle flush & close. But it isn't a big deal either way.
+
+And we absolutely need to make the write(byte, int, int) abstract because the implementation in both FilterOutputStream and OutputStream implementations are horrible. (They call write(int) byte by byte for each element of the array.) Remember, this is the bug that was causing Hadoop to buffer up the RPC commands only to send them byte by byte over the wire.
+
+If we use OutputStream then at least write(int) is already abstract, so we don't need to worry about it. But in general, i think that as part of designing these APIs we do need to be very careful about the default implementations of these methods. Making them abstract to hide a problematic implementation is a good thing, in my opinion.
+
++1 for using abstract methods in Compression{In|Out}putStreams to ensure correct implementations are provided.
+
+Here's an update interface for the streams and codecs...
+
+Let's just use InputStream and OutputStream as our base classes.  We're getting nothing from FilterInputStream and FilterOutputStream except paranoid bloat.  (Why is close() abstract but not flush()?)  Either that, or remove all the spurious abstract methods.  These substantially clutter the javadoc.
+
+
+
+Here are the updated interfaces incorporating Doug's comments:
+a) The Compression{Input|Output}Streams extend {Input|Output}Streams.
+b) Only the CompressionInputStream.read(byte[], int, int) & CompressionOutputStream.write(byte[],int,int) are made 'abstract' to be safe, no other interfaces are fiddled with.
+
+CompressionInputStream overrides mark(), markSupported() and reset() with implementations that are identical to those of its superclass.  These can be removed, no?  close() should probably also be defined to call in.close().
+
+CompressionOutputStream should define close() and flush() to call in.close() and in.flush(), respectively.
+
+I still think the abstract methods are just noise.  These are performance optimizations.  A correct codec can be implemented w/o overriding these methods.  We have seen performance issues when these are not overridden and the underlying stream is unbuffered, causing a system call to be invoked for each call.  But that won't happen in this case.  Here we'd only force a method call per byte to be compressed, which is probably the way the compressor will operate anyway (byte-at-a-time).  A method call is very different than a system call.
+
+I agree with Doug about the mark, markSupported and reset on CompressionInputStream.
+
+I also agree with Doug about having close and flush on CompressionOutputStream close and flush the out stream.
+
+I disagree that the read/write(byte[], int, int) methods are harmless. It is easy to imagine that other codecs will go through jni, like the java.util.zip compressors do. Calling through jni to compress or decompress a byte will likely be really painful. So, yes, it is _just_ a performance concern. But without it, it is very easy to forget to handle the multi-byte case and let it default to a very bad default implementation.
+
+Finally, I think I would make the in/out fields in Compression*Stream as "final" and not "volatile" since it will match the usage and let the optimizer do a far better job.
+
+Here's the patch for custom codecs (sequencefile v5).
+
+I've hit a potential red-flag where the 'writes' to 'block compressed' SequenceFiles through the new custom codec framework suffers ~10%-15% (vis-a-vis version 4 i.e. SEQ4). The 'writes' to non-compressed/record-compressed SequenceFiles seems to hold up very well indeed. Similarly 'reads' of all types of SequenceFiles also are quite fine.
+
+I turned an evaluation version of jprobe's profiler on both v4 and v5 of SequenceFile and the results are very surprising. I have attached the detailed summaries (reports.tgz) of the command:
+$ java org.apache.hadoop.io.TestSequenceFile -local -count {10000 - 10000000 i} -rwonly file_bc.seq -compressType BLOCK
+
+The test was run to write the exact same data (RandomDatum's generator was seeded with '0' in all cases).
+
+Summarising: it seems that the Deflater.deflateBytes (a native jni call - DeflaterOutputStream.write -> Deflater.deflate -> Deflater.deflateBytes) seems to perform very differently in v5. 
+a) In both v4 and v5 the exact same no. of calls are made to SequenceFile.BlockCompressedWriter.writeBlock -> DeflaterOutputStream.write. 
+b) In v4 there seem to be slightly _more_ no. of calls to Deflater.deflate and hence Deflater.deflateBytes
+c) Yet, the performance of v5 (with _lesser_ no. of calls) suffers since Deflater.deflateBytes takes longer to execute! And this completely reproducable.
+
+I talked to Owen who mentioned that he had noticed similar flaky performance with the Deflater earlier...
+
+Appreciate any code reviews/ideas etc.
+
+Thoughts? 
+
+This is looking good.  Let's just commit it with the strange default codec performance and work on that later, as we add more codecs.
+
+One minor problem: we should not add any new public Writer constructor signatures.  We should instead deprecate all existing public constructors and refer folks to the static factory methods.  Some of the newly added constructors are also bogus, accepting a codec parameter that is ignored.
+
+In particular, the Writer constructor should not take a codec since it doesn't compress.
+
+I'd also like the LOG.info("Created a Codec object") downgraded to a LOG.debug.
+
+Here's a new patch incorporating the feedback... my bad, I should never have fiddle around with SequenceFile.Writer's constructors as Owen pointed out; guess the whole perf issue occupied my thoughts - fixed now.
+
+I just committed this.  Thanks, Arun!
+

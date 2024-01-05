@@ -1,0 +1,272 @@
+So, why not set the flag when doing nodetool enablebinary if we found the flag is not true? If I understand your description correctly.
+
+I think there is also another issue
+
+if you start it all just fine and then you do nodetool disablebinary it will not set rpc to false.
+
+so then this https://github.com/apache/cassandra/commit/36bdc253193318ceaf5beb9bc5e869f6af590cb1
+
+it will still think rpc is true / that native transport is running there
+
+bq. why not set the flag when doing nodetool enablebinary if we found the flag is not true
+
+Yes, that's the correct fix, having enablebinary also call setRpcReady(true).  Given that the call appears idempotent, we could move it into the start/stop native transport calls directly.  It's probably a vestige of having thrift and the native protocol.
+
+pinging [~brandon.williams] if this patch makes sense to him https://github.com/apache/cassandra/pull/2817
+
+LGTM
+
+So it seems that we need to create a bug fix for nodetool enablebinary and disablebinary:)
+
+I just renamed the ticket.
+
+Patches are available. I will build it all in next days.
+
+[trunk j17|https://app.circleci.com/pipelines/github/instaclustr/cassandra/3369/workflows/b1dceb9a-e45d-4b1a-b4db-394f361f2689]
+[5.0 j17|https://app.circleci.com/pipelines/github/instaclustr/cassandra/3368/workflows/8309cbb1-cd5b-4945-b590-329617e44c92]
+[4.1 j11|https://app.circleci.com/pipelines/github/instaclustr/cassandra/3367/workflows/8d968041-fd54-4cba-87e2-0d939b7376ca]
+[4.0 j11|https://app.circleci.com/pipelines/github/instaclustr/cassandra/3366/workflows/e4d5c713-cb48-46e5-979b-fc139a6c0733]
+[3.11 j8|https://app.circleci.com/pipelines/github/instaclustr/cassandra/3350/workflows/8416bbd5-a736-49ee-aa50-0a98f5c9eee2]
+[3.0 j8|https://app.circleci.com/pipelines/github/instaclustr/cassandra/3365/workflows/689b2ed4-a32b-4ee7-9b1e-f5bfd53d1d9c]
+
+Missing some JDK runs?
+
+since it is the very same patch just applied to various branches, I would say that we tested it all from Java 8 to 17 :) 
+
+Fair enough, it's a simple patch.  The failure in 5.0 is CASSANDRA-18360 and it didn't repro on trunk so nothing to be concerned about there. +1
+
+[Upgrade tests|https://app.circleci.com/pipelines/github/driftx/cassandra/1346/workflows/b3fec612-e901-4166-a18a-8e1c88128f42].
+
+passed https://app.circleci.com/pipelines/github/driftx/cassandra/1346/workflows/b3fec612-e901-4166-a18a-8e1c88128f42/jobs/59243
+
+[~smiklosovic] Does this mean after this change, if a cluster has multiple nodes binary disabled for some reason, for certain partitions, the counter update will always get UnavailableException because all the replica nodes are not "RPC_READY"? Why counter update needs to bind with native transport enabled?
+
+Also, it is mentioned in https://issues.apache.org/jira/browse/CASSANDRA-13043, "if a cluster have a setup with dedicated coordinator nodes, in which storage nodes don't even bother listening to clients, and have that disabled" counter update will always fail.
+
+Quote: " it sounds like the problem we have is that we move endpoints from 'pending' to 'natural' endpoints too quickly after bootstrap, before the node is actually fully ready, and that this is what we should be fixing"
+
+ 
+
+With all above being said, I think it's better to
+ # set the RPC_READY to true when enable native transport. (This is already done in the merge PR)
+ # Do not set RPC_READY to false if we are using nodetool to shutdown native transport. We just set the value to false when the node is decommissioned and drained. (This is added in this PR) I think we should remove this line: !image-2023-11-16-10-56-16-693.png|width=414,height=127!
+
+Thoughts?
+
+ 
+
+bq. Does this mean after this change, if a cluster has multiple nodes binary disabled for some reason, for certain partitions, the counter update will always get UnavailableException because all the replica nodes are not "RPC_READY"?
+
+I believe it does mean we will throw UE because the 13043 code is still active [here|https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/service/StorageProxy.java#L1764].  It is rather unfortunate that counters have misused this, forcing us to claim rpc is ready regardless of the actual state, but I think that's what we have to do, never set it to false once it has been set to true unless decom/drain, as you said.
+
+interesting catch about dedicated coordinators! I think we need to cover that scenario too. 
+
+This is a tricky ticket! I just keep thinking about the consequences here from various angles. When you say we should never set it to false, does that hold for coordinator nodes as well? I think it should be reworded like this: 
+
+never set it to false, _WHEN IT IS NOT A COORDINATOR_, once it has been set to true unless decom/drain. Why wouldnt you set rpc status to false in coordinator nodes?
+
+Not sure why we added this RPC_READY flag in the first place. But I think the issue  https://issues.apache.org/jira/browse/CASSANDRA-13043 trying to solve is that when doing counter mutation, we do not want the node stilling bootstrapping to be the leader of the counter mutation. The trick we did is to use this flag to make sure the bootstrap is finished. I think we should not use RPC_READY flag to filter the nodes. Maybe we need to add a new flag to indicate if a node is fully bootstrapped?
+
+We already have a flag to indicate this, STATUS.  It seems there could have been some kind of race around this when CASSANDRA-13043 was being worked on that made RPC_READY seem like a better option, but nonetheless it is the de facto way to know whether a node is ready to receive requests, and what the rest of the system uses: counters are special and reinventing that wheel here.
+
+Coordinator nodes, these which will never join a ring, will be in STARTING state for ever. So if we filter only nodes with NORMAL status here (1) instead waiting for RPC, then replicas for hints will ever be just "normal" nodes carrying data. 
+
+So this will not collide with rpc enable/disable as it is now? [~brandon.williams]
+
+(1) https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/service/StorageProxy.java#L1764
+
+The problem is not coordinator-only nodes, but storage nodes that have rpc disabled.
+
+Before this fix, RPC was set to true on startup, then if somebody turned it off, RPC flag was not set to false so that logic around counters always saw RPC of that node up, even if it was not. 
+
+So what is the difference if we set that RPC to false when it is really not enabled? I think what happens here is that if RPC is set to true even it is really not, then in StorageProxy.mutateCounter it will send message with counter mutation with a response handler which has "null" in "hintsOnFailure" parameter so it means that if that message fails (because RPC is false?) it will not even create hints for such mutation.
+
+But the outcome is same?
+
+(1) https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/service/StorageProxy.java#L1736
+
+bq. So what is the difference if we set that RPC to false when it is really not enabled?
+
+Counter writes will fail.  Whether or not RPC is actually enabled has no effect, counters just want the flag.
+
+OK so if they just want that flag, and it is irrelevant whether it is in fact enabled or not, then why could not we replace that with filter on STATUS being NORMAL. 
+
+We can, but all existing installations are still going to want RPC_READY, so it's not so simple to unring this bell.
+
+I will remove that one line [~curlylrt] showed. Too bad there is no simple fix. This will leak e.g. to nodetool gossipinfo where RPC status is visible so it may be misleading. 
+
+We can also switch to checking STATUS here, and then someday we can restore RPC_READY to accuracy.
+
+I think we should probably also add a test for counters in this situation so nobody accidentally "fixes" it again.
+
+[~brandon.williams] , I think the problem of "STATUS" is that when a node started, it will broadcast the NORMAL status to peers. For this just started node, the gossip may have some delay so it may only have the partial view of the cluster. This means the node will consider part of the cluster is down. What we really want in counter mutation is to make sure the leader recent started node(or a new node) is fully connected to the cluster so it has full view of the cluster.
+
+The reason we chose RPC_READY might be that this flag was set to true only when everything is done.  But this flag is indicating if binary port is enabled, I don't think we should use this flag.
+
+I see 4.0 has added a checker before enabling binary port: [https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/service/CassandraDaemon.java#L644]
+
+ 
+
+I think it's better to create a new flag like "FULLY_CONNECTED" so that we know the node has a full view of the cluster. Then we can use this flag in counter mutation and keep "RPC_READY" like what we have today: 1. set to true when binary port enabled. 2. set to false when binary port disabled.
+
+ 
+
+bq. the gossip may have some delay so it may only have the partial view of the cluster.
+
+Gossip has mechanisms to avoid this scenario.  If it was a problem then rolling restarts would break all kinds of queries all the time, nothing specific to counters.
+
+If that's the case, does it mean if a node's status is NORMAL, it means the node should have the full view of the cluster? Then we should change to use status to filter. Also, we have added [test|https://github.com/ostefano/cassandra-dtest/commit/a1e505977a6e8f04f85d053ce1f8bb83e7b04d21] earlier, let me check if changing the filter to use status will work with that test.
+
+We should probably make a new ticket to change the behavior and just revert the one line here to avoid a regression.  I'm not sure why that test didn't fail here though.
+
+btw when I read the code correctly, NORMAL value of STATUS application state will be propagated by Gossip before transports are started and RPC_READY value is set to true. So it may happen that for brief period of time, until RPC_READY is true, it will choose replicas which are NORMAL but their transports are not started yet. 
+
+If NORMAL status would be set after RPC_READY was set and counters wait for NORMAL, there is a guarantee that if it is RPC_READY so queries would not fail. 
+
+bq. it will choose replicas which are NORMAL but their transports are not started yet. 
+
+Which is inconsequential since nothing needs to use them.
+
+The test won't pass if we change to check if the status of the node is normal.
+
+I think we cannot use status NORMAL to filter the leader node for counter mutation. I think the extra requirement for counter mutation leader here is to make sure the leader has full view of the cluster. But the binary port of the leader doesn't have to be enabled.
+
+I dont get this "full view of cluster" thing. if RPC\_READY is true or false is in fact irrelevant. It is used just for leader selection. If we choose NORMAL node and its RPC is not ready yet, that doesnt matter. It would be same situation as now.
+
+The logic around replica leader selection just has to have enough nodes to choose from, whatever that means.
+
+The only discrepancy is that if there is, e.g., 5 nodes cluster and we go to upgrade it in a rolling fashion, after restart of a node and turning off its RPC, that node would not be part of the leader selection process on old nodes, because its rpc would be turned off.
+
+Then if 4 nodes are upgraded with rpc disabled, the last node would have no replicas to choose from but itself.
+
+As soon as the last node is upgraded, it would start to filter on STATUS (as any other node is doing at this moment)
+
+I think that filer on NORMAL would be problematic only when rpc is disabled while cluster is being upgraded.
+
+Sent from ProtonMail mobile
+
+
+
+\
+
+It will be easier to understand If you check the added [test.|https://github.com/ostefano/cassandra-dtest/commit/a1e505977a6e8f04f85d053ce1f8bb83e7b04d21]
+
+Let me explain the "full view of the cluster": We have a 3 node cluster, with a keyspace as replication factor 3. Now we restart node A. After node A restart, it will first set its own status to NORMAL then gossip this info to the rest of the cluster, Node B received the message. Before other nodes send any gossip info to node A, the endpointStateMap of node A is empty. Let's say some how the gossip info sending to node A got delayed. Now, node B received a request to do counter mutation. Node B selects node A as a leader of the counter mutation because Node A is normal, so Node B send the mutation to A. From A's point of view, the other two nodes are down nodes. The only live node is Node A itself. If consistency level is local_quorum, node A will just throw the UAE. To solve the issue, CASSANDRA-13043 made the change to wait for the last flag "RPC_READY" to be true. When RPC_READY is true, A has the "full view of the cluster" (Node B and C is UP and normal).
+
+ 
+{panel:title=Below are logs related to gossip when a node getting started:}
+{"@timestamp":"2023-11-18T08:03:21.358+00:00","@version":1,"message":"Starting up server gossip","logger_name":"o.a.c.service.StorageService","thread_name":"main","level":"INFO","level_value":20000} \{"@timestamp":"2023-11-18T08:03:21.454+00:00","@version":1,"message":"Updating topology for /node1.ip.address:9042","logger_name":"o.a.c.locator.TokenMetadata","thread_name":"main","level":"INFO","level_value":20000} \{"@timestamp":"2023-11-18T08:03:21.455+00:00","@version":1,"message":"Updating topology for /node1.ip.address:9042","logger_name":"o.a.c.locator.TokenMetadata","thread_name":"main","level":"INFO","level_value":20000} \{"@timestamp":"2023-11-18T08:03:21.660+00:00","@version":1,"message":"Node /node2.ip.address:9042 is now part of the cluster","logger_name":"o.a.cassandra.gms.Gossiper","thread_name":"GossipStage:1","level":"INFO","level_value":20000} \{"@timestamp":"2023-11-18T08:03:21.668+00:00","@version":1,"message":"Using saved tokens [-2221857722054656123, -3885079421067140903, -5343119608664883471, -6713057863481554638, -704218406783704283, -8255104289521151109, 1443620187740186167, 2237424365810614485, 3011306438350676741, 3823627889871018402, 4717722679840880909, 491446797270294465, 5682153714635827559, 6562206662586337529, 7479206264222202974, 8684646769397141191]","logger_name":"o.a.c.service.StorageService","thread_name":"main","level":"INFO","level_value":20000} \{"@timestamp":"2023-11-18T08:03:21.688+00:00","@version":1,"message":"JOINING: Finish joining ring","logger_name":"o.a.c.service.StorageService","thread_name":"main","level":"INFO","level_value":20000} \{"@timestamp":"2023-11-18T08:03:21.700+00:00","@version":1,"message":"Updating topology for /node2.ip.address:9042","logger_name":"o.a.c.locator.TokenMetadata","thread_name":"GossipStage:1","level":"INFO","level_value":20000} \{"@timestamp":"2023-11-18T08:03:21.701+00:00","@version":1,"message":"Updating topology for /node2.ip.address:9042","logger_name":"o.a.c.locator.TokenMetadata","thread_name":"GossipStage:1","level":"INFO","level_value":20000} \{"@timestamp":"2023-11-18T08:03:21.707+00:00","@version":1,"message":"Node /node1.ip.address:9042 state jump to NORMAL","logger_name":"o.a.c.service.StorageService","thread_name":"main","level":"INFO","level_value":20000} \{"@timestamp":"2023-11-18T08:03:21.726+00:00","@version":1,"message":"Node /node1.ip.address:9042 state jump to NORMAL","logger_name":"o.a.c.service.StorageService","thread_name":"main","level":"INFO","level_value":20000} \{"@timestamp":"2023-11-18T08:03:21.730+00:00","@version":1,"message":"Node /node3.ip.address:9042 has restarted, now UP","logger_name":"o.a.cassandra.gms.Gossiper","thread_name":"GossipStage:1","level":"INFO","level_value":20000} \{"@timestamp":"2023-11-18T08:03:21.731+00:00","@version":1,"message":"Node /node3.ip.address:9042 state jump to NORMAL","logger_name":"o.a.c.service.StorageService","thread_name":"GossipStage:1","level":"INFO","level_value":20000} \{"@timestamp":"2023-11-18T08:03:21.826+00:00","@version":1,"message":"Updating topology for /node3.ip.address:9042","logger_name":"o.a.c.locator.TokenMetadata","thread_name":"GossipStage:1","level":"INFO","level_value":20000} \{"@timestamp":"2023-11-18T08:03:21.827+00:00","@version":1,"message":"Updating topology for /node3.ip.address:9042","logger_name":"o.a.c.locator.TokenMetadata","thread_name":"GossipStage:1","level":"INFO","level_value":20000} \{"@timestamp":"2023-11-18T08:03:21.832+00:00","@version":1,"message":"InetAddress /node2.ip.address:9042 is now UP","logger_name":"o.a.cassandra.gms.Gossiper","thread_name":"GossipStage:1","level":"INFO","level_value":20000} \{"@timestamp":"2023-11-18T08:03:21.841+00:00","@version":1,"message":"InetAddress /node3.ip.address:9042 is now UP","logger_name":"o.a.cassandra.gms.Gossiper","thread_name":"GossipStage:1","level":"INFO","level_value":20000} {"@timestamp":"2023-11-18T08:03:21.880+00:00","@version":1,"message":"{color:#FF0000}Waiting for gossip to settle...{color}","logger_name":"o.a.cassandra.gms.Gossiper","thread_name":"main","level":"INFO","level_value":20000} {"@timestamp":"2023-11-18T08:03:29.881+00:00","@version":1,"message":"{color:#FF0000}No gossip backlog; proceeding{color}","logger_name":"o.a.cassandra.gms.Gossiper","thread_name":"main","level":"INFO","level_value":20000} \{"@timestamp":"2023-11-18T08:03:29.891+00:00","@version":1,"message":"Blocking coordination until only a single peer is DOWN in the local datacenter, timeout=10s","logger_name":"o.a.c.n.StartupClusterConnectivityChecker","thread_name":"main","level":"INFO","level_value":20000} \{"@timestamp":"2023-11-18T08:03:30.037+00:00","@version":1,"message":"Ensured sufficient healthy connections with [dc1] after 144 milliseconds","logger_name":"o.a.c.n.StartupClusterConnectivityChecker","thread_name":"main","level":"INFO","level_value":20000} \{"@timestamp":"2023-11-18T08:03:30.114+00:00","@version":1,"message":"Starting listening for CQL clients on /0.0.0.0:27906 (unencrypted)...","logger_name":"o.a.c.t.PipelineConfigurator","thread_name":"main","level":"INFO","level_value":20000}
+
+{color:#FF0000}RPC_READY set to true here{color}
+
+{"@timestamp":"2023-11-18T08:03:30.135+00:00","@version":1,"message":"Startup complete","logger_name":"o.a.c.service.CassandraDaemon","thread_name":"main","level":"INFO","level_value":20000}
+{panel}
+ 
+
+ 
+
+ 
+
+I think the *key* part is the wait gossip to settle. If a node take too long to settle the gossip and that node is selected as a leader, we will have problem when doing counter update. I think we need a flag to indicate gossip settled so we don't need to use RPC_READY flag.
+
+ 
+
+ 
+
+ 
+
+I think we should just remove that one line and that's it, for the sake of not having this regression in 5.0.0. We will wait until CEP-21 (TCM) is in place, should be pretty soon. If you check TCM logic in that method, it was rewritten (1) so it does not make sense to introduce new gossip message etc, this stuff is apparently going to be handled differently quite soon.
+
+After TCM changes are in, I think we can finally decouple this rpc readiness from counter's logic and then we can fix enable/disable binary behaviour when it comes to RPC status.
+
+(1) https://github.com/apache/cassandra/blob/cep-21-tcm/src/java/org/apache/cassandra/locator/ReplicaPlans.java#L212-L221
+
+I concur that with CEP 21, the issue should no longer persist. Yet, what approach should we take for versions 3.0.x to 4.1.x?
+
+My inquiry pertains to the precise meaning of RPC_READY. Does RPC_READY equate to binary being enabled? Or does it simply indicate that the node is prepared to enable the binary port for serving client traffic? If RPC_READY merely signifies readiness without guaranteeing the binary port's activation, it might be better to switch this flag to true only after gossip has stabilized, regardless of the binary port's status.
+
+Initially, we encountered a problem when attempting to initiate every node with "start_native_transport": false in cassandra.yaml, intending to activate the binary port via JMX short after the node is status NORMAL and stable. This led to a significant outage, with all counter mutations failing because the RPC_READY flag was absent on all nodes. This flag is only set to true when "start_native_transport" is true. The solution proposed in this ticket appears to resolve this issue, as enabling the binary port will trigger the RPC_READY flag to true. However, we also observed that disabling the binary port sets this flag to false. This could pose a problem for us, as we occasionally need to disable nodes for various reasons, which could obstruct counter updates.
+
+Should we consider separating the RPC_READY status from the actual state of the binary port? For example, for the setup of dedicated coordinator nodes, the storage nodes are started with "start_native_transport": false and never get binary enabled, the "RPC_READY" flag will never be true. Then, counter update for certain partitions will always fail because of the UAE.
+
+RPC_READY is set locally _after_ native transport is started (ports are open, it is fully initialized and it listens to connections) and then it is propagated by Gossip and it will eventually reach other nodes. So by the time another node sees RPC_READY is "true" for such and such node, it is basically guaranteed that it listens to connections. (if the node which started transport service does not stop it by the time RPC_READY = true propagates in Gossip).
+
+I am not sure what is the correct solution but the current one feels like a hack. If RPC_READY is defacto irrelevant what it is set to, then we can change it to something else, questionable to what. However, this is problematic only for corner cases like storage node where RPC is turned off. It is quite a bummer that the current code does not consider that scenario.
+
+[~curlylrt] Why is it so problematic for you to have RPC started even on data nodes? You can still firewall / blacklist them etc if you do not wish the clients to connect to it, no?
+
+This is patch for 3.0 I want to get in (1), I will continue on all branches soon and I ll provide the builds.
+
+(1) [https://github.com/apache/cassandra/pull/2923/files]
+
+I think the fix looks good. It will work for us. Thanks.
+
+[3.0|https://app.circleci.com/pipelines/github/instaclustr/cassandra/3542/workflows/f44d30c4-146d-4183-87ad-2fc9ced5fe9d]
+[3.11|https://app.circleci.com/pipelines/github/instaclustr/cassandra/3543/workflows/6ede27da-a6ef-4f80-846d-fd4de7292329]
+[4.0|https://app.circleci.com/pipelines/github/instaclustr/cassandra/3544/workflows/c649e450-6334-4131-bfa3-a229c6dd6447]
+[4.1|https://app.circleci.com/pipelines/github/instaclustr/cassandra/3545/workflows/0d27e44f-771e-4990-b3d3-3c922ca29521]
+[5.0|https://app.circleci.com/pipelines/github/instaclustr/cassandra/3546/workflows/fa7e792a-ca7a-4ab7-a5d0-d1f824b76504]
+restarted j17 dtest for 5.0 [here|https://app.circleci.com/pipelines/github/instaclustr/cassandra/3552/workflows/f5b5824e-95b5-40da-a43e-21017cf40928/jobs/156678]
+[trunk|https://app.circleci.com/pipelines/github/instaclustr/cassandra/3547/workflows/7b99303f-08b9-45f1-a5b9-70107bbaa1c3]
+
+patch for 3.0 https://github.com/apache/cassandra/pull/2923/files
+
+patches for all other branches are literally identical
+
+[~mck] we are trying to fix the regression here after original 18935 was committed. Mentioning that in case you will want to move this out from 5.0.0 scope.
+
+I am +1 on this.
+
+I think we should figure out why counter_leader_with_partial_view_test didn't fail (and still does not currently) when we set rpc_ready to false, otherwise it's not very useful.
+
+I created this for trunk CASSANDRA-19103
+
+TCM has landed in the meanwhile and stuff has changed around this logic. I will try to get some response from TCM guys.
+
+[~brandon.williams] the reason why test_counter_leader_with_partial_view didn't fail before and still does not fail currently is because "nodetool disablebinary" is not called in the test. The test is only restarting a node and delay update status of other nodes' views for that node. I would say the test is currently useful but it won't cover the case when modifying binary port with nodetool commands.
+
+I see, thanks.  NativeProtocolTest will cover it in Stefan's patch, so I think we're good to go here.
+
+Well, I see in trunk that test_counter_leader_with_partial_view now fails. I am trying to figure out why and fix it.
+
+https://app.circleci.com/pipelines/github/instaclustr/cassandra/3562/workflows/3aeab43a-1b13-4b93-a6a9-c6c3cca0e9ca/jobs/157646/tests#failed-test-1
+
+It seems that the byteman script we inject into node 1 and 3 in test_counter_leader_with_partial does not work. If you look closely, the rule is trying to intercept a method called "findSuitableEndpoint" (1) but there is not such method in 4.0 included. So how does this work then, huh ... 
+
+findSuitableEndpoint is present only in 3.0 and 3.11. For these versions, there is this byteman injected (2).
+
+So, it seems like it does its job for 3.0 and 3.11 only. For 4.0 included it does not inject anything. 
+
+The question is, if it is not injected, how is it possible that the test still passes anyway? Well, if it is not injected, then it goes by the logic currently present in 4.0+, which is - replica which is going to be a leader will be only a node for which RPC is true and it is not marked as dead by FailureDetector. So it seems like when we stop the second node in (3), two remaining nodes will detect this and they will never send any mutation to that node because it is filtered out and byteman script which forces to select it if it is not filtered out does not work anyway. So the node with partial view of the cluster is never selected.
+
+I think we need to do this to fix the tests everywhere [https://github.com/apache/cassandra-dtest/pull/246] (this will go together with 19103)
+
+The byteman injection after we stopped the node is not necessary in trunk because there is TCM machinery in place.
+
+(1) [https://github.com/apache/cassandra-dtest/blob/trunk/byteman/4.0/election_counter_leader_favor_node2.btm#L8]
+(2) [https://github.com/apache/cassandra-dtest/blob/trunk/byteman/pre4.0/election_counter_leader_favor_node2.btm#L8]
+(3) [https://github.com/apache/cassandra-dtest/blob/trunk/counter_test.py#L117-L119]
+(3) [https://github.com/apache/cassandra-dtest/blob/trunk/counter_test.py#L110-L132]
+(4) [https://github.com/apache/cassandra-dtest/blob/trunk/byteman/4.0/election_counter_leader_favor_node2.btm#L10]
+(5) [https://github.com/apache/cassandra-dtest/blob/trunk/counter_test.py#L117]
+
+Well ... it is flaky every now and then [https://app.circleci.com/pipelines/github/instaclustr/cassandra/3569/workflows/363967bb-7390-4aef-9dd1-b2850e3790d9/jobs/158433]
+
+I just dont have time for this for now, I will commit just the revert and we will deal with 19103 separately in trunk afterwards.
+
+That's fine, I'm +1 on that plan.
+
+Good news is that I have a non-flaky test in CASSANDRA-19103 implemented for coordinator + storage nodes scenario. Maybe we could rewrite what is in dtest to in-jvm dtest when it comes to test_counter_leader_with_partial_view . I started the multiplexer on current 5.0 to see if it is flaky already or I made it like that.
+
+I built the patch for trunk as TCM has happened there (1). Even the build contains a lot of failures, this is all known and tracked and I do not see anything wrong with the patch itself.
+
+Also, for the reference, test_counter_leader_with_partial_view test is NOT flaky. I run the multiplexer and it all just passes fine. So I had to introduce the instability in my attempt to bring in the changes in located in CASSANDRA-19103.
+
+Anyway, as already communicated, we go without that.
+
+I am starting the merging process.
+
+(1) [https://app.circleci.com/pipelines/github/instaclustr/cassandra/3572/workflows/70ea8bc0-08c3-472c-a292-a1c050bc65dd]
+
+followup committed from https://github.com/apache/cassandra/commit/c1b12058e71b2a06a20b284c2498979efcd63633
+

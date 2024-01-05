@@ -1,0 +1,88 @@
+I think one of the problems here is that {{secs_since_heartbeat}} is computed from the time the request actually runs on the Impala webserver.
+
+{noformat}
+  Value time_since_heartbeat(
+        StringPrintf(
+            "%.3f", ((MonotonicMicros() - subscriber.second->last_heartbeat_timestamp())
+                        / 1000000.0)).c_str(), document->GetAllocator());
+{noformat}
+
+If there is a delay (say context switching or CPU load etc), the value could be skewed and the assert doesn't hold. I could repro the first assert failure by adding a simple sleep like follows.
+
+{noformat}
+diff --git a/tests/statestore/test_statestore.py b/tests/statestore/test_statestore.py
+index f9e61cf..3493f0c 100644
+--- a/tests/statestore/test_statestore.py
++++ b/tests/statestore/test_statestore.py
+@@ -60,6 +60,7 @@ LOG = logging.getLogger('test_statestore')
+ #    Test that topic deletions take effect correctly.
+ 
+ def get_statestore_subscribers(host='localhost', port=25010):
++  time.sleep(5)
+   response = urllib2.urlopen("http://{0}:{1}/subscribers?json".format(host, port))
+   page = response.read()
+   return json.loads(page)
+@@ -562,14 +563,17 @@ class TestStatestore():
+     acceptable value. Since the statestore heartbeats at 1 second intervals, an acceptable
+     value would be between ((sleep_time-1.0), (sleep_time+1.0))."""
+     sub = StatestoreSubscriber()
+-    sub.start().register().wait_for_heartbeat(1)
+-    sub.kill()
+-    sleep_time = randint(1, 9)
++    logging.info("Registering sub and waiting for 1 hb: " + sub.subscriber_id)
++    sub.start().register().wait_for_heartbeat(1).kill()
++    logging.info("Killing sub: " + sub.subscriber_id);
++    sleep_time = 6
+     time.sleep(sleep_time)
++    logging.info("slept for 6s")
+     subscribers = get_statestore_subscribers()["subscribers"]
+     for s in subscribers:
+       if str(s["id"]) == sub.subscriber_id:
+         secs_since_heartbeat = float(s["secs_since_heartbeat"])
++        logging.info("secs_since_heartbeat: " + str(secs_since_heartbeat))
+         assert (secs_since_heartbeat > float(sleep_time - 1.0))
+         assert (secs_since_heartbeat < float(sleep_time + 1.0))
+{noformat}
+
+
+[~poojanilangekar] Assigning this to you since you added this test. This is not super urgent but something we need to fix. We'll likely be running into this in the future.
+
+Pooja I think is afk for a couple of weeks, if it reoccurs we should probably find someone else to fix.
+
+I was looking for reasons for the secs_since_heartbeat to be lower than the sleep time and I found the following in the python docs:
+{code:java}
+The actual suspension time may be less than that requested because any caught signal will terminate the sleep() following execution of that signal’s catching routine. Also, the suspension time may be longer than requested by an arbitrary amount because of the scheduling of other activity in the system.
+
+Changed in version 3.5: The function now sleeps at least secs even if the sleep is interrupted by a signal, except if the signal handler raises an exception (see PEP 475 for the rationale).
+{code}
+As per [~tarmstrong]'s suggestion I modified the test to check that the secs_since_heartbeats is always greater than the previous time. This test also fails because the statestore's web UI provides the duration in millisecond precision while the sleep function can wake up in less than one millisecond. So I there are two options here
+ # Check for a monotonically increasing duration instead of a strictly increasing duration. This would help solve the issue of the test but I am not sure that it'd actually validate the correctness of the monitoring thread. (A thread could return the exact same value for several seconds/minutes and that would still be accepted by the thread).
+ # Update the version of the time library used to 3.5 or higher and then check for strictly increasing duration since heartbeat. This might affect other instances where "time" is imported but would actually validate the heartbeat monitoring thread. 
+
+Tim, what do you suggest? 
+
+[~poojanilangekar] that's a nice find with time.sleep(), I think we've generally assumed that it sleeps a minimum of time. I suspect that this is probably rare in our tests, but hard to know.
+
+The "right" way to do it, I think, would be to put a loop around time.sleep() and loop until enough time has elapsed. Unfortunately that would depend on using a monotonic clock, which it doesn't look like was exposed in python until 3.something.
+
+I think we could go with 1) except just validate that the first time is higher than the last time. E.g. collect 20 samples at 100ms intervals . It's theoretically possible that time.sleep() could return in less than a ms each time, but vanishingly unlikely.
+
+Commit 85b9c6c4257cabb866a3a4580c009f2729d8df8e in impala's branch refs/heads/master from poojanilangekar
+[ https://git-wip-us.apache.org/repos/asf?p=impala.git;h=85b9c6c ]
+
+IMPALA-8007: Fix test_slow_subscriber
+
+Previously, test_slow_subscriber verified a slow subscriber by
+checking for a precise time window since the last heartbeat.
+This was non-deterministic since sleep duration in python depends
+on the machine's workload. This change makes it deterministic by
+checking for an increase in the time since last heartbeat.
+
+Testing: Executed the test 1000 times in a loop.
+
+Change-Id: Ibeed543a145076cd11d5d0e441a257111a66497d
+Reviewed-on: http://gerrit.cloudera.org:8080/12216
+Reviewed-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+Tested-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+
+

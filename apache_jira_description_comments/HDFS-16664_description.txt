@@ -1,0 +1,153 @@
+While trying to backport HDFS-16064 to an older Hadoop version, the new unit test "testDeleteCorruptReplicaForUnderReplicatedBlock" started failing unexpectedly.
+
+Upon deep diving this unit test failure, I identified a bug in HDFS corrupt replica invalidation which results in the following datanode exception:
+{quote}2022-07-16 08:07:52,041 [BP-958471676-X-1657973243350 heartbeating to localhost/127.0.0.1:61365] WARN  datanode.DataNode (BPServiceActor.java:processCommand(887)) - Error processing datanode Command
+java.io.IOException: Failed to delete 1 (out of 1) replica(s):
+0) Failed to delete replica blk_1073741825_1005: GenerationStamp not matched, existing replica is blk_1073741825_1001
+        at org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.FsDatasetImpl.invalidate(FsDatasetImpl.java:2139)
+        at org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.FsDatasetImpl.invalidate(FsDatasetImpl.java:2034)
+        at org.apache.hadoop.hdfs.server.datanode.BPOfferService.processCommandFromActive(BPOfferService.java:735)
+        at org.apache.hadoop.hdfs.server.datanode.BPOfferService.processCommandFromActor(BPOfferService.java:680)
+        at org.apache.hadoop.hdfs.server.datanode.BPServiceActor.processCommand(BPServiceActor.java:883)
+        at org.apache.hadoop.hdfs.server.datanode.BPServiceActor.offerService(BPServiceActor.java:678)
+        at org.apache.hadoop.hdfs.server.datanode.BPServiceActor.run(BPServiceActor.java:849)
+        at java.lang.Thread.run(Thread.java:750)
+{quote}
+The issue is that the Namenode is sending wrong generationStamp to the datanode. By adding some additional logs, I was able to determine the root cause for this:
+ * the generationStamp sent in the DNA_INVALIDATE is based on the [generationStamp of the block sent in the block report|https://github.com/apache/hadoop/blob/8774f178686487007dcf8c418c989b785a529000/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java#L3733]
+ * the problem is that the datanode with the corrupt block replica (that receives the DNA_INVALIDATE) is not necissarily the same datanode that sent the block report
+ * this can cause the above exception when the corrupt block replica on the datanode receiving the DNA_INVALIDATE & the block replica on the datanode that sent the block report have different generationStamps
+
+The solution is to store the corrupt replicas generationStamp in the CorruptReplicasMap, then to extract this correct generationStamp value when sending the DNA_INVALIDATE to the datanode
+
+ 
+h2. Failed Test - Before the fix
+{quote}> mvn test -Dtest=TestDecommission#testDeleteCorruptReplicaForUnderReplicatedBlock
+
+ 
+
+[INFO] Results:
+[INFO] 
+[ERROR] Failures: 
+[ERROR]   TestDecommission.testDeleteCorruptReplicaForUnderReplicatedBlock:2035 Node 127.0.0.1:61366 failed to complete decommissioning. numTrackedNodes=1 , numPendingNodes=0 , adminState=Decommission In Progress , nodesWithReplica=[127.0.0.1:61366, 127.0.0.1:61419]
+{quote}
+Logs:
+{quote}> cat target/surefire-reports/org.apache.hadoop.hdfs.TestDecommission-output.txt | grep 'Expected Replicas:|XXX|FINALIZED|Block now|Failed to delete'
+
+2022-07-16 08:07:45,891 [Listener at localhost/61378] INFO  hdfs.TestDecommission (TestDecommission.java:testDeleteCorruptReplicaForUnderReplicatedBlock(1942)) - Block now has 2 corrupt replicas on [127.0.0.1:61370 , 127.0.0.1:61375] and 1 live replica on 127.0.0.1:61366
+2022-07-16 08:07:45,913 [Listener at localhost/61378] INFO  hdfs.TestDecommission (TestDecommission.java:testDeleteCorruptReplicaForUnderReplicatedBlock(1974)) - Block now has 2 corrupt replicas on [127.0.0.1:61370 , 127.0.0.1:61375] and 1 decommissioning replica on 127.0.0.1:61366
+XXX invalidateBlock dn=127.0.0.1:61415 , blk=1073741825_1001
+XXX postponeBlock dn=127.0.0.1:61415 , blk=1073741825_1001
+XXX invalidateBlock dn=127.0.0.1:61419 , blk=1073741825_1003
+XXX addToInvalidates dn=127.0.0.1:61419 , blk=1073741825_1003
+XXX addBlocksToBeInvalidated dn=127.0.0.1:61419 , blk=1073741825_1003
+XXX rescanPostponedMisreplicatedBlocks blk=1073741825_1005
+XXX DNA_INVALIDATE dn=/127.0.0.1:61419 , blk=1073741825_1003
+XXX invalidate(on DN) dn=/127.0.0.1:61419 , invalidBlk=blk_1073741825_1003 , blkByIdAndGenStamp = FinalizedReplica, blk_1073741825_1003, FINALIZED
+2022-07-16 08:07:49,084 [BP-958471676-X-1657973243350 heartbeating to localhost/127.0.0.1:61365] INFO  impl.FsDatasetAsyncDiskService (FsDatasetAsyncDiskService.java:deleteAsync(226)) - Scheduling blk_1073741825_1003 replica FinalizedReplica, blk_1073741825_1003, FINALIZED
+XXX addBlock dn=127.0.0.1:61419 , blk=1073741825_1005   *<<<  block report is coming from 127.0.0.1:61419 which has genStamp=1005*
+XXX invalidateCorruptReplicas dn=127.0.0.1:61415 , reported_blk=1073741825_1005   *<<<  corrupt replica is on 127.0.0.1:61415 which is expecting genStamp=1001*
+XXX addToInvalidates dn=127.0.0.1:61415 , blk=1073741825_1005
+2022-07-16 08:07:49,431 [DatanodeAdminMonitor-0] INFO  BlockStateChange (DatanodeAdminManager.java:logBlockReplicationInfo(417)) - Block: blk_1073741825_1005, Expected Replicas: 2, live replicas: 1, corrupt replicas: 0, decommissioned replicas: 0, decommissioning replicas: 1, maintenance replicas: 0, live entering maintenance replicas: 0, excess replicas: 0, Is Open File: false, Datanodes having this block: 127.0.0.1:61366 127.0.0.1:61419 , Current Datanode: 127.0.0.1:61366, Is current datanode decommissioning: true, Is current datanode entering maintenance: false
+XXX addBlocksToBeInvalidated dn=127.0.0.1:61415 , blk=1073741825_1005   *<<<  Namenode sends wrong genStamp to 127.0.0.1:61415*
+XXX DNA_INVALIDATE dn=/127.0.0.1:61415 , blk=1073741825_1005
+XXX invalidate(on DN) dn=/127.0.0.1:61415 , invalidBlk=blk_1073741825_1005 , blkByIdAndGenStamp = null
+XXX invalidate(on DN) dn=/127.0.0.1:61415 , invalidBlk=blk_1073741825_1005 , blkById = FinalizedReplica, blk_1073741825_1001, FINALIZED
+2022-07-16 08:07:52,041 [BP-958471676-X-1657973243350 heartbeating to localhost/127.0.0.1:61365] WARN  datanode.DataNode (BPServiceActor.java:processCommand(887)) - Error processing datanode Command
+java.io.IOException: Failed to delete 1 (out of 1) replica(s):
+0) Failed to delete replica blk_1073741825_1005: GenerationStamp not matched, existing replica is blk_1073741825_1001
+        at org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.FsDatasetImpl.invalidate(FsDatasetImpl.java:2139)
+        at org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.FsDatasetImpl.invalidate(FsDatasetImpl.java:2034)
+        at org.apache.hadoop.hdfs.server.datanode.BPOfferService.processCommandFromActive(BPOfferService.java:735)
+        at org.apache.hadoop.hdfs.server.datanode.BPOfferService.processCommandFromActor(BPOfferService.java:680)
+        at org.apache.hadoop.hdfs.server.datanode.BPServiceActor.processCommand(BPServiceActor.java:883)
+        at org.apache.hadoop.hdfs.server.datanode.BPServiceActor.offerService(BPServiceActor.java:678)
+        at org.apache.hadoop.hdfs.server.datanode.BPServiceActor.run(BPServiceActor.java:849)
+        at java.lang.Thread.run(Thread.java:750)
+2022-07-16 08:07:52,384 [DataXceiver for client  at /127.0.0.1:61434 [Receiving block BP-958471676-X-1657973243350:blk_1073741825_1005]] INFO  datanode.DataNode (DataXceiver.java:writeBlock(939)) - opWriteBlock BP-958471676-X-1657973243350:blk_1073741825_1005 received exception org.apache.hadoop.hdfs.server.datanode.ReplicaAlreadyExistsException: Block BP-958471676-X-1657973243350:blk_1073741825_1005 already exists in state FINALIZED and thus cannot be created.
+2022-07-16 08:07:52,385 [DataXceiver for client  at /127.0.0.1:61434 [Receiving block BP-958471676-X-1657973243350:blk_1073741825_1005]] INFO  datanode.DataNode (DataXceiver.java:run(307)) - 127.0.0.1:61415:DataXceiver error processing WRITE_BLOCK operation  src: /127.0.0.1:61434 dst: /127.0.0.1:61415; org.apache.hadoop.hdfs.server.datanode.ReplicaAlreadyExistsException: Block BP-958471676-X-1657973243350:blk_1073741825_1005 already exists in state FINALIZED and thus cannot be created.
+2022-07-16 08:07:54,422 [DatanodeAdminMonitor-0] INFO  BlockStateChange (DatanodeAdminManager.java:logBlockReplicationInfo(417)) - Block: blk_1073741825_1005, Expected Replicas: 2, live replicas: 1, corrupt replicas: 0, decommissioned replicas: 0, decommissioning replicas: 1, maintenance replicas: 0, live entering maintenance replicas: 0, excess replicas: 0, Is Open File: false, Datanodes having this block: 127.0.0.1:61366 127.0.0.1:61419 , Current Datanode: 127.0.0.1:61366, Is current datanode decommissioning: true, Is current datanode entering maintenance: false
+...
+2022-07-16 08:08:24,426 [DatanodeAdminMonitor-0] INFO  BlockStateChange (DatanodeAdminManager.java:logBlockReplicationInfo(417)) - Block: blk_1073741825_1005, Expected Replicas: 2, live replicas: 1, corrupt replicas: 0, decommissioned replicas: 0, decommissioning replicas: 1, maintenance replicas: 0, live entering maintenance replicas: 0, excess replicas: 0, Is Open File: false, Datanodes having this block: 127.0.0.1:61366 127.0.0.1:61419 , Current Datanode: 127.0.0.1:61366, Is current datanode decommissioning: true, Is current datanode entering maintenance: false
+{quote}
+Note the inline comments above which illustrate the bug
+h2. Successful Test - After the fix
+{quote}> mvn test -Dtest=TestDecommission#testDeleteCorruptReplicaForUnderReplicatedBlock
+
+[INFO] Results:
+[INFO] 
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0
+{quote}
+Logs:
+{quote}> cat target/surefire-reports/org.apache.hadoop.hdfs.TestDecommission-output.txt | grep 'Expected Replicas:|XXX|FINALIZED|Block now|Failed to delete'
+
+2022-07-16 07:54:30,648 [Listener at localhost/60376] INFO  hdfs.TestDecommission (TestDecommission.java:testDeleteCorruptReplicaForUnderReplicatedBlock(1942)) - Block now has 2 corrupt replicas on [127.0.0.1:60364 , 127.0.0.1:60368] and 1 live replica on 127.0.0.1:60373
+2022-07-16 07:54:30,669 [Listener at localhost/60376] INFO  hdfs.TestDecommission (TestDecommission.java:testDeleteCorruptReplicaForUnderReplicatedBlock(1974)) - Block now has 2 corrupt replicas on [127.0.0.1:60364 , 127.0.0.1:60368] and 1 decommissioning replica on 127.0.0.1:60373
+XXX invalidateBlock dn=127.0.0.1:60423 , blk=1073741825_1001
+XXX postponeBlock dn=127.0.0.1:60423 , blk=1073741825_1001
+XXX invalidateBlock dn=127.0.0.1:60427 , blk=1073741825_1003
+XXX addToInvalidates dn=127.0.0.1:60427 , blk=1073741825_1003
+XXX addBlocksToBeInvalidated dn=127.0.0.1:60427 , blk=1073741825_1003
+XXX rescanPostponedMisreplicatedBlocks blk=1073741825_1005
+XXX DNA_INVALIDATE dn=/127.0.0.1:60427 , blk=1073741825_1003
+XXX invalidate(on DN) dn=/127.0.0.1:60427 , invalidBlk=blk_1073741825_1003 , blkByIdAndGenStamp = FinalizedReplica, blk_1073741825_1003, FINALIZED
+2022-07-16 07:54:32,831 [BP-1469857843-X-1657972447604 heartbeating to localhost/127.0.0.1:60363] INFO  impl.FsDatasetAsyncDiskService (FsDatasetAsyncDiskService.java:deleteAsync(226)) - Scheduling blk_1073741825_1003 replica FinalizedReplica, blk_1073741825_1003, FINALIZED
+2022-07-16 07:54:33,772 [DatanodeAdminMonitor-0] INFO  BlockStateChange (DatanodeAdminManager.java:logBlockReplicationInfo(417)) - Block: blk_1073741825_1005, Expected Replicas: 2, live replicas: 0, corrupt replicas: 1, decommissioned replicas: 0, decommissioning replicas: 1, maintenance replicas: 0, live entering maintenance replicas: 0, excess replicas: 0, Is Open File: false, Datanodes having this block: 127.0.0.1:60373 127.0.0.1:60423 , Current Datanode: 127.0.0.1:60373, Is current datanode decommissioning: true, Is current datanode entering maintenance: false
+XXX addBlock dn=127.0.0.1:60427 , blk=1073741825_1005
+XXX invalidateCorruptReplicas dn=127.0.0.1:60423 , reported_blk=1073741825_1005
+XXX getCorruptReplicaGenerationStamp dn=127.0.0.1:60423 , genStamp=1001
+XXX addToInvalidates dn=127.0.0.1:60423 , blk=1073741825_1001
+XXX addBlocksToBeInvalidated dn=127.0.0.1:60423 , blk=1073741825_1001
+XXX DNA_INVALIDATE dn=/127.0.0.1:60423 , blk=1073741825_1001
+XXX invalidate(on DN) dn=/127.0.0.1:60423 , invalidBlk=blk_1073741825_1001 , blkByIdAndGenStamp = FinalizedReplica, blk_1073741825_1001, FINALIZED
+2022-07-16 07:54:35,796 [BP-1469857843-X-1657972447604 heartbeating to localhost/127.0.0.1:60363] INFO  impl.FsDatasetAsyncDiskService (FsDatasetAsyncDiskService.java:deleteAsync(226)) - Scheduling blk_1073741825_1001 replica FinalizedReplica, blk_1073741825_1001, FINALIZED
+XXX addBlock dn=127.0.0.1:60423 , blk=1073741825_1005
+2022-07-16 07:54:40,768 [Listener at localhost/60430] INFO  hdfs.TestDecommission (TestDecommission.java:testDeleteCorruptReplicaForUnderReplicatedBlock(2050)) - Block now has 2 live replicas on [127.0.0.1:60423 , 127.0.0.1:60427] and 1 decommissioned replica on 127.0.0.1:60373
+{quote}
+Using "getCorruptReplicaGenerationStamp" allows the Namenode to get the correct generationStamp for the corrupt block replica
+
+ 
+h2. Why does unit test failure not reproduce in Hadoop trunk?
+
+In trunk the block invalidation does not get [postponed here|https://github.com/apache/hadoop/blob/8774f178686487007dcf8c418c989b785a529000/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java#L1986]
+
+Instead, both corrupt replicas are invalidated immediately during the first block report:
+{quote}> cat target/surefire-reports/org.apache.hadoop.hdfs.TestDecommission-output.txt | grep XXX
+
+XXX addToInvalidates dn=127.0.0.1:57051 , blk=1073741825_1001
+XXX addToInvalidates dn=127.0.0.1:57055 , blk=1073741825_1003
+{quote}
+The reason for this difference in behavior is not clear at this point
+h2. Additional Info
+ * stack trace for when corrupt replica gets immediately invalidated on datanode restart (i.e. first block report)
+
+ 
+{quote}java.lang.Thread.getStackTrace(Thread.java:1564)
+org.apache.hadoop.hdfs.server.blockmanagement.BlockManager.addToInvalidates(BlockManager.java:1670)
+org.apache.hadoop.hdfs.server.blockmanagement.BlockManager.invalidateBlock(BlockManager.java:1850)
+org.apache.hadoop.hdfs.server.blockmanagement.BlockManager.markBlockAsCorrupt(BlockManager.java:1816)
+org.apache.hadoop.hdfs.server.blockmanagement.BlockManager.processFirstBlockReport(BlockManager.java:2929)
+org.apache.hadoop.hdfs.server.blockmanagement.BlockManager.processReport(BlockManager.java:2665)
+org.apache.hadoop.hdfs.server.namenode.NameNodeRpcServer.lambda$blockReport$0(NameNodeRpcServer.java:1588)
+java.util.concurrent.FutureTask.run(FutureTask.java:266)
+org.apache.hadoop.hdfs.server.blockmanagement.BlockManager$BlockReportProcessingThread.processQueue(BlockManager.java:5066)
+org.apache.hadoop.hdfs.server.blockmanagement.BlockManager$BlockReportProcessingThread.run(BlockManager.java:5045)
+{quote}
+ 
+ * stack trace for after corrupt replica is removed from datanode & datanode notifies namenode (i.e. incremental block report)
+ ** this is where the issue begins because the DN which sends the IBR is not the same as the DN with the remaining corrupt replica
+
+{quote}java.lang.Thread.getStackTrace(Thread.java:1564)
+org.apache.hadoop.hdfs.server.blockmanagement.BlockManager.addToInvalidates(BlockManager.java:1670)
+org.apache.hadoop.hdfs.server.blockmanagement.BlockManager.invalidateBlock(BlockManager.java:1850)
+org.apache.hadoop.hdfs.server.blockmanagement.BlockManager.invalidateCorruptReplicas(BlockManager.java:3477)
+org.apache.hadoop.hdfs.server.blockmanagement.BlockManager.addStoredBlock(BlockManager.java:3436)
+org.apache.hadoop.hdfs.server.blockmanagement.BlockManager.processAndHandleReportedBlock(BlockManager.java:4094)
+org.apache.hadoop.hdfs.server.blockmanagement.BlockManager.addBlock(BlockManager.java:4023)
+org.apache.hadoop.hdfs.server.blockmanagement.BlockManager.processIncrementalBlockReport(BlockManager.java:4151)
+org.apache.hadoop.hdfs.server.blockmanagement.BlockManager.processIncrementalBlockReport(BlockManager.java:4118)
+org.apache.hadoop.hdfs.server.namenode.FSNamesystem.processIncrementalBlockReport(FSNamesystem.java:4800)
+org.apache.hadoop.hdfs.server.namenode.NameNodeRpcServer$1.run(NameNodeRpcServer.java:1643)
+org.apache.hadoop.hdfs.server.blockmanagement.BlockManager$BlockReportProcessingThread.processQueue(BlockManager.java:5066)
+org.apache.hadoop.hdfs.server.blockmanagement.BlockManager$BlockReportProcessingThread.run(BlockManager.java:5045)
+{quote}

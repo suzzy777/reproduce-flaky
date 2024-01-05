@@ -1,0 +1,182 @@
+This will be very useful for read queries with different time outs. This will also be useful when changing the timeout in the client. Then we don't need to change it in Cassandra. 
+
+The problem with that is, it removes request backpressure control from the server, leaving it vulnerable to bad client behavior.
+
+So what we can do is that rpc specified in server can be a max. If client is passing timeout less than that, there is no need to keep the read request running for longer. 
+This is very useful as when cluster is on its knees, these extra read requests getting killed can help a lot. 
+
+
+WDYT [~iamaleksey]?
+
+I've already said at NGCC that we should do this. The question is whether or not it's too late for it to make into native protocol v3. And this is for [~slebresne] to decide.
+
+bq. The question is whether or not it's too late for it to make into native protocol v3
+
+We have one remaining flag in the query/execute/batch options in the protocol, so it's easy to add without breaking the protocol v3 and so I don't think the protocol is necessarily a big problem in that instance (as in, we kind of could add it later).
+
+Then we should do it, unless someone has an objection.
+
+"one remaining flag" means that the next protocol level feature would require a "bigger" code change and protocol incompatibility. Suggestion: use 0x80 flag as an "extensions" flag. In the notation of the protocol spec:
+{noformat}
+<consistency><flags>[<n>[name_1]<value_1>...[name_n]<value_n>][<result_page_size>][<paging_state>][<serial_consistency>][<timestamp>][<extension>...]
+
+<extension> consists of the <extension_id> followed by [short] <n> indicating the length of <n> [bytes] extension payload data
+<extension_id> a [byte] indicating the extension type 
+                extension types are:
+                        0x00 query timeout with fixed length 8 consisting of a [long] timeout value in milliseconds
+{noformat}
+There are some RFEs (e.g. _LOCAL_QUORUM_REMOTE_n_) that also require protocol level changes - this one could be encoded on the wire with CL=LOCAL_QUORUM plus an extension that defines the _required remote quorum_ (just as an example).
+
+Assigning to Sylvain so he can delegate it.
+
+Would it make sense to use CASSANDRA-8553?
+
+bq. Would it make sense to use CASSANDRA-8553?
+
+I'd rather not. I'd prefer keeping the custom payload really custom and never use it for anything Cassandra. And honestly, the protocol change for this (using the remaining flag) is really not a big deal so it's not like we need to look for alternatives.
+
+One thing worth mentioning on this issue however is that currently C* doesn't respects timeouts too well. Typically, any query with a digest mismatch could take closer to twice the configured timeout, and with short read retries that can be even worth. And some practical experience with the java driver has shown that it's not a theoretical problem: it's relatively easy to have C* take way longer than the configured timeout to answer (as in multiple seconds more than the configured timeout). So I'm left wondering if we shouldn't fix that first, having timeouts really be a reasonably precise upper-bound on when C* will respond to a user query, before allowing per-query timeouts?
+
+As a side note, the patch on CASSANDRA-5239 was actually fixing the timeout precision problem mentioned above (by using a timer for the whole query and timeouting the future if need be) but that's not directly applicable to the current synchronous {{StorageProxy}}.
+
+Getting rid of digests (CASSANDRA-7168) would fix the timeout problem without having to do weird things like "we'll halve the timeout when digests are involved in case we need to redo it." :)
+
+I see what you did there :)
+
+Unfortunately:
+# digests are far from being the only problem. Short reads are another, but more importantly, any range query is pretty much a free for all as far as timeouts are concerned since we basically reset the timeout for every range (modulo the concurrency factor, but that can very well be 1) and there can be very many range with vnodes. In practice, I suspect its range queries that are more often the culprit when the timeout is not respected.
+# I'm sure we can be smarter than "halve the timeout when digests are involved in case we need to redo it". For instance, we could mark the starting of a query and pass that down to the {{ReadCallback}}, so that it waits for {{timeout - (now - queryStart)}}. I don't think it would be that weird (outside of the fact we'd have to pass {{qeryStart}} down the {{ReadCallback}}).
+
+
+Assigning this to [~geoffxy] as he is working on it. 
+
+I’ve attached a patch implementing this, and would love some feedback!
+
+At a high level, the approach I took was to use the last flag available in the protocol to allow a client to specify whether or not the client supplied a timeout (as a {{long}}, in milliseconds). Cassandra will then use the minimum of either the client specified timeout or the configured RPC timeout. The rest of the changes were essentially for passing the client supplied timeout down to where it’s actually needed. I also bumped the messaging service version to allow for passing the timeout to the replica nodes as a part of serialization/deserialization for  {{ReadCommand}} and {{Mutation}}.
+
+I kind of maintain my objection that I don't think it's a good idea to expose this before we fix our timeout handling.
+
+I doubt most user realize that the so-called "request timeout" are not always a reliable upper-bound on requests (and as said above, sometimes not even close), and we should imo fix that before exposing more fine-grained control, or we're just giving more rope for user to hang themselves. 
+
+Note that fixing said timeout is not that hard, we should just do it first imo.
+
+With that said, the patch modify both the native protocol and inter-node protocol, so I'm afraid it will have to wait on 4.0/native protocol v5.
+
+
+I agree that we should fix issues by putting upper bound on the timeouts. However I dont think we should block this feature for it since it is off by default. Considering it took 5 years for someone to come up with a patch for this, I would vote to get it committed. 
+
+Also this is strictly better than what we have now. 
+
+bq. Also this is strictly better than what we have now.
+
+I disagree. As said above, giving more ways for user to get badly surprised is not better in my book. More precisely, the fact that the timeouts are currently global is probably why people don't rely on it too much, and why the fact that they are not always respected is lost to most users. If you start allowing a per-query timeout, you can be sure that user will start relying on them, and get nastily surprised. And it's not because something is off by default that it's ok to have it broken (and, it should be clear by now, it's imo broken unless the timeout are at least somewhat seriously respected).
+
+So I maintain my arguments and "vote".
+
+But I will also note that whatever what thinks of those points, this will still have to wait for 4.0 due to the protocol changes, which is still months away. So if someone is motivated for having that feature in, there is plenty of time for fixing the timeouts first. I'm not even saying I won't find some time to do so myself in the coming months if no-one beats me to it since this has been bothering me for a while.
+
+Do you want fixing the timeouts to be done as part of this ticket or separate. 
+
+I think it's worth it's own ticket and discussion, so created one: CASSANDRA-12256.
+
+Geoff will work on  CASSANDRA-12256. Can we get this reviewed in parallel and commit it once the other one is committed? 
+
+bq.  Can we get this reviewed in parallel and commit it once the other one is committed?
+
+Sure, no problem. Though as said above, the sheer fact it changes the intra-node protocol means it can't be committed before 4.0, and we don't even have created that branch yet, so I'm not promising I'll put it on the top of my review pile.
+
+CASSANDRA-12256 is fixed now. Can we get this reviewed. 
+
+I would suggest you rebase this on current trunk and make sure it is moved to be part of the beta v5 native protocol introduced in CASSANDRA-12142.  We can then commit it as part of the beta protocol when ever and not have to wait for 4.0.
+
+I'm attaching a second version of the patch that incorporates the changes in CASSANDRA-12256.
+
+*TL;DR:* The timeout is represented as an {{OptionalLong}} that is encoded in {{QueryOptions}}. It is passed all the way to the replica nodes on reads through {{ReadCommand}}, but is only kept on the coordinator for writes.
+
+
+The optional client specified timeout is decoded as a part of {{QueryOptions}}. Since this timeout may or may not be specified by a client, I opted to use an {{OptionalLong}} in an effort to make it clearer in the code that this is optional. I’ve gated the use of the new timeout flag (and encoding the timeout) to protocol v5 and above.
+
+On the read path, the timeout is kept within the {{ReadCommand}} and referenced in the {{ReadCallback.awaitResults()}}. It is also serialized within the {{ReadCommand}} so that replica nodes can use it when setting the monitoring time in {{ReadCommandVerbHandler}}. Of course, because the time when the query started is not propagated to the replicas, this will only enforce the timeout from when the {{MessageIn}} was constructed.
+
+On the write path, the timeout is just passed through the call stack into the {{AbstractWriteResponseHandler}}/{{AbstractPaxosCallback}} where it is referenced in the respective {{await()}} calls.
+
+I had investigated the possibility of passing the timeout to the replicas on the write path. To do so we'd need to incorporate it into the outgoing internode message when making a write, meaning placing it into {{Mutation}} or otherwise creating some sort of wrapper around a mutation that can hold the timeout. It seemed like this would be a very invasive change for minimal gain, considering being able to abort an in progress write didn't seem as useful compared to aborting an in progress read.
+
+This still requires a version bump in the internode protocol to support the change in serialization of {{ReadCommand}} (I haven't touched {{MessagingService.current_version}} yet, though). If we don't want to wait till 4.0, we can delay this part of the patch and just retain the custom timeout on the coordinator (i.e. don't serialize the timeout). Once the branch for 4.0 is available, we can modify the serialization to allow us to pass the timeout to the replicas.
+
+I'd also like to include some dtests for this, namely to just validate which timeout is being used on the coordinator. Is the accepted practice for doing something like this to log something and assert for the presence of the log entry? I want to avoid relying on the actual timeout observed since that can cause the test to be flaky.
+
+[~slebresne] Are you still reviewing this?
+
+I'm afraid I'm not, sorry.
+
+I did skimmed at the patch quickly and one general remark I can make is that I think we should handle that timeout at the message level ({{MessageOut}} and {{MessageIn}}) rather than at the payload level ({{ReadCommand}} in that case, I don't think we should add anything to {{ReadCommand}} in this patch in general). In particular, due to that, it doesn't seem the request timeout is taken into account when 1) timeout messages ("dropping them") and 2) setting the callbacks timeout in the {{MessagingService}} expiring map in the current patch. So that while passing a timeout lower than the configured one should kind of work (that is from a client point of view, we'll answer with the timeout passed, though we'd hold stuff in memory for longer), passing a higher timeout than the default/global one wouldn't (that is, after the global timeout has elapsed, we'll drop the callback and messages so that we won't truly give more time to the query, we'd simply make the client wait longer for something that cannot ever return).
+
+So I don't think the patch works as is for the reason above, and more generally I think we really need proper dtests for this (we'd really want a least a test that shows that if you request a higher timeout that the default one *and* a replica take longer than the default timeout but lower than the requested one, then the query does return properly), but I'm going to remove myself from review otherwise as I'm afraid I don't have time to dig more deeply in the patch at the current time. Sorry again.
+
+
+Cancelling the patch as it's likely very out of date now, and there hasn't been feedback on my prior comment (meaning that I still feel the currently attached patch isn't handling this at the right level and haven't seen argument to convince me of the contrary).
+
+[Code|https://github.com/yifan-c/cassandra/tree/CASSANDRA-2848-per-request-timeout], [PR|https://github.com/apache/cassandra/pull/432], [Test|https://app.circleci.com/jobs/github/yifan-c/cassandra/207]
+
+At high-level, this patch allows clients to set an optional timeout for each query. If the timeout is present and it is valid to be applied, the coordinator adjusts the waiting time and the expiration time of the internode messages are adjusted accordingly.  
+
+The optional timeout has the following specifications: 
+ * New flag & option added in V5 native protocol to allow specifying the optional timeout. 
+ * The timeout is in milliseconds and the valid range is (0, 2147483647), not inclusive. 
+ * Data type is Integer. Not using short because the max value of short is 32767, which may not satisfy all cases. 
+ * Default value is Integer.MAX_VALUE
+ * The timeout value cannot exceeds the database configured one effectively. 
+ ** Perform Math.min between the optional timeout (defaults to Integer.MAX_VALUE) and the configured one.
+
+ *Handling the optional timeout*
+
+The server (coordinator) receives the request and deserializes message with the QueryOptions. QueryState is then created with the computed timings, including the timeout for this query. The query is processed and the coordinator waits for the time duration according to the computed timeout in QueryState. The expiration of the internode messages are adjusted according to the timeout in QueryState, so that the message can be dropped properly if timeout. 
+
+QueryOptions contains all the options set by client. The values of the options remains immutable. 
+
+QueryState stores all the server-side computed values. For example, it has the resolved timeout for the query. QueryState is now truly one per query as an outcome of patch CASSANDRA-14677.
+
+{{CQLStatement}} gains a new method {{void resolveTimeout(QueryOptions options, QueryState state);}} in order to compute the proper timeout for the query at the start of query processing. The resolved timeout is stored in QueryState, which is passed along to the code that 1) awaits for response and 2) generates the internode messages. The method is implemented in the concrete CQL statements and it is called at `QueryHandler#process`
+
+*Read path*
+ * Single read: adjust the timeout and capped at `ReadRpcTimeout`
+ * Range read: adjust the timeout and capped at `RnageRpcTimeout`
+ * Blocking read repair: adjust the timeout of the repair mutation phase to the remaining of the read timeout 
+
+*Write path*
+ * Counter mutation: adjust the timeout and capped at `CounterWriteRpcTimeout`
+ * Normal mutation: adjust the timeout and capped at `WriteRpcTimeout`
+ * CAS: adjust the timeout and capped at `WriteRpcTimeout`
+ ** There is another timeout value to track the contention time (CasContentionTimeout) during cas. This timeout remains unchanged. 
+ * Batch
+ ** Counter batch: see counter mutation 
+ ** CAS or normal: adjust the time and capped at `WriteRpcTimeout`
+
+*Mix-versions compatibility*
+
+The feature is available only in protocol V5. 
+
+*_Client-Server compatibility_* 
+| |Server V4|Server V5|
+|Client V4|Good.|Good. The V4 client will not set the optional timeout. The V5 server uses the default value, Integer.MAX_VALUE|
+|Client V5|Good. But the client acts just like a v4 one. |Good.|
+
+_*Server-Server compatibility*_
+| |Server V4 (Replica)|Server V5 (Replica)|
+|Server V4 (Coordinator)|Good.|Good.|
+|Server V5 (Coordinator)|Good. The V5 coordinator updates the expiration. The V4 replica nodes honor it. |Good.|
+
+*Integration with other components*
+
+Full query logging: the optional timeout exists in QueryOptions. It is already encoded into the log entry properly. 
+
+Audit logging: right now, a timed out query is already logged as `REQUEST_FAILURE` with the exception message by the audit logger. Is it worthy to add the additional timeout in nanoseconds? 
+
+_Added a diagram to visually describe the patch_
+https://gist.github.com/yifan-c/11780706d3666034f940f3476d37c5d8#file-cassandra-2848-per-request-timeout-svg
+
+Review wanted :)
+
+I can help reviewing it and perform some end to end tests with a client driver.
+

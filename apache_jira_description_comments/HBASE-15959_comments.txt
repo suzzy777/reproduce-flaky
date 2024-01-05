@@ -1,0 +1,211 @@
+I will try to take a look at this in the next week or so.
+
+I have a patch ready. The root cause is
+{code}
+      assertCounter("cellsCountCompactedToMob", 2 * numHfiles);
+{code}
+
+Assumes that there is no mob reference cells. Actually, after the first major compact, the compacted files are still there in the family directory (compaction.discharger does not get chance to kick in yet). When scan for the next major compaction, these files may still be used, so scan may hit the cells in these compacted files (hence it has mob reference). 
+
+The fix is to wait compaction.discharger to move compacted files to archive and then start the second major compaction. 
+
+I will upload a patch after some clean up.
+
+
+bq. In second compaction, scanner has 10 storefiles. Shouldn't there be 6? 5 from recent flushes and 1 from earlier compaction. Probably because mob cleaner doesn't clean old hfiles. Does this needs fixing?
+region.compact doesn't compact mob files, I think this is not related with cleaners.
+
+I read the test, I guess this issue is because the scanner is not closed in the second scan. And the compactor cannot find the cells later than the smallest read point?
+{code}
+scanner = table.getScanner(scan);
+      scanner.next(100);
+      numScanNext++;
++   scanner.close();
+{code}
+
+bq. Across runs, same cell (ie. same key) may or may not be considered mob reference cell. here. This at least happens with row keys 0 - 4 (which got compacted earlier)
+Thanks a lot, Appy.
+I think this is design on purpose for this Test?
+In this test, it tries to verify the correctness that how mob cells are moved between store files and mob files.
+before the 1st compaction, the threshold is 0, it means all of the cells are considered as mob ones, and there are only reference cells in store files.
+In the 1st compaction, the threshold is changed to 100 which is larger than the value size of each mob cells. In this compaction, the cells are moved back to store files.
+In the scan after the 1st compaction, all the cells are the real ones, not reference ones.
+In the 2nd compaction, the threshold is changed to 0, and all cells are moved to mob files from store files. And in the second scan, the cells are the reference ones.
+
+bq. region.compact doesn't compact mob files, I think this is not related with cleaners.
+
+If it's moving cells from mob to store, doesn't that mean it's compacting mob files too. [Here|https://github.com/apache/hbase/blob/7efb9edecbdf8b35046230575d504e4caeb80f34/hbase-server/src/main/java/org/apache/hadoop/hbase/mob/DefaultMobStoreCompactor.java#L213], we are moving mob cells to store or new writer.
+
+You're right, first two parts are very clear what they are doing. Set the thresholds, expect things to move around.
+
+bq. In the 2nd compaction, the threshold is changed to 0, and all cells are moved to mob files from store files. And in the second scan, the cells are the reference ones.
+
+Cells 0-4 got moved to store file in the first compaction. And that's why in the [second scan|https://github.com/apache/hbase/blob/master/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestRegionServerMetrics.java#L441], there is [no mob cell|https://github.com/apache/hbase/blob/master/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestRegionServerMetrics.java#L445].  And we write cells 5-9 before [threshold is ste to 0|https://github.com/apache/hbase/blob/master/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestRegionServerMetrics.java#L453], so they should be non-mob cells too.
+So when the second compaction kicks, I would expect them to be non-reference cells. It's only after the compaction has finished, that they'll become the reference cells again.
+(Just to be sure, reference cells = mob cells, right?)
+
+Maybe the automatic run of the region compaction affects the final results, reducing the number of store files might fix this.
+But as Appy said, the number of store files is still 5 after the 1st compaction, the old store files are not archived, I tested this, this is not only for mob, it is also for non-mob tables. I'll file another JIRA to fix this. Thanks.
+
+bq. (Just to be sure, reference cells = mob cells, right?)
+In my context, reference cells are cells in store files, they are linked to cells in mob files, and the cells in mob files are mob files:). Sorry for not clarifying things clearly.
+
+The old store files are not archived right after compaction, compaction.discharger does that periodically. After the first major compaction, there are 6 store files, 5 smaller ones, one with everything. Since compaction.discharger does not kick in yet, at that time, region.initialize() will open these files again, I think at that time, it messed up, some cells are from the old hfile which has mob reference, some from the final one, which does not have the reference cell. I will upload a patch shortly, thanks.
+
+Oops, my mistake. The compacted files are not directly removed any more in the code of master branch (instead it uses a region server chore to do that). Not sure why it needs this after compaction. But this can lead to mob issues just in this case.
+Let me give a example, we have three store files, sf#1 has a seqId as 5, sf#2 has a seqId as 6, and sf#3 has a seqId as 7, after compaction we have a new store file sf#4 who has a seqId as 7. In normal cases, sF#1-3 are removed from the store files in the context (not from file system).
+After the {{region.initialize()}}, some of cells come from sf#3 replace the cells in sf#4, this breaks the test. But the WAL is supposed to guarantee the correctness after region is restarted. But the WAL is not replayed in {{region.initialize()}} in this case, the number of found HLogs is 0, 
+
+Go ahead. Thanks.
+
+[~jingcheng.du@intel.com], agree here. So my fix is to wait for cleaner to move compacted files to archive and then go ahead to do region.initialize(). I have run multiple times, it seems work.
+
+The patch has some comments copied from somewhere which does not make sense, will clean up later. [~jingcheng.du@intel.com], could you take a took to see if this fixes the issue? Thanks.
+
+v2 cleans up some comments.
+
+removed debug log from v2.
+
+I don't know much about MOB, but from the looks, it seems that the test has uncovered a bug here. If that's the case, the current change is basically making the test pass somehow. The correct fix would be addressing the root cause, which i think is cleaning/moving the files in end of compaction.
+What test is doing is plausible in real cluster: compaction happens, region is unloaded and loaded back before cleaner kicks in. Maybe rs went down, maybe rebalancing, anything.
+
+
+Sorry guys.
+I review this case, and confirm that there is no uncovered issues, it should be only the case design issue.
+[~huaxiang] 's patch can fix this issue, but I have a better way to fix it. Just adding {{(HRegion)region).close()}} before {{((HRegion)region).initialize()}} can fix this issue.
+Would you like to provide a patch like this, [~huaxiang]? Thanks.
+
+Thanks [~jingcheng.du@intel.com], I will take a look and provide a new patch based on your suggestion.
+
+Upload v4 based on [~jingcheng.du@intel.com]'s comment, indeed it is a nicer solution as store.close() will move compacted files to archive, please add jingcheng's name to the author list, thanks.
+
+[~appy] could you help to review? Thanks.
+
+To make this consistent, can we add a store.close() before each store.initialize() after the first?
+
+Also, can we change the comment to be a little more explicit? May something like:
+{code}
+// closing the region forces the compaction.discharger to archive the compacted hfiles 
+{code}
+
+I checked the code, that is the only one which store.close() needs to be added.
+I updated the comments, a new diff attached, thanks.
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green} 0m 0s {color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 3m 15s {color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 46s {color} | {color:green} master passed with JDK v1.8.0 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 32s {color} | {color:green} master passed with JDK v1.7.0_79 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 54s {color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 15s {color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 52s {color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 26s {color} | {color:green} master passed with JDK v1.8.0 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 33s {color} | {color:green} master passed with JDK v1.7.0_79 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 41s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 44s {color} | {color:green} the patch passed with JDK v1.8.0 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 44s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 31s {color} | {color:green} the patch passed with JDK v1.7.0_79 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 31s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 54s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 14s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} whitespace {color} | {color:red} 0m 0s {color} | {color:red} The patch has 1 line(s) that end in whitespace. Use git apply --whitespace=fix. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green} 25m 26s {color} | {color:green} Patch does not cause any errors with Hadoop 2.4.0 2.4.1 2.5.0 2.5.1 2.5.2 2.6.1 2.6.2 2.6.3 2.7.1. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 2m 8s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 30s {color} | {color:green} the patch passed with JDK v1.8.0 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 32s {color} | {color:green} the patch passed with JDK v1.7.0_79 {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 82m 2s {color} | {color:green} hbase-server in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 17s {color} | {color:green} Patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 122m 59s {color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12809050/HBASE-15959-v004.patch |
+| JIRA Issue | HBASE-15959 |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux asf907.gq1.ygridcore.net 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build/component/dev-support/hbase-personality.sh |
+| git revision | master / d9463bc |
+| Default Java | 1.7.0_79 |
+| Multi-JDK versions |  /home/jenkins/tools/java/jdk1.8.0:1.8.0 /usr/local/jenkins/java/jdk1.7.0_79:1.7.0_79 |
+| findbugs | v3.0.0 |
+| whitespace | https://builds.apache.org/job/PreCommit-HBASE-Build/2152/artifact/patchprocess/whitespace-eol.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/2152/testReport/ |
+| modules | C: hbase-server U: hbase-server |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/2152/console |
+| Powered by | Apache Yetus 0.2.1   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Thanks for the patch huaxiang, and jingcheng.  Thanks for the input Appy! 
+
+Committed to master.
+
+Thanks [~jmhsieh], [~jingcheng.du@intel.com] and [~appy].
+
+| (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green} 0m 0s {color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 4m 4s {color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 0s {color} | {color:green} master passed with JDK v1.8.0 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 42s {color} | {color:green} master passed with JDK v1.7.0_79 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 1m 4s {color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 19s {color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 2m 33s {color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 54s {color} | {color:green} master passed with JDK v1.8.0 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 51s {color} | {color:green} master passed with JDK v1.7.0_79 {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 1m 5s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 11s {color} | {color:green} the patch passed with JDK v1.8.0 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 1m 11s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 47s {color} | {color:green} the patch passed with JDK v1.7.0_79 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 47s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 1m 12s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 20s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} Patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green} 34m 48s {color} | {color:green} Patch does not cause any errors with Hadoop 2.4.0 2.4.1 2.5.0 2.5.1 2.5.2 2.6.1 2.6.2 2.6.3 2.7.1. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 3m 1s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 42s {color} | {color:green} the patch passed with JDK v1.8.0 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 44s {color} | {color:green} the patch passed with JDK v1.7.0_79 {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 117m 21s {color} | {color:green} hbase-server in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 23s {color} | {color:green} Patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 173m 37s {color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12809076/HBASE-15959-v005.patch |
+| JIRA Issue | HBASE-15959 |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux pomona.apache.org 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build/component/dev-support/hbase-personality.sh |
+| git revision | master / d9463bc |
+| Default Java | 1.7.0_79 |
+| Multi-JDK versions |  /home/jenkins/tools/java/jdk1.8.0:1.8.0 /usr/local/jenkins/java/jdk1.7.0_79:1.7.0_79 |
+| findbugs | v3.0.0 |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/2155/testReport/ |
+| modules | C: hbase-server U: hbase-server |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/2155/console |
+| Powered by | Apache Yetus 0.2.1   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+FAILURE: Integrated in HBase-Trunk_matrix #1015 (See [https://builds.apache.org/job/HBase-Trunk_matrix/1015/])
+HBASE-15959 Fix flaky test TestRegionServerMetrics.testMobMetrics (jmhsieh: rev a7172d5611f33dde2566a4e140aeddc675a56f3a)
+* hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestRegionServerMetrics.java
+
+

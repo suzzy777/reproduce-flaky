@@ -1,0 +1,147 @@
+We experience the same issue with Cassandra 3.0.6 too. This bug makes data inaccessible. It might be related to static columns because we use them too
+
+Same issue with Cassandra 3.0.6
+
+We encountered the same issue with Cassandra 3.0.6 - we are not able to read data anymore due to this error.
+
+Some more details to identify issue in 3.0.7:
+- it happens only with static column
+- it might be related to setting null to static column value
+- I identified that org.apache.cassandra.db.ReadCommand$1WithoutPurgeableTombstones transformation returns null in org.apache.cassandra.db.transform.BaseRows.add(...) method so staticRow is set to null
+- There can be also some data corruption because we lost at least one partition row after it happened
+
+Here is naive fix to mitigate this issue:
+{code}
+diff --git a/src/java/org/apache/cassandra/db/transform/BaseRows.java b/src/java/org/apache/cassandra/db/transform/BaseRows.java
+index 78526e8..bc92b41 100644
+--- a/src/java/org/apache/cassandra/db/transform/BaseRows.java
++++ b/src/java/org/apache/cassandra/db/transform/BaseRows.java
+@@ -1,17 +1,24 @@
+ package org.apache.cassandra.db.transform;
+ 
++import static org.apache.cassandra.utils.Throwables.merge;
++
+ import org.apache.cassandra.config.CFMetaData;
+ import org.apache.cassandra.db.DecoratedKey;
+ import org.apache.cassandra.db.PartitionColumns;
+-import org.apache.cassandra.db.rows.*;
+-
+-import static org.apache.cassandra.utils.Throwables.merge;
++import org.apache.cassandra.db.rows.BaseRowIterator;
++import org.apache.cassandra.db.rows.RangeTombstoneMarker;
++import org.apache.cassandra.db.rows.Row;
++import org.apache.cassandra.db.rows.Unfiltered;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+ 
+ public abstract class BaseRows<R extends Unfiltered, I extends BaseRowIterator<? extends Unfiltered>>
+ extends BaseIterator<Unfiltered, I, R>
+ implements BaseRowIterator<R>
+ {
+ 
++    private static final Logger logger = LoggerFactory.getLogger(BaseRows.class);
++
+     private Row staticRow;
+ 
+     public BaseRows(I input)
+@@ -82,7 +89,14 @@ implements BaseRowIterator<R>
+         super.add(transformation);
+ 
+         // transform any existing data
+-        staticRow = transformation.applyToStatic(staticRow);
++        final Row afterTransform = transformation.applyToStatic(staticRow);
++
++        if (staticRow != null && afterTransform == null)
++            logger.debug("Transformation returns NULL value : " + transformation);
++
++        if (afterTransform != null)
++            staticRow = afterTransform;
++
+         next = applyOne(next, transformation);
+     }
+ 
+diff --git a/src/java/org/apache/cassandra/db/transform/UnfilteredRows.java b/src/java/org/apache/cassandra/db/transform/UnfilteredRows.java
+index 98640ae..e497bef 100644
+--- a/src/java/org/apache/cassandra/db/transform/UnfilteredRows.java
++++ b/src/java/org/apache/cassandra/db/transform/UnfilteredRows.java
+@@ -35,6 +35,9 @@ final class UnfilteredRows extends BaseRows<Unfiltered, UnfilteredRowIterator> i
+     @Override
+     public boolean isEmpty()
+     {
++        if (staticRow() == null)
++            return true;
++
+         return staticRow().isEmpty() && partitionLevelDeletion().isLive() && !hasNext();
+     }
+ }
+
+{code}
+
+[~marekasf] This is really helpful; it definitely focuses the work on this a lot. I'll report back when I have something more.
+
+This issue has been happening all the way back to 3.0; it was caused by CASSANDRA-9975.
+
+We hit this condition when we have tombstoned a static column, and are ready to delete it. I was able to reproduce by setting {{gc_grace_seconds}} to 0, and then doing some tombstones of static columns.
+
+Looking at the usages of {{BaseRows.staticRow()}}, I'm worried that other places might have the same issue; they take the static row, expecting it to be non-null, and call {{isEmpty()}} on it.
+
+[~carlyeks] according to "I'm worried that other places might have the same issue;".  Can deletion of those static columns  protect us from such data corruption in future ?
+
+[~bkowalczyyk]: It is actually the deletion of the static columns that is causing this issue, but I don't think there is presently any data corruption - we need a fix to be able to compact and read this data, but it shouldn't be changed on disk at this point (as we can't compact it away).
+
+I'm working today on a fix.
+
+I had a [fix|https://github.com/carlyeks/cassandra/tree/ticket/11988/3.0], but there seems to be a dependency between the change to return null for empty static rows and early reopen, so there are failing unit tests.
+
+I'll work on a different fix on Monday which will just target the possibly bad usages.
+
+Carl Yeksigian,
+
+Are you aware if your fix will work with sstabledump? I need to find a way to export/dump this data. This bug also prevents me from bootstrapping new nodes (they fail to stream this table), and obviously I can't work with the problematic partitions in the mean time.
+
+[~nimi]: Is there currently an issue with sstabledump?
+
+I believe this issue is only be affecting the read path where the static row has been tombstoned, and sstabledump doesn't use the same read path. If you are having issues, that might be related, or it might be something else.
+
+Okay good to know,
+
+I just did an initial test, and while the CQL Representation seems to work fine, the JSON output returns some errors.
+
+Nimi
+
+Also, for anyone that comes across this, it looks like a temporarily pushed out the issue by increasing gc_grace_seconds.
+
+Not sure what happened, but in the time since I last ran this, the {{SSTableRewriterTest}} is happy on this branch.
+
+[~slebresne]: can you take review on this? This is a really simple fix, which I'm afraid is actually naive.
+
+I'm a little worried of making the {{filter}} and {{purge}} methods, which depend on {{transformAndFilter}}, behave differently if the row is static or not. The semantic "returns null if everything is filtered" feels easier to remember if you don't add "unless it's a static row, in which case it returns an empty row". And more concretely, I can't swear without concrete inspection that there isn't code that actually expect {{null}} from those method to detect full purge (it's admitedly unlikely in that case though).
+
+Anyway, the issue is that the code expects the {{staticRow()}} method of {{UnfilteredRowIterator}} to never return {{null}} (it's kind of part of its contract even though it's not all that clearly stated right now), and I prefer fixing that by brute-forcing {{BaseRows.staticRow()}} to never return {{null}}.
+
+I'm attaching a patch to do so below. The patch does the same {{AbstractBTreePartition}} to be on the safe side (I believe it's theoretically possible to have the static row null today because {{Row.updateAllTimestamp}} can also theoretically return null, but I'm not sure at all this can be practically triggered).
+
+The patch also adds a few precisions to javadocs regarding those behavior as well as minor cleanups I did while looking at that (apologies on the latter, shouldn't pollute patch like that in general, but figured it's simple enough here and couldn't help myself). I've also added a simple unit test to reproduce the issue for good measure. 
+
+Let me know if that work for you.
+
+| [11988-3.0|https://github.com/pcmanus/cassandra/commits/11988-3.0] | [utests|http://cassci.datastax.com/job/pcmanus-11988-3.0-testall] | [dtests|http://cassci.datastax.com/job/pcmanus-11988-3.0-dtest] |
+| [11988-3.9|https://github.com/pcmanus/cassandra/commits/11988-3.9] | [utests|http://cassci.datastax.com/job/pcmanus-11988-3.9-testall] | [dtests|http://cassci.datastax.com/job/pcmanus-11988-3.9-dtest] |
+
+
+That does look like a better way to fix it.
+
++1 once CI is clean
+
+Strangely, the 3.0 run has a unit test failure on a {{SSTableRewriterWriter}} like you also reported. That said, it's not on the 3.9 branch, even though the patch merge cleanly, I wasn't able to reproduce in 10+ runs, and I really can't see how this patch could ever "break" {{SSTableRewriter}}. I'm further pretty confident returning an empty static row from {{UnfilteredRowIterator}} is the right thing to do and that's all what this patch does, so I suspect a rare flaky test and some uncanny coincidence. So I committed, but I'll keep an eye on CI runs in the near term to see if that test start failing regularly.
+
+FYI, we're having the same issue (CASSANDRA-12215).
+
+I implemented the patch, set gc_grace_seconds to 86400, and still ran into the error.  Setting the gc_grace_seconds to something high, all rows show up, including the ones that are supposed to be tombstones.  
+
+I'm with Hau. We're eager to see this resolved in 3.0.9 if at all possible. To be clear, the current patch does not fix the issue for us, compaction still fails.
+
+Currently we're working around this by effectively disabling compaction with an extremely high value for `gc_grace_seconds` on tables with static fields. Clearly the shorter we have to live with that workaround the less nervous we are.
+
+Please don't hesitate to let us know anything we can do to help isolate or reproduce. As Hau mentioned, we can provide an sstable and schema that should reproduce.
+

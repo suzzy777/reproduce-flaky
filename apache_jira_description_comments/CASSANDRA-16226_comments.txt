@@ -1,0 +1,165 @@
+If I understand correctly, only upgraded tables are affected, so new tables (or even INSERTs to upgraded tables?) are not affected. Could the migration code be fixed so that row timestamps are properly generated? While the proposed solution improves performance for migrated tables, also seems to take away the performance benefits of max timestamps from COMPACT STORAGE tables. Fixing the issue for newly upgraded and rebuilt tables and recommending {{nodetool upgradesstables -a}} for fixing the performance issue on already migrated tables might result in even better performance improvements.
+
+Hi [~kornelpal]. Take a look at {{UpdateStatement#addUpdateForKey()}}...
+
+{noformat}
+// We update the row timestamp (ex-row marker) only on INSERT (#6782)
+// Further, COMPACT tables semantic differs from "CQL3" ones in that a row exists only if it has
+// a non-null column, so we don't want to set the row timestamp for them.
+if (type.isInsert() && cfm.isCQLTable())
+    params.addPrimaryKeyLivenessInfo();
+{noformat}
+
+...and {{LegacyLayout}}...
+
+{noformat}
+else if (column.isPrimaryKeyColumn() && metadata.isCQLTable())
+{noformat}
+
+COMPACT tables will never have primary key liveness info, even if those tables are created in 3.0+, so running {{upgradesstables}} doesn't help (at least as far as I can tell). The patch I've posted simply restores the way this optimization worked for COMPACT tables before the 3.0 storage engine rewrite.
+
+I do need to test this w/ {{DROP COMPACT STORAGE}} though...
+
+There is a problem the current patch does not address, and that's dropping compact storage when you've already written SSTables. {{DROP COMPACT STORAGE}} doesn't leave any indication on individual SSTables as to whether the table overall was COMPACT when they were written. Therefore, {{isCQLTable()}} can be true after the drop, and we're back in the same situation. Also, {{upgradesstables}} has to be run before {{DROP COMPACT STORAGE}} can be run, so there is no source of liveness information either way.
+
+Thank you [~maedhroz] for the details, now I understand that this is not an upgrade issue. I don't have any more concerns about your patch, and thank you for fixing this performance issue.
+
+[~marcuse] [~jwest] [~ifesdjeen] What might make sense (and I need to coordinate with you) is whether we could solve the above problem with a simple flag at the SSTable level that indicates whether empty primary key liveness info is valid. If we write this in {{upgradesstables}} and then require its presence before running {{DROP COMPACT STORAGE}}, I think we would have the guardrails necessary to make it basically impossible for people to accidentally re-introduce this regression. (This would be coupled, of course, with changing the current patch to look at that flag, not the table level {{isCQLTable()}}.)
+
+With the now-committed CASSANDRA-16217 bringing back {{isCQLTable()}}, the patch currently posted for this issue is perhaps _more_ defensible. However, the problems around {{DROP COMPACT STORAGE}} persist and will have to be dealt with.
+
+[~maedhroz], since {{COMPACT STORAGE}} support was reintroduced to 4.0, would it make sense to implement the fix for 3.0+ and document the performance degradation as one more of the already many undesirable side effects of {{DROP COMPACT STORAGE}}? {{isCQLTable()}} will be true after that, and then rebuilding the SSTables (compaction, scrub or upgradesstables) will fix the performance issues.
+
+I did some more research and I don't think that the temporary performance issue after {{DROP COMPACT STORAGE}} can be fixed without tracking the dropped status. On another note, I think that the current implementation of {{DROP COMPACT STORAGE}} is of very limited use. Ideally it should record that compact storage was dropped and later rebuild the SSTable using a new structure that is functionally equivalent to the old compact behavior, avoiding the issues described in CASSANDRA-16217. Unfortunately I am not sure how much effort such a change was.
+
+Other {{ALTER TABLE}} operations such as dropping a column, changing bloom_filter_fp_chance or compression options already require the SSTables to be rebuilt (by compaction, scrub or upgradesstables) to take effect. This would be the first of those operations to cause a temporary performance degradation however. Considering even this, I believe that fixing the compact table performance issue and dealing with the side effects of {{DROP COMPACT STORAGE}} as part of the larger effort of removing compact storage support would benefit the community by facilitating upgrade to 3.0+ from 2.x.
+
+bq. I don't think that the temporary performance issue after DROP COMPACT STORAGE can be fixed without tracking the dropped status.
+
+Before going too much farther here, I should probably lay out one more time how the concept of an empty row differs between compact and non-compact tables and how that affects the way they interact with the read path optimizations for skipping SSTables.
+
+For compact tables, there is no concept of primary key liveness. When a row has no live cells, it is simply empty. For a non-compact table, it is possible to have a live row that happens to have no live cells. Imagine the following example:
+
+{noformat}
+INSERT INTO foo (partitionKey, clustering, value) VALUES (0, 1, 1)
+DELETE value FROM foo WHERE partitionKey = 0 AND clustering = 1
+SELECT * FROM foo WHERE partitionKey = 1 AND clustering = 1
+{noformat}
+
+With compact storage, this SELECT will return nothing/zero rows. With a non-compact table, this will return a single row {{(0, 1, null)}}. Any solution for this Jira should preserve this behavior, i.e. when DROP COMPACT STORAGE runs, we should start returning the second result, and all existing non-compact tables should keep the same behavior as well.
+
+Right now, I'm working on a solution that a.) preserves this behavior, b.) requires no changes to the SSTable format, and c.) fixes the performance regression originally reported in this Jira, in addition to one or two that don't actually relate to compact tables. I'll hopefully have a rough patch in the next day or so.
+
+Thank you [~maedhroz] for the example, now I understand that the simple fix for the performance issue would also result in a behavior change. In this case I think that you need to apply the same special behavior when the NO_COMPACT client option is set, not just when DROP COMPACT STORAGE was issued.
+
+I've posted (the 3.0 version of) an alternative solution here, which should merge up cleanly, given {{TableMetadata#isCQLTable()}} is still present on trunk after CASSANDRA-16217: https://github.com/apache/cassandra/pull/823
+
+(CircleCI is having difficulty with the unit tests, but there is an ex-unit test run [here|https://app.circleci.com/pipelines/github/maedhroz/cassandra/155/workflows/cc54c092-cac1-4144-b9be-577ea4c8a78e] and a default config unit test run [here|https://app.circleci.com/pipelines/github/maedhroz/cassandra/158/workflows/12cd707a-2fdd-4b9f-b512-b5f060a63dbf].)
+
+My goals w/ this patch were the following:
+
+1.) Maintain the empty row semantics of tables that have either always been compact or always been non-compact (see [previous|https://issues.apache.org/jira/browse/CASSANDRA-16226?focusedCommentId=17233168&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-17233168] comment), and preserve as much of them as possible after dropping compact storage, given the historical limitations of the compact format.
+
+2.) Either improve/reduce or leave unchanged the number of SSTables read in all cases for tables that have never been compact.
+
+3.) Fix the regression around the number of SSTables read in the original description of this issue for compact tables, and avoid having the regression re-introduced when and if compact storage is dropped.
+
+4.) Avoid creating a new SSTable format or burdening operators with running {{upgradesstables}} again to make all of this above work.
+
+Although there are some issues w/ the unit tests on CI, the relevant local tests are looking clean, including {{operations.DeleteTest}} and {{operations.UpgradeTest}}, which verify item #1 above, and the other points are by and large satisfied. For point #2, there was actually a case where pure non-compact tables appeared to be reading too many SSTables w/ updates present (although that [needs to be reviewed|https://github.com/apache/cassandra/pull/823/files?file-filters%5B%5D=.java#r524809272]).
+
+One drawback of this approach is that when a compact table with existing SSTables has compact storage dropped, those SSTables still do not contain primary key liveness info, and therefore may continue to return zero rows rather than rows w/ primary keys and null regular columns. (Data written after the drop will, of course, have liveness info, and so mixed behavior is possible.) I've discussed a few ideas w/ [~jwest] and [~ifesdjeen] around this, and I'm not convinced any of them would be valuable. (Keep in mind that applications written against compact storage tables will already be handling this case, and good documentation will help even further.)
+
+The first is having enough information, either via a sequence number or a new piece of metadata, to identify whether an SSTable was created while a table was still compact. Having this data might be useful in some other way, but it still does not insert primary key liveness info into pre-drop SSTables. DELETE and UPDATE operations never have primary key liveness information attached to them, even for pure non-compact tables, so an insert pre-drop in one SSTable, followed by a delete in a post-drop SSTable, will still translate to the absence of a row rather than a row with null regular cells.
+
+The second broad idea is to somehow insert primary key liveness information into pre-drop SSTables, but this is problematic for at least a couple reasons. If we make it a prerequisite for running DROP COMPACT STORAGE, it means physically rewriting SSTables. (To be fair, this may not be a huge additional burden for those still on 2.x, who would have to do this anyway.) The other oddity is that there doesn't appear to be any existing procedure for synthesizing primary key liveness info. In the non-compact world, it is carried only by INSERT operations, not UPDATE or DELETE operations. It's not clear to me how we would determine where to add it during a {{runsstableupgrade}} run, particularly how we would know the difference between INSERT and UPDATE starting with just a compact SSTable on disk.
+
+To summarize, I think tables that are purely compact or non-compact should be handled pretty well w/ this patch (and will strictly git all the goals above, where applicable). The interesting case is the mixed compact/non-compact SSTable set caused by dropping compact storage. In this case, I think it makes reasonable trade-offs and avoids all the major pain points for operators. Whatever direction we go, the official docs around compact storage are going to need updating.
+
++1 on the patch. The only change I'd like to suggest is to add tests for tombstones, since previously we weren't taking them into consideration. 
+
+Two nits (pre-existing):
+  * [here|https://github.com/apache/cassandra/pull/823/files#diff-b4515f390c3b40e1f64feda8fd8746647b43cda26f8019ec96fc2dd4320fa96cR1040] "more recent that" should be "more recent than".
+  * should we consider renaming {{canRemoveRow}}? The name is slightly confusing, since the idea here is basically to reduce number of clustering keys to perform search upon. I'm sure this made complete sense to whoever was writing it at first, but out of context this name was a bit hard to parse.
+
+
+
+Thanks [~ifesdjeen].
+
+bq. add tests for tombstones, since previously we weren't taking them into consideration
+
+Indeed, although there is some coverage of this logic across {{SSTablesIteratedTest}}, {{DeleteTest}}, and {{UpgradeTest}}. It might be useful to have a test or two around the number of SSTables hit with range tombstones in {{SSTablesIteratedTest}}.
+
+bq. should be "more recent than"
+
+Fixed.
+
+bq. should we consider renaming canRemoveRow?
+
+I settled on {{isRowComplete()}}, which at least describes what the method tells us, and _not_ what it tells use we can do as a result.
+
+New commit with the changes above is [here|https://github.com/apache/cassandra/pull/823/commits/b71d830ebbe2e5726de2c18b03179ca2b8a74023].
+
+...and just to have everything in one place for [~mck]: [3.0 patch|https://github.com/apache/cassandra/pull/823], [CircleCI|https://app.circleci.com/pipelines/github/maedhroz/cassandra/171/workflows/4781de11-c5e2-40b1-967c-0e96728f843b], [CircleCI Unit Tests Only|https://app.circleci.com/pipelines/github/maedhroz/cassandra/169/workflows/93ea354c-cd12-48a5-a0ec-d88ca1a0dc86]. (For some reason, the HIGHRES configuration isn't handling the unit tests properly.)
+
+I'll post the 3.11 and 4.0 branches, which I expect not to deviate much (if at all) from the 3.0 diff, once we've got a second +1.
+
+ci-cassandra.a.o run [here|https://ci-cassandra.apache.org/job/Cassandra-devbranch/264/#showFailuresLink].
+Failures look erroneous. Maybe the 3.0 patch needs a rebase? (e.g. compare it to 3.0 latest [results|https://ci-cassandra.apache.org/job/Cassandra-3.0/lastSuccessfulBuild/#showFailuresLink].
+
+[~mck] I've rebased the 3.0 patch.
+
+The {{TestCqlshOutput}} errors look like some oddities around unexpected single-quotes, parentheses, and dashes in their output, so those should be unrelated. {{TestOfflineTools}} is flaky in the base branch. Finally, the failing in-jvm tests area all passing in the above CircleCI runs.
+
+Also, it looks like we aren't even running the {{TestCqlshOutput}} tests against {{cassandra-3.0}}? (i.e. 8,246 tests for my branch and 8,030 for the base branch?)
+
+Pushed up the 3.11 and trunk patches...
+
+|[3.0|https://github.com/apache/cassandra/pull/823]|[Circle j8|https://app.circleci.com/pipelines/github/maedhroz/cassandra/172/workflows/2cd5f868-d9ec-44e2-97d0-ea2a809f2533]|n/a|
+|[3.11|https://github.com/apache/cassandra/pull/853]|[Circle j8|https://app.circleci.com/pipelines/github/maedhroz/cassandra/174/workflows/e5fc06b8-3acc-4a7f-bb66-f0c3bea52272]|n/a|
+|[trunk|https://github.com/apache/cassandra/pull/854]|[Circle j8|https://app.circleci.com/pipelines/github/maedhroz/cassandra/175/workflows/e6adf785-c421-4d0b-a0a9-6fe90f313952]|[Circle j11|https://app.circleci.com/pipelines/github/maedhroz/cassandra/175/workflows/0ada7c16-9c60-45d5-8c32-770ee0194a0f]|
+
+
+ci-cassandra.a.o runs for the above:
+ - [3.0|https://ci-cassandra.apache.org/job/Cassandra-devbranch/266/]
+ - [3.11|https://ci-cassandra.apache.org/job/Cassandra-devbranch/267/]
+ - [trunk|https://ci-cassandra.apache.org/job/Cassandra-devbranch/268/]
+
+Summarizing the {{ci-cassandra}} runs...
+
+For the 3.0 and 3.11 patches, there's no test failure that's not also present (assuming it's even run) in the recent history for {{cassandra-3.0}} and {{cassandra-3.11}}, respectively.
+
+For the trunk patch, there is [one failure|https://ci-cassandra.apache.org/job/Cassandra-devbranch/268/testReport/org.apache.cassandra.net/ProxyHandlerConnectionsTest/testExpireSomeFromBatch_compression/] that isn't in the recent history, {{ProxyHandlerConnectionsTest.testExpireSomeFromBatch}} w/ compression, but it looks both completely unrelated and accompanied by failures in the normal and cdc versions on trunk.
+
+It looks like {{ProxyHandlerConnectionsTest}} needs a test fixing Jira...
+
+UPDATE: Filed CASSANDRA-16358
+
+I've added a few more tests in the wake of [~mck]'s review in the 3.0 branch and addressed the concerns raised. If those discussions are resolved, I'll begin the process of updating the 3.11 and trunk PRs...
+
++1 to the 3.0 patch. Will the failure to invalidate the prepared statement cache when dropping compact storage in trunk be addressed in a separate ticket?
+
+bq. Will the failure to invalidate the prepared statement cache when dropping compact storage in trunk be addressed in a separate ticket?
+
+See CASSANDRA-16361. (UPDATE: A patch is now available there.)
+
+[~mck] There are actually a couple changes I want to make to the docs around compact storage, as I mentioned in the Documentation Plan above. Would it be best to include that only in the trunk patch? A separate Jira altogether?
+
+bq. There are actually a couple changes I want to make to the docs around compact storage, as I mentioned in the Documentation Plan above. Would it be best to include that only in the trunk patch? A separate Jira altogether?
+
+3.11 (if doc exists there) and trunk, this jira, please.
+
+[~mck] [~ifesdjeen] I've made the minor adjustment to the docs in the 3.11 branch [here|https://github.com/apache/cassandra/pull/853/commits/1de49337f1ed93bbf023d0b25add179922fd9341]. Let me know what you think.
+
+> I've made the minor adjustment to the docs in the 3.11 branch here. Let me know what you think.
+
+LGTM!
+
+With CASSANDRA-16361 resolved, it looks like all that's left here is to rebase things and get the trunk patch up-to-date. I'll take care of that tomorrow...
+
+The three branches are now squashed, Circle settings removed, etc.
+
+Committed as [f8500ee911343eb8826f9c44bb6db2ab780f6327|https://github.com/apache/cassandra/commit/f8500ee911343eb8826f9c44bb6db2ab780f6327]
+
+Thanks [~mck]!
+

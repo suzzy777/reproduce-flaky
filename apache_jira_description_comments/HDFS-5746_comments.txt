@@ -1,0 +1,586 @@
+See here for some notes about the strategy for 5182: https://issues.apache.org/jira/browse/HDFS-5182?focusedCommentId=13866545&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-13866545
+
+* Add SharedFileDescriptorFactory.  This is a class which can produce anonymous shared memory segments suitable for passing from the DataNode to the DFSClient via file descriptor passing.  It would have been nice to do this without JNI, but unfortunately we don't have {{open(O_EXCL)}} support in JDK6, which we're still supporting.  There is {{NativeIO#open}}, but it doesn't allow me to cleanly separate {{EEXIST}} errors from other errors (the error gets turned into a textual exception which I don't want to parse).  Also there may be some symlink issues with the JDK6 java APIs for listing files in a directory, etc.  Overall, the native implementation was just easier.  This is something we should probably revisit with JDK7, of course.
+
+* Add {{NativeIO#mmap}} and {{NativeIO#munmap}}.  Although it would be nicer to use {{FileChannel#map}}, there is no public interface to get access to the virtual memory address of a {{MappedByteBuffer}}, and I needed that.  Luckily, the amount of code needed to just call mmap is really small.
+
+* I didn't want to duplicate the code used to stuff a reference count + closed bit into {{DomainSocket#refCount}}, so I factored it out into {{CloseableReferenceCount}}.  This class is now used in both DomainSocket and {{ShortCircuitSharedMemorySegment}}.
+
+* {{DomainSocketWatcher}} is a thread which calls poll() in a loop.  This will be used to detect when a DFSClient has closed and its shared memory segments can be closed, by detecting when their associated DomainSockets are closed.  I used poll() here rather than select() since select() has some limitations with high-numbered file descriptors on some platforms.  Also, poll's interface is a bit simpler.  It would have been nice to use Java NIO for this, but {{DomainSocket}} is not integrated with NIO.  poll() doesn't scale as well as epoll() and other platform-specific functions, but we don't need it to, since this just for handling clients closing, which should be a relatively infrequent event.  We're not using this for handling every packet sent through a webserver or something.
+
+* {{ShortCircuitSharedMemorySegment}} is entirely in Java, using {{sun.misc.Unsafe}} for the anchor / unanchor / etc. operations.  This is preferrable to using JNI for this, since {{Unsafe#compareAndSwap}} will be inlined by the JVM.  (Thanks to [~tlipcon] for pointing out the existence of these functions).
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12622157/HDFS-5746.001.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 3 new or modified test files.
+
+      {color:red}-1 javac{color}.  The applied patch generated 1550 javac compiler warnings (more than the trunk's current 1545 warnings).
+
+    {color:red}-1 javadoc{color}.  The javadoc tool appears to have generated 2 warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 1 new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/5854//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/5854//artifact/trunk/patchprocess/newPatchFindbugsWarningshadoop-common.html
+Javac warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/5854//artifact/trunk/patchprocess/diffJavacWarnings.txt
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/5854//console
+
+This message is automatically generated.
+
+Nice work here. I have a fair number of review comments, but most of it's nitty:
+
+I didn't see anything named ShortCircuitSharedMemorySegment in the patch, should it be included?
+
+SharedFileDescriptorFactory:
+* Javadoc for SharedFileDescriptorFactory constructor
+* {{rand()}} isn't reentrant, potentially making it unsafe for {{createDescriptor0}}. Should we use {{rand_r}} instead, or slap a synchronized on it?
+* Also not sure why we concat two {{rand()}}. Seems like one should be enough with the collision detection code. 
+* The {{open}} is done with mode {{0777}}, wouldn't {{0700}} be safer? I thought we were passing these over a domain socket, so we can keep the permissions locked up.
+* Paranoia, should we do a check in CloseableReferenceCount#reference for overflow to the closed bit? I know we have 30 bits, but who knows.
+* Unrelated nit: DomainSocket#write(byte[], int, int) {{boolean exec}} is indented wrong, mind fixing it?
+
+DomainSocketWatcher:
+* Class javadoc is c+p from {{DomainSocket}}, I think it should be updated for DSW. Some high-level description of how the nested classes fit together would be nice.
+* Some Java-isms. {{Runnable}} is preferred over {{Thread}}. It's also weird that DSW is a {{Thread}} subclass and it calls {{start}} on itself. An inner class implementing Runnable would be more idiomatic.
+* Explain use of {{loopSocks 0}} versus {{loopSocks 1}}? This is a crucial part of this class: we need to use a socketpair rather than a plain condition variable because of blocking on poll.
+* "loopSocks" is also not a very descriptive name, maybe "wakeupPair" or "eventPair" instead?
+* Can add a Precondition check to make sure the lock is held in checkNotClosed
+* If we fail to kick, add and remove could block until the poll timeout.
+* Should doc that we only support one Handler per fd, it overwrites on add. Maybe Precondition this instead if we don't want to overwrite, I can't tell from context here.
+* Typo "loopSOcks" in log message
+* The repeated calls to {{sendCallback}} are worrisome. For instance, a sock could be EOF and closed, be removed by the first sendCallback, and then if there's a pending toRemove for the sock, the second sendCallback aborts on the Precondition check.
+* {{closeAll}} parameter in sendCallback is unused
+* This comment probably means to refer to loopSocks:
+{code}
+    // Close shutdownSocketPair[0], so that shutdownSocketPair[1] gets an EOF
+{code}
+* This comment probably meant poll, not select:
+{code}
+          // were waiting in select().
+{code}
+
+TestDomainSocketWatcher:
+* Why are two of the {{@Test}} in TestDomainSocketWatcher commented out?
+* Timeouts seem kind of long, these should be super fast tests right?
+
+bq. I didn't see anything named ShortCircuitSharedMemorySegment in the patch, should it be included?
+
+It should be there...
+
+bq. Javadoc for SharedFileDescriptorFactory constructor
+
+added
+
+bq. rand() isn't reentrant, potentially making it unsafe for createDescriptor0. Should we use rand_r instead, or slap a synchronized on it?
+
+Apparently, on Linux rand is re-entrant because glibc puts a mutex around it.  But you're right, we should be POSIX-compliant here.  I added a mutex around rand.  Using the reentrant versions would be awkward because of the need to pass around state somehow (probably a java array).
+
+bq. Also not sure why we concat two rand(). Seems like one should be enough with the collision detection code.
+
+fair enough.
+
+bq. The open is done with mode 0777, wouldn't 0700 be safer? I thought we were passing these over a domain socket, so we can keep the permissions locked up.
+
+Good point.  we don't want random users to be able to open this file during the brief period it exists in the namespace.
+
+bq. Paranoia, should we do a check in CloseableReferenceCount#reference for overflow to the closed bit? I know we have 30 bits, but who knows.
+
+Well, this code was just moved from DomainSocket.java, not changed.
+
+The issue is that we want to use atomic addition, not compare-and-exchange, for speed.  Given that, all we know is the state after the addition, not before.  This is fairly performance-critical for UNIX domain sockets (it has to do this before every socket operation) so it has to be fast.  The failure mode also seems fairly benign: the refcount overflows into the closed bit and causes the socket to appear closed.
+
+At some point we should evaulate a 64-bit counter.  It might be just as fast on 64-bit machines.
+
+bq. Unrelated nit: DomainSocket#write(byte[], int, int) boolean exec is indented wrong, mind fixing it?
+
+ok
+
+bq. \[DomainSocketWatcher\] javadoc is c+p from DomainSocket, I think it should be updated for DSW. Some high-level description of how the nested classes fit together would be nice.
+
+added
+
+bq. Some Java-isms. Runnable is preferred over Thread. It's also weird that DSW is a Thread subclass and it calls start on itself. An inner class implementing Runnable would be more idiomatic.
+
+It's kind of annoying that using an inner Runnable class would increase the indentation of run().  Still, I suppose it does provide better isolation, making it impossible to invoke random Thread methods on the DomainSocketWatcher.  So I will implement that.
+
+bq. Explain use of loopSocks 0 versus loopSocks 1? This is a crucial part of this class: we need to use a socketpair rather than a plain condition variable because of blocking on poll.
+
+It's arbitrary: both sockets are connected to one another and exactly alike.  I chose to listen on 1 and write on 0, but I could easily have made the opposite choice.
+
+bq. "loopSocks" is also not a very descriptive name, maybe "wakeupPair" or "eventPair" instead?
+
+I changed it to {{notificationSockets}}.
+
+Can add a Precondition check to make sure the lock is held in checkNotClosed
+If we fail to kick, add and remove could block until the poll timeout.
+Should doc that we only support one Handler per fd, it overwrites on add. Maybe Precondition this instead if we don't want to overwrite, I can't tell from context here.
+
+bq. The repeated calls to sendCallback are worrisome. For instance, a sock could be EOF and closed, be removed by the first sendCallback, and then if there's a pending toRemove for the sock, the second sendCallback aborts on the Precondition check.
+
+Good catch.  Fixed.
+
+bq. closeAll parameter in sendCallback is unused
+
+removed
+
+bq. This comment probably means to refer to loopSocks: // Close shutdownSocketPair\[0\], so that shutdownSocketPair\[1\] gets an EOF
+
+ok
+
+bq. This comment probably meant poll, not select: // were waiting in select().
+
+ok
+
+bq. Why are two of the @Test in TestDomainSocketWatcher commented out?
+
+fixed
+
+bq. Timeouts seem kind of long, these should be super fast tests right?
+
+reduced.  I didn't want to reduce too much to avoid flakiness.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12625650/HDFS-5746.002.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 3 new or modified test files.
+
+      {color:red}-1 javac{color}.  The applied patch generated 1550 javac compiler warnings (more than the trunk's current 1545 warnings).
+
+    {color:red}-1 javadoc{color}.  The javadoc tool appears to have generated 2 warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 1 new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/5962//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/5962//artifact/trunk/patchprocess/newPatchFindbugsWarningshadoop-common.html
+Javac warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/5962//artifact/trunk/patchprocess/diffJavacWarnings.txt
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/5962//console
+
+This message is automatically generated.
+
+Fix javadoc warnings.  javac warnings are about the use of {{sun.misc.Unsafe}}, and are unavoidable.  Findbugs warning should be fixed (hopefully) by making {{DomainSocketWatcher}} a final class.
+
+Thanks Colin, more comments:
+
+* For the {{notificationSockets}} javadoc, I basically just wanted the explanation you gave: it's a socketpair, where the loop listens on 1, clients kick the loop by writing on 0.
+* Can we verify the fix for racing {{sendCallback}} and {{toRemove}}? I think we need to check that the fd being removed is in {{entries}} before doing {{sendCallback}}. {{firstEntry}} also doesn't remove the entry from {{toRemove}}, so it looks like this inf loops. {{pollFirstEntry}} instead?
+* Maybe {{remove()}} should also return a boolean "success" value too, rather than just swallowing an unknown socket.
+
+Were these comments addressed?
+
+{quote}
+* Should doc that we only support one Handler per fd, it overwrites on add.
+* Can add a Precondition check to make sure the lock is held in checkNotClosed
+{quote}
+
+ShortCircuitSharedMemorySegment:
+* Flag constants would be more readable as "1<<63" and "1<<62" rather than 15 zeroes (I did verify though :))
+* Comment in Slot constructor talks about incrementing a refcount, but that's no longer happening there.
+* No need to throw IOException in Slot constructor.
+* Terminology: it seems like the "anchorable" flag means "is mlocked by DN and can increment the refcount" and "anchor" is a refcount for "using mlocked data". Renaming things would make this clearer, e.g. "lockable" for the flag, and then "lockcount" for the count. IMO, incrementing an anchor is not a great physical analogy :)
+* How do we communicate the slot index between the DN and client? I see we keep the slot address, but what we need to pass to the client is an index. Maybe this is coming.
+
+bq. Can we verify the fix for racing sendCallback and toRemove? I think we need to check that the fd being removed is in entries before doing sendCallback. firstEntry also doesn't remove the entry from toRemove, so it looks like this inf loops. pollFirstEntry instead?
+
+It doesn't infinitely loop, because sendCallback always removes the fd from toRemove.
+
+I can't think of any practical way to test the scenario you outlined, with an event happening on {{sendCallback}} racing with the same fd added to {{toRemove}} .  Maybe a stress test would hit it.
+
+bq. Maybe remove() should also return a boolean "success" value too, rather than just swallowing an unknown socket.
+
+It's not needed because if we try to remove something that doesn't exist, we hit a precondition check.
+
+bq. Should doc that we only support one Handler per fd, it overwrites on add.
+
+added this comment
+
+bq. Can add a Precondition check to make sure the lock is held in checkNotClosed
+
+added
+
+bq. Flag constants would be more readable as "1<<63" and "1<<62" rather than 15 zeroes (I did verify though )
+
+ok
+
+bq. Comment in Slot constructor talks about incrementing a refcount, but that's no longer happening there.  No need to throw IOException in Slot constructor
+
+fixed
+
+bq. Terminology: it seems like the "anchorable" flag means "is mlocked by DN and can increment the refcount" and "anchor" is a refcount for "using mlocked data"
+
+I like the current terminology.  "lockable" just sounds vague-- especially because we already have an operation which is (m)locking the block on the datanode, so it gets confusing to use the same term for what the client is doing.
+
+bq. How do we communicate the slot index between the DN and client? I see we keep the slot address, but what we need to pass to the client is an index. Maybe this is coming.
+
+the DN will have to pass the slot index as part of the response to the REQUEST_SHORT_CIRCUIT_FDS operation.  It will also pass the shared memory segment itself as part of that operation :)  actually, it's a bit more complex than that... if there is an outstanding shm segment, the DN will try to reuse it-- otherwise it will create a new one.  But since all the slots are the same size and interchangeable, the allocation is not that complex.
+
+Few more test-related comments:
+
+* Tests for {{DSW#remove}} would be good, even when the race is fixed properly. If I'm right about the inf loop, a test would have caught it.
+* TestSCSMS, testStartupShutdown seems like a strict subset of testAllocateSlots functionality.
+* How about some prodding of a closed SCSMS too? Would also be good to test a couple of the other {{free()}} paths of SCSMS, since it can happen at close of the last slot, the SCSMS, and in allocateNextSlot too.
+
+bq. It doesn't infinitely loop, because sendCallback always removes the fd from toRemove.
+I missed this, good point. The verify I wanted was a second look at the code, no need for a test.
+
+bq. I like the current terminology. "lockable" just sounds vague
+Okay, I'm alright with "anchorable" for the flag. Can we change the name of the refcount field and methods though? "anchor" and "unanchor" do not sound not incremental operations to me, and the field being named "anchor" does not evoke a count.
+
+bq, <slot index>
+Yea, I was wondering since I didn't see a field and accessor for the slot index. I assume that'll be added at some point though.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12625767/HDFS-5746.004.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 3 new or modified test files.
+
+      {color:red}-1 javac{color}.  The applied patch generated 1546 javac compiler warnings (more than the trunk's current 1541 warnings).
+
+    {color:red}-1 javadoc{color}.  The javadoc tool appears to have generated -14 warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+        {color:red}-1 release audit{color}.  The applied patch generated 1 release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/5972//testReport/
+Release audit warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/5972//artifact/trunk/patchprocess/patchReleaseAuditProblems.txt
+Javac warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/5972//artifact/trunk/patchprocess/diffJavacWarnings.txt
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/5972//console
+
+This message is automatically generated.
+
+* rename 'anchor' and 'unanchor' to 'addAnchor' and 'removeAnchor'
+
+* add a stress test for DomainSocketWatcher, which also includes some remove operations.
+
+* make some messages TRACE that were formerly INFO.  we don't want info logs when handling every event
+
+* fix a bug in the native code where we were reallocating the fd_set_data structure, but writing the new length to the old structure
+
+* put addNotificationSocket in a new function to avoid cluttering the main loop.  Remember to increment the reference count on the notificationSocket so that we don't get logs about mismatched reference counts when shutting down the watcher
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12625965/HDFS-5746.005.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 3 new or modified test files.
+
+      {color:red}-1 javac{color}.  The applied patch generated 1546 javac compiler warnings (more than the trunk's current 1541 warnings).
+
+    {color:red}-1 javadoc{color}.  The javadoc tool appears to have generated 2 warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs:
+
+                  org.apache.hadoop.hdfs.TestPersistBlocks
+
+                                      The following test timeouts occurred in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs:
+
+org.apache.hadoop.net.unix.TestDomainSocketWatcher
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/5981//testReport/
+Javac warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/5981//artifact/trunk/patchprocess/diffJavacWarnings.txt
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/5981//console
+
+This message is automatically generated.
+
+bq. -1 javac. The applied patch generated 1546 javac compiler warnings (more than the trunk's current 1541 warnings).
+
+These all come from use of sun.misc.Unsafe
+
+bq. -1 javadoc. The javadoc tool appears to have generated 2 warning messages.
+
+These also come from sun.misc.Unsafe.  I will increase OK_JAVADOC_WARNINGS in test-patch.sh like we did in the past.
+
+bq. TestPersistBlocks
+
+Test failure isn't related
+
+bq. TestDomainSocketWatcher timeout
+
+I reduced the test timeout here to get a stack trace if this happens again
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12626050/HDFS-5746.006.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 4 new or modified test files.
+
+      {color:red}-1 javac{color}.  The applied patch generated 1546 javac compiler warnings (more than the trunk's current 1541 warnings).
+
+    {color:red}-1 javadoc{color}.  The javadoc tool appears to have generated -2 warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs:
+
+                  org.apache.hadoop.net.unix.TestDomainSocketWatcher
+                  org.apache.hadoop.hdfs.server.namenode.TestAuditLogs
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/5988//testReport/
+Javac warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/5988//artifact/trunk/patchprocess/diffJavacWarnings.txt
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/5988//console
+
+This message is automatically generated.
+
+TestAuditLogs failure is HDFS-5831, not related to this change.
+
+The other failure is opening too many fds (probably, the jenkins boxes have a lower fd limit than I set locally.) I reduced the number of fds I'm opening during the test.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12626148/HDFS-5746.007.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 4 new or modified test files.
+
+      {color:red}-1 javac{color}.  The applied patch generated 1546 javac compiler warnings (more than the trunk's current 1541 warnings).
+
+    {color:red}-1 javadoc{color}.  The javadoc tool appears to have generated 2 warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs:
+
+                  org.apache.hadoop.hdfs.server.namenode.ha.TestHASafeMode
+                  org.apache.hadoop.hdfs.server.namenode.TestAuditLogs
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/5992//testReport/
+Javac warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/5992//artifact/trunk/patchprocess/diffJavacWarnings.txt
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/5992//console
+
+This message is automatically generated.
+
+TestHASafeMode failure is HDFS-5836.
+
+TestAuditLogs failure is HDFS-5831.
+
+Since this patch doesn't alter any audit logs, or the HA code path, I don't think those are relevant.
+
+As I mentioned earlier, the warnings all come from using sun.misc.Unsafe (the javadoc ones too).
+
+I'm +1 pending the Jenkins stuff (javadoc warnings?) and fixing this one little typo I found:
+
+{code}
+    // Close notificationSockets[0], so that tificationSockets[1] gets an EOF
+{code}
+
+fix typo.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12626380/HDFS-5746.008.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 4 new or modified test files.
+
+      {color:red}-1 javac{color}.  The applied patch generated 1546 javac compiler warnings (more than the trunk's current 1541 warnings).
+
+    {color:red}-1 javadoc{color}.  The javadoc tool appears to have generated 2 warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs:
+
+                  org.apache.hadoop.hdfs.server.namenode.TestNameNodeHttpServer
+                  org.apache.hadoop.hdfs.server.namenode.TestCacheDirectives
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/6004//testReport/
+Javac warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/6004//artifact/trunk/patchprocess/diffJavacWarnings.txt
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/6004//console
+
+This message is automatically generated.
+
+It's frustrating to have so many flaky tests.
+
+TestNameNodeHttpServer is a "port in use" failure.  Not related.
+
+TestCacheDirectives#testCacheManagerRestart is not related, since this patch doesn't change that code path at all.  The issue seems to be that the test directory got changed out from under the test, and the blockID changed.  This suggests a concurrent test messed things up.
+
+I'm going to commit in a few minutes.  Thanks for the reviews, Andrew.
+
+er, that should read "block pool id"
+
+SUCCESS: Integrated in Hadoop-trunk-Commit #5090 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/5090/])
+HDFS-5746.  Add ShortCircuitSharedMemorySegment (cmccabe) (cmccabe: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1563362)
+* /hadoop/common/trunk/dev-support/test-patch.sh
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/pom.xml
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/CMakeLists.txt
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/nativeio/NativeIO.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/nativeio/SharedFileDescriptorFactory.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/net/unix/DomainSocket.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/net/unix/DomainSocketWatcher.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/CloseableReferenceCount.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/native/src/org/apache/hadoop/io/nativeio/NativeIO.c
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/native/src/org/apache/hadoop/io/nativeio/SharedFileDescriptorFactory.c
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/native/src/org/apache/hadoop/net/unix/DomainSocketWatcher.c
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/nativeio/TestSharedFileDescriptorFactory.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/net/unix/TestDomainSocketWatcher.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/client/ShortCircuitSharedMemorySegment.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/client
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/client/TestShortCircuitSharedMemorySegment.java
+
+
+FAILURE: Integrated in Hadoop-Yarn-trunk #468 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/468/])
+HDFS-5746.  Add ShortCircuitSharedMemorySegment (cmccabe) (cmccabe: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1563362)
+* /hadoop/common/trunk/dev-support/test-patch.sh
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/pom.xml
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/CMakeLists.txt
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/nativeio/NativeIO.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/nativeio/SharedFileDescriptorFactory.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/net/unix/DomainSocket.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/net/unix/DomainSocketWatcher.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/CloseableReferenceCount.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/native/src/org/apache/hadoop/io/nativeio/NativeIO.c
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/native/src/org/apache/hadoop/io/nativeio/SharedFileDescriptorFactory.c
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/native/src/org/apache/hadoop/net/unix/DomainSocketWatcher.c
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/nativeio/TestSharedFileDescriptorFactory.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/net/unix/TestDomainSocketWatcher.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/client/ShortCircuitSharedMemorySegment.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/client
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/client/TestShortCircuitSharedMemorySegment.java
+
+
+FAILURE: Integrated in Hadoop-Mapreduce-trunk #1685 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/1685/])
+HDFS-5746.  Add ShortCircuitSharedMemorySegment (cmccabe) (cmccabe: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1563362)
+* /hadoop/common/trunk/dev-support/test-patch.sh
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/pom.xml
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/CMakeLists.txt
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/nativeio/NativeIO.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/nativeio/SharedFileDescriptorFactory.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/net/unix/DomainSocket.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/net/unix/DomainSocketWatcher.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/CloseableReferenceCount.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/native/src/org/apache/hadoop/io/nativeio/NativeIO.c
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/native/src/org/apache/hadoop/io/nativeio/SharedFileDescriptorFactory.c
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/native/src/org/apache/hadoop/net/unix/DomainSocketWatcher.c
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/nativeio/TestSharedFileDescriptorFactory.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/net/unix/TestDomainSocketWatcher.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/client/ShortCircuitSharedMemorySegment.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/client
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/client/TestShortCircuitSharedMemorySegment.java
+
+
+SUCCESS: Integrated in Hadoop-Hdfs-trunk #1660 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/1660/])
+HDFS-5746.  Add ShortCircuitSharedMemorySegment (cmccabe) (cmccabe: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1563362)
+* /hadoop/common/trunk/dev-support/test-patch.sh
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/pom.xml
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/CMakeLists.txt
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/nativeio/NativeIO.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/nativeio/SharedFileDescriptorFactory.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/net/unix/DomainSocket.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/net/unix/DomainSocketWatcher.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/util/CloseableReferenceCount.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/native/src/org/apache/hadoop/io/nativeio/NativeIO.c
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/native/src/org/apache/hadoop/io/nativeio/SharedFileDescriptorFactory.c
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/native/src/org/apache/hadoop/net/unix/DomainSocketWatcher.c
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/io/nativeio/TestSharedFileDescriptorFactory.java
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/net/unix/TestDomainSocketWatcher.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/client/ShortCircuitSharedMemorySegment.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/client
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/client/TestShortCircuitSharedMemorySegment.java
+
+
+[~cmccabe], Jenkins has been flagging two javadoc errors on recent runs. Is it related to this?
+
+This patch increased OK_JAVADOC_WARNINGS, which should have covered the 2 additional warnings.
+
+{code}
+-  OK_JAVADOC_WARNINGS=14;
++  OK_JAVADOC_WARNINGS=16;
+{code}
+
+If we're getting javadoc warnings on clean builds, let's file a JIRA about increasing OK_JAVADOC_WARNINGS further and/or fixing javadoc warnings.  The ones introduced in this patch were not fixable because they related to sun APIs.
+
+[~sureshms]: we've been having a bunch of problems with the javadoc warning detection code.  I filed HADOOP-10325 to fix this properly.
+
+SUCCESS: Integrated in Hadoop-trunk-Commit #5120 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/5120/])
+HADOOP-10327. Trunk windows build broken after HDFS-5746. Contributed by Vinay. (cnauroth: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1565389)
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/CHANGES.txt
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/native/src/org/apache/hadoop/io/nativeio/NativeIO.c
+
+
+SUCCESS: Integrated in Hadoop-Yarn-trunk #474 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/474/])
+HADOOP-10327. Trunk windows build broken after HDFS-5746. Contributed by Vinay. (cnauroth: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1565389)
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/CHANGES.txt
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/native/src/org/apache/hadoop/io/nativeio/NativeIO.c
+
+
+SUCCESS: Integrated in Hadoop-Hdfs-trunk #1666 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/1666/])
+HADOOP-10327. Trunk windows build broken after HDFS-5746. Contributed by Vinay. (cnauroth: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1565389)
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/CHANGES.txt
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/native/src/org/apache/hadoop/io/nativeio/NativeIO.c
+
+
+SUCCESS: Integrated in Hadoop-Mapreduce-trunk #1691 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/1691/])
+HADOOP-10327. Trunk windows build broken after HDFS-5746. Contributed by Vinay. (cnauroth: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1565389)
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/CHANGES.txt
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/native/src/org/apache/hadoop/io/nativeio/NativeIO.c
+
+

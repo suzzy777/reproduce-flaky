@@ -1,0 +1,269 @@
+[~jamestaylor] do you have a background on why we are doing a scan for pre-warming the block cache? Is it worth doing double work? 
+
+Attaching simple patch. Running the index tests with it. 
+
+Thanks for the detective work and explanation, [~enis]. We do the skip scan to load the batch of rows being mutated into the block cache because it improved overall performance of secondary index maintenance.
+
+bq. I think that for some cases, this skip scan turns into an expensive and long scan
+The skip scan would always do point lookups.
+
+Functionally, removing the pre-warming won't have an impact, so if it prevents this situation, then feel free to remove it. However, if the skip scan is taking long, the cumulative time of doing the individual scans on each row will take even longer, so you may just be kicking the can down the road.
+
+Have you tried lower {{phoenix.mutate.batchSize}} or decreasing the number of rows being upserted before a commit is done by the client?
+
+Thanks James. 
+bq. Have you tried lower phoenix.mutate.batchSize or decreasing the number of rows being upserted before a commit is done by the client?
+I believe the cluster was running with {{phoenix.mutate.batchSize=1000}} when this happened initially. With the hbase's asyncprocess grouping the edits by regionserver, there can be even more or less in the incoming {{multi()}} call. 
+
+bq. Functionally, removing the pre-warming won't have an impact, so if it prevents this situation, then feel free to remove it. However, if the skip scan is taking long, the cumulative time of doing the individual scans on each row will take even longer, so you may just be kicking the can down the road.
+We are doing the gets in parallel (I believe 10 threads by default), while the skip scan is still a serial scanner, no? Plus, we are doing double work. Even if the results are coming from the block cache, the scan overhead is not negligible. I am surprised that the secondary index performance was improved. 
+
+I'm running the tests with {{mvn verify -Dtest=*Index*}}, but some tests are failing out of the box without the patch for me. Maybe I have a setup issue. [~chrajeshbabu32@gmail.com] any idea? 
+
+ 
+
+bq. I believe the cluster was running with phoenix.mutate.batchSize=1000 when this happened initially. 
+One thing to try would be to lower this and confirm that the batch size client is using for multiple UPSERT VALUES is small as well. 
+
+bq. We are doing the gets in parallel (I believe 10 threads by default), while the skip scan is still a serial scanner, no?
+A scan (not a get, but I don't think that matters) will be issued for each row in the batch. These scans will be done serially due to PHOENIX-2671 (the change made to ensure that the scans are issued in the same cp thread). The advantage of a skip scan over lots of separate get/scans is outlined here[1], but perhaps HBase is better at this now as that was a long time ago.
+
+Either way, you're going to have the locks due to the processing of the batch mutation for the same amount of time, no?
+
+FYI, some tests are flaky on a Mac (a couple of the join ones), but better on Linux.
+
+[1] http://phoenix-hbase.blogspot.com/2013/05/demystifying-skip-scan-in-phoenix.html
+
+bq. One thing to try would be to lower this and confirm that the batch size client is using for multiple UPSERT VALUES is small as well.
+Makes sense. I think in this cluster, we'll run with a lower batch size than default. Due to the way the hregion internals work, having a very long running mvcc transaction will just cause further delays though. Maybe we should go with 100 or so as the default limit size for updates with index. 
+bq. Either way, you're going to have the locks due to the processing of the batch mutation for the same amount of time, no?
+I imagine the time will reduce since at least we would not be doing the initial scan. The other scans we have to do in ay case. 
+
+BTW, does the correctness of the non-transactional 2ndary index updates depend on row lock being exclusive? In HBase-2.0, the row locks are RW, and doMiniBatchMutation() acquires read-only locks. 
+
+
+
+The batch size should really be byte-based instead of row-based (PHOENIX-541) and secondary indexes should be taken into account (PHOENIX-542).
+
+bq. I imagine the time will reduce since at least we would not be doing the initial scan. The other scans we have to do in any case.
+The initial scan makes the overall operation *faster*, not slower. If it doesn't anymore, we should remove it.
+
+I'm not sure on whether or not exclusive locking is required. Do you know, [~jesse_yates]? 
+
+bq. The initial scan makes the overall operation faster, not slower. If it doesn't anymore, we should remove it.
+How did you guys initially test it? I can try to replicate the setup with and without the patch if it is documented somewhere. I can understand why skip scan can be faster than a batch of gets. But in this case we are doing a skip scan before a batch of gets not instead of. So I think it should be different than the test done in the thread http://comments.gmane.org/gmane.comp.java.hadoop.hbase.user/34697. 
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12803538/phoenix-2892_v1.patch
+  against master branch at commit 5d641ad34207b8e87b1f460a168664387f143286.
+  ATTACHMENT ID: 12803538
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:red}-1 tests included{color}.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:red}-1 javadoc{color}.  The javadoc tool appears to have generated 29 warning messages.
+
+    {color:red}-1 release audit{color}.  The applied patch generated 4 release audit warnings (more than the master's current 0 warnings).
+
+    {color:green}+1 lineLengths{color}.  The patch does not introduce lines longer than 100
+
+     {color:red}-1 core tests{color}.  The patch failed these unit tests:
+                       org.apache.phoenix.spark.PhoenixSparkIT
+
+Test results: https://builds.apache.org/job/PreCommit-PHOENIX-Build/343//testReport/
+Release audit warnings: https://builds.apache.org/job/PreCommit-PHOENIX-Build/343//artifact/patchprocess/patchReleaseAuditWarnings.txt
+Javadoc warnings: https://builds.apache.org/job/PreCommit-PHOENIX-Build/343//artifact/patchprocess/patchJavadocWarnings.txt
+Console output: https://builds.apache.org/job/PreCommit-PHOENIX-Build/343//console
+
+This message is automatically generated.
+
+We need the locks when the edits are updating rows to ensure that we get the atomicity between the index update and the primary table write.
+
+Looking back at the commit history, maybe this made more sense in 0.94? There were some changes around that code to bring Phoenix up to 0.98. I don't remember exactly what we did to validate the caching. 
+
+bq. doing a skip scan before a batch of gets not instead of
+
+I believe the rationale was that we should only be touching a few rows, so using the skip scan to load the rows will be faster (overall) than doing the batched gets/scans later in the CP since the rows will be in cache when we get query them in a moment for the index update building.
+
+At a high level, that sounded like fine logic, but we may have been missing some internals insight.
+
+All that said, 5 mins for a read seems excessively long. Is there some sort of network issue or something else funky going on?
+
+Thanks [~jesse_yates], [~jamestaylor]. I was curious about whether this will be a regression in perf or not. I was able to get a YCSB run with the YCSB jdbc client with small changes on a single node phoenix enabled regionserver. A single client running with 100 threads, I've run the test to write 5M rows of 1KB size, with a index, the same as the primary key, and covering 1 column out of 10. I've artificially limited the block cache to be ~1.3GB to see whether bringing the blocks to the BC will have any affect. 
+
+Table is created with: 
+{code}
+DROP TABLE IF EXISTS USERTABLE;
+CREATE TABLE USERTABLE (
+        YCSB_KEY VARCHAR(255) PRIMARY KEY,
+        FIELD0 VARCHAR,
+        FIELD1 VARCHAR,
+        FIELD2 VARCHAR,
+        FIELD3 VARCHAR,
+        FIELD4 VARCHAR,
+        FIELD5 VARCHAR,
+        FIELD6 VARCHAR,
+        FIELD7 VARCHAR,
+        FIELD8 VARCHAR,
+        FIELD9 VARCHAR
+) SALT_BUCKETS=20, COMPRESSION='NONE' ;
+
+CREATE INDEX USERTABLE_IDX ON USERTABLE (YCSB_KEY) INCLUDE (FIELD0) SALT_BUCKETS=20;
+{code}
+
+Here are the rough numbers (first is load, second is run step): 
+{code}
+WITHOUT PATCH: 
+[OVERALL], RunTime(ms), 1617487.0
+[OVERALL], Throughput(ops/sec), 3091.2149525776713
+[INSERT], Operations, 5000000.0
+[INSERT], AverageLatency(us), 32250.9799648
+[INSERT], MinLatency(us), 4356.0
+[INSERT], MaxLatency(us), 2988031.0
+[INSERT], 95thPercentileLatency(us), 64127.0
+[INSERT], 99thPercentileLatency(us), 103423.0
+[INSERT], Return=OK, 5000000
+
+[OVERALL], RunTime(ms), 476698.0
+[OVERALL], Throughput(ops/sec), 2097.764202912536
+[INSERT], Operations, 1000000.0
+[INSERT], AverageLatency(us), 47000.933524
+[INSERT], MinLatency(us), 3892.0
+[INSERT], MaxLatency(us), 927231.0
+[INSERT], 95thPercentileLatency(us), 91711.0
+[INSERT], 99thPercentileLatency(us), 193151.0
+[INSERT], Return=OK, 1000000
+{code}
+
+and 
+{code}
+[OVERALL], RunTime(ms), 1318665.0
+[OVERALL], Throughput(ops/sec), 3791.713589122332
+[INSERT], Operations, 5000000.0
+[INSERT], AverageLatency(us), 26281.5258828
+[INSERT], MinLatency(us), 3744.0
+[INSERT], MaxLatency(us), 3966975.0
+[INSERT], 95thPercentileLatency(us), 35199.0
+[INSERT], 99thPercentileLatency(us), 75647.0
+[INSERT], Return=OK, 5000000
+
+[OVERALL], RunTime(ms), 267711.0
+[OVERALL], Throughput(ops/sec), 3735.3713519429534
+[INSERT], Operations, 1000000.0
+[INSERT], AverageLatency(us), 26218.333712
+[INSERT], MinLatency(us), 3526.0
+[INSERT], MaxLatency(us), 749567.0
+[INSERT], 95thPercentileLatency(us), 34687.0
+[INSERT], 99thPercentileLatency(us), 75455.0
+[INSERT], Return=OK, 1000000
+{code}
+
+Overall, the load is actually 20% or so faster with the patch. The YCSB JDBC client does not do any batching right now, and autocomit=false is not working since it is not calling commit() at all. If time permits, I'll try to get a run with some batching as well. 
+
+Thanks, [~enis]. Yep, it'll definitely only be faster with batching. 
+
+I've added batching in https://github.com/enis/YCSB, and the improvement still stands with batching. However, I don't think I have the numbers handy. Let's commit this one for 4.8.  
+
++1 from me. The initial numbers you posted were very nice. I trust the numbers with the batching properly enabled were similarly good.
+
+[~enis] - can you point me to the place in which you're doing the batching?
+
+https://github.com/enis/YCSB/commit/f975e55df044f4581f1d5acc0076e2ef9b789a0c#diff-564e0de8a77f56fa41dedad0949c793dR489
+
+Yep, you need the other commit on top of this so that we use UPSERT rather than INSERT in the YCSB JDBC client. 
+
+BTW, [~busbey] do you mind reviewing the PR https://github.com/brianfrankcooper/YCSB/pull/755? 
+
+By batching, I meant something like this:
+{code}
+conn.setAutoCommit(false);
+for (int i = 0; i < 1000; i++) {
+    conn.execute("UPSERT INTO T VALUES (" + i + ")");
+}
+conn.commit(); // Will send over all 1000 rows in one batched mutation
+{code}
+
+In Phoenix, the batching you're doing will still execute a commit after every row is upserted (you could argue that it shouldn't and it wouldn't be hard to change, but that's the way it works today).
+
+bq. In Phoenix, the batching you're doing will still execute a commit after every row is upserted (you could argue that it shouldn't and it wouldn't be hard to change, but that's the way it works today).
+Hmm, I made the changes after looking at CALCITE-1128. I think we should fix that in Phoenix then. Isn't that the "correct" way to do batching in JDBC? setAutoCommit(false) should be more for transactions I believe. YCSB client already can do setAutoCommit(), but it does not call commit at all (even in connection close). 
+
+I've committed this to 4.8.
+Let me open an issue for the executeBatch(). 
+
+Please revert until we can test the right scenario, [~enis]. The pre-warming call was added because it made this faster - I don't think it makes sense to remove until we can confirm it no longer helps.
+
+Batched in Phoenix means a commit with multiple rows (as it always has). The commit is the point at which the mutations are sent to the server. So "batched" corresponds to an htable.batch() call with multiple rows.
+
+You can test this scenario with a UPSERT SELECT call along the lines of:
+{code}
+CREATE TABLE T (K1 BIGINT NOT NULL, K2 BIGINT NOT NULL, 
+    CONSTRAINT PK PRIMARY KEY (K1,K2));
+CREATE INDEX I ON T(K2, K1);
+
+UPSERT INTO T SELECT RAND(), RAND();
+{code}
+
+That UPSERT SELECT will generate random numbers for the primary key and will batch based on {{phoenix.mutate.batchSize}} which defaults to 1000. You'll then be exercising the pre-warming query with a batch of data table rows.
+
+Sure, let me test it today, otherwise I'll revet. I can hack YCSB to do the autoCommit(false) way. 
+
+FAILURE: Integrated in Phoenix-master #1246 (See [https://builds.apache.org/job/Phoenix-master/1246/])
+PHOENIX-2892 Scan for pre-warming the block cache for 2ndary index (enis: rev 4b42f16b20cc4554cbefbbfa4626244c77cbb6ff)
+* phoenix-core/src/main/java/org/apache/phoenix/index/PhoenixIndexBuilder.java
+
+
+FYI, Phoenix has the similar behavior with other databases wrt to batch and auto commit: http://stackoverflow.com/questions/19536513/addbatch-used-together-with-autocommit-true
+
+Did the test again with 3M inserts with YCSB, this time with Connection.autoCommit(): https://github.com/enis/YCSB/commit/6bb5fb8e84ab637cd8768270f1fc895debc60b6d. Each region flushes a couple of times to make sure that the block cache is used. I've tested pure inserts, not updates.
+
+Results are even better with batch size of 1K (75% better throughput) : 
+Without patch:
+{code}
+(batch=1)
+[OVERALL], RunTime(ms), 833913.0
+[OVERALL], Throughput(ops/sec), 3597.497580682877
+
+(batch=10)
+[OVERALL], RunTime(ms), 724676.0
+[OVERALL], Throughput(ops/sec), 4139.781088376047
+
+(batch=100)
+[OVERALL], RunTime(ms), 334914.0
+[OVERALL], Throughput(ops/sec), 8957.523423923754
+
+(batch=1000)
+[OVERALL], RunTime(ms), 215280.0
+[OVERALL], Throughput(ops/sec), 13935.340022296545
+{code}
+
+With patch:
+{code}
+(batch=1)
+[OVERALL], RunTime(ms), 742610.0
+[OVERALL], Throughput(ops/sec), 4039.8055506928267
+
+(batch=10)
+[OVERALL], RunTime(ms), 638678.0
+[OVERALL], Throughput(ops/sec), 4697.202659242998
+
+(batch=100)
+[OVERALL], RunTime(ms), 230182.0
+[OVERALL], Throughput(ops/sec), 13033.165060691106
+
+(batch=1000)
+[OVERALL], RunTime(ms), 122742.0
+[OVERALL], Throughput(ops/sec), 24441.511463068877
+{code}
+
+Thanks for verifying, [~enis]. Looks like it's better to remove that code then.
+
+Thanks [~jamestaylor] for looking. 
+
+Bulk close of all issues that has been resolved in a released version.
+

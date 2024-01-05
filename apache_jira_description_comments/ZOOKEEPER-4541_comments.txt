@@ -1,0 +1,87 @@
+Server 1 was stopped after the session was closed at 17:18:43, and started again. On start it logged digest errors:
+ 
+{code}
+2022-05-10 17:18:58.624 I - cfg1 ACL digest algorithm is: SHA1 (DigestAuthenticationProvider)
+2022-05-10 17:18:58.625 I - cfg1 zookeeper.DigestAuthenticationProvider.enabled = true (DigestAuthenticationProvider)
+2022-05-10 17:18:58.710 I - cfg1 zookeeper.digest.enabled = true (ZooKeeperServer)
+2022-05-10 17:18:58.725 I - cfg1 Reading snapshot /opt/vespa/var/zookeeper/version-2/snapshot.a1a00008bef.gz (FileSnap)
+2022-05-10 17:18:58.753 I - cfg1 The digest in the snapshot has digest version of 2, , with zxid as 0xa1b00000006, and digest value as 2313248497541 (DataTree)
+2022-05-10 17:18:59.842 W - cfg1 Message:Digests are not matching. Value is Zxid. Value:11154030067713 (DataTree)
+2022-05-10 17:18:59.844 E - cfg1 First digest mismatch on txn: 216180518738395136,2361,11154030067713,1652203051156,15
+                                 , '/provision/v1/locks/maintenanceJobLocks/InfrastructureProvisioner/_c_50be1b68-5822-496a-8820-99e3dc4890a1-lock-0000337756,#31302e3231352e3137392e3239,v\{s{31,s{'world,'anyone}}},T,337757
+                                 , expected digest is 2,2649457361965
+                                 , actual digest is 2649853538874,  (DataTree)
+2022-05-10 17:18:59.847 I - cfg1 111604 txns loaded in 987 ms (FileTxnSnapLog)
+2022-05-10 17:18:59.847 I - cfg1 Snapshot loaded in 1123 ms, highest zxid is 0xa2500000117, digest is 2645998505798 (ZKDatabase)
+2022-05-10 17:34:00.004 W - cfg1 [2771 times] Message: Digests are not matching. Value is Zxid. Last value:11154030070498 (DataTree)
+{code}
+
+
+One might suspect HW issues, but I found nothing suspicious in dmesg and journalctl from what I can see.  We have run ZK 3.7.0 for about 6 months and there are no recent changes to how we run ZK.
+
+Server 1 did not have a frozen view of the state of the znode tree:  The set of children of {{/vespa/host-status-service/hosted-vespa:zone-config-servers/lock2}} changed over time, and the set was identical on all servers, except that server 1 also saw that extraneous {{_c_be5a2484-da16-45a6-9a98-4657924040e3-lock-0000024982}} znode.
+
+After some thorough investigation, we have a good idea of what has happened. There are two faults in the ZK codebase, both of which are attempted fixed in [https://github.com/apache/zookeeper/pull/1925]. The details of our findings are as follows:
+
+ 
+
+First, some background: we do rolling restarts of embedded ZK clusters of size 3, roughly 50 times a day, across many data centres. 
+
+A few times a week, we find a ZK server with a different view of the world, from what the other servers in the cluster have. 
+
+As far as we could ascertain, this always happens as a result of the leader restarting, that is, the enclosing JVM shuts down (cleanly, and we call {{{}QuorumPeer.shutdown(){}}}), and start up again a few minutes later. 
+
+Looking at the data directories of the servers after a recent episode, we found two interesting things, of which the second is the critical:
+
+Transaction logs had segments of transactions that were repeated, both 2 and 3 times. This was found on all servers, but it seems to be harmless, despite the ERROR logging it produces when the data directory is loaded on ZK server start. It causes a digest mismatch, which isn't acted upon. It also becomes invisible when a new snapshot is taken. This masked the real error, though, because we were looking for digest mismatches, and the digest already failed prior to what was the second finding: 
+
+_The transaction log_ on the server that did _not_ agree with the others (in particular, it typically insist there are ephemeral nodes present, but for sessions which died a long time ago!) was _missing entries at the end of one of the log files!_ The transaction log in question was the active one at the end of the epoch of the leader which restarted.
+
+We've also noticed this error is more prevalent on machines with slower disks, where we sometimes see complaints from ZK about slow fsyncing. 
+
+ 
+
+Putting this all together, we finally discovered that the following happens:
+
+ 
+
+ZK3 is leader, ZK1 and ZK2 are followers. X < Z are transaction IDs. 
+
+ZK1 is busy fsyncing transactions <= X.
+
+ZK3 proposes Z, and ZK1 and ZK2 receive the proposal.
+
+ZK1 enqueues the proposal, but does not ACK it. ZK2 ACKs the proposal. 
+
+ZK3 observes quorum for Z, and sends a COMMIT to ZK1 and ZK2. 
+
+ZK1 applies Z to its data tree, but it is still not processed by the SyncRequestProcessor, which is busy fsyncing. 
+
+ZK3 shuts down, closing the socket to ZK1 and ZK2.
+
+ZK1 stops following the dead leader, and shuts down its {{{}Follower{}}}, to prepare for a new leader election and epoch.
+
+ZK1 joins a new leader election, using Z as its {{{}lastSeenZxid{}}}, because that was COMMITTed, and applied to its data tree. 
+
+ZK1 completes fsync up to X, and then proceeds to ACK those transactions, but the socket is gone, and the sync thread dies from an unexpected NPE. The remaining transaction Z is not written to disk. 
+
+ZK1 and ZK2 agree that Z is the newest transaction, ZK2 becomes the new leader, and ZK3 eventually rejoins as a follower. 
+
+ZK1 has a data tree which is correct, and new transactions come in, and are written to the transaction log of the new epoch. 
+
+ZK1 restarts. When it comes back up, Z is missing from its transaction log, and its data is inconsistent with that of the other servers. It seems we never hit SNAP syncs, unless we intervene, so it stays this way indefinitely. 
+
+ 
+
+So, expecting the socket of the learner to possibly be {{{}null{}}}, in {{{}SendAckRequestProcessor{}}}, is enough to fix this problem in most cases, because that seems to be the common reason for the sync thread to die—had it lived on, it would eventually have synced Z as well; nevertheless, there would be a thread leak, and there could be other failure scenarios that I'm not aware of as well, both now, and certainly later. 
+
+The attempted fix therefore also refactors the shutdown for child classes of {{{}ZooKeeperServer{}}}, such that they all override the {{shutdown(boolean)}} method, which is ultimately the one that is called. I also moved the shutdown (and sync) of the {{SyncRequestProcessor}} to be before the shutdown of the parent {{{}ZooKeeperServer{}}}, because of the {{fastForwardFromEdits()}} that's called in the latter in an attempt to be up to date when the leader election starts; obviously, this makes more sense if the pending transactions are actually written first, and I believe the missing synchronisation with the persistence thread is also what caused the duplicate series of transactions in the transaction logs: inflight transactions (not yet committed) could be written to the log by the {{SyncRequestProcessor}} in parallel with a leader election using an older Zxid than the tail of the log, where the resulting DIFF from a more up-to-date leader would _also_ contain those same entries that were just written. This wouldn't even be noticeable, because the data tree of the new follower wouldn't have the duplicate entries in it, and not complain when they were applied; and the transaction log itself does not detect this either. It would only be detectable upon database recreation. 
+
+ 
+
+ 
+
+Anyway, long story. I hope you strongly consider this as a candidate to make the next release. We'll be running a patched ZK in the meantime. But I'd be surprised if we're the only ones seeing this. All it takes is a few servers, some automation, and some slow disks :) 
+
+ 
+

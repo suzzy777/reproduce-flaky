@@ -1,0 +1,2262 @@
+Assigning to Russell as placeholder for HMC team.
+
+I'm having trouble joining the operator trees together.  Within
+org.apache.hadoop.hive.ql.optimizer.index.IndexWhereProcessor,
+I'm working within rewriteForIndex(...).  I added a unit test called
+index_opt_where.q, which is what I'll be using for examples.
+
+After line 139, I have 2 parseContexts: 1 is the original parse context
+of the normal query 
+
+(SELECT * FROM src WHERE key=86 ORDER BY key), 
+
+and the other is the parseContext of the reentrant query used to
+generate the temporary table.
+
+(INSERT OVERWRITE DIRECTORY "/tmp/index_result_where1" SELECT
+`_bucketname` ,  `_offsets` FROM default__src_src_index__ WHERE key=86)
+
+I don't really know how to join the operator trees from these
+parseContexts together.  I tried just setting the topOps of the original
+query to include the topOps of the reentrant query.  I ran into null
+pointer exceptions when it went to optimize using other Transforms.
+
+I then tried add the topOps of the original query as the child of the
+very bottom child node of the reentrant query, and then setting that
+combined operator tree as the topOp of the original parseContext.  That
+gave me trouble.  For some reason, the IndexWhereProcessor.process(...)
+method is called twice, and the second time, it would try to use the
+reentrant topOp table name (default__src_src_index...) to lookup the
+tblScan operator, but the new topOp only had src as a TableScan. The new
+topOp was the reentrant query, and that doesn't scan it default__src...
+table, it creates it.
+
+I've attached a patch, in hopes that it will reasonably easy to see what
+I'm talking about.  There are lot of hacks in it (it always uses
+indexOptimizing as an Optimization, and the query reconstruction is
+bad), but it's stuff I didn't want to worry about until I could get it
+working.
+
+You're pretty close with the first method; if I uncomment it and add one line, I can get it as far as execution:
+
+{noformat}
+    pctx.getTopOps().putAll(indexQueryPctx.getTopOps());
+    pctx.getTopToTable().putAll(indexQueryPctx.getTopToTable());
+{noformat}
+
+But then I get an execution-time exception; still looking into that.
+
+{noformat}
+    [junit] java.io.IOException: cannot find dir = pfile:/Users/jsichi/open/hive-trunk/build/ql/test/data/warehouse/src/kv1.txt in pathToPartitionInfo: [pfile:/Users/jsichi/open/hive-trunk/build/ql/test/data/warehouse/default__src_src_index__]
+    [junit] 	at org.apache.hadoop.hive.ql.io.HiveFileFormatUtils.getPartitionDescFromPathRecursively(HiveFileFormatUtils.java:288)
+    [junit] 	at org.apache.hadoop.hive.ql.index.compact.HiveCompactIndexInputFormat.doGetSplits(HiveCompactIndexInputFormat.java:45)
+    [junit] 	at org.apache.hadoop.hive.ql.index.compact.HiveCompactIndexInputFormat.getSplits(HiveCompactIndexInputFormat.java:99)
+...
+{noformat}
+
+
+After looking into this some more, it seems like there are some problems with the approach.  Trying to splice in an INSERT statement directly into the SELECT plan is going to run into trouble since we would normally do extra processing work to move the INSERT results (which first get written to an intermediate dir for atomicity) to the correct location.
+
+So either we need to make some changes with the current approach (by using a fetchless query and figuring out the remaining parsecontext merge issues, maybe getting some help from Persistent Systems since they have figured out a lot of complicated splicing), or we need to keep it as INSERT, but instead of trying to splice the operator trees together, we do the following:
+
+* fully compile the INSERT statement all the way into a task list (instead of stopping at the operator tree)
+* add this task list in front of the root tasks for the main select
+* leave the parse context and operator tree for the main select alone (other than sticking in the index inputformat information)
+
+This is a little clumsy, but keeps the analysis for the two statements isolated, and would more closely mimic the way the manual approach works.
+
+
+Stop the press; ignore that last comment.  I hacked something up to use the full INSERT compilation, and got that working, but hit the same execution-time error as previously.
+
+Then I realized that this is because I was running through with the full test case, and there's a problem with the test case itself:  it contains the manual-mode steps (including explicitly setting HiveCompactIndexInputFormat), and that doesn't play well with the automatic usage.
+
+So then I stripped the test case down to just the automatic usage, and it actually seems to be doing something reasonable with the change I mentioned previously.
+
+{noformat}
+    pctx.getTopOps().putAll(indexQueryPctx.getTopOps());
+    pctx.getTopToTable().putAll(indexQueryPctx.getTopToTable());
+{noformat}
+
+Try this test case:
+
+{noformat}
+CREATE INDEX src_index ON TABLE src(key) as 'COMPACT' WITH DEFERRED REBUILD;
+ALTER INDEX src_index ON src REBUILD;
+
+SET hive.input.format=org.apache.hadoop.hive.ql.io.HiveInputFormat;
+
+SELECT * FROM src WHERE key=86 ORDER BY key;
+
+DROP INDEX src_index on src;
+{noformat}
+
+If you change the SELECT to EXPLAIN, the plan looks reasonable.  Of course the execution won't actually use the index filtering until Jeffery's change is rolled in.
+
+So give that a try.
+
+
+Includes modification of MapReduce tasks to use index input format and broken temp file name.
+
+Like we said, writing the index query to the temp file is broken in patch 2.  I tried to look into the approach you mentioned above: using the already generated tmp file resulting from the SELECT query.
+
+I set a breakpoint in {{org.apache.hadoop.hive.ql.optimizer.GenMapRedUtils.splitTasks}} when executing index_opt_where.q to examine the temp file name, but that method was never executed.  Do you know why?  Even looking through that method, it appears that we only know the directory of the temp file (with {{String taskTmpDir = baseCtx.getMRTmpFileURI();}}, and we never know the actual file name. Without the actual name, we cannot set the input config correctly. Is this the right place to be looking?
+
+We also spoke about changing the re-entrant query construction to live within the IndexHandler class.  Unfortunately, the Index object can only give us access to the Handler's name as a string, not an instance of it (IndexWhereProcessor.rewriteForIndex).  I looked through the codebase some to figure out how classes are loaded from strings, and found several examples of using Class.forName(...).  Any suggestions here?
+
+For loading index handlers, see HiveUtils.getIndexHandler.
+
+For the splitTasks, we'll have to take a closer look.
+
+
+Make sure we update the admin configuration page (http://wiki.apache.org/hadoop/Hive/AdminManual/Configuration) with the new default autoindex property.
+
+I got a boatload of conflicts trying to apply HIVE-1644.2.patch, and it looks like all kinds of unrelated changes crept into there.
+
+
+Much cleaner patch, which includes moving the re-entrant QL generation into the IndexHandler.  Still nothing to figure out the tmp file name.
+
+I got stuck too trying to figure out the temp file stuff, so here is HIVE-1644.4.patch, which contains the "fully compile the INSERT statement" approach I mentioned above (working at the Task level rather than the Operator level, similar to REBUILD).  It runs through index_opt_where_simple.q fine, and the plan looks reasonable, although I think we still need to add an explicit task dependency.
+
+The back-pointer to SemanticAnalyzer is a hack; that would need to be cleaned up to instead encapsulate the necessary information interchange inside of ParseContext.  And we still need to deal with automatic generation and cleanup of the temp file directory.
+
+
+did a quick look at the HIVE-1644.4.patch itself. 
+
+some comments:
+1) add testcase for combinehiveinputformat
+2) in the new testcase, the newly added conf "hive.optimize.autoindex" is not used?
+3) I think there already is an api in Hive.java for getting all indexes on a table, No? Please double check.. If not, rename getIndexesOnTable to getIndexes
+4) in GenMRTableScan1.java, it is not good to hardcode the inputformat name. why not just use indexClassName?
+5) in ExecDriver.java, it is also not good here to hardcode the conf name "hive.index.compact.file", because bitmap index may want to use a different name. So maybe should pass these work to some index type specific class
+6) in the generateIndexQuery, the temp directory is not a random, so could conflict with others (in the same query), and the dir path should not be generated there, should be generated in the optimizer which can have global control. And if i think "insert overwrite directory 'full_path_to_a_dir' select .." would fail if the full_path_to_a_dir does not exist (or its parent does not exist). please check here
+7) In the genereateIndexQuery, what is this used for?
++    ParseContext indexQueryPctx = RewriteParseContextGenerator.generateOperatorTree(pctx.getConf(), qlCommand);
+
+
+And today the index optimizer is before the breaking task tree. So the index scan task is generated before the task for original table scan. so it is very hard to hook them together. The only i can think is to remember the op id for the original table scan, and do another process to hook them together after breaking task tree. But i think it is too hack.
+
+Maybe a better way to do it is in the physical optimizer. In physical optimizer, hive presents a task tree. and the optimizer can go through each task, and do the same thing (since each task has the same operator tree). And it will be much easier for managing task dependency. And i think most code will be the same. And for complex queries, this approach will be cleaner.
+
+
+Yongqiang, could you reference where exactly in physical optimization code you're thinking of?
+
+Also, do you mean move the entire index optimization there, or only the part about creation of the task dependency?
+
+
+take a look at one physical optimizer, it is pretty straightforward. I think the entire index optimization can be moves there (no big changes needed). 
+
+Take SkewJoinResolver as an example, in its resolve method, it adds all root tasks to be iterated by the optimizer. (topNodes.addAll(pctx.rootTasks);) Adding all root task should be good now, but you can add all tasks, and in the second step, look at the table scan operator in the current task, if all table scan ops are not top table scan ops, then skip this task.
+
+And in the dispatcher, the dispatch is in process of current task. It creates a rule R1 ( the same optimizer coder you have now.) And adds the reducer operator tree to iterate (you may want to add the mapper operator tree.). 
+
+Please let me know if you have any questions. 
+
+Yongqiang, thanks for the pointer.  Guys, give that a try.  My original thinking for doing it during logical optimization was that it's similar to the storage handler logic I had added previously, but if you can get it working here, physical optimization makes sense as the place for indexing.
+
+
+HIVE-1644.5.path
+
+I have moved the processing into the PhysicalOptimizer and refactored some of the code into IndexWhereTaskDispatcher.  It follows the patterns of SkewJoinResolver more closely.
+
+However, this will not run.  In IndexWhereProcessor.rewriteForIndex(...) [line 110], we call back to the IndexHandler like before.  But, for some reason, the parseContext we're getting from the physicalContext in IndexWhereResolver does not have a link back to a SemanticAnalyzer.  Any ideas?
+
+I do think that this is correctly making the tasks dependent though.
+
+@Russell:  that would be because of this line in SemanticAnalyzer:
+
+    PhysicalContext physicalContext = new PhysicalContext(conf,
+        getParseContext(), ctx, rootTasks, fetchTask);
+
+Note that getParseContext() is creating a new ParseContext instead of reusing one.  You can fix this by moving the setSemanticAnalyzer(this) call into getParseContext.
+
+(Also note that the setSemanticAnalyzer thing was just a janky way to see something working; we need to come up with a better mechanism.)
+ 
+
+New patch fixes the NPE by linking the SemanticAnalyzer into the parseContext per John's comment.
+
+Also updated unit test to turn off automatic indexing so it doesn't crash when manually using index.  Should probably check somewhere in the code instead.
+
+I'm not sure about those task dependencies...the EXPLAIN output looks wonky.
+
+
+HIVE-1744.7.patch:
+
+@Yongqiang, I fixed the problems in GenMRTableScal1.java, and think I have dealt with most of your comments.  I'm confused about what you mean with the combinehiveinputformat.
+
+@John, I made a first attempt at factoring SemanticAnalyzer calls into the ParseContext, but would appreciate your input.  This patch will also fail the unit test index_opt_where_simple.q as it stands.  However, if you remove the lines that attempt to use manual indexing, it succeeds.  The test that succeeds looks like
+
+{code:sql}
+CREATE INDEX src_index ON TABLE src(key) as 'COMPACT' WITH DEFERRED REBUILD;
+ALTER INDEX src_index ON src REBUILD;
+
+SET hive.optimize.autoindex=true;
+EXPLAIN SELECT key, value FROM src WHERE key=86 ORDER BY key;
+SELECT key, value FROM src WHERE key=86 ORDER BY key;
+
+DROP INDEX src_index on src;
+{code}
+
+It appears as if our regular expression that identifies WHERE clauses by looking for FIL operators (filters) may not be specific enough.  I think the remaining errors might be caused by trying to generate index queries for both the {{{SELECT ... FROM src}}} (as desired), and the {{{SELECT ... FROM default__src_src_index__}}} that we generated, which is a problem.
+
+The test is failing because you forgot to add
+
+SET hive.input.format=org.apache.hadoop.hive.ql.io.HiveInputFormat;
+
+before running the autoindex portion.
+
+The ParseContext change looks OK to me if no one else comes up with anything better during review.
+
+I think what Yongqiang's combinehiveinputformat comment meant was that you should run the autoindex portion twice; once with
+
+SET hive.input.format=org.apache.hadoop.hive.ql.io.HiveInputFormat;
+
+and again with
+
+SET hive.input.format=org.apache.hadoop.hive.ql.io.CombineHiveInputFormat;
+
+to verify that both work as expected.
+
+
+HIVE-1644.8.patch
+
+Fixed unit tests per John and Yonqiang.  Cleaned up comments.  Ready for review.  I still have a few questions that are probably best answered in the review:
+
+ * When we have multiple indexes, and we get different tasks lists from querying each index, what should we do?  Right now we use all tasks (IndexWhereProcessor.java:57)
+ * Is it possible to improve the regex we use so that it only matches WHERE clauses?  Right now we use FIL to get to the WHERE (IndexWhereTaskDispatcher.java:141)
+ * What comparison operators should we support?  Right now it's only <, >, and =.  We don't have <= or >= (CompactIndexHandler.java:272)
+
+Should I put this into the reviewboard?
+
+Russell, the plan still looks wrong.  It shows two stage 1's, with a dependency from one to the other.  The stage numbers should be unique, so probably this is due to the way we merge the two queries?
+
+HIVE-1644.9.patch
+
+Added task relabeling to the addDependentTask method in Task.java.  It still seems like we're generating our re-entrant index query twice.  Yonqiang, I think we end up calling IndexWhereTaskDispatcher.dispatch twice as often as we want, which causes us to process the operator tree twice.
+
+a few comments:
+rename work.getInputFormatFile to work.getIndexInputFile() or IndexIntermediateFile. and remove LOG from IndexWhereResolver
+
+IndexWhereTaskDispatcher:
+findTableScanOps in IndexWhereTaskDispatcher is empty.
+indexesOnTable in IndexWhereTaskDispatcher should be mapper<table, list<index>> because there could be more than one table scanned in one task.
+In getIndexes, use -1 instead of 1024
+
+The reason of duplicate plan is because today's hive apply filter twice, you can verify that by a simple "explain select key from src where key=86;". This is to be fixed in https://issues.apache.org/jira/browse/HIVE-1538. So i guess what you can process the task only one time by remembering it in the IndexWhereProcCtx. 
+And i noticed that the patch added all new tasks as root tasks, but keep the child task (the old root task) remain in root task. That may cause problem. So i guess the old task can just be removed from root task once a new parent task is added to root task.
+
+Yongqiang, I think I fixed the double processing by using a different regular expression.  I use FIL%SEL% instead of just FIL%.  I have also fixed the other comments.  After you look over it, I think it's ready for a reviewboard.
+
+Hi Russell,
+
+FIL%SEL% maybe not not good enough, how about a TBL%FIL?
+
+Also just had an offline talk with Namit. Namit proposed some very good ideas for this task:
+
+1. check index exists or not. For a query on partitioned tables, index optimizer should try to find out indexes do exists on all partitions which the original task is scanning.  This information can be found in ParseContext's OpToPartList.
+
+2. add more parameters to config whether to use the index or not. (like if the filter is a >, not use the index. size of inputs is bigger than some value, not use index)
+
+3. In case the index is not good (like even after scanning the index, it still needs to scan the whole base table), just do not use it, and go back to scan the whole base table. This can be done by adding a conditional task and a backup task. And how to detecting the index is good or not can be done by monitoring the index job's number of input records and number of output records, and compare them. let's say that if the ratio is >50, do not use the index. Kill the index job, and go back to scanning the whole base table. 3) can be done in a followup jira if you want.
+
+
+
+Also, can you add another check - only use the index if the size of the input is greater than a certain
+size (5G - make it configurable). This can be a check per index type - bitmap indices can have a similar
+check.
+
+As Yongqiang said, 3. can be a follow-up task.
+
+
+ * I don't think that my method of relabeling the tasks works correctly (renumberTasks(...) in Task.java).  It also seems like the labels do not affect the run-time execution.
+
+ * I haven't had a chance to write a unit test that uses partitions on an index, so I haven't really looked at how the code will perform (IndexWhereProcessor:66). I'm not really sure how indexes change once there are partitions. Is index_compact_2.q a reasonable starting place for a partitioned index test?
+
+ * Using the TS%FIL instead of FIL%SEL seems to work nicely, as it gives easy access to the table scan operator.
+
+ * I created the followup HIVE-2081 ticket for #3 from above.
+
+I'm having trouble getting the partitions from an Index.  I do not know how to get back to the index table, so I cannot use getPartCols()
+
+I would like to do something like this, but I don't know how to get the indexTable.
+
+{code:java}
+for (Index index : indexes.get(part.getTable())) {
+        Table indexTable;
+        indexTable = ???
+        List<FieldSchema> indexPartitions = indexTable.getPartCols();
+        for (FieldSchema col : part.getCols()) {
+          if (! indexPartitions.contains(col)) {
+            return null;
+          }
+        }
+      }
+{code}
+
+You have the list of partitions for the original table, and you just need to found out those partition names exists or not on the index table. So with "getParitionByName()" (pls check the code to find out the exact name) should work. 
+
+@Russell:  index.getIndexTableName(), and then do additional metastore lookups to retrieve whatever you need.
+
+Includes check to make sure that all partitions in the query exist on the index table.
+
+Review board available at https://reviews.apache.org/r/558/
+
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+https://reviews.apache.org/r/558/
+-----------------------------------------------------------
+
+Review request for hive.
+
+
+Summary
+-------
+
+Review request for HIVE-1644.12.patch
+
+
+This addresses bug HIVE-1644.
+    https://issues.apache.org/jira/browse/HIVE-1644
+
+
+Diffs
+-----
+
+  ql/src/test/results/clientpositive/index_opt_where_simple.q.out PRE-CREATION 
+  ql/src/test/results/clientpositive/index_opt_where_partitioned.q.out PRE-CREATION 
+  ql/src/test/results/clientpositive/index_opt_where.q.out PRE-CREATION 
+  ql/src/java/org/apache/hadoop/hive/ql/plan/MapredWork.java 73391e9 
+  ql/src/test/queries/clientpositive/index_opt_where.q PRE-CREATION 
+  ql/src/test/queries/clientpositive/index_opt_where_partitioned.q PRE-CREATION 
+  ql/src/test/queries/clientpositive/index_opt_where_simple.q PRE-CREATION 
+  ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java f0aca84 
+  ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereTaskDispatcher.java PRE-CREATION 
+  ql/src/java/org/apache/hadoop/hive/ql/parse/ParseContext.java 937a7b3 
+  ql/src/java/org/apache/hadoop/hive/ql/exec/ExecDriver.java 6437385 
+  ql/src/java/org/apache/hadoop/hive/ql/exec/TableScanOperator.java c02d90b 
+  ql/src/java/org/apache/hadoop/hive/ql/index/AbstractIndexHandler.java dd0186d 
+  ql/src/java/org/apache/hadoop/hive/ql/index/HiveIndexHandler.java 411b78f 
+  ql/src/java/org/apache/hadoop/hive/ql/index/compact/CompactIndexHandler.java 1f01446 
+  ql/src/java/org/apache/hadoop/hive/ql/metadata/Table.java 50db44c 
+  ql/src/java/org/apache/hadoop/hive/ql/optimizer/GenMRTableScan1.java 6162676 
+  ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/IndexWhereResolver.java PRE-CREATION 
+  ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/PhysicalOptimizer.java 0ae9fa2 
+  ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcCtx.java PRE-CREATION 
+  ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java PRE-CREATION 
+  common/src/java/org/apache/hadoop/hive/conf/HiveConf.java a21f589 
+  conf/hive-default.xml c42197f 
+
+Diff: https://reviews.apache.org/r/558/diff
+
+
+Testing
+-------
+
+
+Thanks,
+
+Russell
+
+
+
+I added comments in review board.
+
+
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+https://reviews.apache.org/r/558/#review399
+-----------------------------------------------------------
+
+
+
+common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+<https://reviews.apache.org/r/558/#comment748>
+
+    For consistency with my review in HIVE-1694, I suggest hive.optimize.index.filter as the name for this configuration parameter.
+    
+    (In HIVE-1694 I suggested hive.optimize.index.groupby, and we want it to be possible to enable/disable them independently)
+    
+
+
+
+common/src/java/org/apache/hadoop/hive/conf/HiveConf.java
+<https://reviews.apache.org/r/558/#comment749>
+
+    In line with the previous comment, suggest hive.optimize.index.filter.compact.minSize/maxSize.
+    
+    Namit's suggestion for minSize was 5G.
+    
+    I think the default for maxSize should be infinity (I can't think of a case where we want it in effect by default).
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/exec/ExecDriver.java
+<https://reviews.apache.org/r/558/#comment750>
+
+    HIVE-1803 is changing this to hive.index.blockfilter.file.  Assuming that gets committed first, we should use that, since it's generic rather than tied to the index type.
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/index/HiveIndexHandler.java
+<https://reviews.apache.org/r/558/#comment751>
+
+    What are the units here?  Also, don't use colon after parameter name.
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/index/compact/CompactIndexHandler.java
+<https://reviews.apache.org/r/558/#comment752>
+
+    The non-functional changes in this file are gonna conflict with HIVE-1803, so get rid of them.
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/index/compact/CompactIndexHandler.java
+<https://reviews.apache.org/r/558/#comment755>
+
+    Use HiveUtils.unparseIdentifier for quoting table names in generated SQL.
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/index/compact/CompactIndexHandler.java
+<https://reviews.apache.org/r/558/#comment756>
+
+    Isn't it incorrect to set properties on the original table scan here since this is only tentative?
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/index/compact/CompactIndexHandler.java
+<https://reviews.apache.org/r/558/#comment757>
+
+    Likewise, modifying inputs is incorrect before we have a definite plan.
+    
+    Some more work on the new HiveIndexHandler interface method is required for resolving this plus the residuals.
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/index/compact/CompactIndexHandler.java
+<https://reviews.apache.org/r/558/#comment753>
+
+    If searchConditions.size() == 0, it means we didn't find anything which could be handled by the index.  In that case, we should bail out immediately and not try to do anything more with this index.
+    
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/index/compact/CompactIndexHandler.java
+<https://reviews.apache.org/r/558/#comment759>
+
+    We collect the residual here, but we don't do anything with it.  Don't we need to pass it back so that Hive can decide what to leave in the Filter operator?
+    
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/metadata/Table.java
+<https://reviews.apache.org/r/558/#comment760>
+
+    The list actually contains index objects, not index table names.  Also typo: "is exists"
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/optimizer/GenMRTableScan1.java
+<https://reviews.apache.org/r/558/#comment761>
+
+    Only cast once.
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java
+<https://reviews.apache.org/r/558/#comment764>
+
+    Indentation is wrong here.
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java
+<https://reviews.apache.org/r/558/#comment763>
+
+    In my review for HIVE-1694, I noted that we should not be swallowing exceptions.  I think some of this code was copied from there.  If we can't access the metastore during optimization, it should be treated as a fatal error.
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java
+<https://reviews.apache.org/r/558/#comment765>
+
+    The plan still looks wrong (there are two Stage-0's, one for the index scan, one for the final fetch), so the relabeling is still not quite working correctly.
+    
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java
+<https://reviews.apache.org/r/558/#comment766>
+
+    no space after !
+    
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java
+<https://reviews.apache.org/r/558/#comment767>
+
+    Suggested rename for method:  arePartitionsCoveredByIndex
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java
+<https://reviews.apache.org/r/558/#comment768>
+
+    This checks that the metadata matches.  But it does not actually check that the index partitions exist.
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereTaskDispatcher.java
+<https://reviews.apache.org/r/558/#comment769>
+
+    Is that true?  Why couldn't index be used to optimize a map-only task?
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereTaskDispatcher.java
+<https://reviews.apache.org/r/558/#comment770>
+
+    As noted above, we DO want to fail here.
+
+
+
+ql/src/test/queries/clientpositive/index_opt_where.q
+<https://reviews.apache.org/r/558/#comment772>
+
+    Could you add more tests for cases where automatic indexing should decide not to kick in:
+    
+    * index can't be used because of min/max size config
+    * index can't be used because predicate isn't supported
+    * index can't be used columns aren't covered
+    
+    Also:
+    
+    * case where multiple indexes apply and we pick one (currently arbitrarily, but make sure it's at least deterministic so that test doesn't become flaky)
+    
+
+
+
+ql/src/test/queries/clientpositive/index_opt_where_partitioned.q
+<https://reviews.apache.org/r/558/#comment771>
+
+    Could you add a test which shows the index NOT being used in the case where required partitions haven't been built yet?
+    
+
+
+
+ql/src/test/results/clientpositive/index_opt_where_partitioned.q.out
+<https://reviews.apache.org/r/558/#comment773>
+
+    Here's the duplicate Stage-0 I referred to in the code.
+    
+
+
+- John
+
+
+On 2011-04-07 05:27:22, Russell Melick wrote:
+bq.  
+bq.  -----------------------------------------------------------
+bq.  This is an automatically generated e-mail. To reply, visit:
+bq.  https://reviews.apache.org/r/558/
+bq.  -----------------------------------------------------------
+bq.  
+bq.  (Updated 2011-04-07 05:27:22)
+bq.  
+bq.  
+bq.  Review request for hive.
+bq.  
+bq.  
+bq.  Summary
+bq.  -------
+bq.  
+bq.  Review request for HIVE-1644.12.patch
+bq.  
+bq.  
+bq.  This addresses bug HIVE-1644.
+bq.      https://issues.apache.org/jira/browse/HIVE-1644
+bq.  
+bq.  
+bq.  Diffs
+bq.  -----
+bq.  
+bq.    ql/src/test/results/clientpositive/index_opt_where_simple.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_opt_where_partitioned.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_opt_where.q.out PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/plan/MapredWork.java 73391e9 
+bq.    ql/src/test/queries/clientpositive/index_opt_where.q PRE-CREATION 
+bq.    ql/src/test/queries/clientpositive/index_opt_where_partitioned.q PRE-CREATION 
+bq.    ql/src/test/queries/clientpositive/index_opt_where_simple.q PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java f0aca84 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereTaskDispatcher.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/parse/ParseContext.java 937a7b3 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/exec/ExecDriver.java 6437385 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/exec/TableScanOperator.java c02d90b 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/index/AbstractIndexHandler.java dd0186d 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/index/HiveIndexHandler.java 411b78f 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/index/compact/CompactIndexHandler.java 1f01446 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/metadata/Table.java 50db44c 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/GenMRTableScan1.java 6162676 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/IndexWhereResolver.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/PhysicalOptimizer.java 0ae9fa2 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcCtx.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java PRE-CREATION 
+bq.    common/src/java/org/apache/hadoop/hive/conf/HiveConf.java a21f589 
+bq.    conf/hive-default.xml c42197f 
+bq.  
+bq.  Diff: https://reviews.apache.org/r/558/diff
+bq.  
+bq.  
+bq.  Testing
+bq.  -------
+bq.  
+bq.  
+bq.  Thanks,
+bq.  
+bq.  Russell
+bq.  
+bq.
+
+
+
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+https://reviews.apache.org/r/558/
+-----------------------------------------------------------
+
+(Updated 2011-04-15 08:08:14.640798)
+
+
+Review request for hive.
+
+
+Changes
+-------
+
+HIVE-1644.13.patch
+
+
+Summary
+-------
+
+Review request for HIVE-1644.12.patch
+
+
+This addresses bug HIVE-1644.
+    https://issues.apache.org/jira/browse/HIVE-1644
+
+
+Diffs (updated)
+-----
+
+  common/src/java/org/apache/hadoop/hive/conf/HiveConf.java a21f589 
+  conf/hive-default.xml c42197f 
+  ql/src/java/org/apache/hadoop/hive/ql/exec/ExecDriver.java 6437385 
+  ql/src/java/org/apache/hadoop/hive/ql/exec/TableScanOperator.java c02d90b 
+  ql/src/java/org/apache/hadoop/hive/ql/index/AbstractIndexHandler.java dd0186d 
+  ql/src/java/org/apache/hadoop/hive/ql/index/HiveIndexHandler.java 411b78f 
+  ql/src/java/org/apache/hadoop/hive/ql/index/compact/CompactIndexHandler.java 1f01446 
+  ql/src/java/org/apache/hadoop/hive/ql/metadata/Table.java 50db44c 
+  ql/src/java/org/apache/hadoop/hive/ql/optimizer/GenMRTableScan1.java 6162676 
+  ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/IndexWhereResolver.java PRE-CREATION 
+  ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/PhysicalOptimizer.java 0ae9fa2 
+  ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcCtx.java PRE-CREATION 
+  ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java PRE-CREATION 
+  ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereTaskDispatcher.java PRE-CREATION 
+  ql/src/java/org/apache/hadoop/hive/ql/parse/ParseContext.java 937a7b3 
+  ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java f0aca84 
+  ql/src/java/org/apache/hadoop/hive/ql/plan/MapredWork.java 73391e9 
+  ql/src/test/queries/clientpositive/index_opt_where.q PRE-CREATION 
+  ql/src/test/queries/clientpositive/index_opt_where_partitioned.q PRE-CREATION 
+  ql/src/test/queries/clientpositive/index_opt_where_simple.q PRE-CREATION 
+  ql/src/test/results/clientpositive/index_opt_where.q.out PRE-CREATION 
+  ql/src/test/results/clientpositive/index_opt_where_partitioned.q.out PRE-CREATION 
+  ql/src/test/results/clientpositive/index_opt_where_simple.q.out PRE-CREATION 
+
+Diff: https://reviews.apache.org/r/558/diff
+
+
+Testing
+-------
+
+
+Thanks,
+
+Russell
+
+
+
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+https://reviews.apache.org/r/558/#review472
+-----------------------------------------------------------
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java
+<https://reviews.apache.org/r/558/#comment953>
+
+    I would have liked to just make a copy of pctx before I called rewriteForIndex(...) for every index, and then just use whichever of those corresponded to the index rewrite we chose.  However, the pctx did not seem to have an easy way to copy it.
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java
+<https://reviews.apache.org/r/558/#comment957>
+
+    Do we need to propagate the residual predicate any further?
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java
+<https://reviews.apache.org/r/558/#comment955>
+
+    I'm kind of confused about how to check the actual table and not the metadata.  When we call indexTable.getPartitionKeys() and part.getTable.getPartitionKeys(), that method calls getPartitionKeys() on the underlying Thrift Tables.  Is there a way besides getPartitionKeys() that we should be using?
+
+
+
+ql/src/test/queries/clientpositive/index_opt_where.q
+<https://reviews.apache.org/r/558/#comment956>
+
+    I have not yet added the additional unit tests
+
+
+
+ql/src/test/results/clientpositive/index_opt_where_partitioned.q.out
+<https://reviews.apache.org/r/558/#comment954>
+
+    I fixed the labeling for this case, but would it make sense to label our stages differently for indexing?  We only relabel correctly as long as we're overwriting the highest numbered stage, since we only relabel a single task.  Or, should it relabel all tasks in the whole plan?  We only have easy access to the context.currentTask when we iterate through in IndexWhereProcessor (line 153)
+
+
+- Russell
+
+
+On 2011-04-15 08:08:14, Russell Melick wrote:
+bq.  
+bq.  -----------------------------------------------------------
+bq.  This is an automatically generated e-mail. To reply, visit:
+bq.  https://reviews.apache.org/r/558/
+bq.  -----------------------------------------------------------
+bq.  
+bq.  (Updated 2011-04-15 08:08:14)
+bq.  
+bq.  
+bq.  Review request for hive.
+bq.  
+bq.  
+bq.  Summary
+bq.  -------
+bq.  
+bq.  Review request for HIVE-1644.12.patch
+bq.  
+bq.  
+bq.  This addresses bug HIVE-1644.
+bq.      https://issues.apache.org/jira/browse/HIVE-1644
+bq.  
+bq.  
+bq.  Diffs
+bq.  -----
+bq.  
+bq.    common/src/java/org/apache/hadoop/hive/conf/HiveConf.java a21f589 
+bq.    conf/hive-default.xml c42197f 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/exec/ExecDriver.java 6437385 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/exec/TableScanOperator.java c02d90b 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/index/AbstractIndexHandler.java dd0186d 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/index/HiveIndexHandler.java 411b78f 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/index/compact/CompactIndexHandler.java 1f01446 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/metadata/Table.java 50db44c 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/GenMRTableScan1.java 6162676 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/IndexWhereResolver.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/PhysicalOptimizer.java 0ae9fa2 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcCtx.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereTaskDispatcher.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/parse/ParseContext.java 937a7b3 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java f0aca84 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/plan/MapredWork.java 73391e9 
+bq.    ql/src/test/queries/clientpositive/index_opt_where.q PRE-CREATION 
+bq.    ql/src/test/queries/clientpositive/index_opt_where_partitioned.q PRE-CREATION 
+bq.    ql/src/test/queries/clientpositive/index_opt_where_simple.q PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_opt_where.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_opt_where_partitioned.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_opt_where_simple.q.out PRE-CREATION 
+bq.  
+bq.  Diff: https://reviews.apache.org/r/558/diff
+bq.  
+bq.  
+bq.  Testing
+bq.  -------
+bq.  
+bq.  
+bq.  Thanks,
+bq.  
+bq.  Russell
+bq.  
+bq.
+
+
+
+I have several questions on the review board.  I also fixed the minor issues, but have not yet created the new unit tests.
+
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+https://reviews.apache.org/r/558/#review482
+-----------------------------------------------------------
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java
+<https://reviews.apache.org/r/558/#comment982>
+
+    A few comments here.
+    
+    1) Rather than passing in the entire table scan object and letting the handler set properties on it, I think we should just have the handler pass back the necessary information (input format and intermediate file).
+    
+    2) The generateIndexQuery method's parameter list is growing.  For plugin interfaces, a good pattern we've been using in other places is to introduce a new context class (say HiveIndexQueryContext) with getters and setters for the information to be communicated in both directions.  Then the caller instantiates one of these and passes in an instance.  The plugin reads and writes to the context.  On return, the caller gets the modified information out.  The main benefit is that in the future, if we need to pass more information, we just add new members to the context class, and none of the existing plugin implementations break.
+    
+    In this case, you could also put the context objects in a map (instead of having to keep multiple maps indexQueryTasks/additionalInputs etc).
+    
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java
+<https://reviews.apache.org/r/558/#comment983>
+
+    Just put it as a TODO for now; create the followup JIRA issue and reference it in the TODO.
+    
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java
+<https://reviews.apache.org/r/558/#comment990>
+
+    Look in Hive.java; there are methods like
+    
+    public List<Partition> getPartitionsByNames(Table tbl, List<String> partNames)
+    
+    which look up the actual partitions for a table from the metastore.  You can pass in indexTable.
+    
+
+
+
+ql/src/test/results/clientpositive/index_opt_where_partitioned.q.out
+<https://reviews.apache.org/r/558/#comment991>
+
+    Hmm...what if we could avoid relabeling altogether?  If you look in Driver.java, there's a method compile which calls TaskFactory.resetId().  This is what causes us to start back over from 0.
+    
+    If you add an optional parameter resetTaskIds=true, and then pass false for the Driver instance used for compiling the reentrant query, that might do it.
+    
+    
+    
+
+
+- John
+
+
+On 2011-04-15 08:08:14, Russell Melick wrote:
+bq.  
+bq.  -----------------------------------------------------------
+bq.  This is an automatically generated e-mail. To reply, visit:
+bq.  https://reviews.apache.org/r/558/
+bq.  -----------------------------------------------------------
+bq.  
+bq.  (Updated 2011-04-15 08:08:14)
+bq.  
+bq.  
+bq.  Review request for hive.
+bq.  
+bq.  
+bq.  Summary
+bq.  -------
+bq.  
+bq.  Review request for HIVE-1644.12.patch
+bq.  
+bq.  
+bq.  This addresses bug HIVE-1644.
+bq.      https://issues.apache.org/jira/browse/HIVE-1644
+bq.  
+bq.  
+bq.  Diffs
+bq.  -----
+bq.  
+bq.    common/src/java/org/apache/hadoop/hive/conf/HiveConf.java a21f589 
+bq.    conf/hive-default.xml c42197f 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/exec/ExecDriver.java 6437385 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/exec/TableScanOperator.java c02d90b 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/index/AbstractIndexHandler.java dd0186d 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/index/HiveIndexHandler.java 411b78f 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/index/compact/CompactIndexHandler.java 1f01446 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/metadata/Table.java 50db44c 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/GenMRTableScan1.java 6162676 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/IndexWhereResolver.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/PhysicalOptimizer.java 0ae9fa2 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcCtx.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereTaskDispatcher.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/parse/ParseContext.java 937a7b3 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java f0aca84 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/plan/MapredWork.java 73391e9 
+bq.    ql/src/test/queries/clientpositive/index_opt_where.q PRE-CREATION 
+bq.    ql/src/test/queries/clientpositive/index_opt_where_partitioned.q PRE-CREATION 
+bq.    ql/src/test/queries/clientpositive/index_opt_where_simple.q PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_opt_where.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_opt_where_partitioned.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_opt_where_simple.q.out PRE-CREATION 
+bq.  
+bq.  Diff: https://reviews.apache.org/r/558/diff
+bq.  
+bq.  
+bq.  Testing
+bq.  -------
+bq.  
+bq.  
+bq.  Thanks,
+bq.  
+bq.  Russell
+bq.  
+bq.
+
+
+
+Responses added in review board.
+
+
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+https://reviews.apache.org/r/558/
+-----------------------------------------------------------
+
+(Updated 2011-04-16 06:04:26.681814)
+
+
+Review request for hive.
+
+
+Changes
+-------
+
+HIVE-1644.14.patch
+
+
+Summary
+-------
+
+Review request for HIVE-1644.12.patch
+
+
+This addresses bug HIVE-1644.
+    https://issues.apache.org/jira/browse/HIVE-1644
+
+
+Diffs (updated)
+-----
+
+  common/src/java/org/apache/hadoop/hive/conf/HiveConf.java a21f589 
+  conf/hive-default.xml c42197f 
+  ql/src/java/org/apache/hadoop/hive/ql/Driver.java 14015d0 
+  ql/src/java/org/apache/hadoop/hive/ql/exec/ExecDriver.java 6437385 
+  ql/src/java/org/apache/hadoop/hive/ql/exec/TableScanOperator.java c02d90b 
+  ql/src/java/org/apache/hadoop/hive/ql/index/AbstractIndexHandler.java dd0186d 
+  ql/src/java/org/apache/hadoop/hive/ql/index/HiveIndexHandler.java 411b78f 
+  ql/src/java/org/apache/hadoop/hive/ql/index/HiveIndexQueryContext.java PRE-CREATION 
+  ql/src/java/org/apache/hadoop/hive/ql/index/compact/CompactIndexHandler.java 1f01446 
+  ql/src/java/org/apache/hadoop/hive/ql/metadata/Table.java 50db44c 
+  ql/src/java/org/apache/hadoop/hive/ql/optimizer/GenMRTableScan1.java 6162676 
+  ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/IndexWhereResolver.java PRE-CREATION 
+  ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/PhysicalOptimizer.java 0ae9fa2 
+  ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcCtx.java PRE-CREATION 
+  ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java PRE-CREATION 
+  ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereTaskDispatcher.java PRE-CREATION 
+  ql/src/java/org/apache/hadoop/hive/ql/parse/ParseContext.java 937a7b3 
+  ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java f0aca84 
+  ql/src/java/org/apache/hadoop/hive/ql/plan/MapredWork.java 73391e9 
+  ql/src/test/queries/clientpositive/index_auto.q PRE-CREATION 
+  ql/src/test/queries/clientpositive/index_auto_file_format.q PRE-CREATION 
+  ql/src/test/queries/clientpositive/index_auto_multiple.q PRE-CREATION 
+  ql/src/test/queries/clientpositive/index_auto_partitioned.q PRE-CREATION 
+  ql/src/test/queries/clientpositive/index_auto_unused.q PRE-CREATION 
+  ql/src/test/results/clientpositive/index_auto.q.out PRE-CREATION 
+  ql/src/test/results/clientpositive/index_auto_file_format.q.out PRE-CREATION 
+  ql/src/test/results/clientpositive/index_auto_multiple.q.out PRE-CREATION 
+  ql/src/test/results/clientpositive/index_auto_partitioned.q.out PRE-CREATION 
+  ql/src/test/results/clientpositive/index_auto_unused.q.out PRE-CREATION 
+  ql/src/test/results/clientpositive/index_opt_where.q.out PRE-CREATION 
+  ql/src/test/results/clientpositive/index_opt_where_partitioned.q.out PRE-CREATION 
+  ql/src/test/results/clientpositive/index_opt_where_simple.q.out PRE-CREATION 
+
+Diff: https://reviews.apache.org/r/558/diff
+
+
+Testing
+-------
+
+
+Thanks,
+
+Russell
+
+
+
+Include new unit tests.  Also asked a few more questions on the review board.
+
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+https://reviews.apache.org/r/558/#review492
+-----------------------------------------------------------
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/exec/ExecDriver.java
+<https://reviews.apache.org/r/558/#comment998>
+
+    Still need to change hive.index.compact.file to hive.index.blockfilter.file , but hopefully bitmap gets committed soon.
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/index/compact/CompactIndexHandler.java
+<https://reviews.apache.org/r/558/#comment997>
+
+    I'm not sure the way I'm doing it currently will work with partitions.  I don't take them into account when generating the index query.
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java
+<https://reviews.apache.org/r/558/#comment1000>
+
+    see later comment about why this abort needs to be skipped for anything to run.
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java
+<https://reviews.apache.org/r/558/#comment999>
+
+    This doesn't seem to work (it always returns false here).  This checks whether the partitions equal each other, which I don't think can happen since they're on different tables.  What information in a partition do I need to be checking?
+
+
+
+ql/src/test/queries/clientpositive/index_auto_multiple.q
+<https://reviews.apache.org/r/558/#comment995>
+
+    Is there a multiple column table?  Or, what's the best way to create a multi-column table and populate it with data?  I can't figure out a good way to query the value column, so the src table seems less than ideal.
+
+
+
+ql/src/test/queries/clientpositive/index_auto_unused.q
+<https://reviews.apache.org/r/558/#comment996>
+
+    How do unbuilt partitions work?  I didn't see any way to delay the building, so I don't know how to have an index with unbuilt partitions.
+
+
+- Russell
+
+
+On 2011-04-16 06:04:26, Russell Melick wrote:
+bq.  
+bq.  -----------------------------------------------------------
+bq.  This is an automatically generated e-mail. To reply, visit:
+bq.  https://reviews.apache.org/r/558/
+bq.  -----------------------------------------------------------
+bq.  
+bq.  (Updated 2011-04-16 06:04:26)
+bq.  
+bq.  
+bq.  Review request for hive.
+bq.  
+bq.  
+bq.  Summary
+bq.  -------
+bq.  
+bq.  Review request for HIVE-1644.12.patch
+bq.  
+bq.  
+bq.  This addresses bug HIVE-1644.
+bq.      https://issues.apache.org/jira/browse/HIVE-1644
+bq.  
+bq.  
+bq.  Diffs
+bq.  -----
+bq.  
+bq.    common/src/java/org/apache/hadoop/hive/conf/HiveConf.java a21f589 
+bq.    conf/hive-default.xml c42197f 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/Driver.java 14015d0 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/exec/ExecDriver.java 6437385 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/exec/TableScanOperator.java c02d90b 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/index/AbstractIndexHandler.java dd0186d 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/index/HiveIndexHandler.java 411b78f 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/index/HiveIndexQueryContext.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/index/compact/CompactIndexHandler.java 1f01446 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/metadata/Table.java 50db44c 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/GenMRTableScan1.java 6162676 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/IndexWhereResolver.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/PhysicalOptimizer.java 0ae9fa2 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcCtx.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereTaskDispatcher.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/parse/ParseContext.java 937a7b3 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java f0aca84 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/plan/MapredWork.java 73391e9 
+bq.    ql/src/test/queries/clientpositive/index_auto.q PRE-CREATION 
+bq.    ql/src/test/queries/clientpositive/index_auto_file_format.q PRE-CREATION 
+bq.    ql/src/test/queries/clientpositive/index_auto_multiple.q PRE-CREATION 
+bq.    ql/src/test/queries/clientpositive/index_auto_partitioned.q PRE-CREATION 
+bq.    ql/src/test/queries/clientpositive/index_auto_unused.q PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_auto.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_auto_file_format.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_auto_multiple.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_auto_partitioned.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_auto_unused.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_opt_where.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_opt_where_partitioned.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_opt_where_simple.q.out PRE-CREATION 
+bq.  
+bq.  Diff: https://reviews.apache.org/r/558/diff
+bq.  
+bq.  
+bq.  Testing
+bq.  -------
+bq.  
+bq.  
+bq.  Thanks,
+bq.  
+bq.  Russell
+bq.  
+bq.
+
+
+
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+https://reviews.apache.org/r/558/#review494
+-----------------------------------------------------------
+
+
+
+conf/hive-default.xml
+<https://reviews.apache.org/r/558/#comment1019>
+
+    BTW, these property names should be all-lowercase.
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/Driver.java
+<https://reviews.apache.org/r/558/#comment1022>
+
+    When you add an overload, add Javadoc as well (including the new param's meaning).
+    
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/index/HiveIndexQueryContext.java
+<https://reviews.apache.org/r/558/#comment1020>
+
+    Could you explain the usage interaction better (along the lines of what I explained in my review comment)?
+    
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/index/compact/CompactIndexHandler.java
+<https://reviews.apache.org/r/558/#comment1021>
+
+    You're right.  Either we need to treat them as index columns (so that the predicates on them will automatically be collected by the predicate analyzer), or we need to explicitly generate corresponding equality predicates based on the partition values which have already been identified by partition pruning.
+    
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java
+<https://reviews.apache.org/r/558/#comment1024>
+
+    From an efficiency perspective, you certainly don't want to be doing this over and over inside the outer for loop; just do it once first outside.
+    
+    Also, for a table with a huge number of partitions, fetching all of them is a bad idea; it's better to selectively query the partitions of interest (but batching them if possible).
+    
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java
+<https://reviews.apache.org/r/558/#comment1023>
+
+    This doesn't work because the Partition class does not override the default Java equals method (which is based on object identity rather than value), and different metastore queries return different object instances for the same underlying entity.
+
+
+
+ql/src/test/queries/clientpositive/index_auto_multiple.q
+<https://reviews.apache.org/r/558/#comment1025>
+
+    I don't understand what you mean?  src has two columns, key and value.
+
+
+
+ql/src/test/queries/clientpositive/index_auto_unused.q
+<https://reviews.apache.org/r/558/#comment1026>
+
+    From the index design doc, there's an optional PARTITION clause when rebuilding an index which allows you to build just one specific partition, leaving the others unbuilt.  I think there are some examples in the unit tests.
+    
+    ALTER INDEX index_name ON table_name [ PARTITION (...) ] REBUILD
+
+
+- John
+
+
+On 2011-04-16 06:04:26, Russell Melick wrote:
+bq.  
+bq.  -----------------------------------------------------------
+bq.  This is an automatically generated e-mail. To reply, visit:
+bq.  https://reviews.apache.org/r/558/
+bq.  -----------------------------------------------------------
+bq.  
+bq.  (Updated 2011-04-16 06:04:26)
+bq.  
+bq.  
+bq.  Review request for hive.
+bq.  
+bq.  
+bq.  Summary
+bq.  -------
+bq.  
+bq.  Review request for HIVE-1644.12.patch
+bq.  
+bq.  
+bq.  This addresses bug HIVE-1644.
+bq.      https://issues.apache.org/jira/browse/HIVE-1644
+bq.  
+bq.  
+bq.  Diffs
+bq.  -----
+bq.  
+bq.    common/src/java/org/apache/hadoop/hive/conf/HiveConf.java a21f589 
+bq.    conf/hive-default.xml c42197f 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/Driver.java 14015d0 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/exec/ExecDriver.java 6437385 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/exec/TableScanOperator.java c02d90b 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/index/AbstractIndexHandler.java dd0186d 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/index/HiveIndexHandler.java 411b78f 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/index/HiveIndexQueryContext.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/index/compact/CompactIndexHandler.java 1f01446 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/metadata/Table.java 50db44c 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/GenMRTableScan1.java 6162676 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/IndexWhereResolver.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/PhysicalOptimizer.java 0ae9fa2 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcCtx.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereTaskDispatcher.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/parse/ParseContext.java 937a7b3 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java f0aca84 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/plan/MapredWork.java 73391e9 
+bq.    ql/src/test/queries/clientpositive/index_auto.q PRE-CREATION 
+bq.    ql/src/test/queries/clientpositive/index_auto_file_format.q PRE-CREATION 
+bq.    ql/src/test/queries/clientpositive/index_auto_multiple.q PRE-CREATION 
+bq.    ql/src/test/queries/clientpositive/index_auto_partitioned.q PRE-CREATION 
+bq.    ql/src/test/queries/clientpositive/index_auto_unused.q PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_auto.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_auto_file_format.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_auto_multiple.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_auto_partitioned.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_auto_unused.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_opt_where.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_opt_where_partitioned.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_opt_where_simple.q.out PRE-CREATION 
+bq.  
+bq.  Diff: https://reviews.apache.org/r/558/diff
+bq.  
+bq.  
+bq.  Testing
+bq.  -------
+bq.  
+bq.  
+bq.  Thanks,
+bq.  
+bq.  Russell
+bq.  
+bq.
+
+
+
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+https://reviews.apache.org/r/558/#review495
+-----------------------------------------------------------
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java
+<https://reviews.apache.org/r/558/#comment1027>
+
+    Oh, and reading your original comment more carefully:  yeah, they are two separate entities (one for the table partition, and one for the index partition), so even if the equals method were tied to metastore object identity, it still wouldn't work.
+    
+    The getSpec() method on the Partition class is what gives you the actual key/value pairs for the partition, suitable for comparison.
+    
+
+
+- John
+
+
+On 2011-04-16 06:04:26, Russell Melick wrote:
+bq.  
+bq.  -----------------------------------------------------------
+bq.  This is an automatically generated e-mail. To reply, visit:
+bq.  https://reviews.apache.org/r/558/
+bq.  -----------------------------------------------------------
+bq.  
+bq.  (Updated 2011-04-16 06:04:26)
+bq.  
+bq.  
+bq.  Review request for hive.
+bq.  
+bq.  
+bq.  Summary
+bq.  -------
+bq.  
+bq.  Review request for HIVE-1644.12.patch
+bq.  
+bq.  
+bq.  This addresses bug HIVE-1644.
+bq.      https://issues.apache.org/jira/browse/HIVE-1644
+bq.  
+bq.  
+bq.  Diffs
+bq.  -----
+bq.  
+bq.    common/src/java/org/apache/hadoop/hive/conf/HiveConf.java a21f589 
+bq.    conf/hive-default.xml c42197f 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/Driver.java 14015d0 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/exec/ExecDriver.java 6437385 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/exec/TableScanOperator.java c02d90b 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/index/AbstractIndexHandler.java dd0186d 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/index/HiveIndexHandler.java 411b78f 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/index/HiveIndexQueryContext.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/index/compact/CompactIndexHandler.java 1f01446 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/metadata/Table.java 50db44c 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/GenMRTableScan1.java 6162676 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/IndexWhereResolver.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/PhysicalOptimizer.java 0ae9fa2 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcCtx.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereTaskDispatcher.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/parse/ParseContext.java 937a7b3 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java f0aca84 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/plan/MapredWork.java 73391e9 
+bq.    ql/src/test/queries/clientpositive/index_auto.q PRE-CREATION 
+bq.    ql/src/test/queries/clientpositive/index_auto_file_format.q PRE-CREATION 
+bq.    ql/src/test/queries/clientpositive/index_auto_multiple.q PRE-CREATION 
+bq.    ql/src/test/queries/clientpositive/index_auto_partitioned.q PRE-CREATION 
+bq.    ql/src/test/queries/clientpositive/index_auto_unused.q PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_auto.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_auto_file_format.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_auto_multiple.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_auto_partitioned.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_auto_unused.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_opt_where.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_opt_where_partitioned.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_opt_where_simple.q.out PRE-CREATION 
+bq.  
+bq.  Diff: https://reviews.apache.org/r/558/diff
+bq.  
+bq.  
+bq.  Testing
+bq.  -------
+bq.  
+bq.  
+bq.  Thanks,
+bq.  
+bq.  Russell
+bq.  
+bq.
+
+
+
+Responses added in review board.
+
+
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+https://reviews.apache.org/r/558/
+-----------------------------------------------------------
+
+(Updated 2011-04-22 03:50:54.602032)
+
+
+Review request for hive.
+
+
+Changes
+-------
+
+HIVE-1644.15.patch
+
+
+Summary
+-------
+
+Review request for HIVE-1644.12.patch
+
+
+This addresses bug HIVE-1644.
+    https://issues.apache.org/jira/browse/HIVE-1644
+
+
+Diffs (updated)
+-----
+
+  common/src/java/org/apache/hadoop/hive/conf/HiveConf.java 2cdaeb6 
+  conf/hive-default.xml 79ea477 
+  ql/src/java/org/apache/hadoop/hive/ql/Driver.java ca337a8 
+  ql/src/java/org/apache/hadoop/hive/ql/exec/ExecDriver.java 69ee03b 
+  ql/src/java/org/apache/hadoop/hive/ql/exec/TableScanOperator.java c02d90b 
+  ql/src/java/org/apache/hadoop/hive/ql/index/AbstractIndexHandler.java dd0186d 
+  ql/src/java/org/apache/hadoop/hive/ql/index/HiveIndexHandler.java 411b78f 
+  ql/src/java/org/apache/hadoop/hive/ql/index/HiveIndexQueryContext.java PRE-CREATION 
+  ql/src/java/org/apache/hadoop/hive/ql/index/compact/CompactIndexHandler.java 1f01446 
+  ql/src/java/org/apache/hadoop/hive/ql/metadata/Table.java 50db44c 
+  ql/src/java/org/apache/hadoop/hive/ql/optimizer/GenMRTableScan1.java 6162676 
+  ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/IndexWhereResolver.java PRE-CREATION 
+  ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/PhysicalOptimizer.java 0ae9fa2 
+  ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcCtx.java PRE-CREATION 
+  ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java PRE-CREATION 
+  ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereTaskDispatcher.java PRE-CREATION 
+  ql/src/java/org/apache/hadoop/hive/ql/parse/ParseContext.java 374e123 
+  ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java c41bb32 
+  ql/src/java/org/apache/hadoop/hive/ql/plan/MapredWork.java 73391e9 
+  ql/src/test/queries/clientpositive/index_auto.q PRE-CREATION 
+  ql/src/test/queries/clientpositive/index_auto_file_format.q PRE-CREATION 
+  ql/src/test/queries/clientpositive/index_auto_multiple.q PRE-CREATION 
+  ql/src/test/queries/clientpositive/index_auto_partitioned.q PRE-CREATION 
+  ql/src/test/queries/clientpositive/index_auto_unused.q PRE-CREATION 
+  ql/src/test/results/clientpositive/index_auto.q.out PRE-CREATION 
+  ql/src/test/results/clientpositive/index_auto_file_format.q.out PRE-CREATION 
+  ql/src/test/results/clientpositive/index_auto_multiple.q.out PRE-CREATION 
+  ql/src/test/results/clientpositive/index_auto_partitioned.q.out PRE-CREATION 
+  ql/src/test/results/clientpositive/index_auto_unused.q.out PRE-CREATION 
+
+Diff: https://reviews.apache.org/r/558/diff
+
+
+Testing
+-------
+
+
+Thanks,
+
+Russell
+
+
+
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+https://reviews.apache.org/r/558/#review528
+-----------------------------------------------------------
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/index/compact/CompactIndexHandler.java
+<https://reviews.apache.org/r/558/#comment1094>
+
+    When we run a query on a non-partitioned table, we get a single partition in queryPartitions of the whole table (with an empty partSpec).  Then, when we add the partition columns to the list of indexed column, we end up adding all the columns in the src table, instead of just the partitioned ones.  If we make sure the partSpec isn't empty, this doesn't happen.
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java
+<https://reviews.apache.org/r/558/#comment1095>
+
+    We need to cast the work in this task to MapredWork in order to get the input size out (line 176).  I'm not sure if this is the best place to do that checking.
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java
+<https://reviews.apache.org/r/558/#comment1096>
+
+    See above comment about MapredWork
+
+
+- Russell
+
+
+On 2011-04-22 03:50:54, Russell Melick wrote:
+bq.  
+bq.  -----------------------------------------------------------
+bq.  This is an automatically generated e-mail. To reply, visit:
+bq.  https://reviews.apache.org/r/558/
+bq.  -----------------------------------------------------------
+bq.  
+bq.  (Updated 2011-04-22 03:50:54)
+bq.  
+bq.  
+bq.  Review request for hive.
+bq.  
+bq.  
+bq.  Summary
+bq.  -------
+bq.  
+bq.  Review request for HIVE-1644.12.patch
+bq.  
+bq.  
+bq.  This addresses bug HIVE-1644.
+bq.      https://issues.apache.org/jira/browse/HIVE-1644
+bq.  
+bq.  
+bq.  Diffs
+bq.  -----
+bq.  
+bq.    common/src/java/org/apache/hadoop/hive/conf/HiveConf.java 2cdaeb6 
+bq.    conf/hive-default.xml 79ea477 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/Driver.java ca337a8 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/exec/ExecDriver.java 69ee03b 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/exec/TableScanOperator.java c02d90b 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/index/AbstractIndexHandler.java dd0186d 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/index/HiveIndexHandler.java 411b78f 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/index/HiveIndexQueryContext.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/index/compact/CompactIndexHandler.java 1f01446 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/metadata/Table.java 50db44c 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/GenMRTableScan1.java 6162676 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/IndexWhereResolver.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/PhysicalOptimizer.java 0ae9fa2 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcCtx.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereTaskDispatcher.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/parse/ParseContext.java 374e123 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java c41bb32 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/plan/MapredWork.java 73391e9 
+bq.    ql/src/test/queries/clientpositive/index_auto.q PRE-CREATION 
+bq.    ql/src/test/queries/clientpositive/index_auto_file_format.q PRE-CREATION 
+bq.    ql/src/test/queries/clientpositive/index_auto_multiple.q PRE-CREATION 
+bq.    ql/src/test/queries/clientpositive/index_auto_partitioned.q PRE-CREATION 
+bq.    ql/src/test/queries/clientpositive/index_auto_unused.q PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_auto.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_auto_file_format.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_auto_multiple.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_auto_partitioned.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_auto_unused.q.out PRE-CREATION 
+bq.  
+bq.  Diff: https://reviews.apache.org/r/558/diff
+bq.  
+bq.  
+bq.  Testing
+bq.  -------
+bq.  
+bq.  
+bq.  Thanks,
+bq.  
+bq.  Russell
+bq.  
+bq.
+
+
+
+HIVE-1644.15.patch
+
+Few remaining comments on reviewboard.
+
+Looks good, I added a few minor comments and requests for followup creation.
+
+
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+https://reviews.apache.org/r/558/#review530
+-----------------------------------------------------------
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/exec/ExecDriver.java
+<https://reviews.apache.org/r/558/#comment1106>
+
+    Create a followup task for dealing with jobs which access multiple tables.  For that, we need to associate the index formats/files with specific tables, and that requires modifying the way the index input format works.
+    
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/exec/TableScanOperator.java
+<https://reviews.apache.org/r/558/#comment1105>
+
+    Create a followup task for displaying these in the plan (to indicate that a table scan's input is being filtered by the intermediate file).  We only want to do that when they are non-null (to avoid upsetting all the existing test reference files).
+    
+    
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/index/compact/CompactIndexHandler.java
+<https://reviews.apache.org/r/558/#comment1099>
+
+    spacing
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/index/compact/CompactIndexHandler.java
+<https://reviews.apache.org/r/558/#comment1100>
+
+    spacing
+    
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java
+<https://reviews.apache.org/r/558/#comment1102>
+
+    spacing
+    
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java
+<https://reviews.apache.org/r/558/#comment1101>
+
+    When logging errors being propagated, use the two-arg version of the method and pass e as the second arg.  Same thing in a few other places.
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java
+<https://reviews.apache.org/r/558/#comment1103>
+
+    curly bracket placement
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java
+<https://reviews.apache.org/r/558/#comment1104>
+
+    create a followup for this one
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java
+<https://reviews.apache.org/r/558/#comment1098>
+
+    This is not an error, just a condition that prevents usage of the index, so it should be logged as info rather than error.
+
+
+- John
+
+
+On 2011-04-22 03:50:54, Russell Melick wrote:
+bq.  
+bq.  -----------------------------------------------------------
+bq.  This is an automatically generated e-mail. To reply, visit:
+bq.  https://reviews.apache.org/r/558/
+bq.  -----------------------------------------------------------
+bq.  
+bq.  (Updated 2011-04-22 03:50:54)
+bq.  
+bq.  
+bq.  Review request for hive.
+bq.  
+bq.  
+bq.  Summary
+bq.  -------
+bq.  
+bq.  Review request for HIVE-1644.12.patch
+bq.  
+bq.  
+bq.  This addresses bug HIVE-1644.
+bq.      https://issues.apache.org/jira/browse/HIVE-1644
+bq.  
+bq.  
+bq.  Diffs
+bq.  -----
+bq.  
+bq.    common/src/java/org/apache/hadoop/hive/conf/HiveConf.java 2cdaeb6 
+bq.    conf/hive-default.xml 79ea477 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/Driver.java ca337a8 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/exec/ExecDriver.java 69ee03b 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/exec/TableScanOperator.java c02d90b 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/index/AbstractIndexHandler.java dd0186d 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/index/HiveIndexHandler.java 411b78f 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/index/HiveIndexQueryContext.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/index/compact/CompactIndexHandler.java 1f01446 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/metadata/Table.java 50db44c 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/GenMRTableScan1.java 6162676 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/IndexWhereResolver.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/PhysicalOptimizer.java 0ae9fa2 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcCtx.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereTaskDispatcher.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/parse/ParseContext.java 374e123 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java c41bb32 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/plan/MapredWork.java 73391e9 
+bq.    ql/src/test/queries/clientpositive/index_auto.q PRE-CREATION 
+bq.    ql/src/test/queries/clientpositive/index_auto_file_format.q PRE-CREATION 
+bq.    ql/src/test/queries/clientpositive/index_auto_multiple.q PRE-CREATION 
+bq.    ql/src/test/queries/clientpositive/index_auto_partitioned.q PRE-CREATION 
+bq.    ql/src/test/queries/clientpositive/index_auto_unused.q PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_auto.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_auto_file_format.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_auto_multiple.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_auto_partitioned.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_auto_unused.q.out PRE-CREATION 
+bq.  
+bq.  Diff: https://reviews.apache.org/r/558/diff
+bq.  
+bq.  
+bq.  Testing
+bq.  -------
+bq.  
+bq.  
+bq.  Thanks,
+bq.  
+bq.  Russell
+bq.  
+bq.
+
+
+
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+https://reviews.apache.org/r/558/
+-----------------------------------------------------------
+
+(Updated 2011-04-23 06:41:49.007802)
+
+
+Review request for hive.
+
+
+Changes
+-------
+
+HIVE-1644.16.patch
+
+
+Summary
+-------
+
+Review request for HIVE-1644.12.patch
+
+
+This addresses bug HIVE-1644.
+    https://issues.apache.org/jira/browse/HIVE-1644
+
+
+Diffs (updated)
+-----
+
+  common/src/java/org/apache/hadoop/hive/conf/HiveConf.java 2cdaeb6 
+  conf/hive-default.xml 79ea477 
+  ql/src/java/org/apache/hadoop/hive/ql/Driver.java ca337a8 
+  ql/src/java/org/apache/hadoop/hive/ql/exec/ExecDriver.java 69ee03b 
+  ql/src/java/org/apache/hadoop/hive/ql/exec/TableScanOperator.java c02d90b 
+  ql/src/java/org/apache/hadoop/hive/ql/index/AbstractIndexHandler.java dd0186d 
+  ql/src/java/org/apache/hadoop/hive/ql/index/HiveIndexHandler.java 411b78f 
+  ql/src/java/org/apache/hadoop/hive/ql/index/HiveIndexQueryContext.java PRE-CREATION 
+  ql/src/java/org/apache/hadoop/hive/ql/index/compact/CompactIndexHandler.java 1f01446 
+  ql/src/java/org/apache/hadoop/hive/ql/metadata/Table.java 50db44c 
+  ql/src/java/org/apache/hadoop/hive/ql/optimizer/GenMRTableScan1.java 6162676 
+  ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/IndexWhereResolver.java PRE-CREATION 
+  ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/PhysicalOptimizer.java 0ae9fa2 
+  ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcCtx.java PRE-CREATION 
+  ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java PRE-CREATION 
+  ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereTaskDispatcher.java PRE-CREATION 
+  ql/src/java/org/apache/hadoop/hive/ql/parse/ParseContext.java 374e123 
+  ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java c41bb32 
+  ql/src/java/org/apache/hadoop/hive/ql/plan/MapredWork.java 73391e9 
+  ql/src/test/queries/clientpositive/index_auto.q PRE-CREATION 
+  ql/src/test/queries/clientpositive/index_auto_file_format.q PRE-CREATION 
+  ql/src/test/queries/clientpositive/index_auto_multiple.q PRE-CREATION 
+  ql/src/test/queries/clientpositive/index_auto_partitioned.q PRE-CREATION 
+  ql/src/test/queries/clientpositive/index_auto_test_if_used.q PRE-CREATION 
+  ql/src/test/queries/clientpositive/index_auto_unused.q PRE-CREATION 
+  ql/src/test/results/clientpositive/index_auto.q.out PRE-CREATION 
+  ql/src/test/results/clientpositive/index_auto_file_format.q.out PRE-CREATION 
+  ql/src/test/results/clientpositive/index_auto_multiple.q.out PRE-CREATION 
+  ql/src/test/results/clientpositive/index_auto_partitioned.q.out PRE-CREATION 
+  ql/src/test/results/clientpositive/index_auto_test_if_used.q.out PRE-CREATION 
+  ql/src/test/results/clientpositive/index_auto_unused.q.out PRE-CREATION 
+
+Diff: https://reviews.apache.org/r/558/diff
+
+
+Testing
+-------
+
+
+Thanks,
+
+Russell
+
+
+
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+https://reviews.apache.org/r/558/#review533
+-----------------------------------------------------------
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java
+<https://reviews.apache.org/r/558/#comment1110>
+
+    I thought this might what caused the original table to be used, instead of the stale index.  By adding the index table, we keep the original table around.  However, clearing the inputs before adding the index table didn't change anything.
+
+
+
+ql/src/test/results/clientpositive/index_auto_test_if_used.q.out
+<https://reviews.apache.org/r/558/#comment1109>
+
+    We shouldn't be seeing this output.  We're still generating the right plan, but something is wrong when we run it.
+
+
+- Russell
+
+
+On 2011-04-23 06:41:49, Russell Melick wrote:
+bq.  
+bq.  -----------------------------------------------------------
+bq.  This is an automatically generated e-mail. To reply, visit:
+bq.  https://reviews.apache.org/r/558/
+bq.  -----------------------------------------------------------
+bq.  
+bq.  (Updated 2011-04-23 06:41:49)
+bq.  
+bq.  
+bq.  Review request for hive.
+bq.  
+bq.  
+bq.  Summary
+bq.  -------
+bq.  
+bq.  Review request for HIVE-1644.12.patch
+bq.  
+bq.  
+bq.  This addresses bug HIVE-1644.
+bq.      https://issues.apache.org/jira/browse/HIVE-1644
+bq.  
+bq.  
+bq.  Diffs
+bq.  -----
+bq.  
+bq.    common/src/java/org/apache/hadoop/hive/conf/HiveConf.java 2cdaeb6 
+bq.    conf/hive-default.xml 79ea477 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/Driver.java ca337a8 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/exec/ExecDriver.java 69ee03b 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/exec/TableScanOperator.java c02d90b 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/index/AbstractIndexHandler.java dd0186d 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/index/HiveIndexHandler.java 411b78f 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/index/HiveIndexQueryContext.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/index/compact/CompactIndexHandler.java 1f01446 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/metadata/Table.java 50db44c 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/GenMRTableScan1.java 6162676 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/IndexWhereResolver.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/PhysicalOptimizer.java 0ae9fa2 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcCtx.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereTaskDispatcher.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/parse/ParseContext.java 374e123 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java c41bb32 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/plan/MapredWork.java 73391e9 
+bq.    ql/src/test/queries/clientpositive/index_auto.q PRE-CREATION 
+bq.    ql/src/test/queries/clientpositive/index_auto_file_format.q PRE-CREATION 
+bq.    ql/src/test/queries/clientpositive/index_auto_multiple.q PRE-CREATION 
+bq.    ql/src/test/queries/clientpositive/index_auto_partitioned.q PRE-CREATION 
+bq.    ql/src/test/queries/clientpositive/index_auto_test_if_used.q PRE-CREATION 
+bq.    ql/src/test/queries/clientpositive/index_auto_unused.q PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_auto.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_auto_file_format.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_auto_multiple.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_auto_partitioned.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_auto_test_if_used.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_auto_unused.q.out PRE-CREATION 
+bq.  
+bq.  Diff: https://reviews.apache.org/r/558/diff
+bq.  
+bq.  
+bq.  Testing
+bq.  -------
+bq.  
+bq.  
+bq.  Thanks,
+bq.  
+bq.  Russell
+bq.  
+bq.
+
+
+
+Patch 16
+
+One last problem.  It doesn't appear the index is actually used.  I tried looking a little bit at the hadoop logs, but I don't really know what I'm looking for.  I left a comment on the reviewboard.
+
+Yeah, when I look in build/ql/tmp/hive.log after running index_auto_test_if_used.q, I see
+
+-jobconf hive.input.format=org.apache.hadoop.hive.ql.io.HiveInputFormat
+
+in the parameters to the spawned job.  So it looks like you haven't got the plumbing all the way through to the end?
+
+Also, the patch is going to need to be rebased since the commit of HIVE-1803.
+
+
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+https://reviews.apache.org/r/558/
+-----------------------------------------------------------
+
+(Updated 2011-04-29 00:01:06.921150)
+
+
+Review request for hive.
+
+
+Changes
+-------
+
+HIVE-1644.17.patch
+
+
+Summary
+-------
+
+Review request for HIVE-1644.12.patch
+
+
+This addresses bug HIVE-1644.
+    https://issues.apache.org/jira/browse/HIVE-1644
+
+
+Diffs (updated)
+-----
+
+  common/src/java/org/apache/hadoop/hive/conf/HiveConf.java f77f46c 
+  conf/hive-default.xml 6bd615e 
+  eclipse-templates/.classpath 8d2dc52 
+  ql/src/java/org/apache/hadoop/hive/ql/Driver.java ca337a8 
+  ql/src/java/org/apache/hadoop/hive/ql/exec/ExecDriver.java 24e16e4 
+  ql/src/java/org/apache/hadoop/hive/ql/exec/TableScanOperator.java c02d90b 
+  ql/src/java/org/apache/hadoop/hive/ql/index/AbstractIndexHandler.java dd0186d 
+  ql/src/java/org/apache/hadoop/hive/ql/index/HiveIndexHandler.java 411b78f 
+  ql/src/java/org/apache/hadoop/hive/ql/index/HiveIndexQueryContext.java PRE-CREATION 
+  ql/src/java/org/apache/hadoop/hive/ql/index/compact/CompactIndexHandler.java f90d64f 
+  ql/src/java/org/apache/hadoop/hive/ql/metadata/Table.java 50db44c 
+  ql/src/java/org/apache/hadoop/hive/ql/optimizer/GenMRTableScan1.java 6162676 
+  ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/IndexWhereResolver.java PRE-CREATION 
+  ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/PhysicalOptimizer.java 0ae9fa2 
+  ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcCtx.java PRE-CREATION 
+  ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java PRE-CREATION 
+  ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereTaskDispatcher.java PRE-CREATION 
+  ql/src/java/org/apache/hadoop/hive/ql/parse/ParseContext.java 374e123 
+  ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java 2207ac4 
+  ql/src/java/org/apache/hadoop/hive/ql/plan/MapredWork.java 73391e9 
+  ql/src/test/queries/clientpositive/index_auto.q PRE-CREATION 
+  ql/src/test/queries/clientpositive/index_auto_file_format.q PRE-CREATION 
+  ql/src/test/queries/clientpositive/index_auto_multiple.q PRE-CREATION 
+  ql/src/test/queries/clientpositive/index_auto_partitioned.q PRE-CREATION 
+  ql/src/test/queries/clientpositive/index_auto_test_if_used.q PRE-CREATION 
+  ql/src/test/queries/clientpositive/index_auto_unused.q PRE-CREATION 
+  ql/src/test/results/clientpositive/index_auto.q.out PRE-CREATION 
+  ql/src/test/results/clientpositive/index_auto_file_format.q.out PRE-CREATION 
+  ql/src/test/results/clientpositive/index_auto_multiple.q.out PRE-CREATION 
+  ql/src/test/results/clientpositive/index_auto_partitioned.q.out PRE-CREATION 
+  ql/src/test/results/clientpositive/index_auto_test_if_used.q.out PRE-CREATION 
+  ql/src/test/results/clientpositive/index_auto_unused.q.out PRE-CREATION 
+
+Diff: https://reviews.apache.org/r/558/diff
+
+
+Testing
+-------
+
+
+Thanks,
+
+Russell
+
+
+
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+https://reviews.apache.org/r/558/#review610
+-----------------------------------------------------------
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java
+<https://reviews.apache.org/r/558/#comment1253>
+
+    This does not work because the GenMRTableScan1.process() does not get called on these objects after we set these, as far as I can tell.
+
+
+
+ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java
+<https://reviews.apache.org/r/558/#comment1254>
+
+    At this point, the inputFormat for this work is actually null.  I do not know which work I need to change the inputFormat for, and I can't think of an easy way to get to other work.
+
+
+- Russell
+
+
+On 2011-04-29 00:01:06, Russell Melick wrote:
+bq.  
+bq.  -----------------------------------------------------------
+bq.  This is an automatically generated e-mail. To reply, visit:
+bq.  https://reviews.apache.org/r/558/
+bq.  -----------------------------------------------------------
+bq.  
+bq.  (Updated 2011-04-29 00:01:06)
+bq.  
+bq.  
+bq.  Review request for hive.
+bq.  
+bq.  
+bq.  Summary
+bq.  -------
+bq.  
+bq.  Review request for HIVE-1644.12.patch
+bq.  
+bq.  
+bq.  This addresses bug HIVE-1644.
+bq.      https://issues.apache.org/jira/browse/HIVE-1644
+bq.  
+bq.  
+bq.  Diffs
+bq.  -----
+bq.  
+bq.    common/src/java/org/apache/hadoop/hive/conf/HiveConf.java f77f46c 
+bq.    conf/hive-default.xml 6bd615e 
+bq.    eclipse-templates/.classpath 8d2dc52 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/Driver.java ca337a8 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/exec/ExecDriver.java 24e16e4 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/exec/TableScanOperator.java c02d90b 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/index/AbstractIndexHandler.java dd0186d 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/index/HiveIndexHandler.java 411b78f 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/index/HiveIndexQueryContext.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/index/compact/CompactIndexHandler.java f90d64f 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/metadata/Table.java 50db44c 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/GenMRTableScan1.java 6162676 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/IndexWhereResolver.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/PhysicalOptimizer.java 0ae9fa2 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcCtx.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereTaskDispatcher.java PRE-CREATION 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/parse/ParseContext.java 374e123 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java 2207ac4 
+bq.    ql/src/java/org/apache/hadoop/hive/ql/plan/MapredWork.java 73391e9 
+bq.    ql/src/test/queries/clientpositive/index_auto.q PRE-CREATION 
+bq.    ql/src/test/queries/clientpositive/index_auto_file_format.q PRE-CREATION 
+bq.    ql/src/test/queries/clientpositive/index_auto_multiple.q PRE-CREATION 
+bq.    ql/src/test/queries/clientpositive/index_auto_partitioned.q PRE-CREATION 
+bq.    ql/src/test/queries/clientpositive/index_auto_test_if_used.q PRE-CREATION 
+bq.    ql/src/test/queries/clientpositive/index_auto_unused.q PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_auto.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_auto_file_format.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_auto_multiple.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_auto_partitioned.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_auto_test_if_used.q.out PRE-CREATION 
+bq.    ql/src/test/results/clientpositive/index_auto_unused.q.out PRE-CREATION 
+bq.  
+bq.  Diff: https://reviews.apache.org/r/558/diff
+bq.  
+bq.  
+bq.  Testing
+bq.  -------
+bq.  
+bq.  
+bq.  Thanks,
+bq.  
+bq.  Russell
+bq.  
+bq.
+
+
+
+patch 17
+
+Updated to include HIVE-1803.  Still cannot figure out why I cannot set the inputFormat, but I think the real reason is I cannot find the correct MapredWork.  The one I am setting it on begins with inputFormat=null.  Left a comment on the reviewboard in IndexWhereProcessor.
+
+OK, I dug into this and found out what's going on.
+
+As you mentioned in the conf call, the order of operations in SemanticAnalyzer.genMapRedTasks is such that physical optimization happens after GenMRTableScan1.  So the code in GenMRTableScan1 is totally irrelevant and can be removed.
+
+You are setting the input format and intermediate file on the correct work object already inside of IndexWhereProcessor.
+
+What's going wrong is that the test is using MapRedTask instead of its superclass ExecDriver.  And MapRedTask is missing the code to propagate the attributes from the work into the job conf.  So we need to make this code from ExecDriver into a helper method setInputAttributes:
+
+{noformat}
+    if (work.getInputformat() != null) {
+      HiveConf.setVar(job, HiveConf.ConfVars.HIVEINPUTFORMAT, work.getInputformat());
+    }
+    if (work.getIndexIntermediateFile() != null) {
+      job.set("hive.index.compact.file", work.getIndexIntermediateFile());
+    }
+{noformat}
+
+and then invoke setInputAttributes from within MapRedTask.execute, just before the "// enable assertion" comment.
+
+When I do this, then I can see the correct input format and intermediate file being set on the spawned job.  (Speaking of the intermediate file, can we get rid of /tmp/index_banana?  :)
+
+The test passes with or without this change, indicating there could still be some other problem (since the point of the test is to demonstrate different behavior when the index is being used).  However, I'm not sure about the test itself since it is now using a range condition where before it was using an equality condition, and block-level indexing means a block could contain the extra values as long as a single value (47 in this case) is hit by the index.  But you're using text files for some reason, and I still don't know exactly how the "blocks" work there.
+
+
+patch 18
+
+I moved that logic into a helper method, but I'm not seeing the settings being changed in build/ql/tmp/hive.log
+
+When I have the unit test use a predicate like key=86 instead of key > 45 AND key < 55, I see the following error
+{{{
+  java.lang.IllegalArgumentException: Can not create a Path from an empty string
+	at org.apache.hadoop.fs.Path.checkPathArg(Path.java:82)
+	at org.apache.hadoop.fs.Path.<init>(Path.java:90)
+	at org.apache.hadoop.util.StringUtils.stringToPath(StringUtils.java:224)
+	at org.apache.hadoop.mapred.FileInputFormat.setInputPaths(FileInputFormat.java:282)
+	at org.apache.hadoop.hive.ql.index.HiveIndexedInputFormat.getSplits(HiveIndexedInputFormat.java:123)
+	at org.apache.hadoop.mapred.JobClient.writeOldSplits(JobClient.java:810)
+...
+}}}
+
+It seems like this is causing a problem when there are no blocks to return.
+
+hive.log:  did you look at the very last job in the log after the run?  That is the one that uses the index.
+
+If you're seeing it using HiveIndexedInputFormat in the crash, that means that it *is* using the index, right?  Progress!
+
+As for the crash itself, sounds like a corner case for empty results.  Does the same thing happen for manual index usage?
+
+
+
+I've attached the hive.log I get from running
+
+{{{
+ant test -Dtestcase=TestCliDriver -Dqfile=index_auto_test_if_used.q
+}}}
+
+I still am only seeing input formats of org.apache.hadoop.hive.ql.io.HiveInputFormat and org.apache.hadoop.hive.ql.io.CombineHiveInputFormat
+
+
+But, the good news (I guess) is that the splits exception also happens when using the index manually
+
+Oh, I see...the reason it didn't work for you is that your setInputAttributes method is working on the job object.  For MapRedTask, it needs to work on the conf object instead.  So make it take an input parameter and pass in job from ExecDriver, and conf from MapRedTask.
+
+Since the splits exception happens for both manual/auto, we don't need to try to address it as part of this JIRA, so you can open a followup for that.  But it means you won't be able to check in a meaningful test case, so better if you have a fix.  When newInputPaths.toString() == "", you could try calling FileInputFormat.setInputPaths(job, new Path[0]).  I'm not sure whether that will work.
+
+
+I can send it back out of the index handler, and that seems to function correctly.
+{{{
+      if (newInputPaths.length() == 0) {
+        return super.getSplits(job, numSplits);
+      } else {
+        FileInputFormat.setInputPaths(job, newInputPaths.toString());
+      }
+}}}
+But, this means that we won't use the index to get the splits, so I don't think our test will work anymore.  It will return results from the base table.  This feels like the correct behavior in the long term, even though it breaks the test.
+
+The correct behavior is to not do any work at all (it would be sad to scan the whole table when the index already told us there is nothing there).  Setting an empty array of paths didn't work?
+
+I believe in some cases for other kinds of execution, we create an empty file and scan that.  I forget where the code for that lives.
+
+Unfortunately, having an empty array gives out of bounds exceptions.
+
+{{
+java.lang.ArrayIndexOutOfBoundsException: 0
+    [junit] 	at org.apache.hadoop.mapred.FileInputFormat.setInputPaths(FileInputFormat.java:309)
+}}
+
+I tried looking through the code at other places we call setInputPaths. In a few places, we create a directory by calling
+
+{{
+Path dir = new Path(System.getProperty("test.data.dir", "."));
+FileInputFormat.setInputPaths(job, dir);
+}} 
+
+
+I tried using this, but unfortunately, this also gives an exception.
+{{
+java.io.IOException: cannot find dir = file:/Users/rmelick/hive/ql/mapred in pathToPartitionInfo: [pfile:/Users/rmelick/hive/build/ql/test/data/warehouse/temp]
+}}
+
+The ql/mapred directory does not exist on my computer, but I also tried changing it to just hive/ql, and it also failed with the same exception.  I'm not sure if TestFlatFileInputFormat:146 is creating the temp file like you were thinking.  I haven't tried doing it like that.
+
+Seems to me we should get your patch committed without the automated test case; for now we'll just have to verify index usage by checking the log.  And open a followup for dealing with the empty result case.
+
+So can you prepare the final patch for me to review and commit?
+
+
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+https://reviews.apache.org/r/558/
+-----------------------------------------------------------
+
+(Updated 2011-05-01 19:20:02.130293)
+
+
+Review request for hive.
+
+
+Summary
+-------
+
+Review request for HIVE-1644.12.patch
+
+
+This addresses bug HIVE-1644.
+    https://issues.apache.org/jira/browse/HIVE-1644
+
+
+Diffs (updated)
+-----
+
+  common/src/java/org/apache/hadoop/hive/conf/HiveConf.java d28dad0 
+  conf/hive-default.xml 89b5236 
+  eclipse-templates/.classpath 8d2dc52 
+  ql/src/java/org/apache/hadoop/hive/ql/Driver.java ca337a8 
+  ql/src/java/org/apache/hadoop/hive/ql/exec/ExecDriver.java 24e16e4 
+  ql/src/java/org/apache/hadoop/hive/ql/exec/MapRedTask.java 953cc4c 
+  ql/src/java/org/apache/hadoop/hive/ql/index/AbstractIndexHandler.java dd0186d 
+  ql/src/java/org/apache/hadoop/hive/ql/index/HiveIndexHandler.java 411b78f 
+  ql/src/java/org/apache/hadoop/hive/ql/index/HiveIndexQueryContext.java PRE-CREATION 
+  ql/src/java/org/apache/hadoop/hive/ql/index/compact/CompactIndexHandler.java f90d64f 
+  ql/src/java/org/apache/hadoop/hive/ql/metadata/Table.java 50db44c 
+  ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/IndexWhereResolver.java PRE-CREATION 
+  ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/PhysicalOptimizer.java 0ae9fa2 
+  ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcCtx.java PRE-CREATION 
+  ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereProcessor.java PRE-CREATION 
+  ql/src/java/org/apache/hadoop/hive/ql/optimizer/physical/index/IndexWhereTaskDispatcher.java PRE-CREATION 
+  ql/src/java/org/apache/hadoop/hive/ql/parse/ParseContext.java 092484a 
+  ql/src/java/org/apache/hadoop/hive/ql/parse/SemanticAnalyzer.java 404d1fa 
+  ql/src/java/org/apache/hadoop/hive/ql/plan/MapredWork.java 0462749 
+  ql/src/test/queries/clientpositive/index_auto.q PRE-CREATION 
+  ql/src/test/queries/clientpositive/index_auto_file_format.q PRE-CREATION 
+  ql/src/test/queries/clientpositive/index_auto_multiple.q PRE-CREATION 
+  ql/src/test/queries/clientpositive/index_auto_partitioned.q PRE-CREATION 
+  ql/src/test/queries/clientpositive/index_auto_unused.q PRE-CREATION 
+  ql/src/test/results/clientpositive/index_auto.q.out PRE-CREATION 
+  ql/src/test/results/clientpositive/index_auto_file_format.q.out PRE-CREATION 
+  ql/src/test/results/clientpositive/index_auto_multiple.q.out PRE-CREATION 
+  ql/src/test/results/clientpositive/index_auto_partitioned.q.out PRE-CREATION 
+  ql/src/test/results/clientpositive/index_auto_unused.q.out PRE-CREATION 
+
+Diff: https://reviews.apache.org/r/558/diff
+
+
+Testing
+-------
+
+
+Thanks,
+
+Russell
+
+
+
+Patch 19 ready for review.
+
+https://reviews.apache.org/r/558/
+
++1.  Will commit when tests pass.
+
+
+Committed.  Thanks Russell and Jeffrey!
+
+
+Can the same approach be applied to HIVE-2845? I have already tried it, but the output is empty. Is there a major difference that causes this to happen?
+

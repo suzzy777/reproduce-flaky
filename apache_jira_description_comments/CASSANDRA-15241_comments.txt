@@ -1,0 +1,141 @@
+Pull request to iterate over the current SEPWorkers, and find any Runnable's that are currently running in it that implement a new DebuggableTask interface. Those Runnables can now expose the start time and a debug string. The NTR and ReadStage localRunnable already have start time in nanos so this is just exposing information already there without adding overhead to read/write path.
+
+https://github.com/apache/cassandra/pull/333
+
+Nice, thanks [~cnlwsu].  I'm going to get some performance numbers to test the impact of querying this table while the database is under heavy load.  I don't expect we'll see a problem, I'd just like to have them handy for anyone that checks this issue out in the future.
+
+I'm happy to do a code review, or if someone else is interested we can split the review, with me doing perf analysis  and the other doing code review.
+
+The patch looks good, thanks.  It's a low cost, low risk and valuable insight into what the system is doing, so I think it will be really helpful.
+
+I've pushed some minor suggestions [here|https://github.com/belliottsmith/cassandra/tree/15241-suggest].
+
+One problem was that the {{task}} field was not guaranteed under the JMM to ever see modifications to its contents.  It may be that we typically would see them, but we may have to incur the cost of a lazySet to absolutely guarantee it.  Unfortunately I don't know of another mechanism for guaranteeing a write is made visible eventually from within a loop.
+
+There was also a visibility issue with {{nowNanos}} in {{LocalMutationRunnable}}, since the task can be assigned to a worker before it runs, at which time the nowNanos will be zero and the running time would look absurd.
+
+Finally, there remains an issue with the semantics of the start time - in some cases it's when the task starts running, in others when the task was created, so including any time spent queued.  If we want, we could quite easily expose _both_ of these items, and perhaps we might like to.  But otherwise we should pick one and stick to it for all of the implementations.  I would presume we are slightly _more_ interested in actual running time, as otherwise tasks queued up behind long running tasks might appear long running themselves - though this would require the executor to be entirely saturated.
+
+We might also want to put a bit of time into improving the descriptions, to include e.g. the CQL being executed.  Right now, for executing a prepared statement, we only get the statementId and the options it is invoked with.
+
+bq. One problem was that the task field was not guaranteed under the JMM to ever see modifications to its contents
+
+So, thinking on this more - this is probably not actually the case.  We always invoke a virtual method on executing the task (a virtual method on the task itself), which should require that the state of the class is fully visible (not to other threads, but we can depend on implementation details here).  If the task were to inspect this field, it should expect to see the value prior to its invocation.  So this is probably fine, and we can revert the changes I suggested here. 
+
+I think I resolved start time for most part. For the NTR tasks its still entering the queue time included, but to capture the start time I would have to add another nanoTime() call and I didnt want to add any overhead. The queue time for that is included in the timeouts etc as well though and I think for that its Ok.
+
+I fixed execute and batch to actually print things out correctly. At least if it can, if evicted from prepared statement cache at right time and still not prepared it will just display the MD5 still but thats pretty small time window. I fixed a bit with argument truncating as well which should benefit the audit log too.
+
+Examples:
+{code}
+Native-Transport-Requests-17 |            6325 |       QUERY SELECT * FROM system_views.queries; WITH pageSize = 100 AT CONSISTENCY ONE
+ Native-Transport-Requests-4 |           14681 | EXECUTE INSERT INTO tbl (key, val) VALUES (?, ?) WITH [0x00, 'str'] AT CONSISTENCY ONE
+ Native-Transport-Requests-6 |           14678 | LOGGED BATCH of [INSERT INTO tbl2 (key, val) VALUES (0x00 0x00), INSERT INTO tbl2 (key, val) VALUES (?, ?) WITH [0x00 0x00]] AT CONSISTENCY ONE
+                ReadStage-10 |           16535 |                                                SELECT * FROM keyspace.table LIMIT 5000
+             MutationStage-7 |               1 |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               Mutation(keyspace='basic2', key='01', modifications=[\n  [basic2.wide1] key=01 partition_deletion=deletedAt=-9223372036854775808, localDeletion=2147483647 columns=[[] | [data]]\n    Row[info=[ts=1569043995960100] ]: id=01 | [data=01 ts=1569043995960100]\n])
+{code}
+
+Much nicer [~cnlwsu].  I promised you a tlp-stress profile that lets us hammer virtual tables, and I haven't forgotten about it.  I'll have it next week when I get back from vacation.
+
+[~clohfink] sorry, for some reason in my mind this was still in your queue, not mine.  I will get it reviewed for you this week.
+
+Sorry for dropping the ball on this again.  AFAICT the new changes look good, just one minor nit (mixed braces for a single {{if}} in {{BatchExecute.toString()}}
+
+I will give the patch another head-to-tail read over, but unless I missed anything important first time around I think we're good to go.
+
+I've pushed some tiny nits [here|https://github.com/belliottsmith/cassandra/tree/15241-nits]
+
+I'd also quite like to either switch to reporting _both_ queued time and running time, or just a consistent one of the two.  I don't mind hacking that in, as it's a very simple change.  Since we're mostly using {{approxTime}} the extra overhead is close to zero for NTR tasks to grab this as well; in fact we could probably reduce it by simply using {{approxTime}} for both, instead of {{nanoTime}} for start as we do today (plenty sufficient for timeouts).  
+
+Alternatively we could just start reporting time, including queued time, for {{LocalReadRunnable}} and {{LocalMutationRunnable}} for free today, since the info is already there.
+
+Any of the above works for me, but I would really like us to be consistent if that's ok by you?  Otherwise we'll always be code diving to figure out if a quoted number includes queued or not.
+
+I think it would be nice to report both, if it's not too much trouble.  It's what I'd want to see as an operator.
+
+Ok, I've [pushed|https://github.com/belliottsmith/cassandra/tree/15241-suggest] some changes to report queueing time and running time separately.  I've also tweaked the naming of the methods from indicating _units_ to the _clock_ (i.e. _approxTime_), but this is a weakly held conviction (I'm just unconvinced units mean anything by themselves for a clock, since the epoch is equally important)
+
+It's worth noting that running time accuracy depends on the compiler emitting the right instructions, which it's under no duty to do with the JMM (this was true before too).  This is probably fine, since it's likely to and this doesn't impact system correctness, but we could also utilise either {{volatile}} or {{volatile}} with {{lazySet}} when setting the {{approxTimeOfStart}} value in each {{DebuggableTask}} to guarantee it.
+
+[~benedict] are you reviewing this?  Im going through the dash board to see what JIRAs need reviewers, but this history looks active; can you update the status?
+
+Thanks!
+
+[~cnlwsu] It seems that this ticket is being blocked on your side. Do you need some help to push it accross the finish line?
+
+I wasn't sure I should put this in 4.0 but I would love to.
+
+[~clohfink] - It's a new feature so we wouldn't put it in 4.0 right? I don't *think* this is one of the ones we discussed on the ML/slack about straddling the freeze (inferring from dates on the ticket here). Feel free to correct me if I'm wrong on that though; we've been talking a lot lately.
+
+I gave a talk on why I feel its necessary last year at apache con, that said its super late in release and its a pretty big patch (mostly just code making Mutations and Messages human readable) so I understand it not going in. Review feedback has been addressed I believe so waiting on that.
+
+[~cnlwsu] CASSANDRA-16510 is ensuring that {{ReadCommand::toCQLString}} is returning valid CQL strings. I am not sure of how much those changes will impact your patch but you might need to rebase it once CASSANDRA-16510 has been committed.
+
+Cancelling patch as this needs a rebase now.
+
+I'm going to take this over and try to push it to completion. It seems like the latest is [this branch|https://github.com/belliottsmith/cassandra/tree/15241-suggest], so I'll start by rebasing that...
+
+UPDATE: I think most of the concepts from the original patch will survive, but I'm having to rework some minor things in conjunction with the simulator-related changes in 4.1...
+
+I've pushed up a new patch with the adjustments mentioned above. There are discussions started inline around thread safety, duration calculations, and how we wrap {{DebuggableTask}} now. Also, I'm still playing around w/ a few approaches to testing. (We don't have much around recently added virtual tables...)
+
+|[trunk|https://github.com/apache/cassandra/pull/1704]|[CircleCI|https://app.circleci.com/pipelines/github/maedhroz/cassandra?branch=CASSANDRA-15241-trunk-v2&filter=all]|
+
+UPDATE: Tests are hitting at least CASSANDRA-17700, CASSANDRA-17489, and CASSANDRA-17636.
+
+Rebased and kicked off the tests again after making a couple little fixes suggested by [~frankgh]. Unless there's any feedback on a better way to do [this|https://github.com/apache/cassandra/pull/1704#discussion_r907888112] in [TaskFactory|https://github.com/apache/cassandra/pull/1704/files#diff-ea83625365659286d1b6ac9288fe5515a46d5cfc52102293a59130b01ddd9a9aR131], I think this is ready to go.
+
++1 from me thanks Caleb
+
++1 the patch looks good to me
+
+Tests are looking clean, modulo CASSANDRA-17730
+
+Committed as https://github.com/apache/cassandra/commit/89f3978dcde958fbad191b8cf628fd89ace64d7a
+
+[~maedhroz]  
+
+Is there a chance to cherry-pick this change to the 4.1 release as the feature itself seems to be a valuable one for the end user experience? I have checked the comments above as to why the feature is only targeted for 5.0, and not for 4.x, and have not been able to find a good technical answer for myself. 
+
+Is there a technical problem exist or just a product vision? If both are 'no', I can prepare a PR for 4.1.
+
+[~mmuzaf] I don't think there was any technical reason for not including it in 4.1, but we would likely stumble into one very quickly on trying to back-port if one did exist ;)
+
+If you want to put together a quick PR, I can review.
+
+Here are the changes to 4.1:
+[https://github.com/apache/cassandra/pull/2438/files]
+
+I'll check the CI first and let you know when everything it's ready;
+
+[~maedhroz] , 
+
+Here are the changes (no merge conflicts occurred): 
+[https://github.com/apache/cassandra/pull/2438/files]
+
+I have run and checked the CI results here:
+[https://ci-cassandra.apache.org/view/patches/job/Cassandra-devbranch/2518/]
+
+The butler results here to be sure that we are not introducing new flaky tests:
+[https://butler.cassandra.apache.org/?#/ci/upstream/compare/Cassandra-4.1/cassandra-15241-4.1]
+
+I have run the CircleCI, but I'm not able to run everything related to pre-commit as my account plan is limited:
+[https://app.circleci.com/pipelines/github/Mmuzaf/cassandra/238/workflows/5bd1dcb4-a080-464c-a44c-3b202b3c1f59/jobs/15303]
+
+--
+
+Can you help to run everything on CircleCI and review the PR? 
+I've preserved the commit author and message.
+
+Just started a CircleCI run with more hardware [here|https://app.circleci.com/pipelines/github/maedhroz/cassandra?branch=CASSANDRA-15241-4.1-ci]...
+
+[~mmuzaf] The Circle run looks fine. Unless [~frankgh] wants to take a final look at this, I can commit to 4.1.
+
+[~maedhroz] I took a look at it. It looks like a clean cherry-pick. +1 from me
+
+[~mmuzaf] Let me know if there's anything else you want to do/fix before I commit...
+
+[~maedhroz] leaving the commit 'as is' is the best state we've reached :-) So, I'm happy to proceed with this.
+
+Committed to {{cassandra-4.1}} as https://github.com/apache/cassandra/commit/c3327855e4bf98f8631c959b82bd8470726034a8
+

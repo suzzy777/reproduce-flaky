@@ -1,0 +1,97 @@
+Per https://docs.aws.amazon.com/AmazonS3/latest/dev/Introduction.html#ConsistencyModel, we should be experiencing read-after-write consistency:
+{quote}
+Amazon S3 provides read-after-write consistency for PUTS of new objects in your S3 bucket in all regions with one caveat. The caveat is that if you make a HEAD or GET request to the key name (to find if the object exists) before creating the object, Amazon S3 provides eventual consistency for read-after-write.
+{quote}
+
+Perhaps we're re-using filenames across runs. Then we'd have effectively gotten one of these HEAD/GET requests.
+
+Or perhaps HDFS is doing a GET before writing a file. 
+
+I've not yet traced through these paths to figure out if we're hitting that.
+
+Perhaps depressingly, {{hdfs fs -put}} triggers 24 HTTP requests to S3 to upload a small (in this case, 29 byte) file:
+{code}
+[root@philip-bb-3 ~]# HADOOP_ROOT_LOGGER=TRACE,console hadoop fs -put z  s3a://..../test$(date +%s) |& grep 'http.wire.*>>.*HTTP/1.1' | grep -n .
+1:18/12/26 13:13:46 DEBUG http.wire: http-outgoing-0 >> "HEAD / HTTP/1.1[\r][\n]"
+2:18/12/26 13:13:46 DEBUG http.wire: http-outgoing-1 >> "HEAD / HTTP/1.1[\r][\n]"
+3:18/12/26 13:13:46 DEBUG http.wire: http-outgoing-1 >> "HEAD /test1545858824 HTTP/1.1[\r][\n]"
+4:18/12/26 13:13:46 DEBUG http.wire: http-outgoing-1 >> "HEAD /test1545858824/ HTTP/1.1[\r][\n]"
+5:18/12/26 13:13:46 DEBUG http.wire: http-outgoing-1 >> "GET /?list-type=2&delimiter=%2F&max-keys=1&prefix=test1545858824%2F&fetch-owner=false HTTP/1.1[\r][\n]"
+6:18/12/26 13:13:46 DEBUG http.wire: http-outgoing-1 >> "GET /?list-type=2&delimiter=%2F&max-keys=1&prefix=&fetch-owner=false HTTP/1.1[\r][\n]"
+7:18/12/26 13:13:46 DEBUG http.wire: http-outgoing-1 >> "HEAD /test1545858824._COPYING_ HTTP/1.1[\r][\n]"
+8:18/12/26 13:13:46 DEBUG http.wire: http-outgoing-1 >> "HEAD /test1545858824._COPYING_/ HTTP/1.1[\r][\n]"
+9:18/12/26 13:13:46 DEBUG http.wire: http-outgoing-1 >> "GET /?list-type=2&delimiter=%2F&max-keys=1&prefix=test1545858824._COPYING_%2F&fetch-owner=false HTTP/1.1[\r][\n]"
+10:18/12/26 13:13:46 DEBUG http.wire: http-outgoing-1 >> "HEAD /test1545858824._COPYING_ HTTP/1.1[\r][\n]"
+11:18/12/26 13:13:46 DEBUG http.wire: http-outgoing-1 >> "HEAD /test1545858824._COPYING_/ HTTP/1.1[\r][\n]"
+12:18/12/26 13:13:46 DEBUG http.wire: http-outgoing-1 >> "GET /?list-type=2&delimiter=%2F&max-keys=1&prefix=test1545858824._COPYING_%2F&fetch-owner=false HTTP/1.1[\r][\n]"
+13:18/12/26 13:13:46 DEBUG http.wire: http-outgoing-1 >> "HEAD /test1545858824._COPYING_ HTTP/1.1[\r][\n]"
+14:18/12/26 13:13:47 DEBUG http.wire: http-outgoing-1 >> "HEAD /test1545858824._COPYING_/ HTTP/1.1[\r][\n]"
+15:18/12/26 13:13:47 DEBUG http.wire: http-outgoing-1 >> "GET /?list-type=2&delimiter=%2F&max-keys=1&prefix=test1545858824._COPYING_%2F&fetch-owner=false HTTP/1.1[\r][\n]"
+16:18/12/26 13:13:47 DEBUG http.wire: http-outgoing-1 >> "PUT /test1545858824._COPYING_ HTTP/1.1[\r][\n]"
+17:18/12/26 13:13:47 DEBUG http.wire: http-outgoing-1 >> "HEAD /test1545858824._COPYING_ HTTP/1.1[\r][\n]"
+18:18/12/26 13:13:47 DEBUG http.wire: http-outgoing-1 >> "HEAD /test1545858824 HTTP/1.1[\r][\n]"
+19:18/12/26 13:13:47 DEBUG http.wire: http-outgoing-1 >> "HEAD /test1545858824/ HTTP/1.1[\r][\n]"
+20:18/12/26 13:13:47 DEBUG http.wire: http-outgoing-1 >> "GET /?list-type=2&delimiter=%2F&max-keys=1&prefix=test1545858824%2F&fetch-owner=false HTTP/1.1[\r][\n]"
+21:18/12/26 13:13:47 DEBUG http.wire: http-outgoing-1 >> "HEAD /test1545858824._COPYING_ HTTP/1.1[\r][\n]"
+22:18/12/26 13:13:47 DEBUG http.wire: http-outgoing-1 >> "HEAD /test1545858824._COPYING_ HTTP/1.1[\r][\n]"
+23:18/12/26 13:13:47 DEBUG http.wire: http-outgoing-1 >> "PUT /test1545858824 HTTP/1.1[\r][\n]"
+24:18/12/26 13:13:47 DEBUG http.wire: http-outgoing-1 >> "DELETE /test1545858824._COPYING_ HTTP/1.1[\r][\n]"
+{code}
+
+This includes the "HEAD before PUT" behavior that blows away read-after-write consistency. We definitely have some tests that use {{hdfs put}}. We have even more that use Impala to write, though, and it's less clear if this is going on there. (I've had some trouble getting these http wire logs out.)
+
+Commit 6f6d1f64a10f9a958dfa6162ec8bdab4cdcc6d92 in impala's branch refs/heads/master from Philip Zeyliger
+[ https://git-wip-us.apache.org/repos/asf?p=impala.git;h=6f6d1f6 ]
+
+IMPALA-6544: S3 tests fail because S3 is eventually consistent.
+
+This skips test_insert_parquet on S3, as S3's eventually consistent
+behavior is exposing us to "file not found" errors.
+
+To remove this band-aid, we'll need to either handle s3 consistency
+natively in some way, or to retry certain tests.
+
+Note that this may be only a drop in a big bucket at the moment;
+I think we see these issues in a variety of places.
+
+Change-Id: I22e7620e97366bece69a20885f5c3b75de05fab6
+Reviewed-on: http://gerrit.cloudera.org:8080/12127
+Reviewed-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+Tested-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+
+
+yes: S3A create file does a check to see if a file is there before creation
+
+* if its a directory: fail fast
+* if its a file and overwrite=false, falil
+
+It's something we've discussed killing in the past as when we know overwrite=true, all we care about is whether its a directory or not: no need to HEAD the file.
+
+The other thing is that with the newer createFile() API call, we can add an s3 specific option to say "skip all the existence checks". A bit dangerous, but very fast. You had better know what you are doing The Flink team have asked for it already. 
+
+* If you switch to using S3Guard, DynamoDB gives the consistency
+* If you aren't using it, you have other consistency issues lurking
+
+Looking @ the rest of the stack (traces are always interesting), put is doiing an upload to one path, then kicking off a rename; the renames need its own src and data checks. Eliminate that temp file (remember, PUT to an object store is the atomic operation you need), then that'll strip out most of that IO.
+
+
+
+Commit 3a3ab7ff8f6fef0407dc0e2b05b122fd9a0586db in impala's branch refs/heads/master from poojanilangekar
+[ https://git-wip-us.apache.org/repos/asf?p=impala.git;h=3a3ab7f ]
+
+IMPALA-6544/IMPALA-7070: Disable tests which fail due to S3's eventual consistency
+
+This patch is a temporary fix to disable tests which fail due to
+S3's eventually consistent behavior. The permanent fix would
+involve running tests with S3Guard enabled.
+
+Change-Id: I676faa191bec8b156e430661c22ee69242eeba9d
+Reviewed-on: http://gerrit.cloudera.org:8080/12203
+Reviewed-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+Tested-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+
+
+[~joemcdonnell] have we fixed the s3guard issue? SHould this still be open?
+
+We now run S3 tests with s3guard, so that is the preferred workaround for this type of flakiness.
+

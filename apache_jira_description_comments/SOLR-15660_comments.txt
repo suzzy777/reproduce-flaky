@@ -1,0 +1,148 @@
+Commit 1c80803a555457365393cae51729e0c20e9e94ab in solr's branch refs/heads/main from Mark Robert Miller
+[ https://gitbox.apache.org/repos/asf?p=solr.git;h=1c80803 ]
+
+ SOLR-15660: Remove universal 10 second test thread leak linger. (#377)
+
+
+
+Could you please add a description explaining why this should be done?  Needn't be long but its blank.  Maybe I'm missing the point but we don't want threads to linger past tests?  Or maybe you meant something else.
+
+I see several test failures with "leaked threads" in the report, such as [https://ci-builds.apache.org/job/Solr/job/Solr-Check-main/2684/testReport/junit/org.apache.solr.cloud/TestLeaderElectionZkExpiry/classMethod/]
+
+I see this Jira here (if I understand correctly) removed some universal 10s lingering, and replaced it with an explicit annotation:
+{code:java}
+@ThreadLeakLingering(linger = 30)
+{code}
+What puzzles me is the value 30 - [which according to Javadocs|https://javadoc.io/static/com.carrotsearch.randomizedtesting/randomizedtesting-runner/2.1.17/com/carrotsearch/randomizedtesting/annotations/ThreadLeakLingering.html] is milliseconds.. How can 30ms be enough linger time to wait for threads to settle in a test like above? Isn't it so that the test passes, but randomizedtesting fails it due to thread leak?
+
+Another puzzling thing is that the stack trace there appears to resolve to a log statement
+
+   4) Thread[id=7697, name=zkConnectionManagerCallback-4623-thread-1-EventThread, state=BLOCKED, group=TGRP-TestLeaderElectionZkExpiry]
+        at app//org.apache.solr.common.cloud.ZkStateReader.createClusterStateWatchersAndUpdate(ZkStateReader.java:402)
+        at app//org.apache.solr.cloud.ZkController$1.command(ZkController.java:335)
+        at app//org.apache.solr.common.cloud.ConnectionManager$1.update(ConnectionManager.java:170)
+        at app//org.apache.solr.common.cloud.DefaultConnectionStrategy.reconnect(DefaultConnectionStrategy.java:57)
+        at app//org.apache.solr.common.cloud.ConnectionManager.process(ConnectionManager.java:152)
+        at app//org.apache.zookeeper.ClientCnxn$EventThread.processEvent(ClientCnxn.java:580)
+        at app//org.apache.zookeeper.ClientCnxn$EventThread.run(ClientCnxn.java:555)
+
+ !screenshot-1.png! 
+
+There's several issues being conflated here I think. The stack trace that Jan and Gus refer to above _is_ able to be addressed I believe; I've taken an initial stab at doing so in [apache/solr#842|https://github.com/apache/solr/pull/842]. But I think it's impossible to entirely get around ThreadLeakLinger, and probably a mistake to try to do so, due to the [number of errors we're seeing now|https://lists.apache.org/list?builds@solr.apache.org:dfr=2022-4-1%7Cdto=2022-5-31:java.base@11.0.12/java.util.concurrent.ThreadPoolExecutor.tryTerminate] that are really _completely_ spurious.
+
+There's some high-level discussion of ThreadLeakLinger in MAHOUT-1345 that makes it clear even if we fixed all the actual thread leaks, we'd still be getting "leaked" threads detected spuriously [between awaitTermination.signalAll and actual thread death|https://github.com/openjdk/jdk17u/blob/20f3576cd1bbe516360b0d9f7deaacdad94df4d7/src/java.base/share/classes/java/util/concurrent/ThreadPoolExecutor.java#L728-L733].
+
+Universal thread leak linger of 10s is probably overkill, granted; and may (\?) have masked a bunch of actual issues. But I'd argue that universal thread leak linger of perhaps 1s could be viewed as a small price to pay for avoiding tons of spurious failures and avoiding the need for every developer to be intimately familiar with the issues surrounding (perfectly normal) delayed thread death in Executors.
+
+Notably though, even the TestLeaderElectionZkExpiry test failure, though "real" in a sense, may not have been worth the trouble to address. Yes it was surprising to me that ZooKeeper.close() doesn't block until the connection threads die. But although we can tighten that up, I'd argue it represents a transient/aesthetic resource leak, not a practically significant one. And the unavoidable Executor "resource leak" is a game changer from my perspective. I mean, 10ms might _indeed_ be enough time to avoid these spurious errors. Evidently _0s_ is usually enough time to avoid such errors :)
+
+There are actually lots of advantages and value that comes from policing your threads like this, though it is a much tougher game in Solr than Lucene, and it requires solving to 0 and then staying on top and depending on various other quality issues, it can easily end up in a situation where you slave over keeping your sink clean while the rest of the kitchen is a mess. It really depends on the number of issues that crop up, go unattended, and are difficult for people to solve.
+
+I'm pretty sure I've responded on an issue regarding this once, and in this case, I'd make the same judgment, and it would likely be an improvement for most devs to drop back to that 10-second linger.
+
+bq. Another puzzling thing is that the stack trace there appears to resolve to a log statement
+
+The stack for something blocked on a synchronized method will point to the first line in the method. So the sync block is either deadlocked or waiting for something very slow that holds the lock I'd guess.
+
+Thanks for your response, Mark! I'm not sure I understand what you're suggesting as your preferred course of action though.
+
+For my own part, my main concern is actually not "most devs" (for whatever reason this doesn't actually present much of a practical issue for me in local development), but rather the automated builds, which fail several times a day with a stacktrace on, e.g. {{java.util.concurrent.ThreadPoolExecutor.tryTerminate}} (Btw apologies for spamming the list while I edited the above comment until I figured out that I had to percent-encode the pipe character in the lists.apache.org url; the relevant link is [this|https://lists.apache.org/list?builds@solr.apache.org:dfr=2022-4-1%7Cdto=2022-5-31:java.base@11.0.12/java.util.concurrent.ThreadPoolExecutor.tryTerminate]).
+
+To take the stacktrace discussed above blocked in {{ZkStateReader.createClusterStateWatchersAndUpdate}}: I actually think the threads are neither deadlocked _nor_ waiting on something slow that holds the lock. The leaked threads in some (most?) cases -- 1 from a build, and 1 that I was able to reproduce locally -- were all identical, blocked on that synchronized method. I think they just got caught by thread leak detection in the fraction of a second between test method return and when they would naturally have died, with no ill effect.
+
+This is a good case in fact to illustrate the tradeoff, because it _was_ a threadleak, and arguably would indeed be better off fixed. (Again, I'm fairly certain the problem is that {{ZooKeeper.close()}} does not wait for connection threads to terminate; fixed with [apache/solr#842|https://github.com/apache/solr/pull/842]). I'm all for catching and fixing such cases, even if I also think the practical consequence (at least in this case) is likely insignificant. (caveat/tangent: introducing blocking ZooKeeper.close() in automatic Zk reconnection attempts seems to make a significant difference under the hood, sometimes blocking for upwards of 10s, with no ill effect on the overall test suite. It's possible that the change could be significant (and perhaps beneficial, in ways that I don't yet understand?), even if I truly think it is practically insignificant in the end-of-test "ThreadLeakDetection" context where it was initially detected).
+
+But there is literally no way to "fix" the {{tryTerminate}} case (link to builds mentioned above) -- it's not broken. That was the point of the link to the MAHOUT issue. And the negative practical consequences of being so strict by default are significant:
+# people tune out build failures because there are enough failures (many of the classMethod-level, inscrutable failures) that the noise drowns out more meaningful signals
+# developers spend time troubleshooting issues that end up being either unfixable/non-issue ({{tryTerminate}}) or of questionable practical significance (async {{ZooKeeper.close()}} connection thread death).
+# at a "meta" level, people eventually come to the conclusion that "tests are flaky", to the detriment of the project's reputation, externally and internally
+
+I guess as a way forward I'd suggest: sure, 10s is probably too long. But something shorter (1s? 250ms?) probably makes sense as a default. It would be great if there were a way to have this be configurable by project properties.
+
+I'd be really curious to know, if we zeroed out ThreadLeakLinger across the board, how many of the resulting issues would end up being of the completely spurious, {{tryTerminate}}, variety. I'm sure I'm missing something, but in principle one could even inspect leaked thread stack traces and automatically prune false positives?
+
+Is this the same question that I asked on https://github.com/randomizedtesting/randomizedtesting/issues/302 ?
+
+Mike, I think not exactly, though similar in some ways? The [failures I'm looking at|https://lists.apache.org/list?builds@solr.apache.org:dfr=2022-4-1%7Cdto=2022-5-31:java.base@11.0.12/java.util.concurrent.ThreadPoolExecutor.tryTerminate] involve the Executor thread that notifies the threads (e.g., the main test thread) that are waiting on awaitTermination(). That notifying/signalAll thread is still Runnable, in the process of releasing the lock after having notified the threads awaiting executor termination. Presumably the notifying thread is about to die, but I think at the time it's being detected as leaked, it's actually RUNNABLE. All the stack traces in the builds@solr link above are quite similar ... search for {{tryTerminate()}} ...
+
+More generally though, I do think these may be part of a category including the TERMINATED thread you asked about: threads that are technically "leaked", but in normal, harmless, unavoidable, transient ways.
+
+... though actually come to think of it, assuming Dawid's conjecture is correct about "thread is probably still alive when leaks are verified but by the time the method prints the report, it's terminated", then the underlying cause could indeed be essentially the same. Even assuming the classes that handle the Jdbc connection are actually closing everything synchronously, anything handled by a ThreadPoolExecutor could be detected as a leak in the exact same way as the stack traces I was focusing on. Once the thread's been detected as a leak, any superficial difference between the case you were looking at and the case I was looking at could be accounted for by the race condition between detection and log printing that Dawid describes.
+
+The takeaway from my perspective is that Dawid's assertion that there "should be a thread linger annotation on suites that fork threads which cannot be joined before the test returns" actually describes _a lot_ of cases. Some tests directly introduce an Executor as part of the test, but in other cases (e.g., JdbcTest) there are probably Executors behind third-party or JVM abstractions, whose threads are completely beyond our ability to {{join()}} on.
+
+More concretely: I think the thread in the randomizedtesting issue you reported comes from [here|https://github.com/apache/zookeeper/blob/master/zookeeper-server/src/main/java/org/apache/zookeeper/server/NIOServerCnxnFactory.java#L872-L874], invoked (with several extra intermediate layers) via JdbcTest's superclass SolrCloudTestCase.shutdownCluster(). {{expirerThread}} is interrupted (and promptly exits), but not necessarily before the interrupting thread returns (and thread leak detection). Unlike the case with {{ZooKeeper.close()}} ([apache/solr#842|https://github.com/apache/solr/pull/842]), there's no workaround to join() on {{expirerThread}}. So conclusively, ThreadLeakLinger is indeed the only option.
+
+Following on some offline conversation with [~krisden], I double-checked and am now completely convinced that it is unavoidably possible for worker threads to outlive ThreadPoolExecutor, even after {{ThreadPoolExecutor.awaitTermination()}} returns.
+
+The following drop-in test is a simplified version of the exact pattern used in ThreadPoolExecutor termination, and it reliably demonstrates the kind of stack traces that we're talking about in this issue. My conclusion is that it's truly impossible to avoid these errors, absent ThreadLeakLingering, or maybe some crazy fancy footwork (not workable in Executors managed by third-party components) using ThreadFactory to track threads and actually join() on thread death.
+
+I also have an answer regarding why {{linger = 10}} (milliseconds) and such low values seem to make a difference. I think randomizedtesting thread leak linger time [effectively has a floor of 100ms|https://github.com/randomizedtesting/randomizedtesting/blob/65735481fc398424fd17c08a338efcb8b7185a2f/randomized-runner/src/main/java/com/carrotsearch/randomizedtesting/ThreadLeakControl.java#L581-L589], so all of the specific linger times specified by SOLR-15660 would have been effectively rounded up to 100).
+
+{code:java}
+  @Test
+  public void demoFalsePositiveThreadLeak() throws Exception {
+    // This test replicates a simplified version of what happens in
+    // ThreadPoolExecutor.awaitTermination(), to prove that it is possible
+    // to "leak" threads after awaitTermination() returns.
+    final int count = 32;
+    ThreadPoolExecutor exec = (ThreadPoolExecutor) Executors.newFixedThreadPool(count);
+    try {
+      // make other work
+      // without this there isn't enough multithreaded cpu pressure to trigger
+      // false positive thread leak detection
+      for (int i = 0; i < count; i++) {
+        exec.submit(() -> {
+          int j = 0;
+          final Thread current = Thread.currentThread();
+          while ((++j & 0xFFFF) != 0 || !current.isInterrupted()) {
+            // soak up processors
+          }
+        });
+      }
+
+      // now do the signal testing
+      final ReentrantLock lock = new ReentrantLock();
+      final Condition c = lock.newCondition();
+      for (int i = 0; i < 100; i++) {
+        System.err.println("try "+i);
+        final Thread one = new Thread(() -> {
+          lock.lock();
+          try {
+            for (int j = 0; j < 100000000; j++) {
+              // busy-wait
+              // Thread.sleep() is sufficient to generate non-TERMINATED
+              // status, but will not reliably get us representative stack
+              // traces
+            }
+            c.signalAll();
+          } finally {
+            lock.unlock();
+          }
+        });
+        one.start();
+        lock.lock();
+        try {
+          c.await();
+        } finally {
+          lock.unlock();
+        }
+        State state = one.getState();
+        StackTraceElement[] trace = one.getStackTrace();
+        if (State.TERMINATED != state && trace.length > 0) {
+          AssertionError er = new AssertionError("Expected state TERMINATED; found: "+state);
+          er.setStackTrace(trace);
+          throw er;
+        }
+      }
+    } finally {
+      System.err.println("shutting down");
+      ExecutorUtil.shutdownNowAndAwaitTermination(exec);
+    }
+  }
+{code}
+
+Closing after the 9.0.0 release
+
+I created SOLR-16401 to track adding the 1s thread leak linger back in.
+

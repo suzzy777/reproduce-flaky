@@ -1,0 +1,763 @@
+Notice in the above that after the ScannerCallable gets the IOException, the ScannerCallableWithReadReplicas layer retries the same RPC with the same scanner {{next_call_seq}}. That retry call returns with {{more_results_in_region: false}}: 
+{code}
+2016-09-09 16:27:15,967 INFO  [B.fifo.QRpcServer.handler=0,queue=0,port=51833] regionserver.RSRpcServices(2196): scan request:scanner_id: 1 number_of_rows: 100 close_scanner: false next_call_seq: 0 client_handles_partials: true client_handles_heartbeats: true renew: false
+2016-09-09 16:27:15,967 INFO  [B.fifo.QRpcServer.handler=0,queue=0,port=51833] regionserver.RSRpcServices(2549): class org.apache.hadoop.hbase.protobuf.generated.ClientProtos$ScanResponse:scanner_id: 1 more_results: true ttl: 60000 stale: false more_results_in_region: false
+{code}
+
+Some more info.
+KeyValueHeap.generalizedSeek() will leave the heap in "dirty" state by setting the {{current = null}} if it gets an IOException: 
+{code}
+  private boolean generalizedSeek(boolean isLazy, Cell seekKey,
+      boolean forward, boolean useBloom) throws IOException {
+    if (!isLazy && useBloom) {
+      throw new IllegalArgumentException("Multi-column Bloom filter " +
+          "optimization requires a lazy seek");
+    }
+
+    if (current == null) {
+      return false;
+    }
+    heap.add(current);
+    current = null;
+    ...
+    <throw exception> 
+{code}
+
+On the next call, this will return false, indicating that there are no more values to return. 
+
+We can deal with this in a couple of different ways: 
+(1) Handle IOExceptions in individual KVHeap methods and make sure that state is left consistent even in case of IOExceptions. 
+(2) Handle IOExceptions in HRegionScannerImpl and reset the whole RegionScanner state before returning 
+(3) Bubble the exception to the client, but make sure that the scanner is thrown away. The client will restart another RegionScanner, and possibly start from scanning from the start of the row throwing away partial results. 
+
+I think, doing (1) will be very fragile. (2) also will not work, since there should be a way to reset the scanner state reliable in case of an IOException coming deep down from FS layer. If we are doing partial results, we maybe left in the middle of a row, but with partially seek'ed. Thus I think (2) also won't cut. 
+
+(3) is the simplest and most reliable, which would reset the scanner back to the start of the row, and makes sure that the ScannerCallable returns. The challenge with (3) is that, we want the ScannerCallable to not retry, but we want the ClientScanner to retry. ClientScanner only handles a couple of known exceptions which are derivatives of DNRIOE (UnknownScannerException, NotServingRegionException, OutOfOrderScannerNextException, etc). We can introduce another exception type (ResetScannerException), but we have to be careful for BC for existing clients. 
+
+
+Here is a patch which does option (3) as above. 
+
+We close the scanner and throw a new ScannerResetException back to the client. On the client side, the ScannerCallable which is responsible for retrying the RPC re-throws the exception since this is a DNRIOE. The ClientScanner on the other hand knows about this exception, and handles it by resetting the scanner state and opening another region scanner. ClientScanner already handles this logic in loadCache() for DoNotRetryIOException subclasses.  
+
+Reviews welcome since this is a quite important correctness patch which also has implications to the scanner RPC retries. 
+
+Very good find, [~enis]. On the patch, just a thought - should we treat the ScannerResetException the same way as the UnknownScannerException (in terms of checking timeout) in ClientScanner. That way, if the client's scannertimeout has expired, the client gets back an exception. Saying this, because if the IOException happened due to an underlying filesystem issue, the data might be unavailable for a longer duration (which might cause other bigger issues but still), and multiple retries may or may not help...
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 17s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 3 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue} 0m 8s {color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 3m 9s {color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 21s {color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 1m 40s {color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 40s {color} | {color:green} master passed {color} |
+| {color:red}-1{color} | {color:red} findbugs {color} | {color:red} 0m 22s {color} | {color:red} hbase-hadoop2-compat in master has 1 extant Findbugs warnings. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 57s {color} | {color:green} master passed {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue} 0m 8s {color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 1m 17s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 10s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 1m 10s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 1m 27s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 36s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green} 26m 17s {color} | {color:green} Patch does not cause any errors with Hadoop 2.4.0 2.4.1 2.5.0 2.5.1 2.5.2 2.6.1 2.6.2 2.6.3 2.7.1. {color} |
+| {color:green}+1{color} | {color:green} hbaseprotoc {color} | {color:green} 0m 43s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 4m 11s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 59s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 0m 51s {color} | {color:green} hbase-client in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 0m 15s {color} | {color:green} hbase-hadoop-compat in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 0m 17s {color} | {color:green} hbase-hadoop2-compat in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 91m 26s {color} | {color:red} hbase-server in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 56s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 143m 6s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hbase.mapred.TestTableSnapshotInputFormat |
+|   | hadoop.hbase.mapreduce.TestTableMapReduce |
+|   | hadoop.hbase.mapreduce.TestMultithreadedTableMapper |
+|   | hadoop.hbase.mapred.TestTableMapReduce |
+|   | hadoop.hbase.client.TestFastFail |
+|   | hadoop.hbase.mapreduce.TestTableSnapshotInputFormat |
+| Timed out junit tests | org.apache.hadoop.hbase.client.TestSnapshotCloneIndependence |
+|   | org.apache.hadoop.hbase.client.TestClientOperationInterrupt |
+|   | org.apache.hadoop.hbase.client.TestTableSnapshotScanner |
+|   | org.apache.hadoop.hbase.client.TestCloneSnapshotFromClientWithRegionReplicas |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=1.11.2 Server=1.11.2 Image:yetus/hbase:7bda515 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12828165/hbase-16604_v1.patch |
+| JIRA Issue | HBASE-16604 |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux 27a541bfb5a9 3.13.0-92-generic #139-Ubuntu SMP Tue Jun 28 20:42:26 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build/component/dev-support/hbase-personality.sh |
+| git revision | master / 981200b |
+| Default Java | 1.8.0_101 |
+| findbugs | v3.0.0 |
+| findbugs | https://builds.apache.org/job/PreCommit-HBASE-Build/3534/artifact/patchprocess/branch-findbugs-hbase-hadoop2-compat-warnings.html |
+| unit | https://builds.apache.org/job/PreCommit-HBASE-Build/3534/artifact/patchprocess/patch-unit-hbase-server.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-HBASE-Build/3534/artifact/patchprocess/patch-unit-hbase-server.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/3534/testReport/ |
+| modules | C: hbase-client hbase-hadoop-compat hbase-hadoop2-compat hbase-server U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/3534/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+bq.  On the patch, just a thought - should we treat the ScannerResetException the same way as the UnknownScannerException (in terms of checking timeout) in ClientScanne
+Master branch does not have this check any more for USE it seems.  
+
+v2 fixes the UT failures. HTU.loadTable() was changed to write cells with non-null column, hence the UT fixes. 
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 16s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 7 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue} 0m 10s {color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 3m 15s {color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 16s {color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 1m 28s {color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 50s {color} | {color:green} master passed {color} |
+| {color:red}-1{color} | {color:red} findbugs {color} | {color:red} 0m 26s {color} | {color:red} hbase-hadoop2-compat in master has 1 extant Findbugs warnings. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 28s {color} | {color:green} master passed {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue} 0m 11s {color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 1m 36s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 22s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 1m 22s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 1m 34s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 43s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green} 30m 42s {color} | {color:green} Patch does not cause any errors with Hadoop 2.4.0 2.4.1 2.5.0 2.5.1 2.5.2 2.6.1 2.6.2 2.6.3 2.7.1. {color} |
+| {color:green}+1{color} | {color:green} hbaseprotoc {color} | {color:green} 0m 39s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 4m 28s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 12s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 1m 0s {color} | {color:green} hbase-client in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 0m 17s {color} | {color:green} hbase-hadoop-compat in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 0m 22s {color} | {color:green} hbase-hadoop2-compat in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 94m 2s {color} | {color:red} hbase-server in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 48s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 153m 18s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hbase.client.TestTableSnapshotScanner |
+| Timed out junit tests | org.apache.hadoop.hbase.client.TestReplicasClient |
+|   | org.apache.hadoop.hbase.client.TestMetaWithReplicas |
+|   | org.apache.hadoop.hbase.client.TestFromClientSide3 |
+|   | org.apache.hadoop.hbase.client.TestEnableTable |
+|   | org.apache.hadoop.hbase.client.TestMobRestoreSnapshotFromClient |
+|   | org.apache.hadoop.hbase.TestServerSideScanMetricsFromClientSide |
+|   | org.apache.hadoop.hbase.client.TestIncrementsFromClientSide |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=1.11.2 Server=1.11.2 Image:yetus/hbase:7bda515 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12828351/hbase-16604_v2.patch |
+| JIRA Issue | HBASE-16604 |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux 9e8e623e572e 3.13.0-92-generic #139-Ubuntu SMP Tue Jun 28 20:42:26 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build@2/component/dev-support/hbase-personality.sh |
+| git revision | master / 4c6a98b |
+| Default Java | 1.8.0_101 |
+| findbugs | v3.0.0 |
+| findbugs | https://builds.apache.org/job/PreCommit-HBASE-Build/3538/artifact/patchprocess/branch-findbugs-hbase-hadoop2-compat-warnings.html |
+| unit | https://builds.apache.org/job/PreCommit-HBASE-Build/3538/artifact/patchprocess/patch-unit-hbase-server.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-HBASE-Build/3538/artifact/patchprocess/patch-unit-hbase-server.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/3538/testReport/ |
+| modules | C: hbase-client hbase-hadoop-compat hbase-hadoop2-compat hbase-server U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/3538/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+One more UT fix. 
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 16s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 8 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue} 0m 7s {color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 3m 3s {color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 22s {color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 1m 42s {color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 37s {color} | {color:green} master passed {color} |
+| {color:red}-1{color} | {color:red} findbugs {color} | {color:red} 0m 20s {color} | {color:red} hbase-hadoop2-compat in master has 1 extant Findbugs warnings. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 0s {color} | {color:green} master passed {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue} 0m 9s {color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 1m 20s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 18s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 1m 18s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 1m 21s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 34s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green} 25m 37s {color} | {color:green} Patch does not cause any errors with Hadoop 2.4.0 2.4.1 2.5.0 2.5.1 2.5.2 2.6.1 2.6.2 2.6.3 2.7.1. {color} |
+| {color:green}+1{color} | {color:green} hbaseprotoc {color} | {color:green} 0m 38s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 4m 15s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 1s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 0m 55s {color} | {color:green} hbase-client in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 0m 15s {color} | {color:green} hbase-hadoop-compat in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 0m 18s {color} | {color:green} hbase-hadoop2-compat in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 79m 6s {color} | {color:red} hbase-server in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 46s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 129m 42s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hbase.regionserver.TestHRegionWithInMemoryFlush |
+| Timed out junit tests | org.apache.hadoop.hbase.client.TestReplicasClient |
+|   | org.apache.hadoop.hbase.client.TestFromClientSide3 |
+|   | org.apache.hadoop.hbase.client.TestTableSnapshotScanner |
+|   | org.apache.hadoop.hbase.client.TestMobCloneSnapshotFromClient |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=1.11.2 Server=1.11.2 Image:yetus/hbase:7bda515 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12828512/hbase-16604_v3.patch |
+| JIRA Issue | HBASE-16604 |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux abc7db6b1da5 3.13.0-92-generic #139-Ubuntu SMP Tue Jun 28 20:42:26 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build/component/dev-support/hbase-personality.sh |
+| git revision | master / 8ef6c76 |
+| Default Java | 1.8.0_101 |
+| findbugs | v3.0.0 |
+| findbugs | https://builds.apache.org/job/PreCommit-HBASE-Build/3551/artifact/patchprocess/branch-findbugs-hbase-hadoop2-compat-warnings.html |
+| unit | https://builds.apache.org/job/PreCommit-HBASE-Build/3551/artifact/patchprocess/patch-unit-hbase-server.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-HBASE-Build/3551/artifact/patchprocess/patch-unit-hbase-server.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/3551/testReport/ |
+| modules | C: hbase-client hbase-hadoop-compat hbase-hadoop2-compat hbase-server U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/3551/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+[~devaraj] any more concerns with the patch. The test failures are due to flakiness. 
+
+LGTM
+
+Pushed to master. branch-1 and below patches coming. 
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 15m 55s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 8 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue} 1m 14s {color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 6m 47s {color} | {color:green} branch-1 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 36s {color} | {color:green} branch-1 passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 34s {color} | {color:green} branch-1 passed with JDK v1.7.0_111 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 2m 26s {color} | {color:green} branch-1 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 1m 15s {color} | {color:green} branch-1 passed {color} |
+| {color:red}-1{color} | {color:red} findbugs {color} | {color:red} 2m 57s {color} | {color:red} hbase-server in branch-1 has 1 extant Findbugs warnings. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 52s {color} | {color:green} branch-1 passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 2m 10s {color} | {color:green} branch-1 passed with JDK v1.7.0_111 {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue} 0m 16s {color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 2m 24s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 2m 15s {color} | {color:green} the patch passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 2m 15s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 1m 49s {color} | {color:green} the patch passed with JDK v1.7.0_111 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 1m 49s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 2m 33s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 1m 19s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green} 24m 39s {color} | {color:green} The patch does not cause any errors with Hadoop 2.4.0 2.4.1 2.5.0 2.5.1 2.5.2 2.6.1 2.6.2 2.6.3 2.7.1. {color} |
+| {color:green}+1{color} | {color:green} hbaseprotoc {color} | {color:green} 1m 3s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 6m 57s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 1m 52s {color} | {color:green} the patch passed with JDK v1.8.0_101 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 2m 0s {color} | {color:green} the patch passed with JDK v1.7.0_111 {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 2m 18s {color} | {color:green} hbase-client in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 0m 23s {color} | {color:green} hbase-hadoop-compat in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 0m 32s {color} | {color:green} hbase-hadoop2-compat in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 147m 2s {color} | {color:red} hbase-server in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 1m 55s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 241m 59s {color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hbase.regionserver.TestHRegion |
+|   | hadoop.hbase.client.TestConnectionImplementation |
+|   | hadoop.hbase.master.balancer.TestStochasticLoadBalancer2 |
+|   | hadoop.hbase.util.hbck.TestOfflineMetaRebuildHole |
+|   | hadoop.hbase.util.TestRegionSplitter |
+|   | hadoop.hbase.util.TestMergeTable |
+| Timed out junit tests | org.apache.hadoop.hbase.regionserver.TestClusterId |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=1.11.2 Server=1.11.2 Image:yetus/hbase:date2016-09-22 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12829920/hbase-16604_v3.branch-1.patch |
+| JIRA Issue | HBASE-16604 |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux e720f59970e8 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/hbase.sh |
+| git revision | branch-1 / ba650a8 |
+| Default Java | 1.7.0_111 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_101 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_111 |
+| findbugs | v3.0.0 |
+| findbugs | https://builds.apache.org/job/PreCommit-HBASE-Build/3669/artifact/patchprocess/branch-findbugs-hbase-server-warnings.html |
+| unit | https://builds.apache.org/job/PreCommit-HBASE-Build/3669/artifact/patchprocess/patch-unit-hbase-server.txt |
+| unit test logs |  https://builds.apache.org/job/PreCommit-HBASE-Build/3669/artifact/patchprocess/patch-unit-hbase-server.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/3669/testReport/ |
+| modules | C: hbase-client hbase-hadoop-compat hbase-hadoop2-compat hbase-server U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/3669/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+SUCCESS: Integrated in Jenkins build HBase-Trunk_matrix #1655 (See [https://builds.apache.org/job/HBase-Trunk_matrix/1655/])
+HBASE-16604 Scanner retries on IOException can cause the scans to miss (enis: rev 83cf44cd3f19c841ac53889d09454ed5247ce591)
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/ThriftServer.java"
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/IncrementCoalescer.java"
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/generated/TRowResult.java"
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/TDelete.java"
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/THRegionInfo.java"
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestTableMapReduceBase.java
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/TMutation.java"
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestMultithreadedTableMapper.java
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/TCellVisibility.java"
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/TServerName.java"
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/generated/TCell.java"
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/generated/BatchMutation.java"
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/ThriftUtilities.java"
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/TAuthorization.java"
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/ThriftHttpServlet.java"
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/THRegionLocation.java"
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/TTimeRange.java"
+* (edit) hbase-client/src/main/java/org/apache/hadoop/hbase/client/ScannerCallable.java
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/generated/Hbase.java"
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestFromClientSide.java
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/TAppend.java"
+* (add) hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/DelegatingKeyValueScanner.java
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/TBoundedThreadPoolServer.java"
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/ThriftHBaseServiceHandler.java"
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/IncrementCoalescerMBean.java"
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/ThriftServerRunner.java"
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/TCompareOp.java"
+* (edit) hbase-client/src/main/java/org/apache/hadoop/hbase/client/ClientScanner.java
+* (edit) hbase-client/src/main/java/org/apache/hadoop/hbase/UnknownScannerException.java
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/generated/Mutation.java"
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/ThriftMetrics.java"
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/ThriftServer.java"
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/TColumnIncrement.java"
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/TIOError.java"
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/TIllegalArgument.java"
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/generated/TScan.java"
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/TDeleteType.java"
+* (add) hbase-client/src/main/java/org/apache/hadoop/hbase/exceptions/ScannerResetException.java
+* (edit) hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServerSource.java
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/TScan.java"
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/TGet.java"
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/generated/AlreadyExists.java"
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/TResult.java"
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/TPut.java"
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServer.java
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/HbaseHandlerMetricsProxy.java"
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/generated/TAppend.java"
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/generated/ColumnDescriptor.java"
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/TDurability.java"
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/generated/IllegalArgument.java"
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestTableMapReduce.java
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/TRowMutations.java"
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/TColumnValue.java"
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/generated/TRegionInfo.java"
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestTableSnapshotScanner.java
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/package.html"
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/THBaseService.java"
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/TIncrement.java"
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/TColumn.java"
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/ThriftUtilities.java"
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/HThreadedSelectorServerArgs.java"
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/generated/TIncrement.java"
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/generated/TColumn.java"
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TableSnapshotInputFormatTestBase.java
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/HttpAuthenticationException.java"
+* (add) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/generated/IOError.java"
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java
+* (edit) hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServerSourceImpl.java
+
+
+Pushed to rest of 1.1+. Test failures are flaky. 
+
+FAILURE: Integrated in Jenkins build HBase-1.3-JDK8 #21 (See [https://builds.apache.org/job/HBase-1.3-JDK8/21/])
+HBASE-16604 Scanner retries on IOException can cause the scans to miss (enis: rev d600e8b70e10281ec19e3316ca0fd461d824a018)
+* (edit) hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServerSource.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestFromClientSide.java
+* (edit) hbase-client/src/main/java/org/apache/hadoop/hbase/client/ClientScanner.java
+* (add) hbase-client/src/main/java/org/apache/hadoop/hbase/exceptions/ScannerResetException.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestTableMapReduceBase.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServer.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestTableMapReduce.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TableSnapshotInputFormatTestBase.java
+* (edit) hbase-client/src/main/java/org/apache/hadoop/hbase/client/ScannerCallable.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestTableSnapshotScanner.java
+* (edit) hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServerSourceImpl.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestMultithreadedTableMapper.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java
+* (edit) hbase-client/src/main/java/org/apache/hadoop/hbase/UnknownScannerException.java
+* (add) hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/DelegatingKeyValueScanner.java
+
+
+FAILURE: Integrated in Jenkins build HBase-1.2-JDK8 #28 (See [https://builds.apache.org/job/HBase-1.2-JDK8/28/])
+HBASE-16604 Scanner retries on IOException can cause the scans to miss (enis: rev d307ad19fec359fab166f0a6271d6460324f1c16)
+* (edit) hbase-client/src/main/java/org/apache/hadoop/hbase/client/ScannerCallable.java
+* (edit) hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServerSource.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestTableMapReduce.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestMultithreadedTableMapper.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestTableMapReduceBase.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestFromClientSide.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TableSnapshotInputFormatTestBase.java
+* (edit) hbase-client/src/main/java/org/apache/hadoop/hbase/client/ClientScanner.java
+* (edit) hbase-client/src/main/java/org/apache/hadoop/hbase/UnknownScannerException.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java
+* (edit) hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServerSourceImpl.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServer.java
+* (add) hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/DelegatingKeyValueScanner.java
+* (add) hbase-client/src/main/java/org/apache/hadoop/hbase/exceptions/ScannerResetException.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestTableSnapshotScanner.java
+
+
+FAILURE: Integrated in Jenkins build HBase-1.2-JDK7 #31 (See [https://builds.apache.org/job/HBase-1.2-JDK7/31/])
+HBASE-16604 Scanner retries on IOException can cause the scans to miss (enis: rev d307ad19fec359fab166f0a6271d6460324f1c16)
+* (edit) hbase-client/src/main/java/org/apache/hadoop/hbase/UnknownScannerException.java
+* (edit) hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServerSource.java
+* (edit) hbase-client/src/main/java/org/apache/hadoop/hbase/client/ClientScanner.java
+* (add) hbase-client/src/main/java/org/apache/hadoop/hbase/exceptions/ScannerResetException.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestTableSnapshotScanner.java
+* (edit) hbase-client/src/main/java/org/apache/hadoop/hbase/client/ScannerCallable.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestTableMapReduceBase.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServer.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TableSnapshotInputFormatTestBase.java
+* (add) hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/DelegatingKeyValueScanner.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestTableMapReduce.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestFromClientSide.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java
+* (edit) hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServerSourceImpl.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestMultithreadedTableMapper.java
+
+
+FAILURE: Integrated in Jenkins build HBase-1.4 #427 (See [https://builds.apache.org/job/HBase-1.4/427/])
+HBASE-16604 Scanner retries on IOException can cause the scans to miss (enis: rev 8a797e81b83ded184f9ecaeecf26954a27348974)
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestTableMapReduceBase.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestTableMapReduce.java
+* (add) hbase-client/src/main/java/org/apache/hadoop/hbase/exceptions/ScannerResetException.java
+* (edit) hbase-client/src/main/java/org/apache/hadoop/hbase/client/ScannerCallable.java
+* (edit) hbase-client/src/main/java/org/apache/hadoop/hbase/UnknownScannerException.java
+* (edit) hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServerSourceImpl.java
+* (edit) hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServerSource.java
+* (add) hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/DelegatingKeyValueScanner.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TableSnapshotInputFormatTestBase.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServer.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestFromClientSide.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestMultithreadedTableMapper.java
+* (edit) hbase-client/src/main/java/org/apache/hadoop/hbase/client/ClientScanner.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestTableSnapshotScanner.java
+
+
+FAILURE: Integrated in Jenkins build HBase-1.3-JDK7 #20 (See [https://builds.apache.org/job/HBase-1.3-JDK7/20/])
+HBASE-16604 Scanner retries on IOException can cause the scans to miss (enis: rev d600e8b70e10281ec19e3316ca0fd461d824a018)
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestTableMapReduce.java
+* (edit) hbase-client/src/main/java/org/apache/hadoop/hbase/UnknownScannerException.java
+* (edit) hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServerSource.java
+* (add) hbase-client/src/main/java/org/apache/hadoop/hbase/exceptions/ScannerResetException.java
+* (edit) hbase-client/src/main/java/org/apache/hadoop/hbase/client/ScannerCallable.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java
+* (add) hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/DelegatingKeyValueScanner.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TableSnapshotInputFormatTestBase.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestFromClientSide.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestMultithreadedTableMapper.java
+* (edit) hbase-client/src/main/java/org/apache/hadoop/hbase/client/ClientScanner.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServer.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestTableSnapshotScanner.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java
+* (edit) hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServerSourceImpl.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestTableMapReduceBase.java
+
+
+SUCCESS: Integrated in Jenkins build HBase-1.1-JDK7 #1786 (See [https://builds.apache.org/job/HBase-1.1-JDK7/1786/])
+HBASE-16604 Scanner retries on IOException can cause the scans to miss (enis: rev 9d424c20c1caabcabf874a3d4f6b774e83886b57)
+* (edit) hbase-client/src/main/java/org/apache/hadoop/hbase/client/ScannerCallable.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServer.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestFromClientSide.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestTableMapReduceBase.java
+* (edit) hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServerSource.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TableSnapshotInputFormatTestBase.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestMultithreadedTableMapper.java
+* (add) hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/DelegatingKeyValueScanner.java
+* (edit) hbase-client/src/main/java/org/apache/hadoop/hbase/UnknownScannerException.java
+* (add) hbase-client/src/main/java/org/apache/hadoop/hbase/exceptions/ScannerResetException.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestTableSnapshotScanner.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestTableMapReduce.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java
+* (edit) hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServerSourceImpl.java
+* (add) hbase-server/src/main/java/org/apache/hadoop/hbase/client/VersionInfoUtil.java
+* (edit) hbase-client/src/main/java/org/apache/hadoop/hbase/client/ClientScanner.java
+
+
+FAILURE: Integrated in Jenkins build HBase-1.1-JDK8 #1870 (See [https://builds.apache.org/job/HBase-1.1-JDK8/1870/])
+HBASE-16604 Scanner retries on IOException can cause the scans to miss (enis: rev 9d424c20c1caabcabf874a3d4f6b774e83886b57)
+* (add) hbase-server/src/main/java/org/apache/hadoop/hbase/client/VersionInfoUtil.java
+* (edit) hbase-client/src/main/java/org/apache/hadoop/hbase/client/ClientScanner.java
+* (edit) hbase-client/src/main/java/org/apache/hadoop/hbase/client/ScannerCallable.java
+* (add) hbase-client/src/main/java/org/apache/hadoop/hbase/exceptions/ScannerResetException.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestTableMapReduceBase.java
+* (edit) hbase-client/src/main/java/org/apache/hadoop/hbase/UnknownScannerException.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServer.java
+* (edit) hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServerSourceImpl.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestTableSnapshotScanner.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TableSnapshotInputFormatTestBase.java
+* (add) hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/DelegatingKeyValueScanner.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java
+* (edit) hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServerSource.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestMultithreadedTableMapper.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestTableMapReduce.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestFromClientSide.java
+
+
+FAILURE: Integrated in Jenkins build HBase-Trunk_matrix #1661 (See [https://builds.apache.org/job/HBase-Trunk_matrix/1661/])
+Revert "HBASE-16604 Scanner retries on IOException can cause the scans (enis: rev 39db0cac78e44a92f7e730244f0e1ea02e81a4c5)
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/generated/Mutation.java"
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/ThriftHBaseServiceHandler.java"
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/TAuthorization.java"
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestFromClientSide.java
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/generated/Hbase.java"
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/TIllegalArgument.java"
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/TIncrement.java"
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestTableMapReduce.java
+* (delete) hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/DelegatingKeyValueScanner.java
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/ThriftServer.java"
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/TDelete.java"
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/package.html"
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/TDeleteType.java"
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/HThreadedSelectorServerArgs.java"
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/ThriftMetrics.java"
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/TGet.java"
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/TColumnValue.java"
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/HttpAuthenticationException.java"
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/TBoundedThreadPoolServer.java"
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/generated/IllegalArgument.java"
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/TColumnIncrement.java"
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestTableSnapshotScanner.java
+* (edit) hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServerSource.java
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/ThriftServer.java"
+* (edit) hbase-client/src/main/java/org/apache/hadoop/hbase/UnknownScannerException.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/generated/AlreadyExists.java"
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/TColumn.java"
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/generated/TScan.java"
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/generated/TRowResult.java"
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/TTimeRange.java"
+* (edit) hbase-client/src/main/java/org/apache/hadoop/hbase/client/ScannerCallable.java
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/THRegionLocation.java"
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/ThriftUtilities.java"
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/TResult.java"
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestMultithreadedTableMapper.java
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/generated/TIncrement.java"
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/TScan.java"
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/generated/ColumnDescriptor.java"
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/TAppend.java"
+* (edit) hbase-client/src/main/java/org/apache/hadoop/hbase/client/ClientScanner.java
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/TMutation.java"
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/TPut.java"
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/ThriftUtilities.java"
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/IncrementCoalescer.java"
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/TRowMutations.java"
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/TCompareOp.java"
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/THBaseService.java"
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/generated/BatchMutation.java"
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestTableMapReduceBase.java
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/generated/IOError.java"
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/TCellVisibility.java"
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TableSnapshotInputFormatTestBase.java
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/generated/TCell.java"
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/TDurability.java"
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/TServerName.java"
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/ThriftServerRunner.java"
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/TIOError.java"
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/IncrementCoalescerMBean.java"
+* (edit) hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServerSourceImpl.java
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift2/generated/THRegionInfo.java"
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/generated/TColumn.java"
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/HbaseHandlerMetricsProxy.java"
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/ThriftHttpServlet.java"
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/generated/TAppend.java"
+* (delete) hbase-client/src/main/java/org/apache/hadoop/hbase/exceptions/ScannerResetException.java
+* (delete) "hbase-thrift\036src/main/java/org/apache/hadoop/hbase/thrift/generated/TRegionInfo.java"
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServer.java
+HBASE-16604 Scanner retries on IOException can cause the scans to miss (enis: rev eb112783ae11dbb23f74f453f22a0301c6b2b11f)
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestTableMapReduceBase.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestTableSnapshotScanner.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TableSnapshotInputFormatTestBase.java
+* (edit) hbase-client/src/main/java/org/apache/hadoop/hbase/client/ClientScanner.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestFromClientSide.java
+* (add) hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/DelegatingKeyValueScanner.java
+* (edit) hbase-client/src/main/java/org/apache/hadoop/hbase/UnknownScannerException.java
+* (edit) hbase-hadoop-compat/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServerSource.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java
+* (add) hbase-client/src/main/java/org/apache/hadoop/hbase/exceptions/ScannerResetException.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestTableMapReduce.java
+* (edit) hbase-hadoop2-compat/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServerSourceImpl.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/ipc/MetricsHBaseServer.java
+* (edit) hbase-client/src/main/java/org/apache/hadoop/hbase/client/ScannerCallable.java
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/mapreduce/TestMultithreadedTableMapper.java
+
+
+The branch-1.3 commit broke the compilation on branch-1.3.
+Committed and attached branch-1.3-addendum.patch.
+
+FAILURE: Integrated in Jenkins build HBase-1.3-JDK7 #22 (See [https://builds.apache.org/job/HBase-1.3-JDK7/22/])
+HBASE-16604 Scanner retries on IOException can cause the scans to miss (jerryjch: rev 49a4980e6dac1e74275ae5b042b01cd27efc8ebd)
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/DelegatingKeyValueScanner.java
+
+
+FAILURE: Integrated in Jenkins build HBase-1.3-JDK8 #23 (See [https://builds.apache.org/job/HBase-1.3-JDK8/23/])
+HBASE-16604 Scanner retries on IOException can cause the scans to miss (jerryjch: rev 49a4980e6dac1e74275ae5b042b01cd27efc8ebd)
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/DelegatingKeyValueScanner.java
+
+
+[~enis]
+Due to recent failure in master branch test cases I had to check this fix. Few questions on the fix. Pls do correct me if I was wrong.
+{code}
+  // The scanner state might be left in a dirty state, so we will tell the Client to
+          // fail this RPC and close the scanner while opening up another one from the start of
+          // row that the client has last seen.
+          closeScanner(region, scanner, scannerName, context);
+
+          // We closed the scanner already. Instead of throwing the IOException, and client
+          // retrying with the same scannerId only to get USE on the next RPC, we directly throw
+          // a special exception to save an RPC.
+          if (VersionInfoUtil.hasMinimumVersion(context.getClientVersionInfo(), 1, 4)) {
+            // 1.4.0+ clients know how to handle
+            throw new ScannerResetException("Scanner is closed on the server-side", e);
+          } else {
+            // older clients do not know about SRE. Just throw USE, which they will handle
+            throw new UnknownScannerException("Throwing UnknownScannerException to reset the client"
+                + " scanner state for clients older than 1.3.", e);
+          }
+{code}
+So in the catch block first closeScanner happens and then a ScannerresetException of type DNRE is thrown. 
+Inside closeScanner we first remove the scanner from the scanner's map and then cancel the lease also. (the lease is removed from the lease holder).
+Now the client on seeing this exception will try to retry this Exception. Since the scanner is removed from the scanner's map and already we have a scannerId associated with the scan request,
+{code}
+if (request.hasScannerId()) {
+        rsh = scanners.get(scannerName);
+        if (rsh == null) {
+          LOG.warn("Client tried to access missing scanner " + scannerName);
+          throw new UnknownScannerException(
+            "Unknown scanner '" + scannerName + "'. This can happen due to any of the following "
+                + "reasons: a) Scanner id given is wrong, b) Scanner lease expired because of "
+                + "long wait between consecutive client checkins, c) Server may be closing down, "
+                + "d) RegionServer restart during upgrade.\nIf the issue is due to reason (b), a "
+                + "possible fix would be increasing the value of"
+                + "'hbase.client.scanner.timeout.period' configuration.");
+        }
+{code}
+Will not the subsequent retry also fail? 
+The other problem here is that since the above catch block is immediately followed by a finally block
+{code}
+finally {
+          if (context != null) {
+            context.setCallBack(rsh.shippedCallback);
+          }
+          // Adding resets expiration time on lease.
+          if (scanners.containsKey(scannerName)) {
+            ttl = this.scannerLeaseTimeoutPeriod;
+            // When context != null, adding back the lease will be done in callback set above.
+            if (context == null) {
+              if (lease != null) regionServer.leases.addLease(lease);
+            }
+          }
+        }
+{code}
+the rpcCallback (when context  !=null) is set with the shippedCallback. Now even before this since the patch tries to close the scanner the scanner is removed from the scanner map and hence the RegionScannerShippedCallBack#run() will not be able to add the lease back and hence because of this the LeaseExpiry listener does not do the necessary clean up and hence the block eviction also fails. 
+So the 2nd part of the problem is what I was checking and I found the first part also to have some problem which I may be wrong.
+
+Now we have 2 things I think,
+->In case of actual retries whether the scanner internals and its heap are reset properly
+-> In case my retries are over how am I cleaning up the heap and also the blocks. This will happen only for master branch I think and we need to fix only in 2.0.
+Thanks [~enis].
+
+One more thing is that since closeScanner is getting called even on exception the CP hooks preScannerClose and postScannerClose are getting called. Is that expected?
+
+bq. Now the client on seeing this exception will try to retry this Exception. Since the scanner is removed from the scanner's map and already we have a scannerId associated with the scan request,
+No, both UnknownScannerException and ScannerResetException extend DoNotRetryIOException, client will not retry with the same scanner id. This means that the RPC retrying mechanism (RPCRetryingCaller, ScannerCallableWithReplicas, etc) is not gonna be retried. However, at a higher level, there is a retry-from-where-you-are-left mechanism within ClientScanner. Thus, ClientScanner will re-open a new RegionScanner by sending a new scan request and get a new scanner name. This logic is in ClientScanner: 
+{code}
+ // If exception is any but the list below throw it back to the client; else setup
+        // the scanner and retry.
+        Throwable cause = e.getCause();
+        if ((cause != null && cause instanceof NotServingRegionException) ||
+            (cause != null && cause instanceof RegionServerStoppedException) ||
+            e instanceof OutOfOrderScannerNextException ||
+            e instanceof UnknownScannerException ||
+            e instanceof ScannerResetException) {
+          // Pass. It is easier writing the if loop test as list of what is allowed rather than
+          // as a list of what is not allowed... so if in here, it means we do not throw.
+        } else {
+          throw e;
+        }
+{code}
+The client will also toss-away any partial results so far, and continue the scan from the last known row. 
+
+bq. ->In case of actual retries whether the scanner internals and its heap are reset properly
+The heap will be reset correctly, because the region scanner is closed for good. A completely new RegionScanner will be constructed from scratch.
+bq. -> In case my retries are over how am I cleaning up the heap and also the blocks. This will happen only for master branch I think and we need to fix only in 2.0.
+We close the scanner and remove the lease already. We set the rpcCallback which will get run and call shipped(), no? Is it the case that if the scanner is already closed, shipped() will not free up the blocks? 
+
+bq. One more thing is that since closeScanner is getting called even on exception the CP hooks preScannerClose and postScannerClose are getting called. Is that expected?
+Yes, I have checked that in other contexts where we close the scanner in case of exception, we still call the coprocessor methods. 
+
+
+
+bq.Thus, ClientScanner will re-open a new RegionScanner by sending a new scan request and get a new scanner name.
+Let me check this. I was wrong may be.
+bq.The heap will be reset correctly, because the region scanner is closed for good. A completely new RegionScanner will be constructed from scratch.
+Ok.
+bq.Is it the case that if the scanner is already closed, shipped() will not free up the blocks?
+The problem here is that the finally block will reset the rpcCallBack with the RpcShippedCallBack and since the lease is already removed we don't add back the lease and so the LeaseExpiry logic does not work which actually does the return of the blocks. Anyway I think I have a better logic now to fix this after seeing your comments. Will be back here.
+bq.Yes, I have checked that in other contexts where we close the scanner in case of exception, we still call the coprocessor methods.
+Ok. If you have verified it then it is fine. 
+Thanks a lot [~enis].
+
+SUCCESS: Integrated in Jenkins build HBase-Trunk_matrix #1689 (See [https://builds.apache.org/job/HBase-Trunk_matrix/1689/])
+HBASE-16696 After HBASE-16604 - does not release blocks in case of (ramkrishna: rev 47e12fb3a08d5d81ebcfae1abeb1bea909f76e49)
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/client/TestBlockEvictionFromClient.java
+* (edit) hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/RSRpcServices.java
+
+

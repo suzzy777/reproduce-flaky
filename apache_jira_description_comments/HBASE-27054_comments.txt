@@ -1,0 +1,168 @@
+[~apurtell] Do we know if this is a recent regression, or has it always been flaky? My initial thought is that there may be some randomness (it is a stochastic balancer after all) which leads to this end result. I don't believe any recent changes would have caused this to become more flaky, but I suppose it's possible. HBASE-26311 is interesting, since it changes calculations to use standard deviation. [~claraxiong]
+
+Why does the error message say it failed after 77 seconds? The test takes 3 minutes to run for me locally, which is the configured timeout for the balancer in {{StochasticBalancerTestBase2}}. Is there a link to a test failure with full logs that I can inspect? (Note, 3 minute timeout was updated in HBASE-25873. Previous value was 90 seconds.)
+
+With region replicas involved, the {{RegionReplicaCandidateGenerator}} will just move a colocated replica to a random server, without consideration of how many regions that target server is hosting. The cost functions will allow it in basically every case, since it heavily prioritizes resolving colocated replicas. So maybe by the time all the region replicas have been resolved, the number of moves is already pushing limits of one balancer iteration, with having randomly overloaded one regionserver.
+
+A situation that the balancer will have a difficult time getting out of is if one regionserver is hosting 61 replicas of 61 regions, and another regionserver is hosting 59 regions, which are replicas of those 61 regions. The {{LoadCandidateGenerator}} will keep trying to take a region from the server with 61 and give it to the server with 59, but because there is already a replica that matches, it will be too expensive to move. But as long as we can process enough iterations, probabilistically speaking we should be able to get to one of the 2 safe regions to move... when I run this test locally I see nearly 4 million iterations, and with 1/4 of those using the {{LoadCandidateGenerator}} it seems like we should generally find a solution that moves them all.
+
+{code}
+Finished computing new moving plan. Computation took 180001 ms to try 3975554 different iterations.  Found a solution that moves 50006 regions; Going from a computed imbalance of 0.9026309610781538 to a new imbalance of 5.252006025578701E-5. funtionCost=RegionCountSkewCostFunction : (multiplier=500.0, imbalance=0.0); PrimaryRegionCountSkewCostFunction : (multiplier=500.0, imbalance=0.0); MoveCostFunction : (multiplier=7.0, imbalance=0.8334333333333334, need balance); RackLocalityCostFunction : (multiplier=15.0, imbalance=0.0); TableSkewCostFunction : (multiplier=35.0, imbalance=0.0); RegionReplicaHostCostFunction : (multiplier=100000.0, imbalance=0.0); RegionReplicaRackCostFunction : (multiplier=10000.0, imbalance=0.0); ReadRequestCostFunction : (multiplier=5.0, imbalance=0.0); CPRequestCostFunction : (multiplier=5.0, imbalance=0.0); WriteRequestCostFunction : (multiplier=5.0, imbalance=0.0); MemStoreSizeCostFunction : (multiplier=5.0, imbalance=0.0); StoreFileCostFunction : (multiplier=5.0, imbalance=0.0);
+{code}
+
+Since the test case is also using 100 tables, and there is a {{TableSkewCostFunction}} involved, it's also possible that the balancer is happy with a slightly uneven region count balance, because balancing the last region would push towards an imbalance of tables if the target regionserver already has too many regions of that table for every region that is chosen. I don't know if the math would support this, though. If it does, it's possible that out of the last 61 regions, moving any region to the server with 59 would either cause table skew or colocated replicas, and so the balancer cannot fully balance based on the simple {{LoadCandidateGenerator}} alone.
+
+This is all hypothetical, without yet trying to debug. Given the large size of the test, the number of balancer iterations, and the flakiness, it may be difficult to debug. I ran it 10+ times locally so far, and it passes each time. So, some ideas to explore:
+# Don't assert that the cluster is fully balanced in this test case, just assert that there are no colocated replicas. Arguably this is the purpose of the test, and the test framework already appears to allow for this.
+# Change cost function weights for everything else, other than region counts and replica counts, to be 0. In this way, nothing prevents the balancer optimizing for these variables, which the test is expecting to validate. Specifically, set TableSkew and MoveCost functions to 0.
+# Use fewer than 100 tables, if table skew is a contributing factor.
+
+With a lower timeout, like 60 seconds, or on slower hardware, we could get fewer iterations. I suppose in that sense we may just get unlucky in not being able to get to fully balanced state given current configuration.
+
+50,000 regions have to move, and the {{RegionReplicaCandidateGenerator}} is doing most of that work, which is chosen roughly 25% of the time. There are likely some missteps. Conservatively, it seems like we may need 200,000 calls to guarantee the work gets done. That means 800,000 iterations. Running locally, if I had set a timeout of 60 seconds, I'd see 1.3 million iterations. It's close enough that we may see the occasional problem. The tests should ensure that even on slow hardware, with unlucky random choices, we are still virtually guaranteed success. We may not be doing that here. But a 3 minute timeout should make it much more likely. So I'm interested in the test message that says it ran 77 seconds, even though I'm sure the test could be improved to be more deterministic.
+
+I ran it 50 times locally using latest {{{}master{}}}, it failed twice, even with 3-minute timeout, and ~3.9 million stochastic steps. So the 77s appears irrelevant.
+
+I see some good results by changing the cost function weights. I will propose a PR with those changes.
+{code:java}
+conf.setFloat("hbase.master.balancer.stochastic.moveCost", 0f);
+conf.setFloat("hbase.master.balancer.stochastic.tableSkewCost", 0f); {code}
+If I make one change, with {{maxRunningTime}} from 180s to 30s, I see 100% failure rate. If I make the above cost function weight updates, I see 100% pass rate, even with a {{maxRunningTime}} of 15s.
+
+I apologize for not getting back to you earlier [~dmanning]. The test environment is Zulu's OpenJDK (Zulu 8.60.0.21-CA-linux_aarch64) (build 1.8.0_322-b06) running in a Debian 5.10.106-1 aarch64 VM running on Apple Silicon, M1 Max, which probably explains why the running times are so much faster. In comparison all of the x86_64 EC2 VMs seem slow, even the metal ones. 
+
+As for the rounding, there could be some architectural differences, x86_64 vs aarch64, but we should be resilient to that, and I see you were able to trigger failures locally yourself.
+
+bq. Change cost function weights for everything else, other than region counts and replica counts, to be 0. In this way, nothing prevents the balancer optimizing for these variables, which the test is expecting to validate. Specifically, set TableSkew and MoveCost functions to 0.
+
+Agree, this is a good approach to de-flaking this test.
+
+Let me review your PR now, appreciate the effort put in here. 
+
+
+I can repro this pretty easily so let me try this patch locally...
+
+After optimizing the weights for the test conditions [~dmanning] the test always passes for me and also completes more quickly.
+
+Cherry picked back to branch-2.4. 
+
+Thanks for validating and committing!
+
+Results for branch branch-2.4
+	[build #356 on builds.a.o|https://ci-hbase.apache.org/job/HBase%20Nightly/job/branch-2.4/356/]: (/) *{color:green}+1 overall{color}*
+----
+details (if available):
+
+(/) {color:green}+1 general checks{color}
+-- For more information [see general report|https://ci-hbase.apache.org/job/HBase%20Nightly/job/branch-2.4/356/General_20Nightly_20Build_20Report/]
+
+
+
+
+(/) {color:green}+1 jdk8 hadoop2 checks{color}
+-- For more information [see jdk8 (hadoop2) report|https://ci-hbase.apache.org/job/HBase%20Nightly/job/branch-2.4/356/JDK8_20Nightly_20Build_20Report_20_28Hadoop2_29/]
+
+
+(/) {color:green}+1 jdk8 hadoop3 checks{color}
+-- For more information [see jdk8 (hadoop3) report|https://ci-hbase.apache.org/job/HBase%20Nightly/job/branch-2.4/356/JDK8_20Nightly_20Build_20Report_20_28Hadoop3_29/]
+
+
+(/) {color:green}+1 jdk11 hadoop3 checks{color}
+-- For more information [see jdk11 report|https://ci-hbase.apache.org/job/HBase%20Nightly/job/branch-2.4/356/JDK11_20Nightly_20Build_20Report_20_28Hadoop3_29/]
+
+
+(/) {color:green}+1 source release artifact{color}
+-- See build output for details.
+
+
+(/) {color:green}+1 client integration test{color}
+
+
+Results for branch branch-2
+	[build #546 on builds.a.o|https://ci-hbase.apache.org/job/HBase%20Nightly/job/branch-2/546/]: (/) *{color:green}+1 overall{color}*
+----
+details (if available):
+
+(/) {color:green}+1 general checks{color}
+-- For more information [see general report|https://ci-hbase.apache.org/job/HBase%20Nightly/job/branch-2/546/General_20Nightly_20Build_20Report/]
+
+
+
+
+(/) {color:green}+1 jdk8 hadoop2 checks{color}
+-- For more information [see jdk8 (hadoop2) report|https://ci-hbase.apache.org/job/HBase%20Nightly/job/branch-2/546/JDK8_20Nightly_20Build_20Report_20_28Hadoop2_29/]
+
+
+(/) {color:green}+1 jdk8 hadoop3 checks{color}
+-- For more information [see jdk8 (hadoop3) report|https://ci-hbase.apache.org/job/HBase%20Nightly/job/branch-2/546/JDK8_20Nightly_20Build_20Report_20_28Hadoop3_29/]
+
+
+(/) {color:green}+1 jdk11 hadoop3 checks{color}
+-- For more information [see jdk11 report|https://ci-hbase.apache.org/job/HBase%20Nightly/job/branch-2/546/JDK11_20Nightly_20Build_20Report_20_28Hadoop3_29/]
+
+
+(/) {color:green}+1 source release artifact{color}
+-- See build output for details.
+
+
+(/) {color:green}+1 client integration test{color}
+
+
+Results for branch master
+	[build #593 on builds.a.o|https://ci-hbase.apache.org/job/HBase%20Nightly/job/master/593/]: (/) *{color:green}+1 overall{color}*
+----
+details (if available):
+
+(/) {color:green}+1 general checks{color}
+-- For more information [see general report|https://ci-hbase.apache.org/job/HBase%20Nightly/job/master/593/General_20Nightly_20Build_20Report/]
+
+
+
+
+
+
+(/) {color:green}+1 jdk8 hadoop3 checks{color}
+-- For more information [see jdk8 (hadoop3) report|https://ci-hbase.apache.org/job/HBase%20Nightly/job/master/593/JDK8_20Nightly_20Build_20Report_20_28Hadoop3_29/]
+
+
+(/) {color:green}+1 jdk11 hadoop3 checks{color}
+-- For more information [see jdk11 report|https://ci-hbase.apache.org/job/HBase%20Nightly/job/master/593/JDK11_20Nightly_20Build_20Report_20_28Hadoop3_29/]
+
+
+(/) {color:green}+1 source release artifact{color}
+-- See build output for details.
+
+
+(/) {color:green}+1 client integration test{color}
+
+
+Results for branch branch-2.5
+	[build #124 on builds.a.o|https://ci-hbase.apache.org/job/HBase%20Nightly/job/branch-2.5/124/]: (x) *{color:red}-1 overall{color}*
+----
+details (if available):
+
+(/) {color:green}+1 general checks{color}
+-- For more information [see general report|https://ci-hbase.apache.org/job/HBase%20Nightly/job/branch-2.5/124/General_20Nightly_20Build_20Report/]
+
+
+
+
+(/) {color:green}+1 jdk8 hadoop2 checks{color}
+-- For more information [see jdk8 (hadoop2) report|https://ci-hbase.apache.org/job/HBase%20Nightly/job/branch-2.5/124/JDK8_20Nightly_20Build_20Report_20_28Hadoop2_29/]
+
+
+(/) {color:green}+1 jdk8 hadoop3 checks{color}
+-- For more information [see jdk8 (hadoop3) report|https://ci-hbase.apache.org/job/HBase%20Nightly/job/branch-2.5/124/JDK8_20Nightly_20Build_20Report_20_28Hadoop3_29/]
+
+
+(x) {color:red}-1 jdk11 hadoop3 checks{color}
+-- For more information [see jdk11 report|https://ci-hbase.apache.org/job/HBase%20Nightly/job/branch-2.5/124/JDK11_20Nightly_20Build_20Report_20_28Hadoop3_29/]
+
+
+(/) {color:green}+1 source release artifact{color}
+-- See build output for details.
+
+
+(/) {color:green}+1 client integration test{color}
+
+

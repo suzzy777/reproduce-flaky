@@ -1,0 +1,216 @@
+
+From log analysis of local successful/failed tests I spotted the only difference which may be worth to investigate further: when *ConnectionLossListener* is executed from *zk-client-timer-internal* thread, everything works fine, tests pass. But when the same listener is called from *zk-internal* thread, no disconnect/reconnect sequence is executed by the client node.
+
+I checked one run from TC failed tests and confirmed that *zk-internal* thread is responsible for calling ConnectionLossListener.
+
+GitHub user dgarus opened a pull request:
+
+    https://github.com/apache/ignite/pull/4166
+
+    IGNITE-8131 ZookeeperDiscoverySpiTest#testClientReconnectSessionExpire* tests fail on TC
+
+    
+
+You can merge this pull request into a Git repository by running:
+
+    $ git pull https://github.com/dgarus/ignite ignite-8131
+
+Alternatively you can review and apply these changes as the patch at:
+
+    https://github.com/apache/ignite/pull/4166.patch
+
+To close this pull request, make a commit to your master/trunk branch
+with (at least) the following in the commit message:
+
+    This closes #4166
+    
+----
+commit 28fe7b5b9c5c6c07015d3ff99cb249f89493a47f
+Author: Garus Denis <garus.d.g@...>
+Date:   2018-06-09T10:12:08Z
+
+    IGNITE-8131. check TC fail
+
+----
+
+
+[~sergey-chugunov], 
+I deleted a fail line in tests and ran TC. Everything seems to be OK.
+Should we close this ticket?
+Test history:
+https://ci.ignite.apache.org/project.html?projectId=IgniteTests24Java8&testNameId=-1700882236921635901&tab=testDetails
+
+https://ci.ignite.apache.org/project.html?projectId=IgniteTests24Java8&testNameId=1337433329747388373&tab=testDetails
+
+[~garus.d.g], thanks for your efforts.
+
+I double checked your result and managed to reproduce the issue locally: I've run this single test with "Until failure" configuration and observed failure on 120th execution.
+
+I found another detail about failure: in all successful executions ZooKeeper client is closed because of session timeout reported by this line in logs:
+{noformat}
+[WARN ][zk-client-timer-internal.ZookeeperDiscoverySpiTest1][ZookeeperClient] Failed to establish ZooKeeper connection, close client [timeout=2000]
+{noformat}
+
+But in failed execution I don't see this line in the logs. It looks worth investigating what causes this behavior and its implications.
+
+Could you please try to reproduce the failure and figure out what's going on? Or if it is more convenient for you I can share full logs from my local run for both successful and failed executions.
+
+[~sergey-chugunov], I've executed tests 300 times on local and didn't get any error. Could you share logs, please?
+
+[~garus.d.g],
+
+You can find logs here: [^ZK_client_reconnect_failure.log]  [^ZK_client_reconnect_success.log]
+
+[~sergey-chugunov]
+The fix, for this task, contains two parts:
+
+1. testClientReconnectSessionExpire1_1.
+
+When ZK starts a cluster, for some reason, one server may don't start. I think it's ZK test framework's bug.
+That's the reason why we should try to connect to the next ZK server if the previous attempt failed.
+
+2. testClientReconnectSessionExpire1_2.
+
+One of the steps of processing ZK_EVT_NODE_JOIN is an updating the event's data on a znode by the ZookeeperDiscoveryImpl#onEventProcessed method.
+By this time, it's assumed that client node has joined to topology (field ZkRuntimeState#joined is true), but field ZkRuntimeState#evtsData hasn't got value yet.
+If the connection failure occurs for updating event's data, a reconnect process will start. But reconnect process isn't possible because ZkRuntimeState#evtsData is null.
+If we defer an updating the event's data for client local join, fields ZkRuntimeState#joined and ZkRuntimeState#evtsData will have the consistent state.
+
+[~garus.d.g], LGTM.
+
+[~garus.d.g],
+
+I reviewed the change and it looks somewhat reasonable for me, tests look fine as well. But I still have a feeling that we don't fix the root cause of the problem but mask it (most likely it is some kind of race as introducing a delay helps to fix it).
+
+What makes me think like this is that (again from analysis of attached logs) is that in failure example I don't see even report about disconnected event: like client was never able to detect that it has disconnected from topology.
+And your analysis doesn't explain lack of disconnected event but talks only about reconnect process.
+
+Could you please explain from your understanding the sequence of events as detailed as possible? Maybe even with references into the code.
+
+Because I see in logs that in successful scenario client detects connection loss almost immediately and switches its state to Disconnected:
+{noformat}
+[2018-06-09 20:12:35,312][INFO ][zk-internal.ZookeeperDiscoverySpiTest1-EventThread][ZookeeperClient] ZooKeeper client state changed [prevState=Connected, newState=Disconnected]
+{noformat}
+And in failure scenario client does something different at probably similar moment in time:
+{noformat}
+[2018-06-09 20:12:45,591][WARN ][zk-internal.ZookeeperDiscoverySpiTest1-EventThread][ZookeeperClient] Failed to execute ZooKeeper operation [err=org.apache.zookeeper.KeeperException$ConnectionLossException: KeeperErrorCode = ConnectionLoss for /apacheIgnite/n/81b80f1f-744f-47d9-bd8b-5cd17c946376:a7926ce8-3713-4270-a788-1e3e8b000001:81|0000000052, state=Connected]
+[2018-06-09 20:12:45,591][WARN ][zk-internal.ZookeeperDiscoverySpiTest1-EventThread][ZookeeperClient] ZooKeeper operation failed, will retry [err=org.apache.zookeeper.KeeperException$ConnectionLossException: KeeperErrorCode = ConnectionLoss for /apacheIgnite/n/81b80f1f-744f-47d9-bd8b-5cd17c946376:a7926ce8-3713-4270-a788-1e3e8b000001:81|0000000052, retryTimeout=2000, connLossTimeout=2000, path=/apacheIgnite/n/81b80f1f-744f-47d9-bd8b-5cd17c946376:a7926ce8-3713-4270-a788-1e3e8b000001:81|0000000052, remainingWaitTime=2000]
+{noformat}
+It seems to me that in failure scenario client receives ConnectionLoss when executing the code that is not ready for this exception and handles it wrongly.
+
+Another idea here maybe that on connection loss client cannot do necessary cleanup in ZooKeeper and when it establishes new connection to ZK it cannot figure out that it has to generate disconnected event and make a reconnect attempt.
+
+Thanks.
+
+[~sergey-chugunov],
+If the connection failure occurs for updating event's data, then the thread "zk-internal.ZookeeperDiscoverySpiTest1-EventThread" will attempt
+to retry the operation (see ZookeeperClient#setData). Method ZookeeperClient#onZookeeperError contains some logic that defines a number of attempts.
+When the number of attempts exceeds enabled the ZookeeperClient will be closed.
+By this time, the WatchedEvent was created and put to the EventThread#queueEvent method (see SendThread#run in org.apache.zookeeper.ClientCnxn).
+But, this event can't be handled because "zk-internal.ZookeeperDiscoverySpiTest1-EventThread" thread is busy with making to retry setData operation.
+
+This is the reason why we don't see the log of handling WatchedEvent from the ZookeeperClient.
+
+[~garus.d.g],
+
+I finally got the whole picture around the issue.
+
+As part of execution of *ZookeeperDiscoveryImpl#processNewEvents(byte[] data)* client tries to save some data to ZooKeeper (step 0) in *ZookeeperClient#setData(String path, byte[] data, int ver)* but fails because of *KeeperException$SessionExpiredException*.
+Program flow doesn't return to *processNewEvents* and goes to *ZookeeperClient#onZookeeperError* where reconnect closure is scheduled and exception is thrown.
+
+But *processNewEvents* didn't finish some logic crucial for successful reconnect: it hasn't initialized *rtState.evtsData* where topVer for reconnect event is obtained from.
+
+Proposed fix tries to close this race by postponing saving data to ZooKeeper at step 0 so *rtState.evtsData* will be initialized to the moment when session expiration is detected. To me it is risky because it looks like all acks from client nodes will be postponed for a significant amount of time (one minute by default).
+
+As we need *rtState.evtsData* only to retrieve topVer from it on reconnect, why not save topVer earlier, before going to code which could face session expiration? 
+So I opened a [PR|https://github.com/apache/ignite/pull/4366] with a quick fix for the problem, could you take a look at it, please, and share your opinion?
+It may be not a perfect place to do such early initialization, but we could change it - the question is more about approach in general.
+
+
+
+[~sergey-chugunov]
+
+If we'll add field ZkRuntimeState.topVer, we must use it everywhere rather then ZkDiscoveryEventsData#topVer (about 20 usages), 
+else it would be confusing. This would be the reason some refactorings that touched plenty code base.
+If we'll choose this way, I think, we should assign to ZkRuntimeState.topVer default value 1L and add follow condition into 
+ZookeeperDiscoveryImpl#processNewEvents(byte[]):
+{code:java}
+if (rtState.joined)
+   rtState.evtsData = newEvts;
+else
+   rtState.topVer = 1L; //may be it will be constant
+{code}
+I would like offer to move the assigning of rtState.evtsData 
+to ZookeeperDiscoveryImpl#processNewEvents(ZkDiscoveryEventsData) before onEventProcessed call, like this:
+{code:java}
+if (rtState.joined)
+   rtState.evtsData = evtsData;
+
+if (rtState.crd)
+   handleProcessedEvents("procEvt");
+else
+   onEventProcessed(rtState, updateNodeInfo, evtProcessed);
+{code}
+It looks like small change and also fix the issue.
+
+What do you think?
+
+[~garus.d.g],
+
+Agree with you that *topVer* fix may be too invasive. Let's try your idea with initializing *evtsData* earlier: please create new PR and run Zookeeper test suites against it.
+
+[~sergey-chugunov]
+I've done the fix by moving initializing evtsData earlier.
+I've executed test 700 times local and everything looks to be OK.
+[PR|https://github.com/apache/ignite/pull/4384]
+[TC|https://ci.ignite.apache.org/viewLog.html?buildId=1517848&tab=buildResultsDiv&buildTypeId=IgniteTests24Java8_ZooKeeperDiscovery1]
+
+Should I move this fix into the main PR?
+
+[~garus.d.g],
+
+I'm not sure if ZookeeperDiscoveryTestSuite2 has some tests for client reconnects so I triggered [one run|https://ci.ignite.apache.org/viewLog.html?buildId=1517979&tab=queuedBuildOverviewTab]. If TC status is OK lets move the fix into main PR.
+
+It looks good to me so I think we're getting closer to have it merged.
+
+[~sergey-chugunov]
+
+I've made changes to the main PR and added the link to the TC RunAll build.
+
+Everything looks good to me.
+
+[~garus.d.g],
+
+Changes look good to me as well. I run session expire tests locally and didn't manage to reproduce the issue.
+
+Thanks for contribution!
+
+[~dpavlov], could you please also review and merge if you're OK with the patch?
+
+[~garus.d.g], I found pull/4384/head and & pull/4166/head - which PR should I review?
+
+Github user asfgit closed the pull request at:
+
+    https://github.com/apache/ignite/pull/4166
+
+
+[~garus.d.g], thank you for contribution!
+
+I guess one PR was supplementary for test run, so I've considered only https://github.com/apache/ignite/pull/4166
+
+I've checked all suspicious test failures and they seems to be rare-flaky failures.
+
+I've merged changes to master.
+
+[~sergey-chugunov] thank you for review!
+
+guys, but why lines : fail("https://issues.apache.org/jira/browse/IGNITE-8131"); still present and ticket in Resolved state ?
+
+[~zstan] thank you for noticing that. [~garus.d.g] could you please remove fail(), unmute test. By lazy consensus, I will do it in 72h, but anyway, if the author will do the removal, it reduces the risk of introducing new failures to master.
+
+[~zstan], [~dpavlov]
+
+I can't find the line with IGNITE-8131 in code on the master branch.
+
+Could you give the link to this line on GitHub.
+

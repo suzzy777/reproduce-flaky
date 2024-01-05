@@ -1,0 +1,205 @@
+I had some time to investigate this morning by running the tests hundreds of times in a row, individually and as part of the test class suite. Just in case, here are my findings. In SASIIndexTest class, we have a few issues actually:
+ * testMultiExpressionQueriesWhereRowSplitBetweenSSTables: is indeed flaky, when run individually or as part of the test class suite. However it is only flaky for forceFlush = false. I couldn't make it fail when forceFlush = true.
+ * testIndexRedistribution : also flaky, when run individually or as part of the test class suite.
+ * testPagination: also flaky, but only when run as part of the class test suite (it is not flaky when run individually). Note: it is flaky for both forceFlush values.
+ * testTruncate : also flaky, but only when run as part of the class test suite (it is not flaky when run individually).
+ * testIndexMemtableSwitching: also flaky; seems sensitive to test ordering. Never fails when run individually, but fails 100% of time when run as part of the test class suite on my machine. I couldn't determine which other test is making this one fail.
+
+Hope that helps.
+
+What I've got so far:
+ # The usage of {{System.currentTimeMillis()}} to generate timestamps is error-prone. Some tests create and apply many mutations in sequence, but sometimes 2 successive mutations get the same timestamp, and the test fails. The following tests are potentially impacted by this:
+ ## testCrossSSTableQueries
+ ## testMultiExpressionQueriesWhereRowSplitBetweenSSTables
+ ## testPagination
+ ## testColumnNamesWithSlashes
+ ## testInvalidate
+ ## testIndexRedistribution
+ ## testTruncate
+ ## testSameKeyInMemtableAndSSTables
+ ## testUnicodeSupport
+ ## testUnicodeSuffixModeNoSplits
+ ## testChinesePrefixSearch
+ ## testLowerCaseAnalyzer
+ ## testPrefixSSTableLookup
+ ## testIndexMemtableSwitching
+ # {{testIndexRedistribution}}: race condition. The test fails when a {{CompactionTask}} is running while {{getIndexed()}} is called. 
+ ## Wrapping {{getIndexed()}} call within {{store.runWithCompactionsDisabled()}} solves the problem.
+ ## _I am not expert enough to tell if this is hiding a broader problem with index redistribution in general._
+ # {{testIndexMemtableSwitching}}: side-effect issue. The test fails only if {{testInsertingIncorrectValuesIntoAgeIndex}} is executed before:
+ ## {{testInsertingIncorrectValuesIntoAgeIndex}} leaves the store in an inconsistent state due to an invalid mutation. 
+ ## The next memtable flush task fails because of an invalid cell type created by the test.
+ ## afaict, the memtable stays forever among the pending memtables list and will never be flushed or removed.
+ ## Similarly, {{ColumnIndex}} never gets a notification that the parent memtable was flushed, and so {{ColumnIndex.pendingFlush}} is never cleared.
+ ## {{testIndexMemtableSwitching}} verifies that {{ColumnIndex.pendingFlush}} is empty, and fails.
+ ## _I am not expert enough to tell if this is hiding a broader problem with failed memtable flushes._
+
+I am going to propose 3 distinct patches:
+ # Replace all occurrences of {{System.currentTimeMillis()}} in {{SASIIndexTest}} by fixed timestamps.
+ # Fix {{testIndexRedistribution}} by reading the index contents inside {{store.runWithCompactionsDisabled()}}. 
+ # {{testIndexMemtableSwitching}}: manually clear the store memtables using {{store.clearUnsafe()}} and manually clean {{ColumnIndex.pendingFlush}} after {{testInsertingIncorrectValuesIntoAgeIndex}}, so as to leave the store in a consistent state.
+
+Update: {{testIndexRedistribution}} and {{testIndexMemtableSwitching}} are not flaky on trunk afaict. Fixing the timestamps issue on trunk is enough. 
+
+Please review PR for trunk first.
+PR for 3.11 includes the same fixes + 2 additional commits that are only relevant for 3.11.
+
+Thanks for the patches and the deep analysis.
+
+* I believe that even if it does not appear as a problem right now we should make the tests more robusts. 2 things that strike me are that the tables are not cleaned up between the tests and that {{forcedFlushes}} are used but the tests do not disable the automatic flushes.
+
+I would change the {{cleanupData}} method into:
+{code}
+    private static void cleanupData()
+    {
+        stores().forEach(ColumnFamilyStore::truncateBlocking);
+    }
+
+    private static Stream<ColumnFamilyStore> stores()
+    {
+        Keyspace ks = Keyspace.open(KS_NAME);
+        return ks.getMetadata().tables.stream().map(t -> ks.getColumnFamilyStore(t.name));
+    }
+{code}
+
+and the {{cleanUp}} method into:
+{code}
+    @Before
+    public void cleanUp()
+    {
+        cleanupData();
+    }
+{code} 
+That would ensure that we clean all the tables between the different tests.
+
+I would also add {{stores().forEach(ColumnFamilyStore::disableAutoCompaction);}} at the end of the {{loadSchema()}} method to ensure that there are no race condition with automatic compactions.
+
+* Regarding the timestamp fix, would it not make sense to use some thing like:
+{code}
+    private static long timestamp = 0;
+
+    private static long nextTimestamp()
+    {
+        timestamp += 1000;
+        return timestamp;
+    }
+{code}
+rather than specifying the timestamp for each call to {{loadData}}?
+
+* Regarding {{testInsertingIncorrectValuesIntoAgeIndex}} problem in 3.11, it seems that the test has been changed as part of CASSANDRA-15867 and I am not convinced that this change was the correct one. If you roll back that change, do you still see the same issue?
+
+[~adutra] this is a nice investigation on the causes of those failures. I've run our internal test multiplexer for {{SASIIndexTest}} with 200 iterations for the current 3.11 and trunk branches and for each corresponding patch:
+||branch||job||failed tests||
+|cassandra-3.11|[696|https://jenkins-dse.build.dsinternal.org/view/Parameterized/job/parameterized-testall/696/]|testPagination(200), testIndexRedistribution(200), testMultiExpressionQueriesWhereRowSplitBetweenSSTables(1)|
+|trunk|[697|https://jenkins-dse.build.dsinternal.org/view/Parameterized/job/parameterized-testall/697/]|testMultiExpressionQueriesWhereRowSplitBetweenSSTables(5)|
+|16444-3.11|[698|https://jenkins-dse.build.dsinternal.org/view/Parameterized/job/parameterized-testall/698/]|testTableRebuild(11), testIndexRebuild(11)|
+|16444-trunk|[699|https://jenkins-dse.build.dsinternal.org/view/Parameterized/job/parameterized-testall/699/]|testMultiExpressionQueriesWhereRowSplitBetweenSSTables(1)|
+
+So it seems that, if we trust the multiplexer, we still have some flakiness. And, as Benjamin mentioned, {{testIndexMemtableSwitching}} doesn't seem to be failing anymore.
+
+Also, although it's not related to the patch, I think that perhaps we could clean here some of the many warnings in {{SASIIndexTest}}. The most frequent ones are unneeded uses of {{throws Exception}} and many calls of the form:
+{code:java}
+Assert.assertTrue(rows.toString(), Arrays.equals(new String[] { "key1", "key2", "key3", "key4" }, rows.toArray(new String[rows.size()])));
+{code}
+These could be simplified if we added a simple utility method like, for example:
+{code:java}
+assertRows(rows, "key1", "key2", "key3", "key4");
+...
+private static void assertRows(Set<String> actual, String... expected)
+{
+    Assert.assertArrayEquals(expected, Iterables.toArray(actual, String.class));
+}
+{code}
+Not sure whether introducing these changes would be too distracting but I think they would easily increase the readability of the test class. I gave it a quick go [here|https://github.com/adelapena/cassandra/commit/7b6d460b63c48636d907e48e40fe1b64d8687ddc].
+
+I had a look to the failing tests: {{testTableRebuild}}, {{testIndexRebuild}}. They both use the {{CLUSTERING_CF_NAME_1}} table which is not cleaned between the tests.
+I would suggest to add the improvements I proposed and re-run the multiplexer tests.
+
+
+Makes sense, I have started the multiplexer [here|https://jenkins-dse.build.dsinternal.org/view/Parameterized/job/parameterized-testall/700/] for [a 3.11-based branch|https://github.com/adutra/cassandra/compare/16444-3.11...adelapena:16444-3.11-review] with the {{cleanupData}} and {{timestamp}} suggestions. It should be finished in ~2h.
+
+Thank you [~blerer] and [~adelapena] for the thorough reviews.
+{quote}I would change the cleanupData method
+{quote}
+Very good suggestion, done on both PRs.
+{quote}I would also add stores().forEach(ColumnFamilyStore::disableAutoCompaction); at the end of the loadSchema() method
+{quote}
+Done on both PRs.
+{quote}forcedFlushes are used but the tests do not disable the automatic flushes
+{quote}
+How would you do this? Should I play with {{memtable_flush_period_in_ms}} when creating the tables?
+{quote}Regarding testIndexMemtableSwitching problem in 3.11, it seems that the test has been changed as part of CASSANDRA-15867 and I am not convinced that this change was the correct one. If you roll back that change, do you still see the same issue?
+{quote}
+I will try that next and let you know.
+{quote}Regarding the timestamp fix, would it not make sense to use some thing like rather than specifying the timestamp for each call to loadData?
+{quote}
+I actually have a slight preference for fixed timestamps as they produce deterministic results. Using a counter means that you don't really control which timestamps are being used. Besides, at least one test requires very specific timestamps or it fails: {{testTruncate}}.
+{quote}I think that perhaps we could clean here some of the many warnings in SASIIndexTest.
+{quote}
+Absolutely, I cherry-picked your commit on both PRs and indeed the test class looks much better.
+
+At this point, I suggest that we re-run the multiplexer and see if at least {{testTableRebuild}} and {{testIndexRebuild}} are fixed.
+
+[~blerer] I investigated the change introduced by CASSANDRA-15867.
+
+In fact, this change simply fixed a test that was failing for a while.
+
+Doing a git bisect, I found that the commit that introduced the test regression is in fact c4064dd: [Allow recovery from the cases when CQL-created compact sense tables have bytes in EmptyType columns|https://github.com/apache/cassandra/commit/c4064dd80e427aec7c04e8e2e1e4630d6c8087b6#diff-0e5a142c13247885605175ace136c549391fb6c778877f91f589fd94131c241b].
+
+This change introduced an assertion inside {{AbstractType.writeValue()}}:
+{code:java}
+        assert valueLengthIfFixed < 0 || value.remaining() == valueLengthIfFixed : String.format("Expected exactly %d bytes, but was %d",
+                                                                                                 valueLengthIfFixed, value.remaining());
+{code}
+Without the assert, the incorrect 8-bytes value created by {{testInsertingIncorrectValuesIntoAgeIndex}} gets written; with the assertion, it doesn't, and the {{AssertionError}} bubbles up, messing up the store state. The author of CASSANDRA-15867 simply added a try-catch block around the test to avoid the test failure. But I wonder if we shouldn't simply disable this test, since it violates an invariant expressed by the new assertion.
+
+Oddly enough, this assertion was not ported to trunk, which basically conserved the pre-c4064dd behavior. This is why this test ({{testInsertingIncorrectValuesIntoAgeIndex}}) is not dangerous on trunk: it passes normally and doesn't leave the store in an inconsistent state; therefore it doesn't need a try-catch block nor any ugly band-aid to fix the store state.
+
+{quote}forcedFlushes are used but the tests do not disable the automatic flushes
+
+ How would you do this? Should I play with memtable_flush_period_in_ms when creating the tables{quote}
+
+Ignore my comment. I think I mixed up several things in my mind when I wrote that comment. By default flushes are not triggered periodically.
+ Sorry for that.
+
+[~adutra] {{testInsertingIncorrectValuesIntoAgeIndex}} is a pretty strange test to me. In my opinion we can remove it. 
+
+bq. testInsertingIncorrectValuesIntoAgeIndex is a pretty strange test to me. In my opinion we can remove it.
+
+Agreed, done.
+
+Also, we have 2 green builds with the multiplexer:
+
+# [16444-trunk|https://jenkins-dse.build.dsinternal.org/view/Parameterized/job/parameterized-testall/701/]
+# [16444-3.11|https://jenkins-dse.build.dsinternal.org/view/Parameterized/job/parameterized-testall/702/]
+
+So it seems that with Benjamin's suggestions we finally got rid of all the flakiness.
+
++1 Thanks for the patches [~adutra] 
+
+{quote}Regarding the timestamp fix, would it not make sense to use some thing like rather than specifying the timestamp for each call to loadData?
+{quote}
+{quote}I actually have a slight preference for fixed timestamps as they produce deterministic results. Using a counter means that you don't really control which timestamps are being used. Besides, at least one test requires very specific timestamps or it fails: {{testTruncate}}.
+{quote}
+I liked the idea of increasing the timestamp inside of {{loadData}}. I think that, given that the tests are not run in parallel, that automatically increased timestamp would also be deterministic. As for the special case of {{testTruncate}} we can use the current behaviour overloading {{loadData}}. Also I think there is no need to use seconds, we can increase the timestamps one by one with a precision of milliseconds. I gave it a go [here|https://github.com/adelapena/cassandra/commit/fbcef9b9e0bd81a9101682e8bd1ffabe776cba5f]. Nevertheless this is just a detail so feel free to ignore if you don't agree.
+
+Other than this nit, the changes look good to me, it's nice to see this test finally fixed.
+
+Fair enough, I cherry-picked your commits on both branches. I also started two more multiplexer builds, just in case.
+
+Unrelated: regarding the assertion that was introduced in 3.11:
+
+bq. Oddly enough, this assertion was not ported to trunk, which basically conserved the pre-c4064dd behavior.
+
+Do we need to worry about it? From my (admittedly novice) standpoint, it seems that AbstractType has stricter validation rules in 3.11 than in 4.0...
+
+{quote}Do we need to worry about it? From my (admittedly novice) standpoint, it seems that AbstractType has stricter validation rules in 3.11 than in 4.0...{quote}
+
+According to [~slebresne] [comment|https://issues.apache.org/jira/browse/CASSANDRA-15778?focusedCommentId=17117827&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-17117827] the validation was only added because he believe that the new code could trigger this path.
+
+In my opinion the validation make sense anyway so it might be good to put it also in 4.0. I would just use some proper IOException like in {{readValue}} rather than assertions.   
+
+Committed into cassandra-3.11 at e3902bcdad79dcef43562a075d6a130c6a77d63d and merged into trunk
+
+Thanks for the patch [~adutra]. I opened CASSANDRA-16500 to address the missing validation issue.
+

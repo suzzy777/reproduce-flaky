@@ -1,0 +1,40 @@
+Flaky dtest: [test_dead_sync_initiator - repair_tests.repair_test.TestRepair|https://ci-cassandra.apache.org/view/all/job/Cassandra-devbranch-dtest/143/testReport/junit/dtest.repair_tests.repair_test/TestRepair/test_dead_sync_initiator/]
+{code:java|title=stacktrace}
+Unexpected error found in node logs (see stdout for full details). Errors: [ERROR [Stream-Deserializer-127.0.0.1:7000-570871f3] 2020-06-03 04:05:19,081 CassandraEntireSSTableStreamReader.java:145 - [Stream 6f1c3360-a54f-11ea-a808-2f23710fdc90] Error while reading sstable from stream for table = keyspace1.standard1
+org.apache.cassandra.io.sstable.CorruptSSTableException: Corrupted: /home/cassandra/cassandra/cassandra-dtest/tmp/dtest-te4ty0r9/test/node3/data0/keyspace1/standard1-5f5ab140a54f11eaa8082f23710fdc90/na-2-big-Statistics.db
+	at org.apache.cassandra.io.sstable.metadata.MetadataSerializer.maybeValidateChecksum(MetadataSerializer.java:219)
+	at org.apache.cassandra.io.sstable.metadata.MetadataSerializer.deserialize(MetadataSerializer.java:198)
+	at org.apache.cassandra.io.sstable.metadata.MetadataSerializer.deserialize(MetadataSerializer.java:129)
+	at org.apache.cassandra.io.sstable.metadata.MetadataSerializer.mutate(MetadataSerializer.java:226)
+	at org.apache.cassandra.db.streaming.CassandraEntireSSTableStreamReader.read(CassandraEntireSSTableStreamReader.java:140)
+	at org.apache.cassandra.db.streaming.CassandraIncomingFile.read(CassandraIncomingFile.java:78)
+	at org.apache.cassandra.streaming.messages.IncomingStreamMessage$1.deserialize(IncomingStreamMessage.java:49)
+	at org.apache.cassandra.streaming.messages.IncomingStreamMessage$1.deserialize(IncomingStreamMessage.java:36)
+	at org.apache.cassandra.streaming.messages.StreamMessage.deserialize(StreamMessage.java:49)
+	at org.apache.cassandra.streaming.async.StreamingInboundHandler$StreamDeserializingTask.run(StreamingInboundHandler.java:181)
+	at io.netty.util.concurrent.FastThreadLocalRunnable.run(FastThreadLocalRunnable.java:30)
+	at java.lang.Thread.run(Thread.java:748)
+Caused by: java.io.IOException: Checksums do not match for /home/cassandra/cassandra/cassandra-dtest/tmp/dtest-te4ty0r9/test/node3/data0/keyspace1/standard1-5f5ab140a54f11eaa8082f23710fdc90/na-2-big-Statistics.db
+{code}
+ 
+
+In the above test, it executes "nodetool repair" on node1 and kills node2 during repair. At the end, node3 reports checksum validation failure on sstable transferred from node1.
+{code:java|title=what happened}
+1. When repair started on node1, it performs anti-compaction which modifies sstable's repairAt to 0 and pending repair id to session-id.
+2. Then node1 creates {{ComponentManifest}} which contains file lengths to be transferred to node3.
+3. Before node1 actually sends the files to node3, node2 is killed and node1 starts to broadcast repair-failure-message to all participants in {{CoordinatorSession#fail}}
+4. Node1 receives its own repair-failure-message and fails its local repair sessions at {{LocalSessions#failSession}} which triggers async background compaction.
+5. Node1's background compaction will mutate sstable's repairAt to 0 and pending repair id to null via  {{PendingRepairManager#getNextRepairFinishedTask}}, as there is no more in-progress repair.
+6. Node1 actually sends the sstable to node3 where the sstable's STATS component size is different from the original size recorded in the manifest.
+7. At the end, node3 reports checksum validation failure when it tries to mutate sstable level and "isTransient" attribute in {{CassandraEntireSSTableStreamReader#read}}.
+{code}
+Currently, entire-sstable-streaming requires sstable components to be immutable, because \{{ComponentManifest}}
+with component sizes are sent before sending actual files. This isn't a problem in legacy streaming as STATS file length didn't matter.
+
+ 
+
+Ideally it will be great to make sstable STATS metadata immutable, just like other sstable components, so we don't have to worry this special case.
+
+I can think of 2 ways:
+ # Make STATS mutation as a proper compaction to create hard link on the compacting sstable components with a new descriptor, except STATS files which will be copied entirely. Then mutation will be applied on the new STATS file. At the end, old sstable will be released. This ensures all sstable components are immutable and shouldn't make these special compaction tasks slower.
+ # Change STATS metadata format to use fixed length encoding for repair info

@@ -1,0 +1,244 @@
++1
+
+The current implementation is quite inefficient. I find that the overseer thread is idle/waiting for the DQ approx 30% of the time during my tests in SOLR-6554.
+
+First pass.  The DQ tests themselves pass, but I haven't yet run the full test suite.
+
+One big question I have is how to handle session/loss connection issues.  I worry that a hole in the patch I have is what happens if we lose ZK connection and regain it?  I have a feeling we'd end up in deadlock.  I think I need to add a general ConnectionStateListener so that I can mark having no watcher if we lose connection, and when connection comes back, tickle the notEmpty condition to cause all blocked threads to loop and ultimately refetch ZK state.
+
+Or I could tickle notEmpty when we lose session, causing the blocked threads to loop and eventually throw a SessionExpiredException
+
+Minimal tests passing, haven't run full suite.
+
+Added a patch to show the deadlock state I was in.  Not sure why...
+
+Example of a deadlock test is TestMiniSolrCloudCluster.testCollectionCreateSearchDelete
+
+Running ant test now, I actually expect this may pass..
+
+NOTE: committer should start with an svn copy DistributedQueue -> DistributedQueueExt to preserve history.
+
+New patch, with better testing.  Tests all passing, I think.
+
+[~shalin] please sanity check the block of code in testDistributedQueueBlocking() that forces a ZK disconnect / reconnect... I looked around but couldn't really find canonical patterns.  I wanted to ensure that we don't end up in a state where the session is disconnected, but we think we still have a watcher, so we're stuck forever.
+
+I did get ant test to pass, but the new test is flaky.  Any advice on making it less flaky?  In particular, I want to force a ZK session drop and reconnect.  This code sometimes fails:
+
+{quote}
+    // Force session expiry.
+    long sessionId = zkClient.getSolrZooKeeper().getSessionId();
+    zkServer.expire(sessionId);
+    zkClient.getConnectionManager().waitForDisconnected(10000);
+    zkClient.getConnectionManager().waitForConnected(10000);
+    assertTrue(zkClient.isConnected());
+    assertFalse(sessionId == zkClient.getSolrZooKeeper().getSessionId());
+{quote}
+
+
+
+
+[~dragonsinth] Why did you choose to have  a {{DistributedQueue}} and {{DistributedQueueExt}}, why not modify the original class?
+
+[~noble.paul] I feel like the API and implementation of DistributedQueue represents a pretty clean, cohesive, and general API.  This is evidenced by the fact that most of the existing places we were using DQ "just work".
+
+DistributedQueueExt represents what I feel like is kind of crap that was glommed on to support the collection task queue, specifically.  You have methods like containsTaskWithRequestId() that are highly specific to the collection task queue, the strange QueueEvent and response-prefix stuff that I don't even understand what it's supposed to do, getTailId() to peek at the end of the queue with unclear semantics (is it good enough to answer with the end of the in-memory queue, or does the caller expect a synchronous read-through into ZK?), and a remove method that doesn't operate on the head of the queue.  In addition to the unclear semantics on some of these, the implementations of some of them necessarily break the clean model DQ uses and are in some cases FAR less efficient -- containsTaskWithRequestId for example has to not only fetch the entire list from ZK, it then has to actually read all the data nodes.
+
+Suffice it to say I don't think anything in there is good enough to promote into the general purpose DQ.  Maybe the core issue is that the collection work queue is fundamentally looking for something more, like a distributed task queue.  I think someone should go back and analyze the true needs there and figure out if there's something better we can do.
+
+Good reasoning. I'd suggest we come up with a more descriptive modifier than ext though.
+
++1 I was actually hoping someone would suggest a better name!  Any suggestions?
+
+Test is no longer flaky
+
+[~shalin] ping for review
+
+I saw test failures twice in a row but I can't reproduce them on beasting.
+
+Looking at the test itself I can't figure out why it would fail like this:
+{code}
+java.util.NoSuchElementException
+        at __randomizedtesting.SeedInfo.seed([FD3C9C458FB6F5FD:9E2CC8B3009169AB]:0)
+        at org.apache.solr.cloud.DistributedQueue.remove(DistributedQueue.java:203)
+        at org.apache.solr.cloud.DistributedQueueTest.testDistributedQueue(DistributedQueueTest.java:62)
+{code}
+
+Perhaps related to the tests being executed in a wrong order? Maybe each test method should get its own ZK server or at least a different znode path for the queue?
+
+In case it helps, the seeds were:
+{code}
+ant test  -Dtestcase=DistributedQueueExtTest -Dtests.method=testDistributedQueue -Dtests.seed=F156B17A5CB6EA4 -Dtests.slow=true -Dtests.locale=ca -Dtests.timezone=Europe/Vilnius -Dtests.asserts=true -Dtests.file.encoding=UTF-8
+
+ant test  -Dtestcase=DistributedQueueTest -Dtests.method=testDistributedQueue -Dtests.seed=FD3C9C458FB6F5FD -Dtests.slow=true -Dtests.locale=en_AU -Dtests.timezone=Australia/Lindeman -Dtests.asserts=true -Dtests.file.encoding=UTF-8
+{code}
+
+Rewrite DQ test code to fix race, document offer() semantics.
+
+Fixed.  To recap IRC discussion, the old test code assumed that calling offer() would result in the offered element immediately being available from poll().  This is contrary to the design decision in the new DQ.
+
+1) Fixed the test code assumptions and generally cleaned up the test code to be more clear.
+2) Documented offer() semantics.
+
+On the decision to decouple offer() and poll():
+
+The rationale for the design decision is that being the offering VM is not "special".  In the general case different VMs often offer while a single VM is doing the polling, the two are decoupled in reality.  So there's no real need to guarantee that offer() followed by poll() in a single VM always returns the element immediately
+
+
+Final patch? DistributedQueueExt -> OverseerCollectionQueue
+
+Thanks! Looks good to me. I'll commit this tomorrow morning my time.
+
+This gives us a great speedup as well. The rate of processing state operations went up from 4550 requests/min to 26083 requests/min i.e. a boost of 473%!
+
+{code}
+stateFormat = 2, 10 collections, With refactoring (trunk):
+=============================================================
+
+  2> 56663 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 Overseer loop finished processing: 
+  2> 56664 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 	 totalTime: 46405.595921
+  2> 56664 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 	 avgRequestsPerMinute: 0.021548541967677345
+  2> 56664 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 	 5minRateRequestsPerMinute: 0.0
+  2> 56664 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 	 15minRateRequestsPerMinute: 0.0
+  2> 56664 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 	 avgTimePerRequest: 46405.595921
+  2> 56664 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 	 medianRequestTime: 46405.595921
+  2> 56665 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 	 75thPctlRequestTime: 46405.595921
+  2> 56665 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 	 95thPctlRequestTime: 46405.595921
+  2> 56665 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 	 99thPctlRequestTime: 46405.595921
+  2> 56665 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 	 999thPctlRequestTime: 46405.595921
+  2> 56665 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 op: am_i_leader, success: 3, failure: 0
+  2> 56665 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 	 totalTime: 7.714871
+  2> 56665 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 	 avgRequestsPerMinute: 3.9009249281419294
+  2> 56665 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 	 5minRateRequestsPerMinute: 21.00415965703074
+  2> 56665 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 	 15minRateRequestsPerMinute: 22.9566897384727
+  2> 56666 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 	 avgTimePerRequest: 2.5716236666666665
+  2> 56666 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 	 medianRequestTime: 0.390077
+  2> 56666 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 	 75thPctlRequestTime: 7.016754
+  2> 56666 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 	 95thPctlRequestTime: 7.016754
+  2> 56666 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 	 99thPctlRequestTime: 7.016754
+  2> 56667 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 	 999thPctlRequestTime: 7.016754
+  2> 56667 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 op: update_state, success: 20011, failure: 0
+  2> 56669 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 	 totalTime: 8677.820981
+  2> 56669 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 	 avgRequestsPerMinute: 26054.58092669684
+  2> 56669 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 	 5minRateRequestsPerMinute: 28115.736803934476
+  2> 56669 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 	 15minRateRequestsPerMinute: 28300.17714580809
+  2> 56669 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 	 avgTimePerRequest: 0.4336525401529159
+  2> 56669 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 	 medianRequestTime: 0.4546175
+  2> 56669 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 	 75thPctlRequestTime: 0.5425845
+  2> 56669 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 	 95thPctlRequestTime: 0.68700805
+  2> 56670 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 	 99thPctlRequestTime: 0.9623780800000007
+  2> 56670 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 	 999thPctlRequestTime: 3.872901139000002
+  2> 56670 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 op: state, success: 20001, failure: 0
+  2> 56671 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 	 totalTime: 7268.609771
+  2> 56671 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 	 avgRequestsPerMinute: 26083.69778407265
+  2> 56671 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 	 5minRateRequestsPerMinute: 28469.456291781717
+  2> 56671 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 	 15minRateRequestsPerMinute: 28689.269577883602
+  2> 56671 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 	 avgTimePerRequest: 0.36341231793410333
+  2> 56671 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 	 medianRequestTime: 0.37234449999999997
+  2> 56671 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 	 75thPctlRequestTime: 0.451628
+  2> 56671 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 	 95thPctlRequestTime: 0.5609881
+  2> 56671 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 	 99thPctlRequestTime: 0.6850270100000001
+  2> 56671 INFO  (TEST-OverseerTest.testPerformance-seed#[4A854829B14EB462]) [    ] o.a.s.SolrTestCaseJ4 	 999thPctlRequestTime: 3.4499434830000055
+
+
+stateFormat = 2, 10 collections, Without refactoring (trunk):
+=============================================================
+
+   [junit4]   2> 274160 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 Overseer loop finished processing: 
+   [junit4]   2> 274161 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 	 totalTime: 264346.50677
+   [junit4]   2> 274161 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 	 avgRequestsPerMinute: 0.003782893537381759
+   [junit4]   2> 274161 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 	 5minRateRequestsPerMinute: 0.0
+   [junit4]   2> 274162 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 	 15minRateRequestsPerMinute: 0.0
+   [junit4]   2> 274162 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 	 avgTimePerRequest: 264346.50677
+   [junit4]   2> 274162 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 	 medianRequestTime: 264346.50677
+   [junit4]   2> 274162 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 	 75thPctlRequestTime: 264346.50677
+   [junit4]   2> 274162 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 	 95thPctlRequestTime: 264346.50677
+   [junit4]   2> 274162 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 	 99thPctlRequestTime: 264346.50677
+   [junit4]   2> 274162 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 	 999thPctlRequestTime: 264346.50677
+   [junit4]   2> 274163 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 op: am_i_leader, success: 2, failure: 0
+   [junit4]   2> 274163 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 	 totalTime: 10.991148
+   [junit4]   2> 274163 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 	 avgRequestsPerMinute: 0.4544215783246879
+   [junit4]   2> 274163 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 	 5minRateRequestsPerMinute: 10.257958366769442
+   [junit4]   2> 274163 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 	 15minRateRequestsPerMinute: 18.078447754911757
+   [junit4]   2> 274163 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 	 avgTimePerRequest: 5.495574
+   [junit4]   2> 274164 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 	 medianRequestTime: 5.4955739999999995
+   [junit4]   2> 274164 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 	 75thPctlRequestTime: 7.035856
+   [junit4]   2> 274164 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 	 95thPctlRequestTime: 7.035856
+   [junit4]   2> 274164 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 	 99thPctlRequestTime: 7.035856
+   [junit4]   2> 274165 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 	 999thPctlRequestTime: 7.035856
+   [junit4]   2> 274165 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 op: update_state, success: 20011, failure: 0
+   [junit4]   2> 274166 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 	 totalTime: 12397.475361
+   [junit4]   2> 274166 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 	 avgRequestsPerMinute: 4547.833695111793
+   [junit4]   2> 274166 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 	 5minRateRequestsPerMinute: 3847.5781990107857
+   [junit4]   2> 274166 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 	 15minRateRequestsPerMinute: 2998.648631930923
+   [junit4]   2> 274167 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 	 avgTimePerRequest: 0.6195330248863126
+   [junit4]   2> 274167 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 	 medianRequestTime: 0.5545475
+   [junit4]   2> 274167 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 	 75thPctlRequestTime: 0.6847515
+   [junit4]   2> 274167 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 	 95thPctlRequestTime: 0.8879762999999998
+   [junit4]   2> 274167 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 	 99thPctlRequestTime: 1.1280661800000003
+   [junit4]   2> 274167 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 	 999thPctlRequestTime: 3.7108806920000013
+   [junit4]   2> 274167 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 op: state, success: 20001, failure: 0
+   [junit4]   2> 274168 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 	 totalTime: 10719.864045
+   [junit4]   2> 274169 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 	 avgRequestsPerMinute: 4550.14580363099
+   [junit4]   2> 274169 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 	 5minRateRequestsPerMinute: 3861.3377008032517
+   [junit4]   2> 274169 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 	 15minRateRequestsPerMinute: 3010.807350864149
+   [junit4]   2> 274169 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 	 avgTimePerRequest: 0.5359664039298035
+   [junit4]   2> 274169 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 	 medianRequestTime: 0.483754
+   [junit4]   2> 274169 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 	 75thPctlRequestTime: 0.58192225
+   [junit4]   2> 274169 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 	 95thPctlRequestTime: 0.71668745
+   [junit4]   2> 274169 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 	 99thPctlRequestTime: 0.8258062500000001
+   [junit4]   2> 274169 INFO  (TEST-OverseerTest.testPerformance-seed#[1CE0793468424C19]) [    ] o.a.s.SolrTestCaseJ4 	 999thPctlRequestTime: 13.507429244000047
+{code}
+
+Commit 1696706 from shalin@apache.org in branch 'dev/trunk'
+[ https://svn.apache.org/r1696706 ]
+
+SOLR-6760: New optimized DistributedQueue implementation for overseer
+
+In the output above, 'success' new way is 3 instead of 20k, some test bug? Or is it counting with the batching as one op?
+
+Are you looking at success of amILeader op? Look at the state operations. Those are all 20k.
+
+Ah, got it, my bad..
+
+Here is a patch which applies to branch_5x.
+
+# I had to use ImmutableSortedSet.of() in DistributedQueue#getChildren because there is no Collections.emptySortedSet in Java 7.
+# Changed DistributedQueueTest to not use lambdas
+# I had to make local variable "data" as final in Overseer so that it could be used in the ZkWriteCallback anonymous inner class.
+
+I should also mention that I had to change DistributedQueueTest in the trunk patch to use ExecutorUtil for creating the executor service so that forbidden-api-checker is happy:
+{code}
+protected ExecutorService executor = ExecutorUtil.newMDCAwareSingleThreadExecutor(new SolrjNamedThreadFactory("dqtest-"));
+{code}
+
+Commit 1696789 from shalin@apache.org in branch 'dev/branches/branch_5x'
+[ https://svn.apache.org/r1696789 ]
+
+SOLR-6760: New optimized DistributedQueue implementation for overseer
+
+Thanks Scott!
+
+Woohoo!
+
+bq. The rate of processing state operations went up from 4550 requests/min to 26083 requests/min i.e. a boost of 473%!
+
+Nice, huge win!
+
+The naming here conflicts a bit with what I was trying to accomplish with SOLR-7789, so I'm asking here for suggestions on how to resolve.  In SOLR-7789 I am trying to accomplish the following:
+#1 Add another OverseerMessageHandler (OverseerConfigSetMessageHandler) to handle ConfigSet-related operations.
+#2 From the perspective of the non-overseer (i.e. the ConfigSetsHandler), it looks like the operations are written to a separate queue from the collection queue, i.e.  getOverseerConfigSetQueue()
+#3 Since the ConfigSet operations are most likely rare and fast, it made sense to just use the existing collections queue "under the covers" and handle the dispatch separately.  The naming here breaks the illusion of #2, i.e. if I return an OverseerCollectionQueue it's pretty obvious to the non-overseer what's going on.
+
+So, here's my plan:
+Short term: rename OverseerCollectionQueue to something more generic...DistributedTaskQueue?  DistributedAsyncAwareQueue?  There's nothing in there that is actually collection specific (which is why it works for the ConfigSet operations)
+
+Longer term:  I have some more suggestions for the queue interface in SOLR-7789.  For example, on the insertion side the queue should be ZKNodeProps based rather than byte [] based so we can return different queue types that understand the semantics of the operations being inserted (hard to do that with a byte []).  In particular, I want to prefix all operation names to the ConfigSetQueue with "configsets:" automatic to simplify the dispatching to the correct OverseerMessageHandler.  The ConfigSetsHandler needs to do this now (so sort of breaks the illusion of #2) because of the interface.  There's probably a lot more room to break things up for client vs processing side as well -- i.e. why does the CollectionsHandler / ConfigSetsHandler get access to an object that lets it remove something from the queue?
+
+After some more thought, I like the rename of OverseerCollectionQueue -> OverseerTaskQueue.  It makes the term more generic, but makes it clear the scope should be limited to the Overseer (compared to my earlier suggestion of DistributedTaskQueue), which seems like a good idea  given the limitations of the interface discussed in this issue.
+
+My latest version of the patch in SOLR-7789 makes this change.
+
+Let's keep this discussion on SOLR-7789. I'll respond on that issue.
+
+Gregory, glad you're thinking about this.  This kind of discussion is just what I was hoping for when I wrote "I think someone should go back and analyze the true needs there and figure out if there's something better we can do." :)
+

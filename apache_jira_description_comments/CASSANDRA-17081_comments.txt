@@ -1,0 +1,118 @@
+Posted the cause here https://issues.apache.org/jira/browse/CASSANDRA-17085?focusedCommentId=17436995&page=com.atlassian.jira.plugin.system.issuetabpanels%3Acomment-tabpanel#comment-17436995
+
+Here is what I am seeing in bootstrap_test.py::TestBootstrap::test_bootstrap_with_reset_bootstrap_state
+
+{code}
+      node3 = new_node(cluster)
+        try:
+            node3.start()
+        except NodeError:
+            pass  # node doesn't start as expected
+        t.join()
+        node1.start()
+{code}
+
+node1.start checks all the alive nodes (according to ccm) to see if node1 is seen as up in the logs.  node3 is dead (or dying), so it should not be included in the watch set
+
+I was able to repro the issue when I limit the environment to 2 cores; trying a patch where we force shutdown node3 before starting node1 to avoid ccm checking node3's logs
+
+Here is the section of code failing in ccm
+
+https://github.com/riptano/ccm/blob/master/ccmlib/node.py#L890-L895
+
+{code}
+ if common.is_int_not_bool(wait_other_notice):
+            for node, mark in marks:
+                node.watch_log_for_alive(self, from_mark=mark, timeout=wait_other_notice)
+        elif wait_other_notice:
+            for node, mark in marks:
+                node.watch_log_for_alive(self, from_mark=mark)
+{code}
+
+marks is defined as follows (the issue is here)
+
+https://github.com/riptano/ccm/blob/master/ccmlib/node.py#L772-L775
+
+{code}
+if wait_other_notice:
+            marks = [(node, node.mark_log()) for node in list(self.cluster.nodes.values()) if node.is_live()]
+        else:
+            marks = []
+{code}
+
+the node.is_live() check returns true in some cases for node3 (the node which failed to start up), which causes ccm to watch node3's logs for node1 to show up... since node3 is actually down the logs will not see node1; which leads to a timeout.
+
++1 on the change to fix this test.
+
+In general, is this a pattern we use more frequently that'd be worth codifying through the API's here? Having to know that there's coupling between nodes in ccm to watch each others' logs for signals about being up to know about the right timing on node kill vs. start is... brittle at best. :)
+
+ 
+
+fwiw, this test passes 100+ times (unchanged) for me in development, so this seems to be induced by load, but it's not clear why it started failing.
+
+Looking into CASSANDRA-17085 more I actually believe that this patch isn't the solution.  When used to allow bootstrap to fail without shutting down the JVM, but something changed where we not shutdown (no non-daemon threads up); this then causes a race condition with this test as we only pass IFF we think node1 is up before node3 finishes shutting down.
+
+I am trying to figure out the before/after threads to see if this does in fact related to this ticket; as this ticket was stable 2 months back... after I know more about CASSANDRA-17085 I can confirm if this is in fact impacting this test causing it to be flaky.
+
+bq. fwiw, this test passes 100+ times (unchanged) for me in development, so this seems to be induced by load, but it's not clear why it started failing.
+
+When I run "flaky tests" I limit the CPUs to hit issues easier; with 2 cores this happens every 3rd attempt for me.
+
+That makes sense, but it's not clear what caused this to start failing now, as you pointed out.
+
+Have a patch based off this comment https://issues.apache.org/jira/browse/CASSANDRA-17085?focusedCommentId=17437450&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-17437450.  The other test was passing; rerunning without this patch but with the C* patch to confirm stable after this change.
+
+[~brandon.williams] what I am seeing is that CASSANDRA-16925 changed PERIODIC-COMMIT-LOG-SYNCER and COMMIT-LOG-ALLOCATOR to be daemon threads; this meant that main was the only non-daemon thread when we do not join (netty is the only other non-daemon thread, and that doesn't start when bootstrap fails).
+
+If bootstrap is success, we start native networking, which means we have non-daemon threads; so we stay up.  In both tests reported in CASSANDRA-17085 they are impacted as they both fail bootstrap; so the new node shuts down were as before we stay up.
+
+I have a patch locally I am testing which fixes those two to stay non-daemon threads.
+
+This also highlights a huge difference between JVM-dtest and python-dtest; this type of issue would never be found in jvm-dtest as the test thread is still present; so the background daemon threads in the instance will stay up
+
+bq. what I am seeing is that CASSANDRA-16925 changed PERIODIC-COMMIT-LOG-SYNCER and COMMIT-LOG-ALLOCATOR to be daemon threads;
+
+Ah, nice find!  This makes sense.
+
+bq. This also highlights a huge difference between JVM-dtest and python-dtest; this type of issue would never be found in jvm-dtest
+
+Indeed. They may be slow and older but the python dtests are not for nothing.
+
+I am going to close this ticket as a dup of the other one.  There is also another super racy issue with commit log and InfiniteLoopExecutor that I will just pull in to that patch as well (rather than rewrite the interface 2 times... do it once)
+
+and of corse I am wrong... failed in CI for the patch in CASSANDRA-17085 (patch still needed to fix threads); new issue happened which was different than previous ones... zero-copy-streaming causes the disk failure policy to trigger on channel close...
+
+{code}
+ERROR [Stream-Deserializer-/127.0.0.1:7000-bcd266ec] 2021-11-02 21:49:39,859 DefaultFSErrorHandler.java:104 - Exiting forcefully due to file system exception on startup, disk failure policy "stop"
+org.apache.cassandra.io.FSWriteError: java.nio.channels.ClosedChannelException
+	at org.apache.cassandra.io.sstable.format.big.BigTableZeroCopyWriter.write(BigTableZeroCopyWriter.java:227)
+	at org.apache.cassandra.io.sstable.format.big.BigTableZeroCopyWriter.writeComponent(BigTableZeroCopyWriter.java:206)
+	at org.apache.cassandra.db.streaming.CassandraEntireSSTableStreamReader.read(CassandraEntireSSTableStreamReader.java:125)
+	at org.apache.cassandra.db.streaming.CassandraIncomingFile.read(CassandraIncomingFile.java:84)
+	at org.apache.cassandra.streaming.messages.IncomingStreamMessage$1.deserialize(IncomingStreamMessage.java:51)
+	at org.apache.cassandra.streaming.messages.IncomingStreamMessage$1.deserialize(IncomingStreamMessage.java:37)
+	at org.apache.cassandra.streaming.messages.StreamMessage.deserialize(StreamMessage.java:50)
+	at org.apache.cassandra.streaming.StreamDeserializingTask.run(StreamDeserializingTask.java:62)
+	at io.netty.util.concurrent.FastThreadLocalRunnable.run(FastThreadLocalRunnable.java:30)
+	at java.lang.Thread.run(Thread.java:748)
+Caused by: java.nio.channels.ClosedChannelException: null
+	at org.apache.cassandra.net.AsyncStreamingInputPlus.reBuffer(AsyncStreamingInputPlus.java:136)
+	at org.apache.cassandra.net.AsyncStreamingInputPlus.consume(AsyncStreamingInputPlus.java:155)
+	at org.apache.cassandra.io.sstable.format.big.BigTableZeroCopyWriter.write(BigTableZeroCopyWriter.java:217)
+	... 9 common frames omitted
+{code}
+
+org.apache.cassandra.streaming.StreamDeserializingTask tries to handle this case, but org.apache.cassandra.streaming.messages.IncomingStreamMessage$1.deserialize catches and calls inspect; which triggers the JVM to shutdown...
+
+I feel like this is a bug; trying to confirm we are expected to stay alive in this case and will try to include in CASSANDRA-17085; if this is the expected behavior... then can still fix the test like the pr was doing.
+
+I still can see this failing once in 100 runs in CI. And I guess that if we reduce the cores it will fail even more as David suggested. 
+
+I moved CASSANDRA-17076 to open. [~dcapwell] , do you think you can take a look at least to advise as it seems you have quite good understanding here? 
+
+I found the same error in the logs here - https://circle-production-customer-artifacts.s3.amazonaws.com/picard/5e6fbfe503a2a060e70c79ad/61f45ae19e5e0864f0559502-1-build/artifacts/dtest_logs/1643404262862_test_bootstrap_with_reset_bootstrap_state%5B1-4%5D/node3_debug.log?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20220130T221421Z&X-Amz-SignedHeaders=host&X-Amz-Expires=60&X-Amz-Credential=AKIAJR3Q6CR467H7Z55A%2F20220130%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Signature=d15fdd8b33e713dbce36b439d1fc17f80676817fc354b5c5186921065d01e592
+
+[~e.dimitrova] your link doesn't allow access; maybe try sharing the build rather than the logs?
+
+Took this offline, it seems this is the same issue from CASSANDRA-17116. Linking this one as duplicate
+

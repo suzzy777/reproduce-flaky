@@ -1,0 +1,1185 @@
+[~Paul.Rogers] Thanks for your work. Please let me know if you need an real distributed cluster to test these.
+
+[~luoc], thanks for the offer! Most of the scan stuff has been designed to be self-contained, and to be testable via unit tests. That said, there is one item were I could really use your cluster: the LIMIT push-down. My PR will fix how LIMIT is applied within a single fragment. In a many-fragment query, each scan might apply a limit of 10, say, but we also must include a LIMIT operator in the main fragment to limit the limited data. We might have 5 nodes all doing limit 10, and thus return 50 rows to the root, which must apply the final limit. We have to push the limit to all the scans, and do all of them, because it could be that each file has only 1 record, so even with 5 fragments, we still don't reach the limit.
+
+The risk of limit pushdown is that we may not be adding that final limit operator. Your cluster test can easily test if this is the case.
+
+paul-rogers opened a new pull request #2419:
+URL: https://github.com/apache/drill/pull/2419
+
+
+   # [DRILL-8085](https://issues.apache.org/jira/browse/DRILL-8085): EVF V2 support in the "Easy" format plugin
+   
+   ## Description
+   
+   Provides an easy integration between the "Easy" format plugin and the "EVF V2" structure, similar to what already exists for EVF V1. Revised the limit-push-down approach. Fixes the JSON writer to handle `TIMESTAMP` consistently with the reader (so certain tests pass on a non-UTC build machine.) Numerous other bits of cleanup.
+   
+   ## Design Overview
+   
+   Prior work added the "EVF" version 2 framework. Briefly, the original "extended vector framework" (EVF) started with the vector accessor layer to control vector sizes, then added the "result set loader" to provide an easy interface for readers to write to vectors using the accessors. This still left a large amount of plumbing to work out the "schema-on-read" set of columns to use. "EVF V1" fumbled its way to a solution, but the result was complex and limited. EVF V2 reworks the mechanism to cleanly support schema-on-read, a provided schema, an up-front schema defined by the data source, and the set of columns requested in the query. Figuring that out is amazingly complex (which should tell us something about the wisdom of Drill's current schema-on-read approach...)
+   
+   The EVF V1 work split the scan operation into layers, layers which are preserved in V2:
+   
+   * The Volcano operator (AKA the poorly-named "record batch"): `OperatorRecordBatch`
+   * The scan operator (`ScanOperatorExec`), which iterates over the readers within a scan, and issues "events" to a listener: `ScanOperatorEvents`.
+   * The scan and reader event listeners for EVF 2. (The old listeners, for EVF 1, also still exist.)
+   * The format-specific plugins and readers.
+   * The `ResultSetLoader`, `ColumnWriter` and `ValueVector` abstractions.
+   
+   The first two layers are meant to point the way to restructuring Drill's overly-complex record batches by dividing up responsibilities. So far, only the scan has been "modernized" this way.
+   
+   The gist of this change is to modify the `EasyFormatPlugin` to add a third way to build the readers. EVF V2 is simpler than V1, and far simpler than the "classic" do-it-all-yourself approach. A setting in the `EasyFormatConfig` class says which to use.
+   
+   ## Limit Pushdown
+   
+   [DRILL-7763](https://issues.apache.org/jira/browse/DRILL-7763) added `LIMIT` push-down to the file format readers. However, this work was limited in two ways:
+   
+   * The limit work was added to each reader by counting records in the read-each-record loop.
+   * The limit was not applied across multiple readers in the same scan. If the limit is 50, and the scan has two readers: R1 with 40 row, and R2 with 100, rows, then we want to limit R2 to 50-40 = 10 rows.
+   * The code used `maxRecords=0` to mean "no limit." However, `LIMIT 0` is commonly used by BI tools to obtain just a schema for a query. (Much work was done back in 2015 to enable this feature throughout Drill.)
+   
+   As it turns out, the `ResultSetLoader` already does most of this work to enforce its various batch size limits. The cross-reader work should be done in the scan framework. This PR adds this functionality so that the limit is passed from the plan into the EVF V2 mechanism, which automagically computes and enforces the per-reader limit. The `RowReader` will simply report "OK, stop reading, the batch is full" when the limit is reached. The scan framework detects that the batch was full because of the limit, and won't call your reader for another batch. `LIMIT 0` now works properly as well.
+   
+   As a result, to get full limit support, all a reader has to do is use EVF V2, and do nothing else. Readers that did roll-your-own limit support should rip out that code (that is, revert DRILL-7763). See the example  `HttpdLogFormatPlugin` (below) for what to do.
+   
+   As a side-effect, the JSON field for the limit changed names from `maxRecords` to `limit` so it is clear what it means.
+   
+   ## Examples
+   
+   This PR includes conversion of the "compliant text" (AKA "CSV") reader to use EVF V2. However, that reader is quite complex, and is not a good example for others to follow. So, this  PR also converted the `HttpdLogFormatPlugin` which is a much better example for others to follow.
+   
+   ## Next Steps
+   
+   Once this work is merged, I encourage the team to migrate the other plugins that use EVF V1 to use V2. The code will be simpler and you get `LIMIT` support for free. The readers will also automagically get support for a provided schema.
+   
+   Once all plugins are converted, the next step will be to rip out the EVF V1 code since it is so complex even I (as the author) have to take lots of time to understand it. Good riddance. "Build one to throw away" as Brooks said...
+   
+   ## Also includes
+   
+   * [DRILL-8100](https://issues.apache.org/jira/browse/DRILL-8100): JSON record writer does not convert Drill local timestamp to UTC.
+   * [DRILL-8086](https://issues.apache.org/jira/browse/DRILL-8086): Convert the CSV (AKA "compliant text") reader to EVF V2.
+   * [DRILL-8084](https://issues.apache.org/jira/browse/DRILL-8084): Scan LIMIT pushdown fails across files.
+   * Clean-up of several flaky tests.
+   
+   `TestHttpPlugin` chose port 8091 which collides with other software (in this case, Druid.) Ad-hoc uses should use higher numbers, so the port was changed to 44332. (It should ideally be randomly selected on server start.)
+   
+   ## `TIMESTAMP`
+   
+   I struggled with [DRILL-8101](https://issues.apache.org/jira/browse/DRILL-8101): Resolve the TIMESTAMP madness. Drill treats the `TIMESTAMP` type as both a `DATETIME` (no time zone) and a Unix-like timestamp (UTC time zone). The tests are playing whack-a-mole as these conflicting interpretations collide: some tests only work in the UTC time zone (but my machine is in the Pacific zone.)
+   
+   This PR fixes the JSON writer so it converts from Drill's local-time `TIMESTAMP` to UTC, to "undo" the UTC-to-local conversion on read. However, this just caused other tests to fail since Parquet assumes that `TIMESTAMP` is either UTC, or an unspecified timezone (so Parquet can assume UTC if it wants.) As a result certain CTAS tests with both Parquet and JSON fail unless they are run in UTC. Since the problem is too big to fix in this PR, I disabled those tests. (The PR contains some clean-up from my attempt to find and understand the problem.)
+   
+   ## Documentation
+   
+   No user-visible changes. 
+   
+   ## Testing
+   
+   Added unit tests for new functionality. Revised existing tests where needed, or where they were flaky on my machine.
+   
+
+
+-- 
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+To unsubscribe, e-mail: dev-unsubscribe@drill.apache.org
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+lgtm-com[bot] commented on pull request #2419:
+URL: https://github.com/apache/drill/pull/2419#issuecomment-1003840525
+
+
+   This pull request **introduces 3 alerts** and **fixes 1** when merging 9943990c0784ae62a647fe7c7468cd9ea7fedfc6 into ff1fc38e475892eefa812cddce4d2ae822335868 - [view on LGTM.com](https://lgtm.com/projects/g/apache/drill/rev/pr-8bcf16123279f1f9be4457092e0902d61a0decf2)
+   
+   **new alerts:**
+   
+   * 2 for Spurious Javadoc @param tags
+   * 1 for Result of multiplication cast to wider type
+   
+   **fixed alerts:**
+   
+   * 1 for Result of multiplication cast to wider type
+
+
+-- 
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+To unsubscribe, e-mail: dev-unsubscribe@drill.apache.org
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+lgtm-com[bot] commented on pull request #2419:
+URL: https://github.com/apache/drill/pull/2419#issuecomment-1004533251
+
+
+   This pull request **fixes 1 alert** when merging 661a16cc28339ba7e6fee47195301a77d030a583 into fa2cb0f4937c0d8e797a675d8d6c13c316e48d4c - [view on LGTM.com](https://lgtm.com/projects/g/apache/drill/rev/pr-5b136f7448b97826cf5f30a9248832ea4b7f2f3b)
+   
+   **fixed alerts:**
+   
+   * 1 for Result of multiplication cast to wider type
+
+
+-- 
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+To unsubscribe, e-mail: dev-unsubscribe@drill.apache.org
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+lgtm-com[bot] commented on pull request #2419:
+URL: https://github.com/apache/drill/pull/2419#issuecomment-1005369347
+
+
+   This pull request **fixes 1 alert** when merging 8bb05e22640e5eec2f2496e665402866a3fadb6b into fa2cb0f4937c0d8e797a675d8d6c13c316e48d4c - [view on LGTM.com](https://lgtm.com/projects/g/apache/drill/rev/pr-a11a55cb991c8f3078c0bb9b9c83d012fbd469ea)
+   
+   **fixed alerts:**
+   
+   * 1 for Result of multiplication cast to wider type
+
+
+-- 
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+To unsubscribe, e-mail: dev-unsubscribe@drill.apache.org
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+lgtm-com[bot] commented on pull request #2419:
+URL: https://github.com/apache/drill/pull/2419#issuecomment-1007883829
+
+
+   This pull request **fixes 1 alert** when merging fb7d8e44e25669a295cd7c1a2b024a1a7b68275d into 31b1274b6beddd191bee9c1d0ab2c827296b0353 - [view on LGTM.com](https://lgtm.com/projects/g/apache/drill/rev/pr-74703e26462c64592538b077868219ac05cfd9c4)
+   
+   **fixed alerts:**
+   
+   * 1 for Result of multiplication cast to wider type
+
+
+-- 
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+To unsubscribe, e-mail: dev-unsubscribe@drill.apache.org
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+lgtm-com[bot] commented on pull request #2419:
+URL: https://github.com/apache/drill/pull/2419#issuecomment-1007915690
+
+
+   This pull request **fixes 1 alert** when merging 5e022349e21dac8c6606e4226451c20c072c66f5 into 31b1274b6beddd191bee9c1d0ab2c827296b0353 - [view on LGTM.com](https://lgtm.com/projects/g/apache/drill/rev/pr-c9ae71403bf203254d33d196d3b51af3e44a16ee)
+   
+   **fixed alerts:**
+   
+   * 1 for Result of multiplication cast to wider type
+
+
+-- 
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+To unsubscribe, e-mail: dev-unsubscribe@drill.apache.org
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+lgtm-com[bot] commented on pull request #2419:
+URL: https://github.com/apache/drill/pull/2419#issuecomment-1007883829
+
+
+
+
+
+
+-- 
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+To unsubscribe, e-mail: dev-unsubscribe@drill.apache.org
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+paul-rogers commented on pull request #2419:
+URL: https://github.com/apache/drill/pull/2419#issuecomment-1008148926
+
+
+   @luocooong, @jnturton , finally got a clean build. (The recently-added plugins for Splunk and Casandra won't run on my machine, blocking me from the modules that can run. We really should fix that.) Anyway, all the tests pass so please have a look. There is quite a bit here: see the description for what the various bits do. Thanks! 
+
+
+-- 
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+To unsubscribe, e-mail: dev-unsubscribe@drill.apache.org
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+luocooong commented on pull request #2419:
+URL: https://github.com/apache/drill/pull/2419#issuecomment-1008308065
+
+
+   @paul-rogers Thank you for this great contribution, especially the key component: execution engine.
+   
+   In the meantime, we will see the latest version of EVF in service and be friendly to the developers.
+   
+   What would you say if we were to define the 10 highlights of the latest version of EVF?
+
+
+-- 
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+To unsubscribe, e-mail: dev-unsubscribe@drill.apache.org
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+paul-rogers commented on pull request #2419:
+URL: https://github.com/apache/drill/pull/2419#issuecomment-1008495754
+
+
+   @luocooong, the 10 highlights of the latest version? There actually are not that many. If we talk just about this PR, the key bits are:
+   
+   * Simple integration with the Easy Format plugin.
+   * Integrated limit-push-down support.
+   
+   If we talk about EVF V2 compared with EVF V1:
+   
+   * Simpler developer API.
+   * Full support for combining provided, table, and discovered schemas. (Provided is that given by the planner. Table is that which a reader can infer at open time, as for Parquet, CSV, JDBC, etc. Discovered is that which is found as the data is read, as in JDBC.)
+   * Full schema reconciliation support for all data types, including the complex ones such as nested maps and arrays.
+   
+   And if we talk about EVF itself vs. "classic" roll-your-own vector code:
+   
+   * Simple API to write to vectors.
+   * Control batch and individual vector sizes.
+   * Foundation for the `RowSet` family of testing tools.
+   * Highlighted the limitations of "schema on read" and "schema evolution."
+   * Extensible support for type conversion from "native" reader types to Drill types, and between Drill types.
+   
+   Finally, if we talk about the Grand Plan for World Domination, the column accessor and row set mechanisms allow:
+   
+   * Single interface to all data in Drill, allowing us to eventually consider evolving our storage layer.
+   
+   Now, why do we need all this? Partly because working with value vectors directly is tedious and error prone: it's like using assembly language. Partly because Drill, for better or worse, went crazy with the complex data types it supports: maps, arrays, arrays of maps that contain more arrays of more maps... That is, Drill has full JSON support. Getting that right, three levels down in nesting, when working directly with value vectors is near impossible. We've had years of bugs because it is so complex. The EVF and related mechanisms are intended to bring some sanity to the complex types. If we can't convince ourselves to get rid of them, then we have to make them actually work.
+   
+   That's all behind the scenes. Most community contributions these days occurs in storage and format plugins. For that, EVF just makes the developer's job easier by handling all the common boilerplate code.
+
+
+-- 
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+To unsubscribe, e-mail: dev-unsubscribe@drill.apache.org
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+luocooong commented on a change in pull request #2419:
+URL: https://github.com/apache/drill/pull/2419#discussion_r783195693
+
+
+
+##########
+File path: contrib/format-httpd/src/main/java/org/apache/drill/exec/store/httpd/HttpdLogFormatPlugin.java
+##########
+@@ -40,18 +40,16 @@
+   private static class HttpLogReaderFactory extends FileReaderFactory {
+ 
+     private final HttpdLogFormatConfig config;
+-    private final int maxRecords;
+     private final EasySubScan scan;
+ 
+-    private HttpLogReaderFactory(HttpdLogFormatConfig config, int maxRecords, EasySubScan scan) {
++    private HttpLogReaderFactory(HttpdLogFormatConfig config, EasySubScan scan) {
+       this.config = config;
+-      this.maxRecords = maxRecords;
+       this.scan = scan;
+     }
+ 
+     @Override
+-    public ManagedReader<? extends FileScanFramework.FileSchemaNegotiator> newReader() {
+-      return new HttpdLogBatchReader(config, maxRecords, scan);
++    public ManagedReader newReader(FileSchemaNegotiator negotiator) throws EarlyEofException {
+
+Review comment:
+       For the `EarlyEofException`, I could have two questions :
+   1. What happens if the specified constructor does not throw this error?
+   2. How will the new framework handle this error?
+
+##########
+File path: contrib/format-httpd/src/main/java/org/apache/drill/exec/store/httpd/HttpdLogBatchReader.java
+##########
+@@ -40,36 +41,29 @@
+ import java.io.InputStream;
+ import java.io.InputStreamReader;
+ 
+-public class HttpdLogBatchReader implements ManagedReader<FileSchemaNegotiator> {
++public class HttpdLogBatchReader implements ManagedReader {
+ 
+   private static final Logger logger = LoggerFactory.getLogger(HttpdLogBatchReader.class);
+   public static final String RAW_LINE_COL_NAME = "_raw";
+   public static final String MATCHED_COL_NAME = "_matched";
+   private final HttpdLogFormatConfig formatConfig;
+-  private final int maxRecords;
+-  private final EasySubScan scan;
+-  private HttpdParser parser;
+-  private FileSplit split;
++  private final HttpdParser parser;
++  private final FileDescrip file;
+   private InputStream fsStream;
+-  private RowSetLoader rowWriter;
++  private final RowSetLoader rowWriter;
+   private BufferedReader reader;
+   private int lineNumber;
+-  private CustomErrorContext errorContext;
+-  private ScalarWriter rawLineWriter;
+-  private ScalarWriter matchedWriter;
++  private final CustomErrorContext errorContext;
++  private final ScalarWriter rawLineWriter;
++  private final ScalarWriter matchedWriter;
+   private int errorCount;
+ 
+-
+-  public HttpdLogBatchReader(HttpdLogFormatConfig formatConfig, int maxRecords, EasySubScan scan) {
++  public HttpdLogBatchReader(HttpdLogFormatConfig formatConfig, EasySubScan scan, FileSchemaNegotiator negotiator) {
+     this.formatConfig = formatConfig;
+-    this.maxRecords = maxRecords;
+-    this.scan = scan;
+-  }
+ 
+-  @Override
+-  public boolean open(FileSchemaNegotiator negotiator) {
+
+Review comment:
+       We combined the open() and the constructor to simplify the initialization work, and are able to define more and more final scope variables. In the meantime, we no longer need to consider whether to return true or false in the open(). Are there any other advantages for that?
+
+##########
+File path: contrib/format-httpd/src/main/java/org/apache/drill/exec/store/httpd/HttpdLogFormatPlugin.java
+##########
+@@ -75,24 +73,15 @@ private static EasyFormatConfig easyConfig(Configuration fsConf, HttpdLogFormatC
+         .fsConf(fsConf)
+         .defaultName(DEFAULT_NAME)
+         .readerOperatorType(OPERATOR_TYPE)
+-        .useEnhancedScan(true)
++        .scanVersion(ScanFrameworkVersion.EVF_V2)
+         .supportsLimitPushdown(true)
+         .build();
+   }
+ 
+   @Override
+-  public ManagedReader<? extends FileSchemaNegotiator> newBatchReader(
+-    EasySubScan scan, OptionManager options) {
+-    return new HttpdLogBatchReader(formatConfig, scan.getMaxRecords(), scan);
+-  }
+-
+-  @Override
+-  protected FileScanFramework.FileScanBuilder frameworkBuilder(OptionManager options, EasySubScan scan) {
+
+Review comment:
+       How do we continue to pass the `options` in the *PluginFormat?
+   In other words, new batch reader does not require the OptionManager?
+
+
+
+
+-- 
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+To unsubscribe, e-mail: dev-unsubscribe@drill.apache.org
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+paul-rogers commented on a change in pull request #2419:
+URL: https://github.com/apache/drill/pull/2419#discussion_r786323997
+
+
+
+##########
+File path: contrib/format-httpd/src/main/java/org/apache/drill/exec/store/httpd/HttpdLogFormatPlugin.java
+##########
+@@ -40,18 +40,16 @@
+   private static class HttpLogReaderFactory extends FileReaderFactory {
+ 
+     private final HttpdLogFormatConfig config;
+-    private final int maxRecords;
+     private final EasySubScan scan;
+ 
+-    private HttpLogReaderFactory(HttpdLogFormatConfig config, int maxRecords, EasySubScan scan) {
++    private HttpLogReaderFactory(HttpdLogFormatConfig config, EasySubScan scan) {
+       this.config = config;
+-      this.maxRecords = maxRecords;
+       this.scan = scan;
+     }
+ 
+     @Override
+-    public ManagedReader<? extends FileScanFramework.FileSchemaNegotiator> newReader() {
+-      return new HttpdLogBatchReader(config, maxRecords, scan);
++    public ManagedReader newReader(FileSchemaNegotiator negotiator) throws EarlyEofException {
+
+Review comment:
+       To see this in action, take a look at `TestScanBasics.testEOFOnFirstOpen()`. If the exception is thrown, the scan framework skips this reader and moves to the next. This exception reports that "Hey, I have no data and no schema; please ignore me." Doesn't happen very often, but this is a safety-valve when it does happen.
+   
+   Suppose that the file (or result set) is empty an the constructor does not throw an error. In that case, the scan framework calls `next()` which gathers no rows, and returns `false`, which indicates EOF. If there is no schema also, then this case is the same as if the `EarlyEofException` was thrown.
+   
+   On the other hand, for or things that can provide a schema, even without rows, then the first `next()` can build that schema, so we can return that downstream, even if there are no rows.
+   
+   With all of that, we can handle the various use cases:
+   
+   * Reader that has no data at all, and can't even get its act together enough to service a `next()` call: throw `EarlyEofException` from the constructor, and the reader is skipped. Example: a CSV file that existed at plan time, but is now gone.
+   * Reader that has no data, but can provide a fixed schema. The constructor builds the schema and returns. The first call to `next()` returns `false`, with no data.
+   * Reader that has no data, and can provide a schema without it, but only by retrieving results from somewhere else, such as a JDBC connection that can return a schema even if there are no rows. The constructor does nothing with schema. The first `read()` builds the schema, but provides no rows. That `next()` returns `false` so we send the schema, but no data, downstream.
+   * Normal case: the reader either has a fixed schema in the constructor, or discovers the schema on the first `next()`, and also reads data until EOF, loading the data into batches, one per `next()` call.
+   
+   Sorry this is so complex! But, this is is all essential to fully support all the many crazy readers and the "schema-on-read, but only sometimes" world in which Drill operates.
+
+##########
+File path: contrib/format-httpd/src/main/java/org/apache/drill/exec/store/httpd/HttpdLogBatchReader.java
+##########
+@@ -40,36 +41,29 @@
+ import java.io.InputStream;
+ import java.io.InputStreamReader;
+ 
+-public class HttpdLogBatchReader implements ManagedReader<FileSchemaNegotiator> {
++public class HttpdLogBatchReader implements ManagedReader {
+ 
+   private static final Logger logger = LoggerFactory.getLogger(HttpdLogBatchReader.class);
+   public static final String RAW_LINE_COL_NAME = "_raw";
+   public static final String MATCHED_COL_NAME = "_matched";
+   private final HttpdLogFormatConfig formatConfig;
+-  private final int maxRecords;
+-  private final EasySubScan scan;
+-  private HttpdParser parser;
+-  private FileSplit split;
++  private final HttpdParser parser;
++  private final FileDescrip file;
+   private InputStream fsStream;
+-  private RowSetLoader rowWriter;
++  private final RowSetLoader rowWriter;
+   private BufferedReader reader;
+   private int lineNumber;
+-  private CustomErrorContext errorContext;
+-  private ScalarWriter rawLineWriter;
+-  private ScalarWriter matchedWriter;
++  private final CustomErrorContext errorContext;
++  private final ScalarWriter rawLineWriter;
++  private final ScalarWriter matchedWriter;
+   private int errorCount;
+ 
+-
+-  public HttpdLogBatchReader(HttpdLogFormatConfig formatConfig, int maxRecords, EasySubScan scan) {
++  public HttpdLogBatchReader(HttpdLogFormatConfig formatConfig, EasySubScan scan, FileSchemaNegotiator negotiator) {
+     this.formatConfig = formatConfig;
+-    this.maxRecords = maxRecords;
+-    this.scan = scan;
+-  }
+ 
+-  @Override
+-  public boolean open(FileSchemaNegotiator negotiator) {
+
+Review comment:
+       There is a more fundamental consideration. Drill is distributed: we want to hold resources as short a time as possible. In the previous design, developers had to understand to not open files or obtain resources in the constructor. They had to remember to do that in `open()`. A side effect is that many variables where thus non-final.
+   
+   Now, the readers follow the Java `Stream`, `Reader` and `Writer` convention: the constructor opens any external files, connections or other resources. `close()` releases them. The framework ensures that these operations span the shortest possible amount of time.
+   
+   For background, in the pre-EVF (so-called "scan V1") code, it was common for people to open files in the constructor, but we'd create all the readers up front: so we'd have lots of open files, lots of unused buffers, etc. Now, the developer simply can't do things wrong: the constructor is called as late as possible, and it is the only place available to obtain resources. The scan calls `close()` as early as possible (and on an error) so resources can't leak or sit idle.
+   
+   Again, sorry the scan is so complex. At least, with EVF, all the logic is in one place rather than copy-pasted across all readers (where it was often done wrongly) as in "scan V1."
+
+##########
+File path: contrib/format-httpd/src/main/java/org/apache/drill/exec/store/httpd/HttpdLogFormatPlugin.java
+##########
+@@ -75,24 +73,15 @@ private static EasyFormatConfig easyConfig(Configuration fsConf, HttpdLogFormatC
+         .fsConf(fsConf)
+         .defaultName(DEFAULT_NAME)
+         .readerOperatorType(OPERATOR_TYPE)
+-        .useEnhancedScan(true)
++        .scanVersion(ScanFrameworkVersion.EVF_V2)
+         .supportsLimitPushdown(true)
+         .build();
+   }
+ 
+   @Override
+-  public ManagedReader<? extends FileSchemaNegotiator> newBatchReader(
+-    EasySubScan scan, OptionManager options) {
+-    return new HttpdLogBatchReader(formatConfig, scan.getMaxRecords(), scan);
+-  }
+-
+-  @Override
+-  protected FileScanFramework.FileScanBuilder frameworkBuilder(OptionManager options, EasySubScan scan) {
+
+Review comment:
+       Good question. As it turns out, this is done in the base mechanism. We get here (actually, there, in the other column, in the new code) from the `EasyFormatPlugin`:
+   
+   ```java
+     private CloseableRecordBatch buildScanV3(FragmentContext context,
+         EasySubScan scan) throws ExecutionSetupException {
+       EasyFileScanBuilder builder = new EasyFileScanBuilder(context, scan, this);
+       configureScan(builder, scan);
+       return builder.buildScanOperator(context, scan);
+     }
+   ```
+   
+   The base framework, in `EasyFileScanBuilder`, passes the options and a bunch of other general state into the builder so that we don't have redundant code in each reader. The reader only does the bits unique to that reader.
+   
+   Note, the `OptionsManager` should be used only by code that updates options. Code that reads options, such as operators, should use `OptionSet` instead, which is what the new EVF V3 code uses.
+
+
+
+
+-- 
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+To unsubscribe, e-mail: dev-unsubscribe@drill.apache.org
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+luocooong commented on a change in pull request #2419:
+URL: https://github.com/apache/drill/pull/2419#discussion_r790121506
+
+
+
+##########
+File path: contrib/format-httpd/src/main/java/org/apache/drill/exec/store/httpd/HttpdLogFormatPlugin.java
+##########
+@@ -40,18 +40,16 @@
+   private static class HttpLogReaderFactory extends FileReaderFactory {
+ 
+     private final HttpdLogFormatConfig config;
+-    private final int maxRecords;
+     private final EasySubScan scan;
+ 
+-    private HttpLogReaderFactory(HttpdLogFormatConfig config, int maxRecords, EasySubScan scan) {
++    private HttpLogReaderFactory(HttpdLogFormatConfig config, EasySubScan scan) {
+       this.config = config;
+-      this.maxRecords = maxRecords;
+       this.scan = scan;
+     }
+ 
+     @Override
+-    public ManagedReader<? extends FileScanFramework.FileSchemaNegotiator> newReader() {
+-      return new HttpdLogBatchReader(config, maxRecords, scan);
++    public ManagedReader newReader(FileSchemaNegotiator negotiator) throws EarlyEofException {
+
+Review comment:
+       This design is very safety, thank you.
+
+
+
+
+-- 
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+To unsubscribe, e-mail: dev-unsubscribe@drill.apache.org
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+luocooong commented on a change in pull request #2419:
+URL: https://github.com/apache/drill/pull/2419#discussion_r790131253
+
+
+
+##########
+File path: exec/java-exec/src/main/java/org/apache/drill/exec/physical/impl/scan/convert/WriterBuilder.java
+##########
+@@ -0,0 +1,230 @@
++/*
+
+Review comment:
+       I have not found a function to refer to this builder. To avoid developers forgetting this good helper, is it possible to give a sample for use (in unit test?)?
+
+##########
+File path: exec/java-exec/src/main/java/org/apache/drill/exec/physical/impl/scan/project/ReaderSchemaOrchestrator.java
+##########
+@@ -68,10 +71,11 @@ public void setBatchSize(int size) {
+ 
+   @VisibleForTesting
+   public ResultSetLoader makeTableLoader(TupleMetadata readerSchema) {
+-    return makeTableLoader(scanOrchestrator.scanProj.context(), readerSchema);
++    return makeTableLoader(scanOrchestrator.scanProj.context(), readerSchema, -1);
+   }
+ 
+-  public ResultSetLoader makeTableLoader(CustomErrorContext errorContext, TupleMetadata readerSchema) {
++  public ResultSetLoader makeTableLoader(CustomErrorContext errorContext,
++      TupleMetadata readerSchema, long localLimit) {
+
+Review comment:
+       Sorry for the question, how to understand the variable name : localLimit?
+   If need 50 rows (for two bacth), and A batch has only 40 rows, so detect the B batch only need to fetch (50 - 40 =) 10 rows, then 10 rows is the localLimit?
+
+##########
+File path: exec/java-exec/src/main/java/org/apache/drill/exec/physical/impl/scan/ScanOperatorExec.java
+##########
+@@ -32,6 +32,24 @@
+  * Implementation of the revised scan operator that uses a mutator aware of
+  * batch sizes. This is the successor to {@link ScanBatch} and should be used
+  * by all new scan implementations.
++ * <p>
++ * The basic concept is to split the scan operator into layers:
++ * <ul>
++ * <li>The {@code OperatorRecordBatch} which implements Drill's Volcano-like
++ * protocol.</li>
++ * <li>The scan operator "wrapper" (this class) which implements actions for the
++ * operator record batch specifically for scan. It iterates over readers,
++ * delegating semantic work to other classes.</li>
++ * <li>The implementation of per-reader semantics in the two EVF versions and
++ * other ad-hoc implementations.</li>
++ * <li>The result set loader and related classes which pack values into
++ * value vectors.</li>
++ * <li>Value vectors, which store the data.</li>
++ * </ul>
++ * <p>
++ * The layered format can be confusing. However, each layer is somewhat
++ * complex, so dividing the work into layers keeps the overall complexity
++ * somewhat under control.
+
+Review comment:
+       @paul-rogers Thank you for updating these descriptions.
+   If there is an opportunity to publish a new books ("Learning Apache Drill, 2nd"), we can record these in the book. As I understand, for newcomers, perhaps they are concerned about how to use the new easy framework to develop new connectors, for experienced developers, they want to focus more on the internal of scan workflow.
+   Is it possible to record the tutorial and internal mechanisms (scan workflow) of the new framework (based on V2) in the current wiki library? I can provide a copy of Chinese languages.
+
+
+
+
+-- 
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+To unsubscribe, e-mail: dev-unsubscribe@drill.apache.org
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+jnturton commented on pull request #2419:
+URL: https://github.com/apache/drill/pull/2419#issuecomment-1022299941
+
+
+   Hi @paul-rogers, the timestamp handling changes raise some concerns ([see my comments on DRILL-8100](https://issues.apache.org/jira/browse/DRILL-8100)).  I want to move them all out to their own pull request so that they don't further delay the merger of EVF v2.  I'm happy to help out with this piece if you don't have bandwidth at the moment?
+   
+   P.S. when a PR naturally subdivides into multiple disjoint areas, please endeavour to send finer grained commits aligned to those areas to give us the opportunity to use Git to easily cherry pick a subset of the PR, should that be wanted for whatever reason.
+
+
+-- 
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+To unsubscribe, e-mail: dev-unsubscribe@drill.apache.org
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+paul-rogers commented on pull request #2419:
+URL: https://github.com/apache/drill/pull/2419#issuecomment-1023912890
+
+
+   @jnturton, happy to split up the PR. Let me see what can be done. A key reason this one has "unrelated" stuff is that those fixes were needed to get a clean build. So, maybe I can make those fixes in one PR and move this one to a draft until the preliminaries are merged, then rebase and do this one. Over the weekend I'll see what can be done. 
+
+
+-- 
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+To unsubscribe, e-mail: dev-unsubscribe@drill.apache.org
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+jnturton commented on pull request #2419:
+URL: https://github.com/apache/drill/pull/2419#issuecomment-1023990781
+
+
+   > @jnturton A key reason this one has "unrelated" stuff is that those fixes were needed to get a clean build. So, maybe I can make those fixes in one PR and move this one to a draft until the preliminaries are merged, then rebase and do this one. Over the weekend I'll see what can be done.
+   
+   Thank you @paul-rogers.  The timestamp changes aren't needed for a clean build _here in the GitHub CI_, even if that's only because it happens on UTC machines.  So I think that they are not really a prerequisite for merging EVF v2.  Additionally, in my tests the timestamp changes introduce a new bug (exhibited on the Jira issue).
+   
+   So in my opinion the opposite merge ordering is preferable once they're split out.  First we should merge EVF v2, which looks great and not deserving of being sent back to draft, _then_ we can relook our zoneless timestamps and possible short and long term fixes.  Obviously we do want the build and all tests to start working on non-UTC machines, but that is not EVF v2's cross to bear?
+
+
+-- 
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+To unsubscribe, e-mail: dev-unsubscribe@drill.apache.org
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+paul-rogers commented on a change in pull request #2419:
+URL: https://github.com/apache/drill/pull/2419#discussion_r795379597
+
+
+
+##########
+File path: exec/java-exec/src/main/java/org/apache/drill/exec/physical/impl/scan/ScanOperatorExec.java
+##########
+@@ -32,6 +32,24 @@
+  * Implementation of the revised scan operator that uses a mutator aware of
+  * batch sizes. This is the successor to {@link ScanBatch} and should be used
+  * by all new scan implementations.
++ * <p>
++ * The basic concept is to split the scan operator into layers:
++ * <ul>
++ * <li>The {@code OperatorRecordBatch} which implements Drill's Volcano-like
++ * protocol.</li>
++ * <li>The scan operator "wrapper" (this class) which implements actions for the
++ * operator record batch specifically for scan. It iterates over readers,
++ * delegating semantic work to other classes.</li>
++ * <li>The implementation of per-reader semantics in the two EVF versions and
++ * other ad-hoc implementations.</li>
++ * <li>The result set loader and related classes which pack values into
++ * value vectors.</li>
++ * <li>Value vectors, which store the data.</li>
++ * </ul>
++ * <p>
++ * The layered format can be confusing. However, each layer is somewhat
++ * complex, so dividing the work into layers keeps the overall complexity
++ * somewhat under control.
+
+Review comment:
+       @luocooong, good suggestion. I think that there is material that covers creating a plugin using the old-style low-level vector approach. I think there may be material for how to use EVF. I'll see if I can find that material and either update it for EVF V2, or at last write up differences from those earlier versions.
+
+##########
+File path: exec/java-exec/src/main/java/org/apache/drill/exec/physical/impl/scan/project/ReaderSchemaOrchestrator.java
+##########
+@@ -68,10 +71,11 @@ public void setBatchSize(int size) {
+ 
+   @VisibleForTesting
+   public ResultSetLoader makeTableLoader(TupleMetadata readerSchema) {
+-    return makeTableLoader(scanOrchestrator.scanProj.context(), readerSchema);
++    return makeTableLoader(scanOrchestrator.scanProj.context(), readerSchema, -1);
+   }
+ 
+-  public ResultSetLoader makeTableLoader(CustomErrorContext errorContext, TupleMetadata readerSchema) {
++  public ResultSetLoader makeTableLoader(CustomErrorContext errorContext,
++      TupleMetadata readerSchema, long localLimit) {
+
+Review comment:
+       Good question. Let's start at the top. The user specifies a query limit, say, `LIMIT 50000`. Drill is distributed, so the limit must be pushed to each of the scan operators. Let's say there are 2, each running in a different thread. I hope the Calcite planner pushes the full limit to each, so each scan gets a limit of 50,000. (Reason: we can't know ahead of time if either scan can produce that many rows, so we have to pass the full amount in case the other scan produces no rows.)
+   
+   I just realized one other issue: the limit can be pushed into the scan only if there is no `WHERE` clause in the query. It is actually rather unusual to *not* have a `WHERE` clause, so this whole limit-pushdown feature targets a rather simple, and unusual use case.
+   
+   Any, assume we bet past the above issues, and we pass that 50K limit down into the scan. That is the "global limit" for the scan. (Or, maybe a better term term is "scan limit" since the limit is not global to all scans, just this one.)
+   
+   Now, every scan can process any number of readers. Let's say this scan has 3 readers. Each reader has its own "local limit". Let's see how that works. The first reader gets the full limit of 50K rows. Let's say the reader actually returns 10K rows. In that case, the second reader gets a local limit of 40K rows. And so on.
+   
+   Once the local limit goes to zero, we skip any remaining readers: they can't give us any new rows, so no need to even start those readers.
+   
+   So, this function accepts the per-reader ("local") scan limit
+
+##########
+File path: exec/java-exec/src/main/java/org/apache/drill/exec/physical/impl/scan/convert/WriterBuilder.java
+##########
+@@ -0,0 +1,230 @@
++/*
+
+Review comment:
+       Well, that is odd. Maybe this is an earlier draft of something that ended up somewhere else? I'll have to hunt down the answer. I'll do that when I update this PR after doing the smaller PRs that James requested.
+
+
+
+
+-- 
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+To unsubscribe, e-mail: dev-unsubscribe@drill.apache.org
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+luocooong commented on a change in pull request #2419:
+URL: https://github.com/apache/drill/pull/2419#discussion_r795557310
+
+
+
+##########
+File path: exec/java-exec/src/main/java/org/apache/drill/exec/physical/impl/scan/ScanOperatorExec.java
+##########
+@@ -32,6 +32,24 @@
+  * Implementation of the revised scan operator that uses a mutator aware of
+  * batch sizes. This is the successor to {@link ScanBatch} and should be used
+  * by all new scan implementations.
++ * <p>
++ * The basic concept is to split the scan operator into layers:
++ * <ul>
++ * <li>The {@code OperatorRecordBatch} which implements Drill's Volcano-like
++ * protocol.</li>
++ * <li>The scan operator "wrapper" (this class) which implements actions for the
++ * operator record batch specifically for scan. It iterates over readers,
++ * delegating semantic work to other classes.</li>
++ * <li>The implementation of per-reader semantics in the two EVF versions and
++ * other ad-hoc implementations.</li>
++ * <li>The result set loader and related classes which pack values into
++ * value vectors.</li>
++ * <li>Value vectors, which store the data.</li>
++ * </ul>
++ * <p>
++ * The layered format can be confusing. However, each layer is somewhat
++ * complex, so dividing the work into layers keeps the overall complexity
++ * somewhat under control.
+
+Review comment:
+       Thank you.
+
+
+
+
+-- 
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+To unsubscribe, e-mail: dev-unsubscribe@drill.apache.org
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+luocooong commented on a change in pull request #2419:
+URL: https://github.com/apache/drill/pull/2419#discussion_r795558592
+
+
+
+##########
+File path: exec/java-exec/src/main/java/org/apache/drill/exec/physical/impl/scan/project/ReaderSchemaOrchestrator.java
+##########
+@@ -68,10 +71,11 @@ public void setBatchSize(int size) {
+ 
+   @VisibleForTesting
+   public ResultSetLoader makeTableLoader(TupleMetadata readerSchema) {
+-    return makeTableLoader(scanOrchestrator.scanProj.context(), readerSchema);
++    return makeTableLoader(scanOrchestrator.scanProj.context(), readerSchema, -1);
+   }
+ 
+-  public ResultSetLoader makeTableLoader(CustomErrorContext errorContext, TupleMetadata readerSchema) {
++  public ResultSetLoader makeTableLoader(CustomErrorContext errorContext,
++      TupleMetadata readerSchema, long localLimit) {
+
+Review comment:
+       Got it.
+
+
+
+
+-- 
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+To unsubscribe, e-mail: dev-unsubscribe@drill.apache.org
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+paul-rogers commented on pull request #2419:
+URL: https://github.com/apache/drill/pull/2419#issuecomment-1029713312
+
+
+   @jnturton, thanks for the quick reviews & merge of yesterdays' PRs. I think that's the fastest turnaround I've ever seen in Drill!
+   
+   This PR has been stripped down to just the EVF V2 integration: all other fixes and updated plugins were removed. Everything should work as before with EVF V1.
+
+
+-- 
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+To unsubscribe, e-mail: dev-unsubscribe@drill.apache.org
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+paul-rogers commented on pull request #2419:
+URL: https://github.com/apache/drill/pull/2419#issuecomment-1030128132
+
+
+   Build is failing due to a test I'd disabled in a prior draft of this branch. The test has nothing to do with EVF 2, it is a test of the value vectors itself:
+   
+   ```text
+   Crashed tests:
+   Error:  org.apache.drill.exec.record.vector.TestValueVector
+   ```
+
+
+-- 
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+To unsubscribe, e-mail: dev-unsubscribe@drill.apache.org
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+cgivre commented on pull request #2419:
+URL: https://github.com/apache/drill/pull/2419#issuecomment-1030830633
+
+
+   > 
+   
+   @paul-rogers I re-ran the tests and everything passed.  
+
+
+-- 
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+To unsubscribe, e-mail: dev-unsubscribe@drill.apache.org
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+jnturton commented on a change in pull request #2419:
+URL: https://github.com/apache/drill/pull/2419#discussion_r789682495
+
+
+
+##########
+File path: exec/java-exec/src/main/codegen/templates/ParquetOutputRecordWriter.java
+##########
+@@ -142,94 +142,110 @@ public void writeField() throws IOException {
+         minor.class == "Decimal9" ||
+         minor.class == "UInt4">
+     <#if mode.prefix == "Repeated" >
+-            reader.read(i, holder);
+-            consumer.addInteger(holder.value);
++        reader.read(i, holder);
++        consumer.addInteger(holder.value);
+     <#else>
+-    consumer.startField(fieldName, fieldId);
+-    reader.read(holder);
+-    consumer.addInteger(holder.value);
+-    consumer.endField(fieldName, fieldId);
++        consumer.startField(fieldName, fieldId);
++        reader.read(holder);
++        consumer.addInteger(holder.value);
++        consumer.endField(fieldName, fieldId);
+     </#if>
+   <#elseif
+         minor.class == "Float4">
+       <#if mode.prefix == "Repeated" >
+-              reader.read(i, holder);
+-              consumer.addFloat(holder.value);
++        reader.read(i, holder);
++        consumer.addFloat(holder.value);
+       <#else>
+-    consumer.startField(fieldName, fieldId);
+-    reader.read(holder);
+-    consumer.addFloat(holder.value);
+-    consumer.endField(fieldName, fieldId);
++        consumer.startField(fieldName, fieldId);
++        reader.read(holder);
++        consumer.addFloat(holder.value);
++        consumer.endField(fieldName, fieldId);
+       </#if>
+   <#elseif
+         minor.class == "BigInt" ||
+         minor.class == "Decimal18" ||
+-        minor.class == "TimeStamp" ||
+         minor.class == "UInt8">
+       <#if mode.prefix == "Repeated" >
+-              reader.read(i, holder);
+-              consumer.addLong(holder.value);
++        reader.read(i, holder);
++        consumer.addLong(holder.value);
+       <#else>
+-    consumer.startField(fieldName, fieldId);
+-    reader.read(holder);
+-    consumer.addLong(holder.value);
+-    consumer.endField(fieldName, fieldId);
++        consumer.startField(fieldName, fieldId);
++        reader.read(holder);
++        consumer.addLong(holder.value);
++        consumer.endField(fieldName, fieldId);
+       </#if>
++  <#elseif minor.class == "TimeStamp" >
++    <#if mode.prefix == "Repeated" >
++        reader.read(i, holder);
++        // Write Drill timestamp directly: writes local time to Parquet's UTC type.
++        // This is a bug: see DRILL-8099.
++        // The commented-out line is the correct way to do this. However, doing
++        // the correct way breaks other Drill code as explained in DRILL-8099.
+
+Review comment:
+       Okay so this case is yet to be fixed (in another PR).
+
+##########
+File path: contrib/storage-jdbc/src/test/java/org/apache/drill/exec/store/jdbc/TestJdbcPluginWithH2IT.java
+##########
+@@ -100,6 +101,9 @@ public void testCrossSourceMultiFragmentJoin() throws Exception {
+   }
+ 
+   @Test
++  // See Drill-8101: The timestamp type is broken: this test only works
++  // in UTC.
++  @Ignore("Only works in the UTC timezone")
+
+Review comment:
+       While this shrinks the unit test coverage of our CI build, TIMESTAMP is a well documented priority so I'm not worried that we will not return to these tests.
+
+##########
+File path: exec/java-exec/src/main/java/org/apache/drill/exec/physical/impl/scan/RowBatchReader.java
+##########
+@@ -81,31 +81,28 @@
+  * from any method. A {@link UserException} is preferred to provide
+  * detailed information about the source of the problem.
+  */
+-
+ public interface RowBatchReader {
+ 
+   /**
+    * Name used when reporting errors. Can simply be the class name.
+    *
+    * @return display name for errors
+    */
+-
+   String name();
+ 
+   /**
+    * Setup the record reader. Called just before the first call
+-   * to <tt>next()</tt>. Allocate resources here, not in the constructor.
++   * to {@code next()}. Allocate resources here, not in the constructor.
+
+Review comment:
+       @paul-rogers is this commentary still correct?  In the HTTP log format batch reader above, the new pattern is resource allocation in the constructor and not in `open()`...
+
+##########
+File path: exec/java-exec/src/main/java/org/apache/drill/exec/physical/impl/scan/v3/lifecycle/OutputBatchBuilder.java
+##########
+@@ -277,11 +279,18 @@ protected void defineSourceBatchMapping(TupleMetadata schema, int source) {
+   @SuppressWarnings("unchecked")
+   private void physicalProjection() {
+     outputContainer.removeAll();
++    mapVectors.clear();
+     for (int i = 0; i < outputSchema.size(); i++) {
+-      ValueVector outputVector;
+       ColumnMetadata outputCol = outputSchema.metadata(i);
++      ValueVector outputVector;
+       if (outputCol.isMap()) {
+         outputVector = buildTopMap(outputCol, (List<VectorSource>) vectorSources[i]);
++
++        // Map vectors are a nuisance: they carry their own value could which
+
+Review comment:
+       ```suggestion
+           // Map vectors are a nuisance: they carry their own value which
+   ```
+
+##########
+File path: contrib/storage-jdbc/src/test/java/org/apache/drill/exec/store/jdbc/TestJdbcWriterWithH2.java
+##########
+@@ -61,7 +60,7 @@
+   public static void init() throws Exception {
+     startCluster(ClusterFixture.builder(dirTestWatcher));
+     // Force timezone to UTC for these tests.
+
+Review comment:
+       Well that's one way to do it 😆.
+
+##########
+File path: exec/java-exec/src/main/java/org/apache/drill/exec/physical/impl/scan/v3/lifecycle/ReaderLifecycle.java
+##########
+@@ -226,10 +240,16 @@ public boolean next() {
+     // a new batch just to learn about EOF. Don't read if the reader
+     // already reported EOF. In that case, we're just processing any last
+     // lookahead row in the result set loader.
++    //
++    // If the scan has hit is pushed-down limit, then the reader might
+
+Review comment:
+       ```suggestion
+       // If the scan has hit its pushed-down limit, then the reader might
+   ```
+
+
+
+
+-- 
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+To unsubscribe, e-mail: dev-unsubscribe@drill.apache.org
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+jnturton merged pull request #2419:
+URL: https://github.com/apache/drill/pull/2419
+
+
+   
+
+
+-- 
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+To unsubscribe, e-mail: dev-unsubscribe@drill.apache.org
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+

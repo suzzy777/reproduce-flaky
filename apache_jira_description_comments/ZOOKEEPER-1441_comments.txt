@@ -1,0 +1,89 @@
+We don't see this very often, typically if one of the tests fails it may not cleanup, then the subsequent tests (using the same jvm) will see this. I've also seen this in Jenkins environment where multiple slots are being used on a host (and either ZK itself or some other component which uses zk is being tested simultaneously)
+
+Looks like this is showing up again repeatedly with Java11 when multiple test threads are used:
+
+https://builds.apache.org/view/S-Z/view/ZooKeeper/job/ZooKeeper-trunk-java11/
+
+Jenkins job has:
+> test.junit.threads=4
+
+
+PortAssignment itself could also be more flaky under Java 11 because it can't guarantee atomicity between the time of allocation of a port and the time of actually binding the port inside a ZK server. I remember [~lvfangmin] mentioned that in FB they improved PortAssignment by using random ports rather than sequential port, which might help here. Alternatively we could also let ZK server to atomically allocate and bind a port inside it and then return the binded port number to caller, for testing purpose, rather than having to pass a port in, which will fix the root cause of the issue.
+
+"it can't guarantee atomicity between the time of allocation of a port and the time of actually binding the port inside a ZK server"
+
+How is that possible? If all tests are using PortAssigment (which I believe is the case), they should get different numbers, because PortAssigment maintains that. I never actually got why PortAssigment tries to bind the port before returns, because technically other test should not get the same number. Though there could be other processes running on the same server which binds that port, so it does make sense actually.
+
+PortAssignment itself is fine and if everyone is using it, they should not get conflicts because PortAssignment is the single source of truth of port allocation. However, the problem here is not every processes running on test machine using PortAssignment, despite most, if not all of ZK unit tests do use it. So if there are heavy workloads running on the test machine while ZK unit tests were running, potential port conflicts would occur.
+
+>> I never actually got why PortAssigment tries to bind the port before returns
+
+What PortAssignment implemented is a "reserve and release" pattern for port allocation, and this is better than "choose a port but not reserver" approach, because it is very unlikely the OS, regardless of how it allocates actual ports to the processes, will yield two consecutive port for two socket bind calls. Thus, by creating the socket via bind, and the immediately close it, we buy us sometime during which OS will not reuse this same socket for a successive socket call. This time however varies, thus there could be race conditions that by the time we actually going to bind this port again, it's already grabbed by another process. For ZK server, it requires an unbinded port number pass to it (otherwise it can't bind the port), but due to the same race condition it's possible when the server tries to bind, the port was taken already. The only way to guarantee atomicity in this case is to have ZK server asking a port from OS and bind immediately.
+
+
+I see in the most recent failures:
+https://builds.apache.org/view/S-Z/view/ZooKeeper/job/ZooKeeper-trunk-java11/155/testReport/junit/org.apache.zookeeper.test/FollowerResyncConcurrencyTest/testResyncByDiffAfterFollowerCrashes/
+
+The following sequence (extracted from the larger log):
+{noformat}
+2018-11-09 23:33:57,175 [myid:] - INFO  [main:PortAssignment@85] - Assigned port 27380 from range 27379 - 32764.
+2018-11-09 23:33:57,221 [myid:] - INFO  [main:QuorumUtil@116] - Creating QuorumPeer 1; public port 27380
+2018-11-09 23:33:57,287 [myid:] - INFO  [main:NIOServerCnxnFactory@683] - binding to port /127.0.0.1:27380
+... some successful work....
+2018-11-09 23:33:57,339 [myid:] - INFO  [main:QuorumUtil@250] - Shutting down quorum peer QuorumPeer
+2018-11-09 23:33:57,343 [myid:] - INFO  [main:QuorumUtil@259] - Waiting for QuorumPeer to exit thread
+...
+2018-11-09 23:34:12,366 [myid:] - INFO  [main:QuorumUtil@203] - Creating QuorumPeer 1; public port 27380
+2018-11-09 23:34:12,366 [myid:] - INFO  [main:ServerCnxnFactory@161] - Using org.apache.zookeeper.server.NIOServerCnxnFactory as server connection factory
+2018-11-09 23:34:12,367 [myid:] - INFO  [main:NIOServerCnxnFactory@670] - Configuring NIO connection handler with 10s sessionless connection timeout, 2 selector thread(s), 32 worker threads, and 64 kB direct buffers.
+2018-11-09 23:34:12,368 [myid:] - INFO  [main:NIOServerCnxnFactory@683] - binding to port /127.0.0.1:27380
+2018-11-09 23:34:12,369 [myid:] - INFO  [main:JUnit4ZKTestRunner$LoggedInvokeMethod@98] - TEST METHOD FAILED testResyncByTxnlogThenDiffAfterFollowerCrashes
+java.net.BindException: Address already in use
+{noformat}
+
+I updated that job to not use parallel test threads and the issue still happens:
+https://builds.apache.org/view/S-Z/view/ZooKeeper/job/ZooKeeper-trunk-java11/156/testReport/junit/org.apache.zookeeper.server/ZxidRolloverTest/testRolloverThenLeaderRestart/
+so it's not related to "test.junit.threads=1"
+
+It seems like it may be a real issue with some change in java11 semantics around sockets? 
+
+Has anything else been updated that could be related? java10 with the same code seems fine.
+
+
+It looks like that tests which use QuorumUtil to create quorum are failing, so my guess is that it's not related to PortAssigment.
+QuorumUtil works as follows:
+1) Creates QuorumPeer objects and starts them (bind port)
+2) Calls startAll() -> call shutdownAll() -> calls shutdown() on each QP -> creates new QPs -> starts each QP (bind port)
+
+Bind fails at NIOServerCnxnFactory:684 - ss.socket().bind(...)
+NIOServerCnxnFactory shutdown() method might not close the socket properly by calling ss.close() at line 875.
+
+That worked with previous Java versions.
+
+Sounds to be related:
+https://www.oracle.com/technetwork/java/javase/11-relnote-issues-5012449.html#JDK-8198562
+
+
+I might have found the issue:
+
+QuorumUtil creates QuorumPeers in its constructor, but doesn't actually start them resulting it creates NIOServerCnxnFactory, but doesn't start its threads. It could be a bug in the factory that in the constructor of Accept/Select threads it opens and registers selectors on the socket, but if the thread is not running, closeSelector() method will not be called.
+
+This is exactly what QuorumUtil is doing in tests: creates QuorumPeers without starting them and in startAll() (which is always the call after the constructor) shuts down them all and create new ones and starting them. In Java 11 we have to properly close (unregister) selectors in order to properly close the socket.
+
+I'm working on a patch to fix this.
+
+Issue resolved by pull request 700
+[https://github.com/apache/zookeeper/pull/700]
+
+SUCCESS: Integrated in Jenkins build Zookeeper-trunk-single-thread #119 (See [https://builds.apache.org/job/Zookeeper-trunk-single-thread/119/])
+ZOOKEEPER-1441: JAVA 11 - Some test cases are failing because Port bind (andor: rev c3babb94275ad667dc71c10dcb08a383a3c154c2)
+* (add) zookeeper-server/src/test/java/org/apache/zookeeper/server/NIOServerCnxnFactoryTest.java
+* (edit) zookeeper-server/src/main/java/org/apache/zookeeper/server/NIOServerCnxnFactory.java
+
+
+SUCCESS: Integrated in Jenkins build ZooKeeper-trunk #280 (See [https://builds.apache.org/job/ZooKeeper-trunk/280/])
+ZOOKEEPER-1441: JAVA 11 - Some test cases are failing because Port bind (andor: rev c3babb94275ad667dc71c10dcb08a383a3c154c2)
+* (edit) zookeeper-server/src/main/java/org/apache/zookeeper/server/NIOServerCnxnFactory.java
+* (add) zookeeper-server/src/test/java/org/apache/zookeeper/server/NIOServerCnxnFactoryTest.java
+
+

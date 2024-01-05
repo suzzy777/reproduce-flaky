@@ -1,0 +1,90 @@
+Our unit tests, those that use byteman, depend on the byteman agent's default listening port on the internal server the test prepares and uses.
+
+This is another example of where out unit tests don't support parallelism (parallel JVMs).
+
+I can see two different paths forward here.
+
+1) Admit defeat that our different 'test' targets are not parallel JVM friendly, and remove everything related to 'testparallel' and 'test.runners' from the  build.xml. This would solve a number of problems: distributed in-jvm tests, conf files, and byteman agent. 
+
+2) Fix the issues one-by-one, the best we can…
+
+For (1), the performance issue is of concern: running tests one at a time on ci-cassandra agents that have 4 cores and 16gb ram available to each executor is a waste of resources and time. Going from one test.runner to two on these agents, doubled the performance. If we were to remove test parallelism from the build.xml (like [this patch|https://github.com/apache/cassandra/compare/trunk...thelastpickle:mck/16587-2/trunk]) it could be replaced with parallelism at the docker level, example patch [here|https://github.com/apache/cassandra-builds/compare/trunk...thelastpickle:mck/16587-2/trunk].
+
+
+
+For (2) the following patch, which isn't absolutely completely reliable does shows a lot of promise (see CI), makes byteman tests wait until the byteman port becomes available before running the test…
+- https://github.com/apache/cassandra/compare/trunk...thelastpickle:mck/16587/trunk
+
+CI [!https://ci-cassandra.apache.org/job/Cassandra-devbranch/616/badge/icon!|https://ci-cassandra.apache.org/blue/organizations/jenkins/Cassandra-devbranch/detail/Cassandra-devbranch/616/pipeline]
+
+If you override {{BMUnitRunner}} to incorporate that waiting behaviour by default, then on build.xml grep and warn for uses of {{BMUnitRunner}} instead of the new {{MicksBMUnitRunner}} on tests, you are going to prevent this problem popping up and getting fixed over and over again in the future for new uses of {{BMUnitRunner}}. wdyt?
+
+bq. …override BMUnitRunner to incorporate that waiting behaviour by default…
+
+Yeah, this would make sense. Though I think the problem is more than just the byteman agent port. For example CASSANDRA-16569 
+
+I am also leaning towards using junit's {{ExternalResource}}, and doing something like…
+{code}
+@ClassRule
+public static BytemanAgentDefaultPort globalFolder = new BytemanAgentDefaultPort();
+{code}
+(This approach could go further and reserve the port for us, via tmp file locking, making it reliable.)
+
+bq. …build.xml grep and warn for uses of BMUnitRunner…
+
+This could also be done with {{`file contains "@RunWith(BMUnitRunner.class)" and not "BytemanAgentDefaultPort"`}}.
+Do we do such types of checks anywhere already??
+
+First, we want to make a decision about (1) vs (2). It sounds like you are in favour of (2)? I suspect once we start to introduce {{@ClassRule}} is won't take long for us to fix the issues… but that said, waiting on and reserving fixed ports undermines the test.parallel performance gains, and it is kinda odd we're doing this when docker is readily available on the servers we want to be performance savvy. (Currently the biggest overhead with the docker approach is it [build|https://github.com/apache/cassandra-builds/blob/trunk/build-scripts/cassandra-test.sh#L77] on a clean container overhead.)
+
+Yes I favor 2.
+
+And yes, despite I can't still repro CASSANDRA-16569 even with the latest tips, it looks indeed the same problem. The solution would then be a Rule that reserves N ports for you, you use those in your test and they get released when finished.
+
+Sorry I didn't get your reference to docker. The clean/build overhead couldn't be solved with an upfront clean/build and then cp-ing that into the docker container? Apologies I don't have a clear picture of how machines, dockers, jvms, parallel runs, etc sit.
+
+Actually let me try the Rule thing...
+
+Sthg like [this|https://github.com/apache/cassandra/pull/955/commits/e165a89e868a3d8753217b854f75f0b0fba39ef0] is what you were thinking?
+
+Been thinking a bit more...
+
+For the byteman problem we could use a server socket in some weird port number rather than a file as the file may/usually survives jvm and other crashes. I would expect the server socket to die if the jvm goes down on the other hand iirc. That would make it deterministic indeed as you point out.
+
+But for other tests having a deterministic behavior is not easy imo. We can't detect if some other test not using the rule is changing or using shared ips under our feet. The problem here is that if 'fails silently' and these can be hellish flakies.
+
+I think changing (or finding available) port numbers is outside the scope of this ticket. Regarding file locking, I was thinking of process temporary files. Like [this|https://github.com/apache/cassandra/compare/trunk...thelastpickle:mck/16587-3/trunk] (untested!)
+
+I was referring to using a server socket as a replacement of the file for the locking semantics. Not proposing we find available ports for the test and moving onto those, sorry if I was not clear. I will propose a full solution tomorrow with the ant grep etc that should be worth merging even as if just a POC to hopefully put us on track to solve both tickets.
+
+I feel like we may need a larger conversation about 1) vs 2) approaches and perhaps this ticket is not the right venue for that.
+
+bq. I feel like we may need a larger conversation about 1) vs 2) approaches and perhaps this ticket is not the right venue for that.
+
+Let me start something on dev@
+
+bq. Let me start something on dev@
+
+done: https://lists.apache.org/thread.html/r1ca3c72b90fa6c57c1cb7dcd02a44221dcca991fe7392abd8c29fe95%40%3Cdev.cassandra.apache.org%3E
+
+[~mck] how is docker an option for parallel runs if we're already running splits under docker containers, what am I missing?
+
+{noformat}
+./cassandra-builds/build-scripts/cassandra-test-docker.sh apache trunk https://github.com/apache/cassandra-builds.git trunk apache/cassandra-testing-ubuntu2004-java11 test 6/8
+{noformat}
+
+bq. how is docker an option for parallel runs if we're already running splits under docker containers, what am I missing?
+
+"Splits" are at the Jenkins level: a matrix axes in the matrixJob; where each split runs on one executor on any jenkins agent.
+Each Jenkins agent is ~16 logical cores and 32gm ram, and have two executor slots assigned.
+
+Each split runs the command as configured in the job, i.e. the {{cassandra-test-docker.sh}} as you write above, which today is one docker container.
+
+So while jvm dtests and python dtests will run and effectively use half of an agents capacity (docker containers are bound to 15g ram today), the other test runs are only using the executor's capacity (within one docker container) via test.runners.
+
+This [patch|https://github.com/apache/cassandra-builds/compare/trunk...thelastpickle:mck/16587-2/trunk] changes that so the test (for one split) run kicks off three containers, each limited to 5g ram. This kinda makes sense as a single test.runner uses/relies-on about one third resources as a jvm or python dtest.
+
+
+
+Ok Mick helped me clear the understanding on how parallel are laid out and docker is indeed a better option so we can drop the {{Rule}} approach imo as well.
+

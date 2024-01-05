@@ -1,0 +1,393 @@
+While implementing the task i rely on the following 
+
+1)When entry is updated, both 'invoke update' and get\put\remove metrics can be updated.
+2)When entry processor is invoked, but cache entry isn't affected, then invoke metric isn't incremented.
+3)'invoke update' metrics incremented only when cache entry value is changed(or removed) by entry processor(not just when entry processor is invoked).
+4)If entry processor process(...) is called once, and multiple entries(perhaps on different nodes) are affected, then local invoke metric is incremented only once, cluster global metric is incremented once, local metrics on other nodes are zero.
+5)Read-only 'invoke' metric is incremented if processor invoke operation is called without executing entry.setValue(...) (even calling entry.getValue() can be omit), processor can return non-null value.Also, cache might be empty while processor invocation.
+6)'invoke removal' metric is incremented only if old cache value exists and removal succeedes.
+If there was no old value, associated with a key, then 'invoke read-only' metric is incremented.
+7)The following metrics are going to be added : total number of invokes, number of invoke updates, number of invoke removals, number of read-only invokes, min\max\avg number of invocations(all invocations).
+
+Do you think its correct?
+
+[~Alexey Kuznetsov], here are my comments.
+
+1. Makes sense.
+2. Metrics for total number of invocations should be incremented.
+3. Correct.
+4. This sounds like a weird case, how do you update multiple entries with one entry processor invocation?
+5. Correct. And this does not depend on what entry processor returns.
+6. How does regular 'remove' metric behaves in this case? I think similar 'invoke' metric should be consistent with that one.
+7. Can you draft the API and present it here?
+
+[~vkulichenko] Thanks for answers. I still have several questions :
+
+2.Assume, we invoked processor(read-only, not value is changed) on primary node, on transactional cache. Right after that expiry policy got expired(ttl equals CU.TTL_ZERO) and entry is removed. So 'invoke read-only' metric isn't incremented. Should we increment 'total number of invocations' metric in this case? I think no(moreover, no 'invoke*' metrics should be incremented)
+
+4.For instance.If we update one key, in replicated atomic cache, entry processor is invoked only once, on primary node. And then invocation result is transfered by atomic update requests between backups(entry processor isn't transfered). 
+So, may be we should increment only primary node's 'invoke *' metric ? While leaving backup's metrics zero.
+
+6.In ATOMIC caches regular 'remove' metric isn't incremented if cache is empty. Whereas TRANSACTIONAL cache's 'remove' metric is incremented!
+I think we should not increment it in this case, and should not increment 'invoke delete' metric if cache is empty. And file a bug on TRANSACTIONAL cache 'removal' metric calculation. 
+
+7. The following metrics going to be added into CacheMetrics :
+
+{code:java}
+    /**
+     * The total number of cache invocations, caused update.
+     *
+     * @return The number of invocation updates.
+     */
+    public long getCacheInvokeUpdates();
+
+    /**
+     * The total number of cache invocations, caused removal.
+     *
+     * @return The number of invocation removals.
+     */
+    public long getCacheInvokeRemovals();
+
+    /**
+     * The total number of cache invocations, caused no updates.
+     *
+     * @return The number of read-only invocations.
+     */
+    public long getCacheReadOnlyInvokes();
+
+    /**
+     * The total number of cache invocations.
+     *
+     * @return The number of cache invocations.
+     */
+    public long getCacheInvokes();
+
+    /**
+     * The mean time to execute cache invokes.
+     *
+     * @return The time in µs.
+     */
+    public long getAverageCacheInvokesTime();
+
+    /**
+     * So far, the minimum time to execute cache invokes.
+     *
+     * @return The time in µs.
+     */
+    public long getMinCacheInvokesTime();
+
+    /**
+     * So far, the maximum time to execute cache invokes.
+     *
+     * @return The time in µs.
+     */
+    public long getMaxCacheInvokesTime();
+{code}
+
+8.In partitioned cache with backup nodes. 
+* If we perform read-only invoke operation, then 'read-only' metric on primary node is incremented, while on other nodes its zero.
+* If we perform update\remove invoke operation, then 'update'\'remove' metric on primary and backup nodes is incremented, while on others its zero.
+It is correct?
+
+
+
+2. Why not? Entry processor is atomic and expiration happens *after*, even if TTL is zero. I don't see a reason why invoke metrics should not change.
+4. This should be consistent with other operations. Do we increment metrics for 'put' on backup node? If yes, let's do the same for invoke.
+6. Again, behavior should be consistent for all operations and across all nodes.
+8. And once again, it should be consistent with other operations :) Invoke is a regular cache operation; the only difference is that it can do both read and update/remove in one go. Let's not overcomplicate this.
+
+As for the API, how about this?
+
+{code}
+public long getEntryProcessorInvocations();
+public long getEntryProcessorReadOnlyInvocations();
+public long getEntryProcessorHits();
+public long getEntryProcessorMisses();
+public long getEntryProcessorHitPercentage();
+public long getEntryProcessorMissPercentage();
+public long getEntryProcessorPuts();
+public long getEntryProcessorRemovals();
+public long getMinEntryProcessorInvocationTime();
+public long getAverageEntryProcessorInvocationTime();
+public long getMaxEntryProcessorInvocationTime();
+public long getMinEntryProcessorReadOnlyInvocationTime();
+public long getAverageEntryProcessorReadOnlyInvocationTime();
+public long getMaxEntryProcessorReadOnlyInvocationTime();
+{code}
+
+[~vkulichenko] Ok, Im going to rework API.
+And make 'invoke' metrics be calculated the similar way as corresponding regular cache operations(invoke remove metrics equals regular removes metrics, and so on.)
+There will be problems with implementing "getAverageEntryProcessorReadOnlyInvocationTime();" metric, because we don't know whether invoke is read-only or not on initiating node(node, initiated invoke operation, and waiting for invoke response from cluster)
+
+9)Assume we have 3 operations in EntryProcessor.invoke() :
+{code:java}
+                cache0.invoke(i, new CacheEntryProcessor<Integer, Integer, Object>() {
+                    @Override public Object process(MutableEntry<Integer, Integer> entry,
+                        Object... arguments) throws EntryProcessorException {
+                        entry.getValue();
+
+                        entry.setValue(1);
+
+                        entry.remove();
+                        return null;
+                    }
+                });
+{code}
+Effective result of invoking is empty removal.
+So, *only* 'invoke removal' metric will be incremented, am I right ?
+
+10) In *empty* ATOMIC PARTITIONED cache.
+      We are calling cache.remove(someKey), and *regular* 'remove' metric *is incremented* on primary node A.
+      If we invoke processor, which do entry.remove() , than *regular* 'remove' metric is *not incremented* on primary node A.
+So, in this case 'invoke remove' metric should be incremented on node A, am I right ?
+
+If its true, than incrementing 'invoke remove' metric would be very non-trivial task.
+
+How do we calculate times for other operations, on server or on client? If the latter, then I think we can just remove `ReadOnly` times. If on server, you should be able to easily calculate this though.
+
+9. This is a very weird case, so I don't think it really matters. But since this EP removes entry at the end, let's count it as removal.
+
+10. In my view, it's a missed read and then removal. What exactly is non-trivial here?
+
+[~vkulichenko] 
+_"How do we calculate times for other operations"_
+times calculated the same way, by the same method on both client and server.How it works : we start invoke by sending certain request to primary node and waiting for response.When response is received we must calculate time, but response message contains no information about whether it was 'read-only' or 'update' operation. As a result we cannot decide whether we should increment 'read-only' or 'update' metric.
+
+Solution can be add flag to message. So, should we add new flag to message?
+
+
+
+_"What exactly is non-trivial here?"_
+Update is done after receiving update request message.When we got GridDhtAtomicSingleUpdateRequest on backup node, it contains no entry processor, no info about whether it is invoke or regular update operation. So we don't know whether it is transformation op or not.
+
+So, should we add some flag into message GridDhtAtomicSingleUpdateRequest  indicating entryProcessor calculated value ?(there is no other way to implement it)
+
+
+
+11) getEntryProcessorHits() - Hit number - number of total entry processor invocations happened on keys exsisting in cache. While Mises number - number of invocations on keys not existing in cache. Am i right ?
+
+[~vkulichenko]
+_"8. And once again, it should be consistent with other operations  Invoke is a regular cache operation; the only difference is that it can do both read and update/remove in one go. Let's not overcomplicate this."_
+Imagine, we perform regular get operation.The value would be extracted from near cache on the same node.As a result 'get' metric would be incremented on *local node*.
+
+Now, consider performing invoke:
+{code:java}
+                cache0.invoke(i, new CacheEntryProcessor<Integer, Integer, Object>() {
+                    @Override public Object process(MutableEntry<Integer, Integer> entry,
+                        Object... arguments) throws EntryProcessorException {
+                        entry.getValue();
+
+                        return null;
+                    }
+                });
+{code}
+It would be executed on *primary node*(a-priory), and 'read-only invoke' metric must be incremented on *primary node* *only*(not on local node!).Do you agree ?
+
+If so, how could they be consistent with each other? 
+
+
+[~Alexey Kuznetsov], when {{IgniteCache#put}} is called on a client, on which nodes do we update the metrics? Only client? Only primary? Primary and backups? All participating nodes including client and affinity nodes?
+
+[~vkulichenko] Only primary and backups.
+
+I have 2 questions left, could you please answer them: 
+
+
+11) getEntryProcessorHits() - Hit number - number of total entry processor invocations happened on keys exsisting in cache. While Mises number - number of invocations on keys not existing in cache. Am i right ?
+
+
+12) Don't you mind if i create a separate ticket(current ticket sub-task) for the following metrics(motivation below) ?
+{code:java}
+getMinEntryProcessorReadOnlyInvocationTime();
+getAverageEntryProcessorReadOnlyInvocationTime();
+getMaxEntryProcessorReadOnlyInvocationTime();
+{code}
+
+_Motivation :_ too much new complicated code needed.
+
+_How time calculations work_ : we start invoke by sending certain request to primary node and waiting for response.When response is received we must calculate time.
+
+_Problem, faced when implementing 'read-only invoke time' metrics:_ response message contains no information about whether it was 'read-only' or 'update'\'remove' operation. As a result we cannot decide whether we should increment 'read-only' or 'update'\'remove' metric.
+
+_Solution to problem:_ alter message, add field indicating transform operation was performed.
+
+[~vkulichenko] ticket is ready for review
+
+[~Alexey Kuznetsov], I tried to apply the pull request, but there are conflicts with master. Can you please check and resolve them?
+
+[~Alexey Kuznetsov], do you have any update here? Would be great if you do the proper merge, I will then review your change. Thanks!
+
+[~vkulichenko] , hi !
+
+Sorry, for delay. I have resolved conflicts, and rerun [tests|https://ci.ignite.apache.org/viewLog.html?buildId=1110794&tab=buildResultsDiv&buildTypeId=IgniteTests24Java8_RunAll]
+
+Please, review the ticket.
+
+ 
+
+[~Alexey Kuznetsov], I'm sorry for delays from my side, but looks like there are conflicts with master again. Can you please take a look?
+
+[~vkulichenko] Hi!
+
+I updated PR on 26th of February 2018. There were no conflicts since then.
+Are you looking at correct PR ? This is the  [correct link to PR|https://github.com/apache/ignite/pull/3148]
+Also links in ticket header were updated more than a week ago.
+
+[~vkulichenko] Are you planning to review this ticket some day?
+
+[~dpavlov] Hi!
+
+ 
+
+Could you review this important ticket, or suggest somebody who would not mind review it? 
+
+ 
+
+PS, I added test for metrics in atomic mode GridCacheNearAtomicMetricsSelfTest, this test reveled `read` (not invoke-metric) metric bug. See `GridCacheNearAtomicMetricsSelfTest.testNearRead`
+
+Should I create a separate ticket for this bug ?  
+
+Seems [~vkulichenko] has started this review. I suggest to keep Val as reviewer.
+
+[TC run|https://ci.ignite.apache.org/viewLog.html?buildId=1159375&tab=buildResultsDiv&buildTypeId=IgniteTests24Java8_RunAll]
+
+There are several failed tests :
+GridCacheNearAtomicMetricsSelfTest#testNearRead - as I said above, test failed due to bug in `read` metric. Seems, new ticket should be created.
+GridVersionSelfTest#testVersions, DynamicColumnsConcurrentTransactionalReplicatedSelfTest#testOperationChaining - cannot reproduce locally, and I think my changes must not affect this test.
+
+Other tests are flacky, and seems my changes doesn't affect them.
+
+
+[~Alexey Kuznetsov], please see TC results:
+
+  Cache [3] [ tests 1 ]  
+    No fail rate info, probably new failure 
+IgniteBinaryObjectsCacheTestSuite3: GridCacheNearAtomicMetricsSelfTest.testNearRead 
+
+why do you think it should be fixed separately. Please see https://cwiki.apache.org/confluence/display/IGNITE/How+to+Contribute - it requires by default tests are passed.
+
+GridVersionSelfTest#testVersions - is known flaky. testOperationChaining  was failed before. Retriggered both builds for PR.
+
+
+[~dpavlov] `read` metric bug fix is nontrivial and doesn't relate to this task.
+I propose to create another new ticket and write fail("IGNITE-XYZ") in GridCacheNearAtomicMetricsSelfTest.testNearRead.
+
+[~dpavlov]
+Looks like bug not related to the issue.
+In that case it's ok to create new issue, add test with fail(https:/...) and mute it on merge.
+
+[~Alexey Kuznetsov]
+please don't forget to link issues and set muted label.
+
+[~avinogradov], why this test became failing while was passed?
+
+Please see https://cwiki.apache.org/confluence/display/IGNITE/How+to+Contribute - it requires by default tests are passed.
+
+[~avinogradov], please also consider following solution - fixing this test before issue merge. WDYT?
+
+[~dpavlov]
+Once again. It's ok to write test for one task and find it fails because of another issue. 
+In that case we have to create initially failing test + issue + mute TC. 
+So, you'll gain no failing issues after this.
+
+That's not ok to mix fixes since found is not trivial 
+
+[~Alexey Kuznetsov]
+Is found issue really not trivial?
+
+
+[~dpavlov]
+Found issue can be fixed simultaneously with this fix or later 
+But we have to have another issue for that
+
+[~avinogradov], to be sure if it is related or not, issue needs to be deeply investigated.
+
+Deep investigation usually brings fix as result.
+
+So I prefer simultaneously. 
+
+Number of tickets we will have is not significiant, so you can create 2 if it seems more reasonable to you.
+
+[~Alexey Kuznetsov]
+Let's try to fix as a part of this issue.
+
+[~avinogradov] found issue needs additional investigation. Ok, I will try to fix it
+
+In reply to
+Dmitriy Pavlov GridCacheNearAtomicMetricsSelfTest.testNearRead fails because of not related issue : atomic remove() operation doesn't remove entry from near cache. As a consequence, 'read' metric test fails.
+So the problem isn't with metrics.
+
+So, it seems it is really separate issue. I'm ok with merge and mute added test with separate ticket.
+See also http://apache-ignite-developers.2346864.n4.nabble.com/Near-cache-entry-removal-td28698.html
+
+
+testNearPut test performs put into near cache, after calling afterTest(), near entry still exists as a result, testNearRead fails.
+
+[~vkulichenko] The ticket is ready for review
+
+Rerun failed tests:
+https://ci.ignite.apache.org/viewLog.html?buildId=1163304&tab=buildResultsDiv&buildTypeId=IgniteTests24Java8_IgniteQueries2
+As I said, there are flacky and don't relate to my ticket .
+
+[~dpavlov] Hi!
+
+may be we should choose another reviewer for this ticket?
+
+[~Alexey Kuznetsov] I still would like to wait Val response.
+
+I don't know any expert, which is not loaded with reviews currently.
+
+[~dpavlov] He was asked several times in dev-list, in jira. There is no chance Val would response.
+
+[~Alexey Kuznetsov] let me remind you about open TC fix issue https://issues.apache.org/jira/browse/IGNITE-8161
+
+IMO it is good practice to fix previous issues before merge of new.
+
+[~dpavlov] Ok, I will fix it first. Thanks for reminder.
+
+[~Alexey Kuznetsov], sorry for big delays. I looked at the code, here are some comments:
+* There are conflicts again, please resolve them so that we can do the merge.
+* Please rename {{getAverageEntryProcessorInvocationTime}} to {{getEntryProcessorAverageInvocationTime}}. Same goes for {{max}} and {{min}}. All entry processor related metrics should start with {{getEntryProcessor...}}.
+* What is {{DHT_ATOMIC_TRANSFORM_OP_FLAG_MASK}} and why is it introduced?
+
+[~dpavlov], I'm overall OK with the change, but would be good if someone more experienced in cache internals does the review. There are modifications in cache messages and other deep internals, I'm not completely sure we are not breaking anything.
+
+[~vkulichenko] Thanks for review.
+
+> What is DHT_ATOMIC_TRANSFORM_OP_FLAG_MASK and why is it introduced?
+
+This flag indicates value was updated by EP(entry processor), so EP metrics could be updated on backup nodes.
+
+When value is changed we don't know whether it was changed by EP or not.
+Look at example, illustrating it : _GridCacheNearMetricsSelfTest#testCreateReadRemoveInvokesFromPrimary_.
+In this test single value is changed by EP in _setValue1ByEntryProcessor_. 
+At first step key is updated on node0, then it must be propagated to backup node by _GridDhtAtomicSingleUpdateRequest_  message. When backup node receives this message, we don't know whether update was a result of EP invocation or not, so we cannot increment EP metrics correctly on backup node.
+
+PS, we cannot put EP into GridDhtAtomicSingleUpdateRequest#entryProcessor.
+
+This flag do change message, but I don't thing it brake something.
+
+[~Alexey Kuznetsov], I've looked at your patch, changes looks good to me.
+
+[~vkulichenko] [~dpavlov] I rerun tests and attached results, all failed tests are flaky. We can proceed review
+
+[~DmitriyGovorukhin], could you please take a look?
+
+Feel free to involve me into (re)running tests and check its result, run additional plugin(s) tests if necessary.
+
+[~DmitriyGovorukhin] Hi. Are you going to review the task ?
+
+[~Alexey Kuznetsov] I am working on the review, try to leave comments in the near future if they will.
+
+[~DmitriyGovorukhin] Hi!
+
+Have you got any questions yet?
+
+[~Alexey Kuznetsov] Changes looks good for me. I guess we should check performance benchmarks before a merge. Please, fetch the last master changes.
+
+I've linked issue to dev list thread.
+
+Merged to master.
+
+[~Alexey Kuznetsov] thank you for contribution.
+

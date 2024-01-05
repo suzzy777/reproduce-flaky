@@ -1,0 +1,81 @@
+New failures in test_scanners.TestParquet.test_zero_rows() and test_scanners.TestParquet.test_corrupt_rle_counts(). Since a bunch of these involve test_scanners.py, IMPALA-6709 comes to mind: [https://github.com/apache/impala/commit/e27954a5aa585db23fe3c97726aa89305efa306d#diff-c0076d575312e4fb9c8d8fad0191224e]
+
+This changed how we load files for several of these tests. It may have unforeseen s3 implications.
+
+ 
+
+Separately, Amazon has this blurb in their s3 introduction about consistency:
+{noformat}
+Amazon S3 provides read-after-write consistency for PUTS of new objects in your S3 bucket in all regions with one caveat. The caveat is that if you make a HEAD or GET request to the key name (to find if the object exists) before creating the object, Amazon S3 provides eventual consistency for read-after-write.{noformat}
+If I understand this correctly, whenever we check for the existence of a file, that puts us into the eventual consistency case when we write it. If the file doesn't exist and we do a direct put, it is consistent. In quite a few of our tests, we know the file won't already exist and we don't care about checking for existence. Based on the s3 output, we are definitely checking for existence before writing the file (in this case, renaming to that location, which is a copy):
+{noformat}
+18/11/18 05:42:51 DEBUG s3a.S3AFileSystem: Getting path status for s3a://impala-test-uswest2-1/test-warehouse/test_corrupt_rle_counts_44c21800.db/bad_rle_repeat_count.parquet  (test-warehouse/test_corrupt_rle_counts_44c21800.db/bad_rle_repeat_count.parquet)
+18/11/18 05:42:51 DEBUG s3a.S3AStorageStatistics: object_metadata_requests += 1  ->  12
+18/11/18 05:42:51 DEBUG s3a.S3AStorageStatistics: object_metadata_requests += 1  ->  13
+18/11/18 05:42:51 DEBUG s3a.S3AStorageStatistics: object_list_requests += 1  ->  6
+18/11/18 05:42:52 DEBUG s3a.S3AFileSystem: Not Found: s3a://impala-test-uswest2-1/test-warehouse/test_corrupt_rle_counts_44c21800.db/bad_rle_repeat_count.parquet
+18/11/18 05:42:52 DEBUG s3a.S3AFileSystem: rename: destination path s3a://impala-test-uswest2-1/test-warehouse/test_corrupt_rle_counts_44c21800.db/bad_rle_repeat_count.parquet not found
+...
+18/11/18 05:42:52 DEBUG s3a.S3AFileSystem: rename: renaming file s3a://impala-test-uswest2-1/test-warehouse/test_corrupt_rle_counts_44c21800.db/bad_rle_repeat_count.parquet._COPYING_ to s3a://impala-test-uswest2-1/test-warehouse/test_corrupt_rle_counts_44c21800.db/bad_rle_repeat_count.parquet
+18/11/18 05:42:52 DEBUG s3a.S3AFileSystem: copyFile test-warehouse/test_corrupt_rle_counts_44c21800.db/bad_rle_repeat_count.parquet._COPYING_ -> test-warehouse/test_corrupt_rle_counts_44c21800.db/bad_rle_repeat_count.parquet {noformat}
+Impala's LOAD DATA statement checks for existence in [FileSystemUtil::relocateAllVisibleFiles()|https://github.com/apache/impala/blob/master/fe/src/main/java/org/apache/impala/common/FileSystemUtil.java#L143], and it seems like the hadoop commandline also does so. Our s3 filesystem utility based on Boto3 (tests/util/s3_util.py) has an overwrite mode that doesn't seem to do an existence check. Switching to use this filesystem util might impact our s3 consistency.
+
+Here's a theory about IMPALA-6709:
+
+Before the change, this is the order:
+ # Create table
+ # Copy file to table's directory in HDFS
+ # Query it
+
+After the change, this is the order:
+ # Copy file to the database's directory in HDFS (not the table's dir)
+ # Create table
+ # LOAD DATA INPATH moves the file from the database directory to the table directory
+ # Query it
+
+The difference has to do with metadata. Before IMPALA-6709, we get the metadata when we query the table (#3) after we've copied the file (#2). This gives the filesystem time to get consistent, because metadata takes a couple seconds. After IMPALA-6709, we get the metadata in the LOAD step before we copy the file. This means that when we immediately query it, we don't need to load metadata. So, very little time passes after we copy the file before we query it, and the filesystem has less time to get consistent.
+
+Also saw this on TestScannersFuzzing
+
+Commit f1a3c47959e17d301f970b7ea2755067d00ae986 in impala's branch refs/heads/master from [~joemcdonnell]
+[ https://git-wip-us.apache.org/repos/asf?p=impala.git;h=f1a3c47 ]
+
+IMPALA-7804: Mitigate s3 consistency issues for test_scanners
+
+test_scanners.py has seen several flaky failures on
+s3 due to eventual consistency. The symptom is Impala
+being unable to read a file that it just loaded to s3.
+
+A large number of tables used in test_scanners.py
+use the file_utils helper functions for creating
+the tables. These follow the pattern:
+1. Copy files to temporary directory in HDFS/S3/etc
+2. Create table
+3. Run LOAD DATA to move the files to the table
+
+In step #3, LOAD DATA gets the metadata for the
+table before it runs the move statement on the
+files. Subsequent queries on the table will not
+need to reload metadata and can access the file
+quickly after the move.
+
+This changes the ordering to put the files in place
+before loading metadata. This may improve the
+likelihood that the filesystem is consistent by
+the time we read it. Specifically, we now do:
+1. Put the files in directory that the table
+   will use when it is created.
+2. Create table
+Neither of these steps load metadata, so the next
+query that runs will load metadata.
+
+Change-Id: Id042496beabe0d0226b347e0653b820fee369f4e
+Reviewed-on: http://gerrit.cloudera.org:8080/11959
+Reviewed-by: Joe McDonnell <joemcdonnell@cloudera.com>
+Tested-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+
+
+[~joemcdonnell] - Can we close this one?
+
+Closing this, as we made some test changes that alleviated this issue in 3.2
+

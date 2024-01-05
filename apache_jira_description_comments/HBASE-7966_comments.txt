@@ -1,0 +1,324 @@
+I have seen this too.
+
+Should we be throwing out something like HBaseServers' ServerNotRunningYetException until the acl table is in place?
+
+[~enis] So this is a code level issue. Issue type of JIRA is marked as New Feature. You really mean it?
+
+We have pre/post start master hooks now. But before postStartMaster() hook call, master's 'initialized' flag is set to true.  So we need a hook in middle of this. More clearly saying, a hook after the master init operations are over but before marking it as initialized (So that it can take client requests)
+We had a similar need and we added a new hook I think.. Let me see the code.
+
+mm..  But any table creation (_acl_) needs the master to be in "initialized" state. !!
+
+Lars was talking about dependency for tables, and system tables in general. Ideally, what we need is that if AccessController is installed, every table operation depends on _acl_ table being available. 
+Other than the coprocessor, _acl_ table is not special to the rest of hbase, so not sure how we can handle that in the least hacky way. 
+
+This is a kinda ugly one.  We need system tables! Can AccessControlFilter retry when it gets TableNotFoundException?
+
+In TestTablePermissions, shouldn't the following be blocking until the {{_acl_}} table is available?
+{code:java}
+    // Wait for the ACL table to become available
+    UTIL.waitTableEnabled(AccessControlLists.ACL_TABLE_NAME);
+{code}
+
+This is in TestTablePermissions.beforeClass(), before any other table creation is attempted.  Actually since this opens a scanner on meta, maybe this is causing the exception...  Might be worth doing a "git bisect" to track down when the test started failing, though it's possible the race was just being masked before.
+
+We could add another API for a special class of system tables, but that adds some complexity and deserves to be thought out on it's own.  Or, we could block in the test instead on the AccessController.postStartMaster() operation completing.
+
+I think we should get the tests running reliably.  But I'm not sure it's worth trying to add a general mechanism for all distributed operations to block until {{_acl_}} is available.
+
+Here is example fail: https://builds.apache.org/job/hbase-0.95/7/testReport/org.apache.hadoop.hbase.security.access/TestAccessController/org_apache_hadoop_hbase_security_access_TestAccessController/
+
+Yeah, what Gary says, why are we not waiting for _acl_ to come on line?  The above doesn't have associate *_output.txt so can't see what is going on.  Exception does say that we are failing the createTable (#158) that follows the waitTableEnabled (#143).
+
+
+
+Gary, you are right that we are waiting for the table available. It might be b/c we timeout on the wait. I'll investigate more. 
+
+I cannot reproduce locally after running a bunch of times (standalone test).  I have seen it running in suite.   The test above on jenkins claims it lasted 3ms which seems way too short for starting up a minicluster, etc.  Looking at the test that ran just previous, it seems like it went down fine....
+
+Here is failure w/ stdout: https://builds.apache.org/job/hbase-0.95/2/testReport/junit/org.apache.hadoop.hbase.security.access/TestAccessControlFilter/testQualifierAccess/
+
+As soon as master is initialized, some one is trying to scan a not-yet-created _acl_ table.
+
+2013-02-26 21:42:50,488 DEBUG [Master:0;vesta.apache.org,50372,1361914960929] client.ClientScanner(209): Advancing internal scanner to startKey at '_acl_,,'
+
+200ms later we start the creation of _acl_
+
+2013-02-26 21:42:50,644 DEBUG [Master:0;vesta.apache.org,50372,1361914960929] master.TableLockManager$ZKTableLockManager$TableLockImpl(225): Attempt to acquire table write lock on :_acl_ for:C_M_CREATE_TABLE
+
+
+In same second just after acquiring lock because we are going to start in for real on table creation, someone is trying again to scan...
+
+2013-02-26 21:42:50,680 DEBUG [Master:0;vesta.apache.org,50372,1361914960929] client.ClientScanner(209): Advancing internal scanner to startKey at '_acl_,,'
+
+Seems like its the ACL#addUserPermission running in the postCreateTable.
+
+But its #92 inside in testQualifiedAccess.  Again we have blown past waitTableEnabled on _acl_ though it not yet present.
+
+Adding a bit of debug log...
+
+
+
+Few lines of debug that I committed.
+
+bq. As soon as master is initialized, some one is trying to scan a not-yet-created acl table.
+
+I'd guess the meta scans are coming from UTIL.waitForTableEnabled(), since it just loops on:
+{code:java}
+    while (!getHBaseAdmin().isTableAvailable(table) &&
+           !getHBaseAdmin().isTableEnabled(table)) {
+{code}
+
+with a 200ms pause between.
+
+I've been running AccessController unit tests extensively locally and have not seen this. I would do that git bisect Gary suggests but would have a low probability of finding the culprit. Agree on the general principle of introducing table dependencies, later. 
+
+In HBASE-7856 we upped the timeout for waitTableAvailable to 30 seconds. I don't have access to source right now. Is there a WARN or ERROR log line if the timeout is exceeded? If not let's add it. And similar timeouts for related util methods like waitTableEnabled. 
+
+Just one query here, from when this has been flaky? Is it because of some recent changes that the table creation is taking time?  Just asking.
+
+[~ram_krish] It might be since the locks have gone in since that means more time but we are talking seconds here so my guess is issue was always there.
+
+Regards bisecting, yeah, thinking might be hard to correlate our noisy test runs w/ a commit; like Andrew suggests and with Andrew, I cannot repro locally (have been trying various), so would be hard doing the verify.
+
+[~ghelmling] Thanks.  Makes sense.
+
+
+
+Integrated in hbase-0.95 #11 (See [https://builds.apache.org/job/hbase-0.95/11/])
+    HBASE-7966 ACL tests fail on trunk (flaky) -- Some debug log (Revision 1451843)
+
+     Result = FAILURE
+stack : 
+Files : 
+* /hbase/branches/0.95/hbase-server/src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java
+
+
+Looking back 10 builds before HBASE-7305 went in (build #3890), I don't see ACL test failure.
+
+Yeah, this slows down the table creation so is spotlighting a problem we have always have is my take.  In other words, backing out table locking to 'fix' this issue is not the way to go (thanks for looking though Ted)
+
+https://builds.apache.org/job/hbase-0.95/4/artifact/0.95/hbase-server/target/surefire-reports/org.apache.hadoop.hbase.security.access.TestAccessController.txt failed TestAccessController too.
+
+There might be a couple of things to try for fixing the test:
+- Wait for the table to be enabled with a much longer timeout
+- Redo the wait for the table to be enabled with a waitFor(..., Predicate) where the predicate that checks master and RS internal state for the regions and complains if different from what the admin API gets back via meta scan
+
+The former might work around the flakiness we see on Jenkins but treats a symptom. 
+
+Seems like the later would make it more likely to show a problem rather than have issues surface indirectly as test setup timeouts. 
+
+Integrated in hbase-0.95 #12 (See [https://builds.apache.org/job/hbase-0.95/12/])
+    HBASE-7966 ACL tests fail on trunk (flaky) -- Some debug log (Revision 1451936)
+
+     Result = FAILURE
+stack : 
+Files : 
+* /hbase/branches/0.95/hbase-server/src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java
+
+
+bq.Yeah, this slows down the table creation so is spotlighting a problem we have always have is my take
+Yes i agree with this.  I did not mean to revert the table lock fix.  I just meant to say with this fix we have exposed some internal problem, may be the wait logic can be improved in the lines of the new fix.
+
+The added debug logging states after the wait is done uncovers interesting fact that a table can be enabled though not available:
+
+2013-03-03 10:39:12,499 DEBUG [pool-1-thread-1] hbase.HBaseTestingUtility(1905): REMOVE AFTER table=_acl_, isTableAvailable=false, isTableEnabled=true
+
+Looking into this...
+
+Patch v1 waits for the table to be available.
+
+Test passes locally.
+
+{color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12571808/7966-v1.txt
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 3 new or modified tests.
+
+    {color:green}+1 hadoop2.0{color}.  The patch compiles against the hadoop 2.0 profile.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 lineLengths{color}.  The patch does not introduce lines longer than 100
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in .
+
+Test results: https://builds.apache.org/job/PreCommit-HBASE-Build/4644//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/4644//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-protocol.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/4644//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-client.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/4644//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-examples.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/4644//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-hadoop1-compat.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/4644//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-prefix-tree.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/4644//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-common.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/4644//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-server.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/4644//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-hadoop-compat.html
+Console output: https://builds.apache.org/job/PreCommit-HBASE-Build/4644//console
+
+This message is automatically generated.
+
+waitTableEnabled came in with:
+
+{code}
+  1 ------------------------------------------------------------------------
+  0 r1373520 | apurtell | 2012-08-15 09:33:40 -0700 (Wed, 15 Aug 2012) | 2 lines                                                                                                                            
+  1 
+  2 HBASE-6478. TestClassLoading.testClassLoadingFromLibDirInJar occasionally fails
+{code}
+
+It has not changed since it came in.
+
+Looking at when we set the table enabled state, it looks unchanged too being last thing done in the createtablehandler (as it has always been)
+
+
+
+Fix waitTableEnabled.  Make it do what folks seem to be expecting it to do (it is used in a few places).  Previous it would return if the zk state was set to enabled but the regions were not yet assigned.  Make it so now table is enabled AND regions are assigned.  Add javadoc.  In TestAccessControlFilter also close a used table and in HCM, change variable name so it is clearer what enable/disable internals are doing.
+
+{code}
++     * @param online True if table is enabled
+      */
+-    private boolean testTableOnlineState(byte [] tableName, boolean online)
++    private boolean testTableOnlineState(byte [] tableName, boolean enabled)
+{code}
+The name of parameter has been changed to enabled, right ?
+
+{color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12571827/7966v3.txt
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 6 new or modified tests.
+
+    {color:green}+1 hadoop2.0{color}.  The patch compiles against the hadoop 2.0 profile.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 lineLengths{color}.  The patch does not introduce lines longer than 100
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in .
+
+Test results: https://builds.apache.org/job/PreCommit-HBASE-Build/4646//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/4646//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-protocol.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/4646//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-client.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/4646//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-examples.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/4646//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-hadoop1-compat.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/4646//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-prefix-tree.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/4646//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-common.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/4646//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-server.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/4646//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-hadoop-compat.html
+Console output: https://builds.apache.org/job/PreCommit-HBASE-Build/4646//console
+
+This message is automatically generated.
+
+What I committed to trunk and 0.95 (addresses Ted param comment)
+
+Leaving open to see if test is fixed...
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12571836/7966v4.txt
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 6 new or modified tests.
+
+    {color:red}-1 patch{color}.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-HBASE-Build/4648//console
+
+This message is automatically generated.
+
+Integrated in HBase-TRUNK #3910 (See [https://builds.apache.org/job/HBase-TRUNK/3910/])
+    HBASE-7966 ACL tests fail on trunk (flaky) (Revision 1452161)
+
+     Result = FAILURE
+stack : 
+Files : 
+* /hbase/trunk/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HConnectionManager.java
+* /hbase/trunk/hbase-server/src/test/java/org/apache/hadoop/hbase/security/access/TestAccessControlFilter.java
+
+
+Integrated in hbase-0.95 #15 (See [https://builds.apache.org/job/hbase-0.95/15/])
+    HBASE-7966 ACL tests fail on trunk (flaky) (Revision 1452160)
+
+     Result = FAILURE
+stack : 
+Files : 
+* /hbase/branches/0.95/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HConnectionManager.java
+* /hbase/branches/0.95/hbase-server/src/test/java/org/apache/hadoop/hbase/security/access/TestAccessControlFilter.java
+
+
+Integrated in HBase-TRUNK-on-Hadoop-2.0.0 #429 (See [https://builds.apache.org/job/HBase-TRUNK-on-Hadoop-2.0.0/429/])
+    HBASE-7966 ACL tests fail on trunk (flaky) (Revision 1452161)
+
+     Result = FAILURE
+stack : 
+Files : 
+* /hbase/trunk/hbase-client/src/main/java/org/apache/hadoop/hbase/client/HConnectionManager.java
+* /hbase/trunk/hbase-server/src/test/java/org/apache/hadoop/hbase/security/access/TestAccessControlFilter.java
+
+
+bq. Yes i agree with this. I did not mean to revert the table lock fix. I just meant to say with this fix we have exposed some internal problem, may be the wait logic can be improved in the lines of the new fix.
+I was also suspecting that acquiring the table lock might be stalling table creation a bit more, since we have to do create znode + list children for acquiring the table lock even without contention. But could not look into that last week. Though it should not take multiple seconds. 
+Thanks for looking into this. 
+
+bq. I was also suspecting that acquiring the table lock might be stalling table creation a bit more, since we have to do create znode + list children for acquiring the table lock even without contention
+
+I do see this in places, but it is just a small increase in test running time.
+
+Looks like it happened again:
+
+https://builds.apache.org/job/HBase-0.95/22/testReport/org.apache.hadoop.hbase.security.access/TestAccessController/org_apache_hadoop_hbase_security_access_TestAccessController/
+
+Patch was incompletely applied.  Just reapplied on trunk and 0.95 (Ted, thanks but there is no need to repeat here what is already up in the mailing list, especially for builds I triggered myself and on a branch build that I've been working to get green over the last few days; i.e. I'm watching this stuff).
+
+Integrated in HBase-TRUNK-on-Hadoop-2.0.0 #430 (See [https://builds.apache.org/job/HBase-TRUNK-on-Hadoop-2.0.0/430/])
+    HBASE-7966 ACL tests fail on trunk (flaky) (Revision 1452662)
+
+     Result = FAILURE
+stack : 
+Files : 
+* /hbase/trunk/hbase-server/src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java
+
+
+Integrated in hbase-0.95 #23 (See [https://builds.apache.org/job/hbase-0.95/23/])
+    HBASE-7966 ACL tests fail on trunk (flaky) (Revision 1452661)
+
+     Result = FAILURE
+stack : 
+Files : 
+* /hbase/branches/0.95/hbase-server/src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java
+
+
+Integrated in HBase-TRUNK #3913 (See [https://builds.apache.org/job/HBase-TRUNK/3913/])
+    HBASE-7966 ACL tests fail on trunk (flaky) (Revision 1452662)
+
+     Result = FAILURE
+stack : 
+Files : 
+* /hbase/trunk/hbase-server/src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java
+
+
+This test failed here https://builds.apache.org/job/HBase-TRUNK/4005/console  Seems like jenkins was  having trouble though around this time so perhaps environment.   Looking at EC2 build box, not failures of this test in last ten builds.  Going to just resolve.
+
+
+
+Resolving.  Will open new issue if this test shows up again.
+
+Marking closed.
+

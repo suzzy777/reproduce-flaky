@@ -1,0 +1,200 @@
+Fails with TableNotFoundException with commit 6786b2b. For commits 68436c9, 75d2eca, 50bb045, df93c13 it fails but error is different: "TestServerCrashProcedure.setup:65 » NoClassDefFound com/google/protobuf/Genera...".
+
+6786b2b reverts df93c13 and related to protobuf. can be ignored for now. 68436c9 is doc changes, can be ignored. Looking into:
+50bb045, 75d2eca.
+
+
+Reverting 75d2eca seems to fix the test. Looking into it. [~easyliangjob], do you know about commit HBASE-17931?
+
+No, I do not know about that one 
+
+Hi [~yangzhe1991], Please see my comments on this ticket. I wonder, if you can share more details about commit HBASE-17931?
+
+Thanks, Umesh
+
+[~uagashe] Which table is not found sir? At what point is the TNF exception being thrown (startup/shutdown/etc)? Is there no RS to assign to? Thanks.
+
+Should we disable it while it is so flakey and is being worked on [~uagashe]? Thanks.
+
+HBASE-17931 add a logic to check if there are region servers whose version is not same with others, if so we will move system tables to RS with highest version. But in all UTs our RSs are in same version so we may not have any difference with or without this commit. I run TestServerCrashProcedure in master branch locally several times but all passed.
+
+Thanks [~stack], [~yangzhe1991]!
+
+I think its timing issue as I have seen it passing too! But for me its failing much more number of times than passing. I am still debugging it. From what I see:
+TableNotFoundException is for table 'testRecoveryAndDoubleExecution-carryingMeta-true'. This table is created by the test and exception is thrown in util.countRows() when table is scanned, in following code snippet:
+
+{code}
+      // Now run through the procedure twice crashing the executor on each step...
+      MasterProcedureTestingUtility.testRecoveryAndDoubleExecution(procExec, procId);
+      // Assert all data came back.
+      assertEquals(count, util.countRows(t));
+{code}
+
+Here is the exception:
+{code}
+org.apache.hadoop.hbase.TableNotFoundException: testRecoveryAndDoubleExecution-carryingMeta-true
+  at org.apache.hadoop.hbase.client.ConnectionImplementation.locateRegionInMeta(ConnectionImplementation.java:845)
+  at org.apache.hadoop.hbase.client.ConnectionImplementation.locateRegion(ConnectionImplementation.java:745)
+  at org.apache.hadoop.hbase.client.ConnectionImplementation.relocateRegion(ConnectionImplementation.java:720)
+  at org.apache.hadoop.hbase.client.RpcRetryingCallerWithReadReplicas.getRegionLocations(RpcRetryingCallerWithReadReplicas.java:316)
+  at org.apache.hadoop.hbase.client.ScannerCallable.prepare(ScannerCallable.java:139)
+  at org.apache.hadoop.hbase.client.ScannerCallableWithReplicas$RetryingRPC.prepare(ScannerCallableWithReplicas.java:399)
+  at org.apache.hadoop.hbase.client.RpcRetryingCallerImpl.callWithRetries(RpcRetryingCallerImpl.java:104)
+  at org.apache.hadoop.hbase.client.ResultBoundedCompletionService$QueueingFuture.run(ResultBoundedCompletionService.java:80)
+  at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1142)
+  at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:617)
+  at java.lang.Thread.run(Thread.java:745)
+{code}
+
+At this time I am not quite sure about how changes for HBASE-17931 are affecting the test but after reverting the changes locally I ran test 4-5 times and it passed all the time. If meta region is being transitioned while scan is going on, we can see this exception but I will have to confirm thats the case here.
+
+AssignmentManager.checkIfShouldMoveSystemRegionAsync() is being called during active master initialization and from RegionServerTracker.refresh() and moveAsync() is used to submit the procedure. This can explain timing issue. If I can not get to bottom of this by tomorrow, I will disable the test and continue working on it.
+
+
+Hi [~stack], [~yangzhe1991]:
+
+FWICS here is the root cause:
+
+The UT tests ServerCrashProcedure when RS carrying meta region crashes. It also simulates master crash after executing each step in the procedure.
+
+Initially all RS are at the same version i.e. 3.0.0-SNAPSHOT. HMaster.getRegionServerVersion() returns version 0.0.0 for dead RS (carrying meta). This makes AssignmentManager.getExcludedServersForSystemTable() return non-empty list and the logic in AssignmentManager.checkIfShouldMoveSystemRegionAsync() is triggered which in turn submits MoveRegionProcedure to move meta region from RS with version 0.0.0 to one of other RS with latest version.
+
+As commented before this causes race condition between scan and MoveRegionProcedure.
+
+AssignmentManager.getExcludedServersForSystemTable() uses master.getServerManager().getOnlineServersList() to get list of online servers only. But on further scrutiny of code and logs I found that server can be online and dead at the same time!
+
+IMO, 
+* Currently meta is re/assigned from ServerCrashProcedure, during master initialization from MasterMetaBootstrap and followed by in checkIfShouldMoveSystemRegionAsync().
+* that means meta re/assignment may be attempted at max 3 times in certain conditions.
+* I am working on HBASE-18261 to have meta recovery/ assignment logic at one place.
+* I think we can pull these changes for assigning meta to RS with highest version number there.
+* This will result in, RS with highest version number will be considered for meta region assignment when:
+# When meta region carrying RS crashes
+# During master startup
+
+Along with above changes, obviously we need to fix ServerManager.isServerOnline() and ServerManager.isServerDead() returning true at the same time. This could be result of test code simulating crash but the class itself should not allow this case (IMHO).
+
+I have a following fix ready (and tested) which will fix the test but I don't consider it a long term fix.
+{code}
+diff --git a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/AssignmentManager.java b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/AssignmentManager.java
+index 046612a..1a2d53b 100644
+--- a/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/AssignmentManager.java
++++ b/hbase-server/src/main/java/org/apache/hadoop/hbase/master/assignment/AssignmentManager.java
+@@ -1760,6 +1760,7 @@ public class AssignmentManager implements ServerListener {
+   public List<ServerName> getExcludedServersForSystemTable() {
+     List<Pair<ServerName, String>> serverList = master.getServerManager().getOnlineServersList()
+         .stream()
++        .filter((s)->!master.getServerManager().isServerDead(s))
+         .map((s)->new Pair<>(s, master.getRegionServerVersion(s)))
+         .collect(Collectors.toList());
+     if (serverList.isEmpty()) {
+{code}
+
+[~stack], as you have suggested, we can disable the test for now. When we agree on fix, we can enable it. Let me know your thoughts. Thanks!
+
+bq. Initially all RS are at the same version i.e. 3.0.0-SNAPSHOT. HMaster.getRegionServerVersion() returns version 0.0.0 for dead RS (carrying meta)....MoveRegionProcedure to move meta region from RS with version 0.0.0 to one of other RS with latest version.
+
+This is good. We have double the procedures working on reassign now.
+
+bq. I found that server can be online and dead at the same time!
+
+Good one [~uagashe] This is a 'hole'.
+
+On the change, it looks good to me. I wonder though how something went into the serverdead list w/o being pulled from the online list. That seems like a backdoor we want to close.
+
+I can disable for now but will not resolve this issue. I like pulling the checkIfShouldMoveSystemRegionAsync logic handling into your new procedure, HBASE-18261. Would be good to figure why addition to dead list does not get a server purged from the online list? Because it has not been processed yet by crash procedure?  How did it get into dead list then?
+
+Thanks [~uagashe]
+
+Pushed disabling the test for now until the more fundamental fix is in place. See nice finding above [~yangzhe1991] sir. Thanks [~uagashe]
+
+Oh, disabled this test in master and branch-2.
+
+Thanks for disabling the test, [~stack]!
+
+FAILURE: Integrated in Jenkins build HBase-2.0 #175 (See [https://builds.apache.org/job/HBase-2.0/175/])
+HBASE-18366 Fix flaky test (stack: rev 4663d7b9a741f3e374510880d2c47a549591da46)
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/master/procedure/TestServerCrashProcedure.java
+
+
+FAILURE: Integrated in Jenkins build HBase-Trunk_matrix #3377 (See [https://builds.apache.org/job/HBase-Trunk_matrix/3377/])
+HBASE-18366 Fix flaky test (stack: rev a9352fe9564f57658f918ef63ac4a5ebdc17fb45)
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/master/procedure/TestServerCrashProcedure.java
+
+
+Thanks [~uagashe]. 
+Reconsidered HBASE-17931, checkIfShouldMoveSystemRegionAsync may only needed when there is a region server startup. When RS stop or HMaster startup we can use a suitable Procedure to make sure we keep system tables in highest version RSs , right?
+
+Sorry for making noise.
+
+FAILURE: Integrated in Jenkins build HBASE-14070.HLC #69 (See [https://builds.apache.org/job/HBASE-14070.HLC/69/])
+HBASE-18366 Fix flaky test (stack: rev a9352fe9564f57658f918ef63ac4a5ebdc17fb45)
+* (edit) hbase-server/src/test/java/org/apache/hadoop/hbase/master/procedure/TestServerCrashProcedure.java
+
+
+Hi [~yangzhe1991], thats right. 
+* Same as current logic, when master restarts all system table regions will be reassigned to highest versioned RSs. Except it will be done in a new procedure that will recover/ initialize meta and then reassign system table regions.
+* When any RS crashes, only highest versioned RSs will be considered to move system table regions on crashed RS.
+
+Before I start working on it, I've a question: I wonder, why this logic is not included in AssignmentManager.processAssignQueue(). So any region assignment will first check if the region belongs to system table and consider only highest versioned RS as targets? I can think of concerns around regions getting re-assigned without any admin action except of course deployment of new RS.
+
+Thanks, Umesh
+
+
+
+[~uagashe] I like your question. [~yangzhe1991] what you think? Is it that you are going from branch-1 to branch-2 so we don't take consideration of new way of assigning? processAssignQueue is a good choke point for region assignment?
+
+bq. why this logic is not included in AssignmentManager.processAssignQueue().
+
+There is another scenario that master is not restarted and there is no RS crashed, but there is a RS with highest version coming in. We should move all system tables to this new RS. Does processAssignQueue can handle this? Thanks.
+
+bq. there is a RS with highest version coming in. We should move all system tables to this new RS
+
+Concern here is if one new node with higher version is added to the cluster, all system table regions will be moved to this node. Subsequent addition of new nodes with same version as previous one will not have any affect but these regions will only be moved (if at all) by load balancer or by user.
+
+Hi, I've uploaded one-pager describing my findings while going through logs and code while debugging this issue. I have also attached patch files with changes per different approaches described in the doc. Please review it and let me know your thoughts.
+
+Thanks, Umesh
+
+
+Changes in attached files hbase-18366.fix1.patch & hbase-18366.fix1.patch are partial and meant to detail fixes discussed in the doc.
+
+[~stack], [~yangzhe1991]: any thoughts, comments?
+
+Nice writeup @umesh. Added a few comments. Let me look at patches.
+
+Why this change sir:
+
+	  optional ServerName destination_server = 3;
+
+It was required. A move w/o a destination doesn't make sense?
+
+I like the change that foists assignment on to the balancer (by passing null) presuming balancer will favor regionservers with higher versions....
+
+High-level, how would you describe the change [~uagashe]? I like the bit of having assign conscious of favoring system tables...
+
+Patch looking good. What else is to be done?
+
+Thanks boss.
+
+bq. Why this change sir: optional ServerName destination_server = 3;
+
+destination_server when not specified, LoadBalancer will select it. It can be used when region is required to be moved from RS but target server will be selected by load balancer.
+
+[~stack] and I had discussion on this JIRA, unit test TestServerCrashProcedure and patched uploaded here. We identified following areas for improving code/ fixing bugs:
+
+* Currently UnassignProcedure returns success when server carrying a region is not online. Assumption here is that ServerCrashProcedure will handle splitting logs etc for these regions. When UnassignProcedure completes, MoveRegionProcedure resumes with AssignProcedure. AssignProcedure can assign region without pre-requisite steps. Fix is to fail UnassignProcedure and parent MoveRegionProcedure if source server is not online.
+* Embed logic of selecting highest versioned region server for system table regions in AssignmentManager.processAssignQueue(). This way from any section of the code system table regions are re/assigned, only highest versioned RS are considered for target servers.
+* As ServerCrashProcedure handles reassignment of regions on a crashed server, don't process those regions on crashed server through call to AssignmentManager.checkIfShouldMoveSystemRegionAsync()
+* Modify LoadBalancer implementation to consider highest versioned Region Servers as favorites for system table regions.
+* Look into ServerManager refactoring to make isServerOnline() and isServerDead() mutually exclusive
+
+All these issues are related to AMv2, I will create a JIRAs to track these issues.
+
+Thanks, Umesh
+
+
+Seems not flakey any more?
+
+Not flaky anymore. Fixed by other JIRAs.
+

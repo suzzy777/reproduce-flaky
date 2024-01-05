@@ -1,0 +1,108 @@
+This test class is new for a few branches and It might have been committed being flaky, not sure. I see it all the time in CircleCI midres. 
+Here is reproduction in [4.1|https://app.circleci.com/pipelines/github/ekaterinadimitrova2/cassandra/1753/workflows/21981540-9461-4efd-91a9-0d9b3160cad2/jobs/12548/tests#failed-test-0] and [trunk|https://app.circleci.com/pipelines/github/ekaterinadimitrova2/cassandra?branch=RepairErrorsTest-trunk&filter=all], probably it flakes also on the other branches where it was committed. 
+
+[~maedhroz], do you mind to take a look, please? 
+
+ 
+
+Let me see if this is just a simple timeout or some kind of legitimate deadlock....
+
+Thanks, appreciate it :) Fingers crossed It is just a timeout :) 
+
+For some reason, the {{MessagingService}} (this test uses {{NETWORK}}) is not shutting down promptly on node 2 every once in a while :-|
+
+(Shutdown completion logging is mine.)
+
+{noformat}
+INFO  [node2_isolatedExecutor:17] node2 2022-06-29 11:49:10,035 MessagingService.java:522 - Waiting for messaging service to quiesce
+INFO  [node1_isolatedExecutor:13] node1 2022-06-29 11:49:10,035 MessagingService.java:522 - Waiting for messaging service to quiesce
+INFO  [node3_isolatedExecutor:3] node3 2022-06-29 11:49:10,035 MessagingService.java:522 - Waiting for messaging service to quiesce
+INFO  [node3_isolatedExecutor:3] node3 2022-06-29 11:49:12,103 MessagingService.java:567 - Non-graceful messaging service shutdown complete.
+INFO  [node1_isolatedExecutor:13] node1 2022-06-29 11:49:12,103 MessagingService.java:567 - Non-graceful messaging service shutdown complete.
+
+java.lang.RuntimeException: java.util.concurrent.TimeoutException
+
+	at org.apache.cassandra.utils.Throwables.maybeFail(Throwables.java:73)
+	at org.apache.cassandra.utils.FBUtilities.waitOnFutures(FBUtilities.java:509)
+	at org.apache.cassandra.distributed.impl.AbstractCluster.close(AbstractCluster.java:1028)
+{noformat}
+
+It looks like every once in a while, the {{defaultGroup}} in {{SocketFactory}} doesn't terminate quickly enough. It's possible there's a task executing there that's hung up...
+
+Alright, so I think I've reproduced a bit of a deadlock during the node 2 shutdown. Here's a blocked thread that's part of the {{defaultGroup}} thread pool mentioned above:
+
+{noformat}
+"node2_Messaging-EventLoop-3-10" Id=1118 BLOCKED on org.apache.cassandra.streaming.StreamSession@7f8372dc owned by "node2_Stream-Deserializer-/127.0.0.1:7012-ef252195" Id=1123
+	at org.apache.cassandra.streaming.StreamSession.onError(StreamSession.java:649)
+	-  blocked on org.apache.cassandra.streaming.StreamSession@7f8372dc
+	at org.apache.cassandra.streaming.async.StreamingMultiplexedChannel.onMessageComplete(StreamingMultiplexedChannel.java:264)
+	at org.apache.cassandra.streaming.async.StreamingMultiplexedChannel.lambda$sendMessage$1(StreamingMultiplexedChannel.java:233)
+	at org.apache.cassandra.streaming.async.StreamingMultiplexedChannel$$Lambda$15818/1783972732.operationComplete(Unknown Source)
+	at org.apache.cassandra.utils.concurrent.ListenerList.notifyListener(ListenerList.java:134)
+	at org.apache.cassandra.utils.concurrent.ListenerList.notifyListener(ListenerList.java:148)
+	at org.apache.cassandra.utils.concurrent.ListenerList$GenericFutureListenerList.notifySelf(ListenerList.java:190)
+	at org.apache.cassandra.utils.concurrent.ListenerList.lambda$notifyExclusive$0(ListenerList.java:124)
+{noformat}
+
+That {{Stream-Deserializer}} thread looks like this:
+
+{noformat}
+"node2_Stream-Deserializer-/127.0.0.1:7012-ef252195" Id=1123 WAITING
+	at sun.misc.Unsafe.park(Native Method)
+	at java.util.concurrent.locks.LockSupport.park(LockSupport.java:304)
+	at org.apache.cassandra.utils.concurrent.WaitQueue$Standard$AbstractSignal.await(WaitQueue.java:289)
+	at org.apache.cassandra.utils.concurrent.WaitQueue$Standard$AbstractSignal.await(WaitQueue.java:282)
+	at org.apache.cassandra.utils.concurrent.Awaitable$AsyncAwaitable.await(Awaitable.java:306)
+	at org.apache.cassandra.utils.concurrent.AsyncFuture.await(AsyncFuture.java:154)
+	at org.apache.cassandra.utils.concurrent.AsyncPromise.await(AsyncPromise.java:244)
+	at org.apache.cassandra.net.AsyncChannelPromise.await(AsyncChannelPromise.java:127)
+	at org.apache.cassandra.net.AsyncChannelPromise.await(AsyncChannelPromise.java:34)
+	at org.apache.cassandra.utils.concurrent.Awaitable$Defaults.awaitUninterruptibly(Awaitable.java:186)
+	at org.apache.cassandra.utils.concurrent.AbstractFuture.awaitUninterruptibly(AbstractFuture.java:482)
+	at org.apache.cassandra.utils.concurrent.AsyncPromise.awaitUninterruptibly(AsyncPromise.java:254)
+	at org.apache.cassandra.net.AsyncChannelPromise.awaitUninterruptibly(AsyncChannelPromise.java:133)
+	at org.apache.cassandra.net.AsyncChannelPromise.awaitUninterruptibly(AsyncChannelPromise.java:34)
+	at org.apache.cassandra.utils.concurrent.Future.syncUninterruptibly(Future.java:94)
+	at org.apache.cassandra.utils.concurrent.AsyncPromise.syncUninterruptibly(AsyncPromise.java:186)
+	at org.apache.cassandra.net.AsyncChannelPromise.syncUninterruptibly(AsyncChannelPromise.java:121)
+	at org.apache.cassandra.net.AsyncChannelPromise.syncUninterruptibly(AsyncChannelPromise.java:34)
+	at org.apache.cassandra.streaming.StreamSession.onError(StreamSession.java:673)
+	at org.apache.cassandra.streaming.StreamDeserializingTask.run(StreamDeserializingTask.java:84)
+{noformat}
+
+Multiple threads are hitting the failure handling pathways on node 2 when node 1 fails its streaming session, and either we need to avoid sending a failure message in {{onError()}} when the local session is in a final state, or we need to allow that, but not {{syncUninterruptibly()}} on it.
+
+I have a [clean multiplexer run|https://app.circleci.com/pipelines/github/maedhroz/cassandra?branch=CASSANDRA-17706-deadlock&filter=all] (400 iterations) against a fix that relaxes the synchronization requirements for {{StreamSession#onError()}}. Patch should be incoming soon...
+
+The patch here basically just relaxes the synchronization on {{StreamSession#onError()}}, which allows error handling to proceed even if multiple threads arrive there, avoiding the possibility that waiting for the result of sending the failure message can cause a deadlock. (i.e. Processing a failure on a send initiated from {{onError()}} can end up right back in {{onError()}}, which is logically reentrant but doesn't happen on literally the same thread.) This shouldn't really be a problem, given {{closeSession()}} itself is still synchronized, we still won't send a failure message if channels are closed, and we now just use {{awaitUninterruptibly()}} instead of {{syncUninterruptibly()}} (and avoid re-throwing if an error occurs).
+
+|[4.1|https://github.com/apache/cassandra/pull/1717]|[CircleCI|https://app.circleci.com/pipelines/github/maedhroz/cassandra?branch=CASSANDRA-17706-4.1&filter=all]|
+|[trunk|https://github.com/apache/cassandra/pull/1713]|[CircleCI|https://app.circleci.com/pipelines/github/maedhroz/cassandra?branch=CASSANDRA-17706-trunk&filter=all]|
+
++1
+
+Running the tests once more before adding the other patches and committing, now that CASSANDRA-17700 has been fixed.
+
+4.1 patch is up and tests are in progress (updated table above). I'm actually not sure how this happens in 4.0, so investigating that further...
+
+
+So in 4.0, the nominal cause of the problem mentioned above doesn't exist. What does seem to happen every so often though is that the scheduled (delay) timeout task in {{StreamTransferTask}} isn't terminated on {{Instance}} shutdown, and this causes cluster closure to timeout. The fix is pretty simple for that, and it seems like the multiplexer [likes it|https://app.circleci.com/pipelines/github/maedhroz/cassandra/455/workflows/e0fc99c3-7cd0-4238-92c7-6a3e1bbc078d], so I should have a 4.0 patch up soon.
+
+|[4.0|https://github.com/apache/cassandra/pull/1718]|[CircleCI|https://app.circleci.com/pipelines/github/maedhroz/cassandra?branch=CASSANDRA-17706-4.0&filter=all]|
+
+[~dcapwell] The 4.0 patch is ready for review ;)
+
+In terms of the failures in {{test_recover_negative_expiration_date_sstables_with_scrub}}, it looks like [it fails even with vanilla 4.0|https://app.circleci.com/pipelines/github/maedhroz/cassandra?branch=CASSANDRA-17706-4.0-CircleCI&filter=all] on Circle. Will create a separate Jira. I'm also planning on creating a separate Jira to look at a general possible in-JVM shutdown order issue between the messaging service and scheduled executors.
+
++1 from me
+
+Created CASSANDRA-17730 to deal with {{test_recover_negative_expiration_date_sstables_with_scrub}}.
+
+Created CASSANDRA-17731 to track down scheduled task/messaging service shutdown order issues.
+
+Committed
+
+4.0 - https://github.com/apache/cassandra/commit/924cd8f52c2437d0a0ce8c48196bb6aa8976fbb8
+4.1 - https://github.com/apache/cassandra/commit/15bdf2e8e7e7a66dd85bf3f86cc58576a13657be
+trunk - https://github.com/apache/cassandra/commit/5c7a47b384acf0f2cc38f9ebe8eff289afe48028
+

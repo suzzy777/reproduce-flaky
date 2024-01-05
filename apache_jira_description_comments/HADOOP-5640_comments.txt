@@ -1,0 +1,317 @@
+I'd go with option 2, making {{NamenodePlugin}} and {{DatanodePlugin}} implement {{ServicePlugin}}, but being loaded as instances of their classes:
+
+{code}
+  // For the namenode:
+  List<NamenodePlugin> plugins = conf.getInstances("dfs.namenode.plugins", NamenodePlugin.class);
+{code}
+
+{quote}
+DataNode:
+ * namenode reconnect
+{quote}
+
+Do datanodes get notified on that kind of events? That would be the way to solve our problem in HADOOP-4707, when the namenode is restarted.
+
+{quote}
+Do datanodes get notified on that kind of events? That would be the way to solve our problem in HADOOP-4707, when the namenode is restarted.
+{quote}
+
+Yep, there's a perfect place to insert that, which was the other motivation I forgot to mention for this ticket :)
+
+I am slightly worried that making the datanode/namenode invoke plug-ins calls synchronously at many different places introduces code complexity and may also cause deadlocks depending on how the plug-ins are implemented. A plug-in implementor has to know the finer-grain details about how the namenode/datanode code pieces to write plugins that behave well without impacting namenode/datanode performance.
+
+Another approach would be to come up with a asynchronous publish/subscribe kind of model. The namenode/datanode could write data to this channel without waiting for the consumer(s) to pick it up. It could be similar to a file-change-log, but will also contain internal state changes of dfs modules. Thoughts?
+
+{quote}
+Another approach would be to come up with a asynchronous publish/subscribe kind of model. The namenode/datanode could write data to this channel without waiting for the consumer(s) to pick it up. It could be similar to a file-change-log, but will also contain internal state changes of dfs modules. Thoughts?
+{quote}
+
+I like the idea of an async pub/sub model. A couple options for how we might implement this:
+
+a) We have a single LinkedBlockingQueue attached to the service. When an event happens, the service enqueues an event. We have a PluginDispatcher instance which has a thread doing something like:
+
+{code:java}
+while (true) {
+  Event e = queue.take();
+  for (Plugin p : plugins) {
+    p.handleEvent(e);
+  }
+}
+{code}
+
+events are dispatched from the service by just calling dispatcher.enqueueEvent(foo). We also delegate plugin registration/start/stop to PluginDispatcher
+
+b) We have a LinkedBlockingQueue per plugin. Plugins are responsible for creating a thread which does a similar loop to above, trying to take events off the queue. Dispatch from the service then looks like:
+
+{code:java}
+for (Plugin p : plugins) {
+  p.enqueueEvent(foo);
+}
+{code}
+
+
+Both of the options above are a little ugly in that they require classes for each type of event that can be handled, and introduce a handleEvent(PluginEvent e) function in the plugins, likely with an ugly switch statement. With my functional programmer hat on, I'd personally prefer something like:
+
+{code:java}
+/* does this generic interface exist somewhere in hadoop yet? */
+interface <T> SingleArgumentCaller {
+  void call(T p);
+}
+
+/* in namenode: */
+
+...
+// we just heard about a new data node
+dispatcher.enqueue(new SingleArgumentCaller<DatanodePlugin>() {
+  void call(DatanodePlugin p) { p.newDatanodeAppeared(...); }
+});
+..
+
+interface DatanodePlugin {
+  void newDatanodeAppeared(...);
+  /* all the other hook points */
+}
+
+/* dispatcher looks like: */
+
+class <T> PluginDispatcher {
+  private LinkedBlockingQueue<T> queue;
+  private List<T> plugins;
+
+  void run() {
+    while (true) {
+      SingleArgumentCaller caller = queue.take();
+      for (T plugin : plugins) {
+        caller.call(plugin); /* plus some try..catch */
+      }
+    }
+  }
+}
+{code}
+
+If no one has any strong objections, I'll go with the SingleArgumentCaller route, since I think class-per-event proliferation here is a messy solution.
+
+Hacked this up today, but I just realized there may be a big downside to the multithread approach. While it's nice to decouple the execution of the plugin with the execution of the service, it's likely to introduce a lot of hairy synchronization bugs. As a specific example, the Thrift datanode plugin accesses the datanode.dnRegistration member without synchronization,and the datanode potentially modifies this instance when re-registering with the namenode after a disconnection. My bet is that there other more subtle instances where this is the case.
+
+Given this, I think I'd prefer to say "plugin authors should take care that they do not block or create potential deadlock situations with their host services. Install plugins at your own risk" rather than force them to execute in separate threads everywhere.
+
+The other option is to look over all public members (and those available through accessors) to be sure that anything allowed to escape out of the daemon is an immutable snapshot of the internal state.
+
+Another option would be to copy the associated data into the event data structure itself. In that case, the pluging does not have to inspect any namenode/datanode data structures, instead all the information that it needs is encapsulated in the event. Is this feasible?
+
+That's somewhat feasible, but lacking deep-copy support in a lot of the hadoop classes, it's a bit hard to ensure.
+
+I guess we're probably best off just leaving this with a warning... the two warning options are:
+
+a) Your plugin hooks are called in the same thread as the service you are plugging into. Ensure that you do not ever block in a plugin hook.
+b) Your plugin hooks are called in a separate thread from the service you are plugging into. Ensure that you do are aware of any synchronization issues that might arise as a result.
+
+Personally I prefer (a) still, since it's trivial to understand whether your code blocks, whereas it is somewhat more difficult to know whether you have a race. But, if others still prefer (b), that's fine.
+
+Attaching a patch for the threaded version of plugin hook point dispatch. Test case included as well.
+
+Oops - realized there's a flaw in the previous patch that could make the test flaky on multicore boxes. Will resubmit when fixed.
+
++1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12405720/HADOOP-5640.v2.txt
+  against trunk revision 766190.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 2 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 Eclipse classpath. The patch retains Eclipse classpath integrity.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-vesta.apache.org/213/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-vesta.apache.org/213/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-vesta.apache.org/213/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-vesta.apache.org/213/console
+
+This message is automatically generated.
+
+Realized I didn't re-comment after uploading the new patch. The most recent patch (as QAed above) should be good to go.
+
+Unsurprisingly the patch fell out of date against trunk. This is the same patch, rebased. Its tests still pass.
+
++1 Code changes look good. I will wait for HadoopQA to post results of running the tests before I can commit it. 
+
+I would like fsck to use this same plugin service and invoke a callback when it detects missing blocks for a file. Then I can setup such a plugin to automatically restore the corrupted file from an archival store (if such a store exists).
+
+Thanks for the review, Dhruba. I imagine that once this is committed we can start moving forward on some other hook points. Your fsck hook is a good example of how I envision this being useful - another is hooks for various JobTracker events (eg job completion, task completion, etc).
+
+-1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12408851/hadoop-5640.v3.txt
+  against trunk revision 781602.
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 2 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs warnings.
+
+    +1 Eclipse classpath. The patch retains Eclipse classpath integrity.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed core unit tests.
+
+    -1 contrib tests.  The patch failed contrib unit tests.
+
+Test results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-vesta.apache.org/458/testReport/
+Findbugs warnings: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-vesta.apache.org/458/artifact/trunk/build/test/findbugs/newPatchFindbugsWarnings.html
+Checkstyle results: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-vesta.apache.org/458/artifact/trunk/build/test/checkstyle-errors.html
+Console output: http://hudson.zones.apache.org/hudson/job/Hadoop-Patch-vesta.apache.org/458/console
+
+This message is automatically generated.
+
+Failed test is capacity scheduler.
+
+Overall +1. A few comments:
+
+* The plugin design is actually the listener pattern. For API extensibility it might be worth considering a ServiceEvent class that is passed to the methods of ServicePlugin and subclasses so that extra context information can be passed without breaking plugins. Also, ServicePlugin should be an abstract class.
+* Rename PluginDispatcher to ServicePluginDispatcher. There are other plugins (e.g. MemoryCalculatorPlugin) so it's worth being more precise.
+* SingleArgumentRunnable might be named ServicePluginCallback to better indicate its use.
+
+BTW the latest patch doesn't apply; however it will need regenerating anyway after the project split.
+
+bq. The plugin design is actually the listener pattern. For API extensibility it might be worth considering a ServiceEvent class that is passed to the methods of ServicePlugin and subclasses so that extra context information can be passed without breaking plugins. Also, ServicePlugin should be an abstract class.
+
+The ServicePlugin interface is a holdover from a previous JIRA HADOOP-5257, so I didn't want to modify that. Hopefully Carlos can chime in with regard to this, since he wrote that original patch. Can you explain more about the ServiceEvent idea? I think this is similar to one of the ideas discussed above, but I think it's cleaner to use actual methods with full signatures rather than exposing a single "handleEvent(ServiceEvent e)" and switching on "e instanceof FooEvent" vs "e instanceof BarEvent".
+
+bq. Rename PluginDispatcher to ServicePluginDispatcher. There are other plugins (e.g. MemoryCalculatorPlugin) so it's worth being more precise.
+
+Fixed in attached patch.
+
+bq. SingleArgumentRunnable might be named ServicePluginCallback to better indicate its use.
+
+I disagree - this is a very generic interface that is quite usable for a lot of different things. Since this code is going in util, we might as well make it available for other use cases as well rather than proliferating several interfaces that have the same use.
+
+
+The new patch I just attached is for the Common portion. I'll make a new JIRA in HDFS for the NameNodePlugin and DataNodePlugin portions of the patch.
+
+{quote}
+bq. The plugin design is actually the listener pattern. For API extensibility it might be worth considering a ServiceEvent class that is passed to the methods of ServicePlugin and subclasses so that extra context information can be passed without breaking plugins.
+
+The ServicePlugin interface is a holdover from a previous JIRA HADOOP-5257, so I didn't want to modify that. Hopefully Carlos can chime in with regard to this, since he wrote that original patch.
+{quote}
+
+Sounds good to me. We could even go further and have just one single method in {{ServicePlugin}}:
+
+{code}
+public abstract class ServicePlugin {
+
+    public abstract void onEvent(ServiceEvent event);
+}
+{code}
+
+,instead of the current:
+
+{code}
+public interface ServicePlugin extends Closeable {
+
+    void start(Object service);
+
+    void stop();
+}
+{code}
+
+I guess the {{ServiceEvent}} field would have a reference to the {{Object service}} parameter, among other things.
+
+{quote}
+Can you explain more about the ServiceEvent idea? I think this is similar to one of the ideas discussed above, but I think it's cleaner to use actual methods with full signatures rather than exposing a single "handleEvent(ServiceEvent e)" and switching on "e instanceof FooEvent" vs "e instanceof BarEvent".
+{quote}
+
+I agree, I was just suggesting having a ServiceEvent parameter to hang other contextual information off, to ease API evolution in the future.
+
+{quote}
+bq. SingleArgumentRunnable might be named ServicePluginCallback to better indicate its use.
+
+I disagree - this is a very generic interface that is quite usable for a lot of different things. Since this code is going in util, we might as well make it available for other use cases as well rather than proliferating several interfaces that have the same use.
+{quote}
+
+I would argue that code goes into common once it has been demonstrated that it is needed by more than one other subproject. This is true in this case since there will be HDFS and MapReduce plugins, so it makes sense for the service plugin stuff to live in util in common. Whether SingleArgumentRunnable is better called ServicePluginCallback or not depends on whether the interface gains further adoption outside service plugins. This is hard to predict so I'm +0 on calling it SingleArgumentRunnable.
+
+
+This Jira was motivated by HADOOP-5257, RPC plugins. I understand the motivation for RPC plugins.
+However I fail to see why a RPC plugin needs to be notifed when a NN or DN starts. 
+Further Todd says:
+>>Do datanodes get notified on that kind of events? That would be the way to solve our problem in HADOOP-4707, when the namenode is restarted.
+>Yep, there's a perfect place to insert that, which was the other motivation I forgot to mention for this ticket
+
+Does that mean that such notification events are across the network (DN gets notified when NN restarts)?
+
+If the motivation is general service lifecycle, then is it related to HDFS-326?
+
+
+Hey Sanjay,
+
+It's been a while, but I think the issue was this:
+
+- In the Thrift/HDFS RPC stuff, both the DN and the NN have plugins. The DN exposes things to let the client read chunks out of blocks, and the NN of course exposes the metadata ops, getBlockLocations, etc.
+- The trick is that we don't want to force the DN thrift plugins to bind to a hardcoded port. So, by default the DN plugin binds to an ephemeral port, and once the server is up and listening, it passes along the actual port to the NN Plugin via Thrift. Thus, the NN Plugin maintains a list of DatanodeID -> DN Plugin Thrift Port and can give out the thrift port to clients in response to getBlockLocations.
+- This is all well and good, since that registration happens via thrift call from DN to NN when the DN plugin starts. The issue comes up when the NN restarts while the DN stays up. In that case, the DN service loop automatically re-registers itself with the new NN, but the DN plugin has no idea that it has to re-register. Hence the DatanodeID->ThriftPort map in the NN Plugin is empty and has no way of repopulating itself.
+
+The only solutions here were (a) to add a hook on registration so the DN Plugin can reregister, or (b) add a second heartbeat from the DN Plugin to the NN Plugin. We decided that the heartbeats added unnecessary complexity as well as extra load on the NN, so went with the hook solution.
+
+From what I understand, if Thrift was used to do the DN-NN communications then this feature would not be need.
+I don't know the scope of doing that, but that would be my first choice in addressing this issue. Since Thrift RPC has replaced client-NN rpc, can't you do the same for the DN to NN rpc?
+
+# Strongly consider using Thrift rpc for NN-DN heartbeats if that is reasonably easy to do. 
+# Look at the lifecycle Jira (HDFS-326) and explain if there is any overlap on the lifecycle events.
+# Explain how you are planning to deliver the events.
+** I assume that you do not need any cross machine events (eg NN-DN); if you do please explain why.
+** Have you considered using JMX notifications? Hadoop does use JMX so adding JMX notifications should be easy.
+# Mark  the APIs as Unstable for now.
+
+PS, sorry for the late reply to you jira.
+
+
+bq. Since Thrift RPC has replaced client-NN rpc, can't you do the same for the DN to NN rpc? 
+
+Currently we haven't replaced the Client-NN RPC with anything - for Java clients using DistributedFileSystem, it continues to use Hadoop RPC and the BlockXceiverProtocol. The Thrift stuff is a second option for clients not written in Java. Our particular use case for the Thrift interface is mostly concerned with management and metadata, and less with making a fully functional and performant client interface replacement.
+
+bq. Look at the lifecycle Jira (HDFS-326) and explain if there is any overlap on the lifecycle events.
+
+Not to be too pessimistic, but that JIRA has been in the works for over a year and recently got pushed back again so it won't be in 0.21. We'd like to have this in 0.21. If we go ahead and mark this API as Unstable as you mentioned, I'd be happy to do the work at a later date to cut it back out if HDFS-326 covers the use case.
+
+bq. Explain how you are planning to deliver the events. 
+
+The current patch should illustrate this. The event dispatch uses a separate thread to make the calls on the plugins. Events are dispatched by submitting Runnables to this thread, which is not blocking. This puts the synchronization onus on the receiver, but earlier in the discussion on this JIRA we determined that was probably preferable to possibly allowing plugin code to block daemon code.
+
+bq. Mark the APIs as Unstable for now.
+
+Will do. I'll upload a rebased patch on trunk with this change later this week.
+
+bq. Have you considered using JMX notifications?
+
+Oops, completely skipped over that when I read your comment the first time :) I'll admit I know very little about JMX. I'll do some research - it may very well fit the bill. Thanks for the suggestion.
+
+Todd, any update on your JMX notifications research?
+
+
+There is a patch for this in the Cloudera distribution but it doesn't appear to have been committed upstream.  What is the status?
+
+Hi Allen,
+
+Yes, unfortunately we ran into some disagreement about this patch and weren't able to push it upstream. For reference I will attach the patch that we have committed to our distro to this JIRA momentarily.
+
+Here is a patch series for branch-20, though not up to date on current trunk. For illustration - not meant to be committed (though it has been in use in many clusters for many months now).
+
+I will try to circle back on this issue to add the necessary hooks to upstream trunk in the coming weeks. Thanks for reminding me, Allen.
+

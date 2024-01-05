@@ -1,0 +1,33 @@
+Summary: a major delta compaction thread from mt-tablet-test rebuilt a DRS's base data, destroying the old base data in the process. Shortly thereafter, a flush thread tried to read the min/max keys from that destroyed base data.
+
+How can this happen? Conceptually a flush only touches an MRS (input) and the new rowsets (output). The flush code is written such that making the output rowsets visible to other tablet threads is the very last thing done, under the tablet's component lock. All other threads respect the component lock, so it doesn't seem possible for this to be the source of the race.
+
+However, the atomic row swap code touches all the rowsets in the tablet in order to rebuild the rowset tree. So here's how I think this happened:
+# The major delta compaction thread picks some rowset and begins compacting it.
+# The flush thread begins to flush the MRS.
+# The flush is nearly over and the flush thread calls AtomicSwapRowSets() to swap in the new rowsets and remove the duplicating rowset.
+# This in turn calls ModifyRowSetTree() with all of the existing rowsets (unrelated rowsets + duplicating rowset) as input, the duplicating rowset as "to remove", and the new rowsets as "to add".
+# ModifyRowSetTree() calls RowSetTree::Reset() with a rowset vector containing the unrelated rowsets and the new rowsets. Remember, one of the "unrelated" rowsets is undergoing major delta compaction.
+# The flush thread executes rowset_tree.cc:L81 and now has slices pointing to base data memory belonging to the rowset undergoing delta compaction.
+# At that precise moment, the major delta compaction thread finishes the compaction and replaces the rowset's base data. The base data is reference counted, but the flush thread isn't holding onto a reference, so the memory behind those slices is freed.
+# The flush thread moves on to rowset_tree.cc:L102 and, by calling ToString() on the slices, reads from the freed memory.
+
+This race can actually be observed in isolation by comparing RowSet::GetBounds()'s stated contract to the actual DRS behavior. From rowset.h: "the storage for these slices is part of the RowSet and only guaranteed to stay until the RowSet is destroyed." But this is violated by the DRS's major delta compaction behavior, which blows away said storage while retaining the enclosing RowSet.
+
+So how should we fix this? Perhaps RowSet::GetBounds() callers should make copies of the bounds. Or we could force them to take an additional reference on the DRS' base data. The latter seems more performant, but it also breaks the RowSet abstraction somewhat since a CFileSet reference only applies to DRS, not other rowsets.
+
+
+
+On a related note, why does major delta compaction mutate the DRS by replacing its base data instead of throwing out the entire DRS for another? Seems like that would bypass this problem altogether, plus it'd be more consistent with how flushes and merge compactions work (that is, by adding/removing entire rowsets).
+
+
+Hoping someone can pick this up next week.
+
+Seems rare enough that I'm gonna punt this to GA
+
+Investigating some flakiness on mt-tablet-test and going to try to fix this one
+
+Fixed in 1cda5dcd0bc4a9fd41ffd4d13b60c473c04a9ff5
+
+Updated the Fix Version since 0.8.0 is practically out.
+

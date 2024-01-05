@@ -1,0 +1,1491 @@
+One idea I actually really like is to set the dfs.block.size to the size of the file being uploaded. This should prevent HDFS from reserving any excess capacity during the write.
+
+[~andrew.wang] thanks for the idea. I've just created a POC based on your comment, and now I am evaluating it (some refactoring is needed in OozieSharelibCLI, [copyFolderRecursively | https://github.com/apache/oozie/blob/master/tools/src/main/java/org/apache/oozie/tools/OozieSharelibCLI.java#L255] could be replaced with a new method that creates a new Filesystem object with the proper dfs.block.size before submitting the copy job).  
+
+I think you can do it without a new FileSystem object since there's a create method that takes a blockSize parameter (FileSystem is also a bit heavyweight):
+
+https://github.com/apache/hadoop/blob/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/FileSystem.java#L1048
+
+[~andrew.wang] I did not know about that. Thanks. 
+
+I've just noticed another thing: if there is an exception during the sharelib installation (e.g. copy task fails), files in the temporary directory (https://github.com/apache/oozie/blob/master/tools/src/main/java/org/apache/oozie/tools/OozieSharelibCLI.java#L137) will not be deleted at the end. 
+
+{code}
+Error: Copy task for "/var/folders/9q/f8p_r6gj0wbck49_dc092q_m0000gp/T/oozie5744006317396681919.dir/share/lib/hive2/hadoop-yarn-common-2.4.0.jar" failed with exception
+...
+
+$ ls /var/folders/9q/f8p_r6gj0wbck49_dc092q_m0000gp/T/oozie5744006317396681919.dir/share/lib/hive2/hadoop-yarn-common-2.4.0.jar 
+/var/folders/9q/f8p_r6gj0wbck49_dc092q_m0000gp/T/oozie5744006317396681919.dir/share/lib/hive2/hadoop-yarn-common-2.4.0.jar
+{code}
+
+
+I took a peek at this class, looks like that's a Java API rather than an HDFS one. My guess though is that {{temp.deleteOnExit}} doesn't work since the directory isn't empty (same for the {{temp.delete()}} before it), so we should handle this with a try/finally if you always want this temp dir to be cleaned up. There's already a call to {{FileUtils.deleteDirectory}} at the bottom that will do a recursive delete that could be moved into a {{finally}} block.
+
+[~asasvari], the issue for reverting partially uploaded sharelibs is handled in OOZIE-2629. I don't think that should be part of this task.
+
+I tried to copy files to HDFS with block size set to the size of the file being uploaded.
+
+{code}
+try (FSDataOutputStream out = fs.create(
+                                dstPath,
+                                true,
+                                CommonConfigurationKeysPublic.IO_FILE_BUFFER_SIZE_DEFAULT,
+                                (short) 3,
+                                file.length())) {
+  Files.copy(file.toPath(), out);
+}
+{code}
+It seems the size of some jar files in the Oozie sharelib is less than the configured minimum value.
+
+{noformat}
+java.io.IOException: At least one copy task failed with exception
+	at org.apache.oozie.tools.OozieSharelibCLI.checkCopyResults(OozieSharelibCLI.java:255)
+	at org.apache.oozie.tools.OozieSharelibCLI.concurrentCopyFromLocal(OozieSharelibCLI.java:234)
+	at org.apache.oozie.tools.OozieSharelibCLI.run(OozieSharelibCLI.java:184)
+	at org.apache.oozie.tools.OozieSharelibCLI.main(OozieSharelibCLI.java:71)
+Caused by: org.apache.hadoop.ipc.RemoteException(java.io.IOException): Specified block size is less than configured minimum value (dfs.namenode.fs-limits.min-block-size): 658429 < 1048576
+{noformat}
+
+Now I tried to set block size to Math.max(1048576, file.length()) (I know it is hardcoded, but I have not found the proper function in FileSystem, getDefaultBlockSize is different), and I ran into the same problem. 
+
+Anyway, only doing this only will solve the problem described above.I still see 
+{noformat}
+org.apache.hadoop.ipc.RemoteException(java.io.IOException): File /user/asasvari/share/lib/lib_20170208141323/hive2/jline-2.12.jar could only be replicated to 0 nodes instead of minReplication (=1).  There are 1 datanode(s) running and no node(s) are excluded in this operation.
+{noformat}
+
+Is there an API to check the status of HDFS that can be relevant here (capacity, blockplacement status, etc.)? I want to wait before copying if the server is overloaded, or probably come up with some suggestion to retry sharelib installation with a proper  / more reasonable concurrency number. For example, if we have 464 files to copy than using 464 thread would not make sense.
+
+On the data node I can see:
+{noformat}
+2017-02-08 15:16:25,933 WARN org.apache.hadoop.hdfs.server.blockmanagement.BlockPlacementPolicy: Failed to place enough replicas, still in need of 1 to reach 1. For more information, please enable DEBUG log level on org.apache.hadoop.hdfs.server.blockmanagement.BlockPlacementPolicy
+{noformat}
+
+
+I tried the Oozie sharelib installation with {{-concurrency}} option with different number of parallel thread and It was able to install the oozie sharelib.
+
+Cluster Information: 3 node cluster, build using virtual box within Mac.
+The load on the cluster was not much, a bunch of MR jobs were running.
+Values tried for number of threads: 50, 150, 250, 350, 450.
+
+Thanks.
+
+[~abhishekbafna] thanks for the additional info. We ran into this issue on a 4-node cluster with Hadoop 2.6 (multiple components were talking to HDFS).
+
+When I tried to reproduce the problem with {{-concurrency 150}} on my single-node pseudo Hadoop, I noticed that sharelib was partially installed (exception failures for copy tasks were logged). At the end of the execution there were multiple files with 0 byte size created in HDFS.
+
+Now I have a working solution that I tested on Mac with pseudo Hadoop 2.6.0. Briefly, I add information about each failed copy task to a concurrent hash set, and retry uploading missed files using a single thread (with copyFromLocalFile). Before re-uploading files, we wait 1000 ms. If it fails again, we increase delay by the factor of 2, and decrease retry count (it is now hardcoded to be 5 times).  
+
+Testing JIRA OOZIE-2791
+
+Cleaning local git workspace
+
+----------------------------
+
+{color:green}+1 PATCH_APPLIES{color}
+{color:green}+1 CLEAN{color}
+{color:red}-1 RAW_PATCH_ANALYSIS{color}
+.    {color:green}+1{color} the patch does not introduce any @author tags
+.    {color:green}+1{color} the patch does not introduce any tabs
+.    {color:green}+1{color} the patch does not introduce any trailing spaces
+.    {color:green}+1{color} the patch does not introduce any line longer than 132
+.    {color:red}-1{color} the patch does not add/modify any testcase
+{color:green}+1 RAT{color}
+.    {color:green}+1{color} the patch does not seem to introduce new RAT warnings
+{color:green}+1 JAVADOC{color}
+.    {color:green}+1{color} the patch does not seem to introduce new Javadoc warnings
+{color:green}+1 COMPILE{color}
+.    {color:green}+1{color} HEAD compiles
+.    {color:green}+1{color} patch compiles
+.    {color:green}+1{color} the patch does not seem to introduce new javac warnings
+{color:red}-1{color} There are [2] new bugs found below threshold in total that must be fixed.
+.    {color:green}+1{color} There are no new bugs found in [server].
+.    {color:green}+1{color} There are no new bugs found in [client].
+.    {color:green}+1{color} There are no new bugs found in [core].
+.    {color:green}+1{color} There are no new bugs found in [docs].
+.    {color:green}+1{color} There are no new bugs found in [hadooplibs/hadoop-utils-2].
+.    {color:red}-1{color} There are [2] new bugs found below threshold in [tools] that must be fixed.
+.    You can find the FindBugs diff here (look for the red and orange ones): tools/findbugs-new.html
+.    The most important FindBugs errors are:
+.    At OozieSharelibCLI.java:[line 185]: Boxing/unboxing to parse a primitive org.apache.oozie.tools.OozieSharelibCLI.run(String[])
+.    At OozieSharelibCLI.java:[lines 221-226]: Should org.apache.oozie.tools.OozieSharelibCLI$CopyTaskConfiguration be a _static_ inner class?
+.    {color:green}+1{color} There are no new bugs found in [examples].
+.    {color:green}+1{color} There are no new bugs found in [sharelib/streaming].
+.    {color:green}+1{color} There are no new bugs found in [sharelib/sqoop].
+.    {color:green}+1{color} There are no new bugs found in [sharelib/distcp].
+.    {color:green}+1{color} There are no new bugs found in [sharelib/oozie].
+.    {color:green}+1{color} There are no new bugs found in [sharelib/hcatalog].
+.    {color:green}+1{color} There are no new bugs found in [sharelib/hive].
+.    {color:green}+1{color} There are no new bugs found in [sharelib/hive2].
+.    {color:green}+1{color} There are no new bugs found in [sharelib/pig].
+.    {color:green}+1{color} There are no new bugs found in [sharelib/spark].
+{color:green}+1 BACKWARDS_COMPATIBILITY{color}
+.    {color:green}+1{color} the patch does not change any JPA Entity/Colum/Basic/Lob/Transient annotations
+.    {color:green}+1{color} the patch does not modify JPA files
+{color:green}+1 TESTS{color}
+.    Tests run: 1872
+{color:green}+1 DISTRO{color}
+.    {color:green}+1{color} distro tarball builds with the patch 
+
+----------------------------
+{color:red}*-1 Overall result, please check the reported -1(s)*{color}
+
+
+The full output of the test-patch run is available at
+
+.   https://builds.apache.org/job/oozie-trunk-precommit-build/3635/
+
+Thanks for the patch [~asasvari]!
+
+I like the overall approach of collecting the failures and retrying at the end.
+The {{Set<CopyTaskConfiguration>}} is not used as a real set because the class {{CopyTaskConfiguration}} does not implement equals and hashcode.
+Could you update the CLI documentation to explain this behavior?
+
+
+
+Thanks for the review [~gezapeti]. You are right. I attached a new patch that addresses it. I am not sure if adding this implementation detail to the documentation is really needed. Setting /recommending a "proper" concurrency number is also tricky, but I will think on it.
+
+Testing JIRA OOZIE-2791
+
+Cleaning local git workspace
+
+----------------------------
+
+{color:green}+1 PATCH_APPLIES{color}
+{color:green}+1 CLEAN{color}
+{color:red}-1 RAW_PATCH_ANALYSIS{color}
+.    {color:green}+1{color} the patch does not introduce any @author tags
+.    {color:green}+1{color} the patch does not introduce any tabs
+.    {color:green}+1{color} the patch does not introduce any trailing spaces
+.    {color:green}+1{color} the patch does not introduce any line longer than 132
+.    {color:red}-1{color} the patch does not add/modify any testcase
+{color:green}+1 RAT{color}
+.    {color:green}+1{color} the patch does not seem to introduce new RAT warnings
+{color:green}+1 JAVADOC{color}
+.    {color:green}+1{color} the patch does not seem to introduce new Javadoc warnings
+{color:green}+1 COMPILE{color}
+.    {color:green}+1{color} HEAD compiles
+.    {color:green}+1{color} patch compiles
+.    {color:green}+1{color} the patch does not seem to introduce new javac warnings
+{color:red}-1{color} There are [2] new bugs found below threshold in total that must be fixed.
+.    {color:green}+1{color} There are no new bugs found in [server].
+.    {color:green}+1{color} There are no new bugs found in [client].
+.    {color:green}+1{color} There are no new bugs found in [core].
+.    {color:green}+1{color} There are no new bugs found in [docs].
+.    {color:green}+1{color} There are no new bugs found in [hadooplibs/hadoop-utils-2].
+.    {color:red}-1{color} There are [2] new bugs found below threshold in [tools] that must be fixed.
+.    You can find the FindBugs diff here (look for the red and orange ones): tools/findbugs-new.html
+.    The most important FindBugs errors are:
+.    At OozieSharelibCLI.java:[line 185]: Boxing/unboxing to parse a primitive org.apache.oozie.tools.OozieSharelibCLI.run(String[])
+.    At OozieSharelibCLI.java:[lines 340-367]: Should org.apache.oozie.tools.OozieSharelibCLI$CopyTaskConfiguration be a _static_ inner class?
+.    {color:green}+1{color} There are no new bugs found in [examples].
+.    {color:green}+1{color} There are no new bugs found in [sharelib/streaming].
+.    {color:green}+1{color} There are no new bugs found in [sharelib/sqoop].
+.    {color:green}+1{color} There are no new bugs found in [sharelib/distcp].
+.    {color:green}+1{color} There are no new bugs found in [sharelib/oozie].
+.    {color:green}+1{color} There are no new bugs found in [sharelib/hcatalog].
+.    {color:green}+1{color} There are no new bugs found in [sharelib/hive].
+.    {color:green}+1{color} There are no new bugs found in [sharelib/hive2].
+.    {color:green}+1{color} There are no new bugs found in [sharelib/pig].
+.    {color:green}+1{color} There are no new bugs found in [sharelib/spark].
+{color:green}+1 BACKWARDS_COMPATIBILITY{color}
+.    {color:green}+1{color} the patch does not change any JPA Entity/Colum/Basic/Lob/Transient annotations
+.    {color:green}+1{color} the patch does not modify JPA files
+{color:red}-1 TESTS{color}
+.    Tests run: 1873
+.    Tests failed: 5
+.    Tests errors: 3
+
+.    The patch failed the following testcases:
+
+.      testMain(org.apache.oozie.action.hadoop.TestHiveMain)
+.      testPigScript(org.apache.oozie.action.hadoop.TestPigMain)
+.      testEmbeddedPigWithinPython(org.apache.oozie.action.hadoop.TestPigMain)
+.      testPig_withNullExternalID(org.apache.oozie.action.hadoop.TestPigMain)
+.      testPigScript(org.apache.oozie.action.hadoop.TestPigMainWithOldAPI)
+
+.    Tests failing with errors:
+.      testAddXIncludeFromStream(org.apache.oozie.util.TestXConfiguration)
+.      testAddXIncludeFromReader(org.apache.oozie.util.TestXConfiguration)
+.      testLoadDump(org.apache.oozie.tools.TestDBLoadDump)
+
+{color:green}+1 DISTRO{color}
+.    {color:green}+1{color} distro tarball builds with the patch 
+
+----------------------------
+{color:red}*-1 Overall result, please check the reported -1(s)*{color}
+
+
+The full output of the test-patch run is available at
+
+.   https://builds.apache.org/job/oozie-trunk-precommit-build/3642/
+
+Test failures are unrelated to the changeset, FindBugs is valid.
+
+[~rkanter] what do you think about this problem? Do you have an idea to predict/approximate a proper concurrency level setting for sharelib installation? 
+
+While I agree that Oozie should do retry to cover for other issues (bad network, etc), it still seems funny to me that a perfectly healthy HDFS can get write failures.
+
+Anyway, for choosing a default concurrency level, you could try running the thing on say 3 different sizes of clusters using 1, 2, 3, ... concurrency and timing it.  Then see which one is the fastest.  I imagine it eventually peaks at some point?  Alternatively, we could just pick an reasonable but arbitrary value like 10.  
+
+PreCommit-OOZIE-Build started
+
+
+
+Testing JIRA OOZIE-2791
+
+Cleaning local git workspace
+
+----------------------------
+
+{color:red}-1{color} Patch failed to apply to head of branch
+
+----------------------------
+
+
+PreCommit-OOZIE-Build started
+
+
+
+Testing JIRA OOZIE-2791
+
+Cleaning local git workspace
+
+----------------------------
+
+{color:red}-1{color} Patch failed to apply to head of branch
+
+----------------------------
+
+
+PreCommit-OOZIE-Build started
+
+
+
+Testing JIRA OOZIE-2791
+
+Cleaning local git workspace
+
+----------------------------
+
+{color:red}-1{color} Patch failed to apply to head of branch
+
+----------------------------
+
+
+PreCommit-OOZIE-Build started
+
+
+
+Testing JIRA OOZIE-2791
+
+Cleaning local git workspace
+
+----------------------------
+
+{color:green}+1 PATCH_APPLIES{color}
+{color:green}+1 CLEAN{color}
+{color:red}-1 RAW_PATCH_ANALYSIS{color}
+.    {color:green}+1{color} the patch does not introduce any @author tags
+.    {color:green}+1{color} the patch does not introduce any tabs
+.    {color:green}+1{color} the patch does not introduce any trailing spaces
+.    {color:green}+1{color} the patch does not introduce any line longer than 132
+.    {color:red}-1{color} the patch does not add/modify any testcase
+{color:green}+1 RAT{color}
+.    {color:green}+1{color} the patch does not seem to introduce new RAT warnings
+{color:green}+1 JAVADOC{color}
+.    {color:green}+1{color} the patch does not seem to introduce new Javadoc warnings
+{color:green}+1 COMPILE{color}
+.    {color:green}+1{color} HEAD compiles
+.    {color:green}+1{color} patch compiles
+.    {color:green}+1{color} the patch does not seem to introduce new javac warnings
+{color:red}-1{color} There are [3] new bugs found below threshold in total that must be fixed.
+. {color:green}+1{color} There are no new bugs found in [examples].
+. {color:green}+1{color} There are no new bugs found in [webapp].
+. {color:green}+1{color} There are no new bugs found in [core].
+. {color:red}-1{color} There are [3] new bugs found below threshold in [tools] that must be fixed.
+. You can find the FindBugs diff here (look for the red and orange ones): tools/findbugs-new.html
+. The most important FindBugs errors are:
+. At OozieSharelibCLI.java:[line 193]: Boxing/unboxing to parse a primitive org.apache.oozie.tools.OozieSharelibCLI.run(String[])
+. Possible null pointer dereference in org.apache.oozie.tools.OozieSharelibCLI.copyFolderRecursively(OozieSharelibCLI$CopyTaskConfiguration) due to return value of called method: Another occurrence at OozieSharelibCLI.java:[line 194]
+. Known null at OozieSharelibCLI.java:[line 239]: Dereferenced at OozieSharelibCLI.java:[line 239]
+. At OozieSharelibCLI.java:[lines 361-387]: Should org.apache.oozie.tools.OozieSharelibCLI$CopyTaskConfiguration be a _static_ inner class?
+. {color:green}+1{color} There are no new bugs found in [server].
+. {color:green}+1{color} There are no new bugs found in [docs].
+. {color:green}+1{color} There are no new bugs found in [sharelib/hive2].
+. {color:green}+1{color} There are no new bugs found in [sharelib/pig].
+. {color:green}+1{color} There are no new bugs found in [sharelib/streaming].
+. {color:green}+1{color} There are no new bugs found in [sharelib/hive].
+. {color:green}+1{color} There are no new bugs found in [sharelib/hcatalog].
+. {color:green}+1{color} There are no new bugs found in [sharelib/sqoop].
+. {color:green}+1{color} There are no new bugs found in [sharelib/oozie].
+. {color:green}+1{color} There are no new bugs found in [sharelib/distcp].
+. {color:green}+1{color} There are no new bugs found in [sharelib/spark].
+. {color:green}+1{color} There are no new bugs found in [client].
+{color:green}+1 BACKWARDS_COMPATIBILITY{color}
+.    {color:green}+1{color} the patch does not change any JPA Entity/Colum/Basic/Lob/Transient annotations
+.    {color:green}+1{color} the patch does not modify JPA files
+{color:red}-1 TESTS{color}
+.    Tests run: 2112
+.    Tests failed: 1
+.    Tests errors: 2
+
+.    The patch failed the following testcases:
+
+testCoordActionRecoveryServiceForWaitingRegisterPartition(org.apache.oozie.service.TestRecoveryService)
+
+.    Tests failing with errors:
+testConnectionRetryExceptionListener(org.apache.oozie.service.TestJMSAccessorService)
+testConnectionRetry(org.apache.oozie.service.TestJMSAccessorService)
+
+.    {color:orange}Tests failed at first run:{color}
+TestJavaActionExecutor#testCredentialsSkip
+TestOozieDBCLI#testOozieDBCLI
+.    For the complete list of flaky tests, see TEST-SUMMARY-FULL files.
+{color:green}+1 DISTRO{color}
+.    {color:green}+1{color} distro tarball builds with the patch 
+
+----------------------------
+{color:red}*-1 Overall result, please check the reported -1(s)*{color}
+
+
+The full output of the test-patch run is available at
+
+. https://builds.apache.org/job/PreCommit-OOZIE-Build/505/
+
+
+
+PreCommit-OOZIE-Build started
+
+
+
+Testing JIRA OOZIE-2791
+
+Cleaning local git workspace
+
+----------------------------
+
+{color:green}+1 PATCH_APPLIES{color}
+{color:green}+1 CLEAN{color}
+{color:red}-1 RAW_PATCH_ANALYSIS{color}
+.    {color:green}+1{color} the patch does not introduce any @author tags
+.    {color:green}+1{color} the patch does not introduce any tabs
+.    {color:green}+1{color} the patch does not introduce any trailing spaces
+.    {color:red}-1{color} the patch contains 2 line(s) longer than 132 characters
+.    {color:green}+1{color} the patch adds/modifies 1 testcase(s)
+{color:green}+1 RAT{color}
+.    {color:green}+1{color} the patch does not seem to introduce new RAT warnings
+{color:green}+1 JAVADOC{color}
+.    {color:green}+1{color} the patch does not seem to introduce new Javadoc warnings
+{color:green}+1 COMPILE{color}
+.    {color:green}+1{color} HEAD compiles
+.    {color:green}+1{color} patch compiles
+.    {color:green}+1{color} the patch does not seem to introduce new javac warnings
+{color:red}-1{color} There are [1] new bugs found below threshold in total that must be fixed.
+. {color:green}+1{color} There are no new bugs found in [webapp].
+. {color:green}+1{color} There are no new bugs found in [core].
+. {color:red}-1{color} There are [1] new bugs found below threshold in [tools] that must be fixed.
+. You can find the FindBugs diff here (look for the red and orange ones): tools/findbugs-new.html
+. The most important FindBugs errors are:
+. Dereferenced at OozieSharelibCLI.java:[line 368]: Possible null pointer dereference in org.apache.oozie.tools.OozieSharelibCLI$ConcurrentCopyFromLocal.copyFolderRecursively(OozieSharelibCLI$CopyTaskConfiguration) due to return value of called method
+. Known null at OozieSharelibCLI.java:[line 368]
+. {color:green}+1{color} There are no new bugs found in [sharelib/hive2].
+. {color:green}+1{color} There are no new bugs found in [sharelib/distcp].
+. {color:green}+1{color} There are no new bugs found in [sharelib/hcatalog].
+. {color:green}+1{color} There are no new bugs found in [sharelib/streaming].
+. {color:green}+1{color} There are no new bugs found in [sharelib/sqoop].
+. {color:green}+1{color} There are no new bugs found in [sharelib/oozie].
+. {color:green}+1{color} There are no new bugs found in [sharelib/pig].
+. {color:green}+1{color} There are no new bugs found in [sharelib/hive].
+. {color:green}+1{color} There are no new bugs found in [sharelib/spark].
+. {color:green}+1{color} There are no new bugs found in [client].
+. {color:green}+1{color} There are no new bugs found in [examples].
+. {color:green}+1{color} There are no new bugs found in [docs].
+. {color:green}+1{color} There are no new bugs found in [server].
+{color:green}+1 BACKWARDS_COMPATIBILITY{color}
+.    {color:green}+1{color} the patch does not change any JPA Entity/Colum/Basic/Lob/Transient annotations
+.    {color:green}+1{color} the patch does not modify JPA files
+{color:red}-1 TESTS{color}
+.    Tests run: 2132
+.    Tests failed: 1
+.    Tests errors: 0
+
+.    The patch failed the following testcases:
+
+testHiveAction(org.apache.oozie.action.hadoop.TestHiveActionExecutor)
+
+.    Tests failing with errors:
+
+
+.    {color:orange}Tests failed at first run:{color}
+TestJavaActionExecutor#testCredentialsSkip
+TestCoordActionsKillXCommand#testActionKillCommandActionNumbers
+TestOozieDBCLI#testOozieDBCLI
+.    For the complete list of flaky tests, see TEST-SUMMARY-FULL files.
+{color:green}+1 DISTRO{color}
+.    {color:green}+1{color} distro tarball builds with the patch 
+
+----------------------------
+{color:red}*-1 Overall result, please check the reported -1(s)*{color}
+
+
+The full output of the test-patch run is available at
+
+. https://builds.apache.org/job/PreCommit-OOZIE-Build/522/
+
+
+
+PreCommit-OOZIE-Build started
+
+
+
+Testing JIRA OOZIE-2791
+
+Cleaning local git workspace
+
+----------------------------
+
+{color:green}+1 PATCH_APPLIES{color}
+{color:green}+1 CLEAN{color}
+{color:green}+1 RAW_PATCH_ANALYSIS{color}
+.    {color:green}+1{color} the patch does not introduce any @author tags
+.    {color:green}+1{color} the patch does not introduce any tabs
+.    {color:green}+1{color} the patch does not introduce any trailing spaces
+.    {color:green}+1{color} the patch does not introduce any line longer than 132
+.    {color:green}+1{color} the patch adds/modifies 4 testcase(s)
+{color:green}+1 RAT{color}
+.    {color:green}+1{color} the patch does not seem to introduce new RAT warnings
+{color:green}+1 JAVADOC{color}
+{color:green}+1 JAVADOC{color}
+.    {color:green}+1{color} the patch does not seem to introduce new Javadoc warning(s)
+.    {color:green}+1{color} the patch does not seem to introduce new Javadoc error(s)
+.    {color:red}ERROR{color}: the current HEAD has 2 Javadoc error(s)
+{color:green}+1 COMPILE{color}
+.    {color:green}+1{color} HEAD compiles
+.    {color:green}+1{color} patch compiles
+.    {color:green}+1{color} the patch does not seem to introduce new javac warnings
+{color:red}-1{color} There are [1] new bugs found below threshold in total that must be fixed.
+. {color:green}+1{color} There are no new bugs found in [examples].
+. {color:green}+1{color} There are no new bugs found in [webapp].
+. {color:green}+1{color} There are no new bugs found in [core].
+. {color:red}-1{color} There are [1] new bugs found below threshold in [tools] that must be fixed.
+. You can find the FindBugs diff here (look for the red and orange ones): tools/findbugs-new.html
+. The most important FindBugs errors are:
+. Dereferenced at OozieSharelibCLI.java:[line 388]: Possible null pointer dereference in org.apache.oozie.tools.OozieSharelibCLI$ConcurrentCopyFromLocal.copyFolderRecursively(OozieSharelibCLI$CopyTaskConfiguration) due to return value of called method
+. Known null at OozieSharelibCLI.java:[line 388]
+. {color:green}+1{color} There are no new bugs found in [server].
+. {color:green}+1{color} There are no new bugs found in [docs].
+. {color:green}+1{color} There are no new bugs found in [sharelib/hive2].
+. {color:green}+1{color} There are no new bugs found in [sharelib/pig].
+. {color:green}+1{color} There are no new bugs found in [sharelib/streaming].
+. {color:green}+1{color} There are no new bugs found in [sharelib/hive].
+. {color:green}+1{color} There are no new bugs found in [sharelib/hcatalog].
+. {color:green}+1{color} There are no new bugs found in [sharelib/sqoop].
+. {color:green}+1{color} There are no new bugs found in [sharelib/oozie].
+. {color:green}+1{color} There are no new bugs found in [sharelib/distcp].
+. {color:green}+1{color} There are no new bugs found in [sharelib/spark].
+. {color:green}+1{color} There are no new bugs found in [client].
+{color:green}+1 BACKWARDS_COMPATIBILITY{color}
+.    {color:green}+1{color} the patch does not change any JPA Entity/Colum/Basic/Lob/Transient annotations
+.    {color:green}+1{color} the patch does not modify JPA files
+{color:green}+1 TESTS{color}
+.    Tests run: 2159
+{color:green}+1 DISTRO{color}
+.    {color:green}+1{color} distro tarball builds with the patch 
+
+----------------------------
+{color:red}*-1 Overall result, please check the reported -1(s)*{color}
+
+
+The full output of the test-patch run is available at
+
+. https://builds.apache.org/job/PreCommit-OOZIE-Build/604/
+
+
+
+PreCommit-OOZIE-Build started
+
+
+
+Testing JIRA OOZIE-2791
+
+Cleaning local git workspace
+
+----------------------------
+
+{color:green}+1 PATCH_APPLIES{color}
+{color:green}+1 CLEAN{color}
+{color:green}+1 RAW_PATCH_ANALYSIS{color}
+.    {color:green}+1{color} the patch does not introduce any @author tags
+.    {color:green}+1{color} the patch does not introduce any tabs
+.    {color:green}+1{color} the patch does not introduce any trailing spaces
+.    {color:green}+1{color} the patch does not introduce any line longer than 132
+.    {color:green}+1{color} the patch adds/modifies 4 testcase(s)
+{color:green}+1 RAT{color}
+.    {color:green}+1{color} the patch does not seem to introduce new RAT warnings
+{color:green}+1 JAVADOC{color}
+{color:green}+1 JAVADOC{color}
+.    {color:green}+1{color} the patch does not seem to introduce new Javadoc warning(s)
+.    {color:green}+1{color} the patch does not seem to introduce new Javadoc error(s)
+.    {color:red}ERROR{color}: the current HEAD has 2 Javadoc error(s)
+{color:green}+1 COMPILE{color}
+.    {color:green}+1{color} HEAD compiles
+.    {color:green}+1{color} patch compiles
+.    {color:green}+1{color} the patch does not seem to introduce new javac warnings
+{color:green}+1{color} There are no new bugs found in total.
+. {color:green}+1{color} There are no new bugs found in [webapp].
+. {color:green}+1{color} There are no new bugs found in [core].
+. {color:green}+1{color} There are no new bugs found in [tools].
+. {color:green}+1{color} There are no new bugs found in [sharelib/hive2].
+. {color:green}+1{color} There are no new bugs found in [sharelib/distcp].
+. {color:green}+1{color} There are no new bugs found in [sharelib/hcatalog].
+. {color:green}+1{color} There are no new bugs found in [sharelib/streaming].
+. {color:green}+1{color} There are no new bugs found in [sharelib/sqoop].
+. {color:green}+1{color} There are no new bugs found in [sharelib/oozie].
+. {color:green}+1{color} There are no new bugs found in [sharelib/pig].
+. {color:green}+1{color} There are no new bugs found in [sharelib/hive].
+. {color:green}+1{color} There are no new bugs found in [sharelib/spark].
+. {color:green}+1{color} There are no new bugs found in [client].
+. {color:green}+1{color} There are no new bugs found in [examples].
+. {color:green}+1{color} There are no new bugs found in [docs].
+. {color:green}+1{color} There are no new bugs found in [server].
+{color:green}+1 BACKWARDS_COMPATIBILITY{color}
+.    {color:green}+1{color} the patch does not change any JPA Entity/Colum/Basic/Lob/Transient annotations
+.    {color:green}+1{color} the patch does not modify JPA files
+{color:red}-1 TESTS{color}
+.    Tests run: 2159
+.    Tests failed: 2
+.    Tests errors: 6
+
+.    The patch failed the following testcases:
+
+testOozieSharelibCLICreate(org.apache.oozie.tools.TestConcurrentCopyFromLocal)
+testOozieSharelibCLICreateConcurrent(org.apache.oozie.tools.TestConcurrentCopyFromLocal)
+
+.    Tests failing with errors:
+testConcurrentCopyFromLocal(org.apache.oozie.tools.TestConcurrentCopyFromLocal)
+testImportTablesOverflowBatchSize(org.apache.oozie.tools.TestDBLoadDump)
+testImportToNonExistingTablesSucceedsOnHsqldb(org.apache.oozie.tools.TestDBLoadDump)
+testImportInvalidDataLeavesTablesEmpty(org.apache.oozie.tools.TestDBLoadDump)
+testImportToNonEmptyTablesCausesPrematureExit(org.apache.oozie.tools.TestDBLoadDump)
+testImportedDBIsExportedCorrectly(org.apache.oozie.tools.TestDBLoadDump)
+
+.    {color:orange}Tests failed at first run:{color}
+TestCoordActionsKillXCommand#testActionKillCommandActionNumbers
+.    For the complete list of flaky tests, see TEST-SUMMARY-FULL files.
+{color:green}+1 DISTRO{color}
+.    {color:green}+1{color} distro tarball builds with the patch 
+
+----------------------------
+{color:red}*-1 Overall result, please check the reported -1(s)*{color}
+
+
+The full output of the test-patch run is available at
+
+. https://builds.apache.org/job/PreCommit-OOZIE-Build/605/
+
+
+
+PreCommit-OOZIE-Build started
+
+
+
+Testing JIRA OOZIE-2791
+
+Cleaning local git workspace
+
+----------------------------
+
+{color:green}+1 PATCH_APPLIES{color}
+{color:green}+1 CLEAN{color}
+{color:green}+1 RAW_PATCH_ANALYSIS{color}
+.    {color:green}+1{color} the patch does not introduce any @author tags
+.    {color:green}+1{color} the patch does not introduce any tabs
+.    {color:green}+1{color} the patch does not introduce any trailing spaces
+.    {color:green}+1{color} the patch does not introduce any line longer than 132
+.    {color:green}+1{color} the patch adds/modifies 4 testcase(s)
+{color:green}+1 RAT{color}
+.    {color:green}+1{color} the patch does not seem to introduce new RAT warnings
+{color:green}+1 JAVADOC{color}
+{color:green}+1 JAVADOC{color}
+.    {color:green}+1{color} the patch does not seem to introduce new Javadoc warning(s)
+.    {color:green}+1{color} the patch does not seem to introduce new Javadoc error(s)
+.    {color:red}ERROR{color}: the current HEAD has 2 Javadoc error(s)
+{color:green}+1 COMPILE{color}
+.    {color:green}+1{color} HEAD compiles
+.    {color:green}+1{color} patch compiles
+.    {color:green}+1{color} the patch does not seem to introduce new javac warnings
+{color:green}+1{color} There are no new bugs found in total.
+. {color:green}+1{color} There are no new bugs found in [examples].
+. {color:green}+1{color} There are no new bugs found in [webapp].
+. {color:green}+1{color} There are no new bugs found in [core].
+. {color:green}+1{color} There are no new bugs found in [tools].
+. {color:green}+1{color} There are no new bugs found in [server].
+. {color:green}+1{color} There are no new bugs found in [docs].
+. {color:green}+1{color} There are no new bugs found in [sharelib/hive2].
+. {color:green}+1{color} There are no new bugs found in [sharelib/pig].
+. {color:green}+1{color} There are no new bugs found in [sharelib/streaming].
+. {color:green}+1{color} There are no new bugs found in [sharelib/hive].
+. {color:green}+1{color} There are no new bugs found in [sharelib/hcatalog].
+. {color:green}+1{color} There are no new bugs found in [sharelib/sqoop].
+. {color:green}+1{color} There are no new bugs found in [sharelib/oozie].
+. {color:green}+1{color} There are no new bugs found in [sharelib/distcp].
+. {color:green}+1{color} There are no new bugs found in [sharelib/spark].
+. {color:green}+1{color} There are no new bugs found in [client].
+{color:green}+1 BACKWARDS_COMPATIBILITY{color}
+.    {color:green}+1{color} the patch does not change any JPA Entity/Colum/Basic/Lob/Transient annotations
+.    {color:green}+1{color} the patch does not modify JPA files
+{color:green}+1 TESTS{color}
+.    Tests run: 2159
+{color:green}+1 DISTRO{color}
+.    {color:green}+1{color} distro tarball builds with the patch 
+
+----------------------------
+{color:green}*+1 Overall result, good!, no -1s*{color}
+
+
+The full output of the test-patch run is available at
+
+. https://builds.apache.org/job/PreCommit-OOZIE-Build/606/
+
+
+
+Thanks for the contribution [~kmarton]! Left some more comments over on RB.
+
+PreCommit-OOZIE-Build started
+
+
+
+Testing JIRA OOZIE-2791
+
+Cleaning local git workspace
+
+----------------------------
+
+{color:green}+1 PATCH_APPLIES{color}
+{color:green}+1 CLEAN{color}
+{color:red}-1 RAW_PATCH_ANALYSIS{color}
+.    {color:green}+1{color} the patch does not introduce any @author tags
+.    {color:green}+1{color} the patch does not introduce any tabs
+.    {color:green}+1{color} the patch does not introduce any trailing spaces
+.    {color:red}-1{color} the patch contains 1 line(s) longer than 132 characters
+.    {color:green}+1{color} the patch adds/modifies 5 testcase(s)
+{color:green}+1 RAT{color}
+.    {color:green}+1{color} the patch does not seem to introduce new RAT warnings
+{color:green}+1 JAVADOC{color}
+{color:green}+1 JAVADOC{color}
+.    {color:green}+1{color} the patch does not seem to introduce new Javadoc warning(s)
+.    {color:green}+1{color} the patch does not seem to introduce new Javadoc error(s)
+.    {color:red}ERROR{color}: the current HEAD has 2 Javadoc error(s)
+{color:green}+1 COMPILE{color}
+.    {color:green}+1{color} HEAD compiles
+.    {color:green}+1{color} patch compiles
+.    {color:green}+1{color} the patch does not seem to introduce new javac warnings
+{color:green}+1{color} There are no new bugs found in total.
+. {color:green}+1{color} There are no new bugs found in [examples].
+. {color:green}+1{color} There are no new bugs found in [webapp].
+. {color:green}+1{color} There are no new bugs found in [core].
+. {color:green}+1{color} There are no new bugs found in [tools].
+. {color:green}+1{color} There are no new bugs found in [server].
+. {color:green}+1{color} There are no new bugs found in [docs].
+. {color:green}+1{color} There are no new bugs found in [sharelib/hive2].
+. {color:green}+1{color} There are no new bugs found in [sharelib/pig].
+. {color:green}+1{color} There are no new bugs found in [sharelib/streaming].
+. {color:green}+1{color} There are no new bugs found in [sharelib/hive].
+. {color:green}+1{color} There are no new bugs found in [sharelib/hcatalog].
+. {color:green}+1{color} There are no new bugs found in [sharelib/sqoop].
+. {color:green}+1{color} There are no new bugs found in [sharelib/oozie].
+. {color:green}+1{color} There are no new bugs found in [sharelib/distcp].
+. {color:green}+1{color} There are no new bugs found in [sharelib/spark].
+. {color:green}+1{color} There are no new bugs found in [client].
+{color:green}+1 BACKWARDS_COMPATIBILITY{color}
+.    {color:green}+1{color} the patch does not change any JPA Entity/Colum/Basic/Lob/Transient annotations
+.    {color:green}+1{color} the patch does not modify JPA files
+{color:green}+1 TESTS{color}
+.    Tests run: 2151
+{color:green}+1 DISTRO{color}
+.    {color:green}+1{color} distro tarball builds with the patch 
+
+----------------------------
+{color:red}*-1 Overall result, please check the reported -1(s)*{color}
+
+
+The full output of the test-patch run is available at
+
+. https://builds.apache.org/job/PreCommit-OOZIE-Build/612/
+
+
+
+PreCommit-OOZIE-Build started
+
+
+
+Testing JIRA OOZIE-2791
+
+Cleaning local git workspace
+
+----------------------------
+
+{color:green}+1 PATCH_APPLIES{color}
+{color:green}+1 CLEAN{color}
+{color:green}+1 RAW_PATCH_ANALYSIS{color}
+.    {color:green}+1{color} the patch does not introduce any @author tags
+.    {color:green}+1{color} the patch does not introduce any tabs
+.    {color:green}+1{color} the patch does not introduce any trailing spaces
+.    {color:green}+1{color} the patch does not introduce any line longer than 132
+.    {color:green}+1{color} the patch adds/modifies 5 testcase(s)
+{color:green}+1 RAT{color}
+.    {color:green}+1{color} the patch does not seem to introduce new RAT warnings
+{color:green}+1 JAVADOC{color}
+{color:green}+1 JAVADOC{color}
+.    {color:green}+1{color} the patch does not seem to introduce new Javadoc warning(s)
+.    {color:green}+1{color} the patch does not seem to introduce new Javadoc error(s)
+.    {color:red}ERROR{color}: the current HEAD has 2 Javadoc error(s)
+{color:green}+1 COMPILE{color}
+.    {color:green}+1{color} HEAD compiles
+.    {color:green}+1{color} patch compiles
+.    {color:green}+1{color} the patch does not seem to introduce new javac warnings
+{color:green}+1{color} There are no new bugs found in total.
+. {color:green}+1{color} There are no new bugs found in [docs].
+. {color:green}+1{color} There are no new bugs found in [webapp].
+. {color:green}+1{color} There are no new bugs found in [sharelib/distcp].
+. {color:green}+1{color} There are no new bugs found in [sharelib/hive].
+. {color:green}+1{color} There are no new bugs found in [sharelib/spark].
+. {color:green}+1{color} There are no new bugs found in [sharelib/hive2].
+. {color:green}+1{color} There are no new bugs found in [sharelib/hcatalog].
+. {color:green}+1{color} There are no new bugs found in [sharelib/streaming].
+. {color:green}+1{color} There are no new bugs found in [sharelib/pig].
+. {color:green}+1{color} There are no new bugs found in [sharelib/sqoop].
+. {color:green}+1{color} There are no new bugs found in [sharelib/oozie].
+. {color:green}+1{color} There are no new bugs found in [examples].
+. {color:green}+1{color} There are no new bugs found in [client].
+. {color:green}+1{color} There are no new bugs found in [core].
+. {color:green}+1{color} There are no new bugs found in [tools].
+. {color:green}+1{color} There are no new bugs found in [server].
+{color:green}+1 BACKWARDS_COMPATIBILITY{color}
+.    {color:green}+1{color} the patch does not change any JPA Entity/Colum/Basic/Lob/Transient annotations
+.    {color:green}+1{color} the patch does not modify JPA files
+{color:green}+1 TESTS{color}
+.    Tests run: 2158
+.    {color:orange}Tests failed at first run:{color}
+TestCoordActionsKillXCommand#testActionKillCommandActionNumbers
+.    For the complete list of flaky tests, see TEST-SUMMARY-FULL files.
+{color:green}+1 DISTRO{color}
+.    {color:green}+1{color} distro tarball builds with the patch 
+
+----------------------------
+{color:green}*+1 Overall result, good!, no -1s*{color}
+
+
+The full output of the test-patch run is available at
+
+. https://builds.apache.org/job/PreCommit-OOZIE-Build/627/
+
+
+
+Thank you [~andras.piros], for the +1, [~pbacsko], I have uploaded a new patch with the fix of your comments as well. Could you please take a look at the review?
+
+[~pbacsko], I have made the suggested changes. Can you please check the new patch?
+
+PreCommit-OOZIE-Build started
+
+
+
+Testing JIRA OOZIE-2791
+
+Cleaning local git workspace
+
+----------------------------
+
+{color:green}+1 PATCH_APPLIES{color}
+{color:green}+1 CLEAN{color}
+{color:green}+1 RAW_PATCH_ANALYSIS{color}
+.    {color:green}+1{color} the patch does not introduce any @author tags
+.    {color:green}+1{color} the patch does not introduce any tabs
+.    {color:green}+1{color} the patch does not introduce any trailing spaces
+.    {color:green}+1{color} the patch does not introduce any line longer than 132
+.    {color:green}+1{color} the patch adds/modifies 5 testcase(s)
+{color:green}+1 RAT{color}
+.    {color:green}+1{color} the patch does not seem to introduce new RAT warnings
+{color:green}+1 JAVADOC{color}
+{color:green}+1 JAVADOC{color}
+.    {color:green}+1{color} the patch does not seem to introduce new Javadoc warning(s)
+.    {color:green}+1{color} the patch does not seem to introduce new Javadoc error(s)
+.    {color:red}ERROR{color}: the current HEAD has 2 Javadoc error(s)
+{color:green}+1 COMPILE{color}
+.    {color:green}+1{color} HEAD compiles
+.    {color:green}+1{color} patch compiles
+.    {color:green}+1{color} the patch does not seem to introduce new javac warnings
+{color:green}+1{color} There are no new bugs found in total.
+. {color:green}+1{color} There are no new bugs found in [examples].
+. {color:green}+1{color} There are no new bugs found in [core].
+. {color:green}+1{color} There are no new bugs found in [sharelib/distcp].
+. {color:green}+1{color} There are no new bugs found in [sharelib/hive].
+. {color:green}+1{color} There are no new bugs found in [sharelib/pig].
+. {color:green}+1{color} There are no new bugs found in [sharelib/spark].
+. {color:green}+1{color} There are no new bugs found in [sharelib/hive2].
+. {color:green}+1{color} There are no new bugs found in [sharelib/hcatalog].
+. {color:green}+1{color} There are no new bugs found in [sharelib/sqoop].
+. {color:green}+1{color} There are no new bugs found in [sharelib/oozie].
+. {color:green}+1{color} There are no new bugs found in [sharelib/streaming].
+. {color:green}+1{color} There are no new bugs found in [webapp].
+. {color:green}+1{color} There are no new bugs found in [tools].
+. {color:green}+1{color} There are no new bugs found in [docs].
+. {color:green}+1{color} There are no new bugs found in [server].
+. {color:green}+1{color} There are no new bugs found in [fluent-job/fluent-job-api].
+. {color:green}+1{color} There are no new bugs found in [client].
+{color:green}+1 BACKWARDS_COMPATIBILITY{color}
+.    {color:green}+1{color} the patch does not change any JPA Entity/Colum/Basic/Lob/Transient annotations
+.    {color:green}+1{color} the patch does not modify JPA files
+{color:green}+1 TESTS{color}
+.    Tests run: 2908
+{color:green}+1 DISTRO{color}
+.    {color:green}+1{color} distro tarball builds with the patch 
+
+----------------------------
+{color:green}*+1 Overall result, good!, no -1s*{color}
+
+
+The full output of the test-patch run is available at
+
+. https://builds.apache.org/job/PreCommit-OOZIE-Build/652/
+
+
+
+PreCommit-OOZIE-Build started
+
+
+
+Testing JIRA OOZIE-2791
+
+Cleaning local git workspace
+
+----------------------------
+
+{color:green}+1 PATCH_APPLIES{color}
+{color:green}+1 CLEAN{color}
+{color:green}+1 RAW_PATCH_ANALYSIS{color}
+.    {color:green}+1{color} the patch does not introduce any @author tags
+.    {color:green}+1{color} the patch does not introduce any tabs
+.    {color:green}+1{color} the patch does not introduce any trailing spaces
+.    {color:green}+1{color} the patch does not introduce any line longer than 132
+.    {color:green}+1{color} the patch adds/modifies 5 testcase(s)
+{color:green}+1 RAT{color}
+.    {color:green}+1{color} the patch does not seem to introduce new RAT warnings
+{color:green}+1 JAVADOC{color}
+{color:green}+1 JAVADOC{color}
+.    {color:green}+1{color} the patch does not seem to introduce new Javadoc warning(s)
+.    {color:green}+1{color} the patch does not seem to introduce new Javadoc error(s)
+.    {color:red}ERROR{color}: the current HEAD has 2 Javadoc error(s)
+{color:green}+1 COMPILE{color}
+.    {color:green}+1{color} HEAD compiles
+.    {color:green}+1{color} patch compiles
+.    {color:green}+1{color} the patch does not seem to introduce new javac warnings
+{color:green}+1{color} There are no new bugs found in total.
+. {color:green}+1{color} There are no new bugs found in [webapp].
+. {color:green}+1{color} There are no new bugs found in [core].
+. {color:green}+1{color} There are no new bugs found in [tools].
+. {color:green}+1{color} There are no new bugs found in [fluent-job/fluent-job-api].
+. {color:green}+1{color} There are no new bugs found in [sharelib/hive2].
+. {color:green}+1{color} There are no new bugs found in [sharelib/distcp].
+. {color:green}+1{color} There are no new bugs found in [sharelib/hcatalog].
+. {color:green}+1{color} There are no new bugs found in [sharelib/streaming].
+. {color:green}+1{color} There are no new bugs found in [sharelib/sqoop].
+. {color:green}+1{color} There are no new bugs found in [sharelib/oozie].
+. {color:green}+1{color} There are no new bugs found in [sharelib/pig].
+. {color:green}+1{color} There are no new bugs found in [sharelib/hive].
+. {color:green}+1{color} There are no new bugs found in [sharelib/spark].
+. {color:green}+1{color} There are no new bugs found in [client].
+. {color:green}+1{color} There are no new bugs found in [examples].
+. {color:green}+1{color} There are no new bugs found in [docs].
+. {color:green}+1{color} There are no new bugs found in [server].
+{color:green}+1 BACKWARDS_COMPATIBILITY{color}
+.    {color:green}+1{color} the patch does not change any JPA Entity/Colum/Basic/Lob/Transient annotations
+.    {color:green}+1{color} the patch does not modify JPA files
+{color:red}-1 TESTS{color}
+.    Tests run: 2908
+.    Tests failed: 0
+.    Tests errors: 488
+
+.    The patch failed the following testcases:
+
+
+
+.    Tests failing with errors:
+testShellScriptHadoopConfDir(org.apache.oozie.action.hadoop.TestShellActionExecutor)
+testShellScriptError(org.apache.oozie.action.hadoop.TestShellActionExecutor)
+testSetupMethods(org.apache.oozie.action.hadoop.TestShellActionExecutor)
+testShellScript(org.apache.oozie.action.hadoop.TestShellActionExecutor)
+testEnvVar(org.apache.oozie.action.hadoop.TestShellActionExecutor)
+testShellScriptHadoopConfDirWithNoL4J(org.apache.oozie.action.hadoop.TestShellActionExecutor)
+testPerlScript(org.apache.oozie.action.hadoop.TestShellActionExecutor)
+testUpdateSLA(org.apache.oozie.sla.TestSLAService)
+testEndMissDBConfirm(org.apache.oozie.sla.TestSLAService)
+testSLAOperations(org.apache.oozie.sla.TestSLAService)
+testBasicService(org.apache.oozie.sla.TestSLAService)
+testJobs(org.apache.oozie.servlet.TestV1JobsServlet)
+testSubmit(org.apache.oozie.servlet.TestV1JobsServlet)
+testDefaultConfigurationInActionConf(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testParseJobXmlAndConfiguration(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testCannotKillActionWhenACLSpecified(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testOutputSubmitOK(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testSubmitLauncherConfigurationOverridesLauncherMapperProperties(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testJobXmlWithOozieLauncher(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testCredentialsSkip(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testACLDefaults_noFalseChange(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testJobSubmissionWithoutYarnKill(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testFilesystemScheme(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testExceptionSubmitException(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testKill(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testDefaultConfigurationInLauncher(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testCommaSeparatedFilesAndArchives(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testSubmitOKWithLauncherEnvVars(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testSetRootLoggerLevel(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testSubmitOKWithLauncherJavaOpts(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testPrepare(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testAddActionShareLib(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testJobXmlAndNonDefaultNamenode(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testSubmitFailsWithInvalidLauncherEnvVars(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testActionLibsPath(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testSubmitOKWithVcoresAndMemory(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testSetupMethods(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testEmptyArgsWithNullArgsNotAllowed(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testRecovery(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testAddToCache(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testSubmitWithLauncherQueue(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testEnvVarsPropagatedFromLauncherConfig(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testJavaOpts(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testActionSharelibResolution(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testGlobalConfigurationWithActionDefaults(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testExceptionSubmitThrowable(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testAdditionalJarSubmitOK(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testChildKill(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testLibFileArchives(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testCredentialsModule(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testIdSwapSubmitOK(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testParseJobXmlAndConfigurationWithELExpression(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testUpdateConfForTimeLineServiceEnabled(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testAddShareLibSchemeAndAuthority(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testEmptyArgsWithNullArgsAllowed(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testExit0SubmitOK(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testSimplestSubmitWithResourceManagerOK(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testCredentialsWithoutCredTag(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testResourceManagerInGlobalConfigurationCanBeOverridenWithJobTrackerInAction(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testACLDefaults_launcherACLsSetToDefault(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testMaxOutputDataSetByUser(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testActionShareLibWithNonDefaultNamenode(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testSubmitFailsWithNegativeMemory(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testCredentialsInvalid(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testACLDefaults_explicitLauncherAndActionSettings(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testSimpestSleSubmitOK(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testExit1SubmitError(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testSubmitFailsWithNegativeVcores(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testFileWithSpaces(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testInvalidMaxOutputDataSetByUser(org.apache.oozie.action.hadoop.TestJavaActionExecutor)
+testMain(org.apache.oozie.action.hadoop.TestPipesMain)
+testMaxMatThrottleNotPickedMultipleJobs(org.apache.oozie.service.TestCoordMaterializeTriggerService)
+testCoordMaterializeTriggerService1(org.apache.oozie.service.TestCoordMaterializeTriggerService)
+testCoordMaterializeTriggerService2(org.apache.oozie.service.TestCoordMaterializeTriggerService)
+testCoordMaterializeTriggerService3(org.apache.oozie.service.TestCoordMaterializeTriggerService)
+testMaxMatThrottleNotPicked(org.apache.oozie.service.TestCoordMaterializeTriggerService)
+testPurgeServiceForBundle(org.apache.oozie.service.TestPurgeService)
+testPurgeServiceForCoordinator(org.apache.oozie.service.TestPurgeService)
+testPurgeServiceForWorkflow(org.apache.oozie.service.TestPurgeService)
+testCoordActionKill(org.apache.oozie.servlet.TestV1JobServlet)
+testJobInfo(org.apache.oozie.servlet.TestV1JobServlet)
+testStartForErrorCode(org.apache.oozie.servlet.TestV1JobServlet)
+testGraph(org.apache.oozie.servlet.TestV1JobServlet)
+testStart(org.apache.oozie.servlet.TestV1JobServlet)
+testKill(org.apache.oozie.servlet.TestV1JobServlet)
+testCoordChange(org.apache.oozie.servlet.TestV1JobServlet)
+testJobDef(org.apache.oozie.servlet.TestV1JobServlet)
+testJobLog(org.apache.oozie.servlet.TestV1JobServlet)
+testResume(org.apache.oozie.servlet.TestV1JobServlet)
+testSuspend(org.apache.oozie.servlet.TestV1JobServlet)
+testJobIDPattern(org.apache.oozie.action.hadoop.TestDistcpMain)
+testMain(org.apache.oozie.action.hadoop.TestDistcpMain)
+testDeleteTable(org.apache.oozie.action.hadoop.TestLauncherHCatURIHandler)
+testDelete(org.apache.oozie.action.hadoop.TestLauncherHCatURIHandler)
+testIncorrectConfigurationDefault(org.apache.oozie.service.TestJMSTopicService)
+testTopicAsUser(org.apache.oozie.service.TestJMSTopicService)
+testIncorrectConfigurationJobType(org.apache.oozie.service.TestJMSTopicService)
+testMixedTopic1(org.apache.oozie.service.TestJMSTopicService)
+testMixedTopic2(org.apache.oozie.service.TestJMSTopicService)
+testTopicAsFixedString(org.apache.oozie.service.TestJMSTopicService)
+testTopicProperties1(org.apache.oozie.service.TestJMSTopicService)
+testTopicProperties2(org.apache.oozie.service.TestJMSTopicService)
+testTopicAsJobId(org.apache.oozie.service.TestJMSTopicService)
+testMultipleCoordinators(org.apache.oozie.servlet.TestBulkMonitorWebServiceAPI)
+testNoRecords(org.apache.oozie.servlet.TestBulkMonitorWebServiceAPI)
+testSingleRecord(org.apache.oozie.servlet.TestBulkMonitorWebServiceAPI)
+testDefaultStatus(org.apache.oozie.servlet.TestBulkMonitorWebServiceAPI)
+testMultipleRecords(org.apache.oozie.servlet.TestBulkMonitorWebServiceAPI)
+testBundleIdWithCoordId(org.apache.oozie.servlet.TestBulkMonitorWebServiceAPI)
+testBundleId(org.apache.oozie.servlet.TestBulkMonitorWebServiceAPI)
+testMultipleBundleIdsForName(org.apache.oozie.servlet.TestBulkMonitorWebServiceAPI)
+testSafeMode(org.apache.oozie.servlet.TestAdminServlet)
+testPurgeServiceV2(org.apache.oozie.servlet.TestAdminServlet)
+testOsEnv(org.apache.oozie.servlet.TestAdminServlet)
+testConfiguration(org.apache.oozie.servlet.TestAdminServlet)
+testVersion(org.apache.oozie.servlet.TestAdminServlet)
+testShareLib(org.apache.oozie.servlet.TestAdminServlet)
+testJavaSysProps(org.apache.oozie.servlet.TestAdminServlet)
+testShareLibUpdate(org.apache.oozie.servlet.TestAdminServlet)
+testMetrics(org.apache.oozie.servlet.TestAdminServlet)
+testPurgeServiceV2Negative(org.apache.oozie.servlet.TestAdminServlet)
+testStatus(org.apache.oozie.servlet.TestAdminServlet)
+testShareLib_withKey(org.apache.oozie.servlet.TestAdminServlet)
+testCoordLogStreaming(org.apache.oozie.TestCoordinatorEngineStreamLog)
+testShellScriptSuccess(org.apache.oozie.action.hadoop.TestShellMain)
+testShellScriptFailure(org.apache.oozie.action.hadoop.TestShellMain)
+testWorkflowJobSLANewSubmitStart(org.apache.oozie.sla.TestSLAEventGeneration)
+testSLASchema1BackwardCompatibilityKill(org.apache.oozie.sla.TestSLAEventGeneration)
+testWorkflowJobSLANewKill(org.apache.oozie.sla.TestSLAEventGeneration)
+testFailureAndMissEventsOnKill(org.apache.oozie.sla.TestSLAEventGeneration)
+testWorkflowJobSLARerun(org.apache.oozie.sla.TestSLAEventGeneration)
+testCoordinatorActionCommandsSubmitAndStart(org.apache.oozie.sla.TestSLAEventGeneration)
+testPartitionDependency(org.apache.oozie.service.TestPartitionDependencyManagerService)
+testHCatCanonicalHostName(org.apache.oozie.service.TestPartitionDependencyManagerService)
+testMemoryUsageAndSpeed(org.apache.oozie.service.TestPartitionDependencyManagerService)
+testGetJobIdsForThisServer(org.apache.oozie.service.TestZKJobsConcurrencyService)
+testGetServerUrls(org.apache.oozie.service.TestZKJobsConcurrencyService)
+testIsLeader(org.apache.oozie.service.TestZKJobsConcurrencyService)
+testInstrumentation(org.apache.oozie.service.TestZKJobsConcurrencyService)
+testRegisterUnregister(org.apache.oozie.service.TestZKJobsConcurrencyService)
+testisAllServerRequest(org.apache.oozie.service.TestZKJobsConcurrencyService)
+testIsJobIdForThisServer(org.apache.oozie.service.TestZKJobsConcurrencyService)
+testCreate(org.apache.oozie.action.hadoop.TestLauncherFSURIHandler)
+testDelete(org.apache.oozie.action.hadoop.TestLauncherFSURIHandler)
+testPurgeMissingDependencies(org.apache.oozie.service.TestHAPartitionDependencyManagerService)
+testDependencyCacheWithHA(org.apache.oozie.service.TestHAPartitionDependencyManagerService)
+testCheckAfterActionDelete(org.apache.oozie.service.TestHAPartitionDependencyManagerService)
+testInfoWithBundle(org.apache.oozie.action.hadoop.TestOozieJobInfo)
+testFunctions(org.apache.oozie.action.hadoop.TestFsELFunctions)
+testDecision(org.apache.oozie.action.decision.TestDecisionActionExecutor)
+testValidateBundle(org.apache.oozie.servlet.TestV2ValidateServlet)
+testValidateSla(org.apache.oozie.servlet.TestV2ValidateServlet)
+testValidateWFNegative2(org.apache.oozie.servlet.TestV2ValidateServlet)
+testValidateWFNegative3(org.apache.oozie.servlet.TestV2ValidateServlet)
+testValidateWFNegative4(org.apache.oozie.servlet.TestV2ValidateServlet)
+testValidateWF(org.apache.oozie.servlet.TestV2ValidateServlet)
+testValidateWFonHDFSNegative(org.apache.oozie.servlet.TestV2ValidateServlet)
+testValidateSlaNegative(org.apache.oozie.servlet.TestV2ValidateServlet)
+testValidateWFonHDFS(org.apache.oozie.servlet.TestV2ValidateServlet)
+testValidateBundleNegative1(org.apache.oozie.servlet.TestV2ValidateServlet)
+testValidateBundleNegative2(org.apache.oozie.servlet.TestV2ValidateServlet)
+testValidateCoordinator(org.apache.oozie.servlet.TestV2ValidateServlet)
+testValidateCoordinatorNegative1(org.apache.oozie.servlet.TestV2ValidateServlet)
+testValidateCoordinatorNegative2(org.apache.oozie.servlet.TestV2ValidateServlet)
+testValidateWFNegative(org.apache.oozie.servlet.TestV2ValidateServlet)
+testLastErrorNodeWithRetryFail(org.apache.oozie.TestDagELFunctions)
+testFunctions(org.apache.oozie.TestDagELFunctions)
+testLastErrorNodeWithRetrySucceed(org.apache.oozie.TestDagELFunctions)
+testJobInfo(org.apache.oozie.servlet.TestV0JobServlet)
+testGraph(org.apache.oozie.servlet.TestV0JobServlet)
+testReRun(org.apache.oozie.servlet.TestV0JobServlet)
+testStart(org.apache.oozie.servlet.TestV0JobServlet)
+testKill(org.apache.oozie.servlet.TestV0JobServlet)
+testJobDef(org.apache.oozie.servlet.TestV0JobServlet)
+testJobLog(org.apache.oozie.servlet.TestV0JobServlet)
+testResume(org.apache.oozie.servlet.TestV0JobServlet)
+testSuspend(org.apache.oozie.servlet.TestV0JobServlet)
+testEventLogging(org.apache.oozie.service.TestEventHandlerService)
+testEventListener(org.apache.oozie.service.TestEventHandlerService)
+testService(org.apache.oozie.service.TestEventHandlerService)
+testSLAHistorySet(org.apache.oozie.sla.TestSLACalculatorMemory)
+testEventOutOfOrder(org.apache.oozie.sla.TestSLACalculatorMemory)
+testWorkflowActionSLAStatusOnRestart(org.apache.oozie.sla.TestSLACalculatorMemory)
+testHistoryPurge(org.apache.oozie.sla.TestSLACalculatorMemory)
+testWFEndNotCoord(org.apache.oozie.sla.TestSLACalculatorMemory)
+testWorkflowJobSLAStatusOnRestart(org.apache.oozie.sla.TestSLACalculatorMemory)
+testEventMissOnRestart(org.apache.oozie.sla.TestSLACalculatorMemory)
+testDuplicateEndMiss(org.apache.oozie.sla.TestSLACalculatorMemory)
+testWhenSLARegistrationIsAddedAndAllDBCallsAreDisruptedBeanIsNotStored(org.apache.oozie.sla.TestSLACalculatorMemory)
+testSingleAddUpdateRemoveInstrumentedCorrectly(org.apache.oozie.sla.TestSLACalculatorMemory)
+testSLAEvents1(org.apache.oozie.sla.TestSLACalculatorMemory)
+testSLAEvents2(org.apache.oozie.sla.TestSLACalculatorMemory)
+testAddMultipleRestartRemoveMultipleInstrumentedCorrectly(org.apache.oozie.sla.TestSLACalculatorMemory)
+testWhenSLARegistrationIsUpdatedBeanIsStoredCorrectly(org.apache.oozie.sla.TestSLACalculatorMemory)
+testErrorLoggingWithJobIdPrefix(org.apache.oozie.sla.TestSLACalculatorMemory)
+testDisablingAlertsEvents(org.apache.oozie.sla.TestSLACalculatorMemory)
+testWhenSLARegistrationIsUpdatedAndAllDBCallsAreDisruptedBeanIsNotStored(org.apache.oozie.sla.TestSLACalculatorMemory)
+testLoadOnRestart(org.apache.oozie.sla.TestSLACalculatorMemory)
+testCoordinatorActionSLAStatusOnRestart(org.apache.oozie.sla.TestSLACalculatorMemory)
+testDuplicateStartMiss(org.apache.oozie.sla.TestSLACalculatorMemory)
+testWhenSLARegistrationExistsWithoutSLASummaryUpdateSLARetries(org.apache.oozie.sla.TestSLACalculatorMemory)
+testWhenSLARegistrationIsAddedBeanIsStoredCorrectly(org.apache.oozie.sla.TestSLACalculatorMemory)
+testActionSharelibConfigPropagation(org.apache.oozie.action.hadoop.TestSharelibConfigs)
+testBundleStatusTransitRunningWithError(org.apache.oozie.service.TestStatusTransitService)
+testCoordStatusTransitServiceSuspendAndResume(org.apache.oozie.service.TestStatusTransitService)
+testCoordStatusTransitServiceSucceeded(org.apache.oozie.service.TestStatusTransitService)
+testBundleStatusTransitServiceSucceeded1(org.apache.oozie.service.TestStatusTransitService)
+testBundleStatusTransitServiceSucceeded2(org.apache.oozie.service.TestStatusTransitService)
+testBundleStatusTransitServiceSucceeded3(org.apache.oozie.service.TestStatusTransitService)
+testCoordStatusTransitServiceStaleCoordActions(org.apache.oozie.service.TestStatusTransitService)
+testFoo(org.apache.oozie.service.TestStatusTransitService)
+testCoordStatusTransitServiceSuspendedWithError(org.apache.oozie.service.TestStatusTransitService)
+testBundleStatusTransitServiceKilled(org.apache.oozie.service.TestStatusTransitService)
+testBundleStatusTransitWithLock(org.apache.oozie.service.TestStatusTransitService)
+testBundleStatusTransitServicePaused(org.apache.oozie.service.TestStatusTransitService)
+testBundleRunningAfterCoordResume(org.apache.oozie.service.TestStatusTransitService)
+testBundleStatusTransitServiceSuspended(org.apache.oozie.service.TestStatusTransitService)
+testCoordStatusTransitServiceUpdateLastModifiedTime(org.apache.oozie.service.TestStatusTransitService)
+testCoordStatusTransitServiceKilledByUser1(org.apache.oozie.service.TestStatusTransitService)
+testCoordStatusTransitServiceKilledByUser2(org.apache.oozie.service.TestStatusTransitService)
+testBundleStatusTransitServiceRunningWithError(org.apache.oozie.service.TestStatusTransitService)
+testCoordStatusTransitServicePaused(org.apache.oozie.service.TestStatusTransitService)
+testCoordStatusTransitServiceBackwardSupport(org.apache.oozie.service.TestStatusTransitService)
+testCoordStatusTransitServiceForTimeout(org.apache.oozie.service.TestStatusTransitService)
+testBundleStatusTransitRunningFromKilled(org.apache.oozie.service.TestStatusTransitService)
+testCoordStatusTransitServiceRunning1(org.apache.oozie.service.TestStatusTransitService)
+testCoordStatusTransitServiceRunning2(org.apache.oozie.service.TestStatusTransitService)
+testCoordStatusTransitServiceRunning3(org.apache.oozie.service.TestStatusTransitService)
+testCoordStatusTransitServiceSuspendedByUser(org.apache.oozie.service.TestStatusTransitService)
+testBundleStatusTransitServiceSuspendedWithError(org.apache.oozie.service.TestStatusTransitService)
+testBundleStatusCoordSubmitFails(org.apache.oozie.service.TestStatusTransitService)
+testCoordStatusTransitServiceDoneWithError(org.apache.oozie.service.TestStatusTransitService)
+testBundleStatusTransitServicePausedWithError(org.apache.oozie.service.TestStatusTransitService)
+testCoordStatusTransitServiceNoDoneWithErrorForBackwardSupport(org.apache.oozie.service.TestStatusTransitService)
+testBundleStatusTransitServiceForTerminalStates(org.apache.oozie.service.TestStatusTransitService)
+testCoordStatusTransitRunningFromKilled(org.apache.oozie.service.TestStatusTransitService)
+testBundleStatusTransitServiceKilled2(org.apache.oozie.service.TestStatusTransitService)
+testCoordStatusTransitServiceSuspendedBottomUp(org.apache.oozie.service.TestStatusTransitService)
+testCoordStatusTransitServicePausedWithError(org.apache.oozie.service.TestStatusTransitService)
+testBundleStatusNotTransitionFromKilled(org.apache.oozie.service.TestStatusTransitService)
+testCoordStatusTransitWithLock(org.apache.oozie.service.TestStatusTransitService)
+testCoordNotTransitionfromKilled(org.apache.oozie.service.TestStatusTransitService)
+testRerun(org.apache.oozie.action.hadoop.TestRerun)
+testGetHCatConfLocal(org.apache.oozie.service.TestHCatAccessorService)
+testGetHCatConfHDFS(org.apache.oozie.service.TestHCatAccessorService)
+testGetJMSConnectionInfoNoDefault(org.apache.oozie.service.TestHCatAccessorService)
+testGetJMSConnectionInfo(org.apache.oozie.service.TestHCatAccessorService)
+testActionCheckerService(org.apache.oozie.service.TestActionCheckerService)
+testActionCheckerServiceCoord(org.apache.oozie.service.TestActionCheckerService)
+testActionCheckerServiceDelay(org.apache.oozie.service.TestActionCheckerService)
+testSLARegistrationGet(org.apache.oozie.sla.TestSLARegistrationGetJPAExecutor)
+testSLARegistrationBulkConfigMap(org.apache.oozie.sla.TestSLARegistrationGetJPAExecutor)
+testSlaConfigStringToMap(org.apache.oozie.sla.TestSLARegistrationGetJPAExecutor)
+testPartitionDependency(org.apache.oozie.service.TestPartitionDependencyManagerEhcache)
+testMaxElementsInMemory(org.apache.oozie.service.TestPartitionDependencyManagerEhcache)
+testEvictionOnTimeToIdle(org.apache.oozie.service.TestPartitionDependencyManagerEhcache)
+testEvictionOnTimeToLive(org.apache.oozie.service.TestPartitionDependencyManagerEhcache)
+testHCatCanonicalHostName(org.apache.oozie.service.TestPartitionDependencyManagerEhcache)
+testMemoryUsageAndSpeed(org.apache.oozie.service.TestPartitionDependencyManagerEhcache)
+testCoordActionIgnore(org.apache.oozie.servlet.TestV2JobServlet)
+testJobInfo(org.apache.oozie.servlet.TestV2JobServlet)
+testGetWfActionByJobIdAndNameNormal(org.apache.oozie.servlet.TestV2JobServlet)
+testGetWfActionFromV0JobServlet(org.apache.oozie.servlet.TestV2JobServlet)
+testGetWfActionByJobIdAndNameLenOutOfRange(org.apache.oozie.servlet.TestV2JobServlet)
+testGetCoordActionReruns(org.apache.oozie.servlet.TestV2JobServlet)
+testGetWfActionByJobIdAndNameActionNameMissing(org.apache.oozie.servlet.TestV2JobServlet)
+testGetWfActionByJobIdAndNameUnparseableLen(org.apache.oozie.servlet.TestV2JobServlet)
+testGetWfActionFromV1JobServlet(org.apache.oozie.servlet.TestV2JobServlet)
+testGetWfActionByJobIdAndNameUnparseableOffset(org.apache.oozie.servlet.TestV2JobServlet)
+testGetWfActionByJobIdAndNameOffsetOutOfRange(org.apache.oozie.servlet.TestV2JobServlet)
+testCoordJobIgnore(org.apache.oozie.servlet.TestV2JobServlet)
+testJobStatus(org.apache.oozie.servlet.TestV2JobServlet)
+testDelete(org.apache.oozie.action.hadoop.TestHCatPrepareActions)
+testCreateFileSystem(org.apache.oozie.service.TestHadoopAccessorService)
+testCheckSupportedFilesystem(org.apache.oozie.service.TestHadoopAccessorService)
+testCreateJobClient(org.apache.oozie.service.TestHadoopAccessorService)
+testValidateNameNode(org.apache.oozie.service.TestHadoopAccessorService)
+testCreateLocalResourceForConfigurationFile(org.apache.oozie.service.TestHadoopAccessorService)
+testActionConfigurations(org.apache.oozie.service.TestHadoopAccessorService)
+testCreateYarnClient(org.apache.oozie.service.TestHadoopAccessorService)
+testService(org.apache.oozie.service.TestHadoopAccessorService)
+testValidateJobTracker(org.apache.oozie.service.TestHadoopAccessorService)
+testPauseCoordinatorForBackwardSupport(org.apache.oozie.service.TestPauseTransitService)
+testUnpauseBundleAndCoordinator(org.apache.oozie.service.TestPauseTransitService)
+testPauseUnpause1(org.apache.oozie.service.TestPauseTransitService)
+testPauseUnpause2(org.apache.oozie.service.TestPauseTransitService)
+testPauseBundleAndCoordinator(org.apache.oozie.service.TestPauseTransitService)
+testStart1(org.apache.oozie.service.TestPauseTransitService)
+testStart2(org.apache.oozie.service.TestPauseTransitService)
+testDeleteTable(org.apache.oozie.dependency.TestHCatURIHandler)
+testExists(org.apache.oozie.dependency.TestHCatURIHandler)
+testDoAuthEmail(org.apache.oozie.action.email.TestEmailActionExecutor)
+testContentType(org.apache.oozie.action.email.TestEmailActionExecutor)
+testValidation(org.apache.oozie.action.email.TestEmailActionExecutor)
+testSetupMethods(org.apache.oozie.action.email.TestEmailActionExecutor)
+testContentTypeDefault(org.apache.oozie.action.email.TestEmailActionExecutor)
+testServerTimeouts(org.apache.oozie.action.email.TestEmailActionExecutor)
+testDoNormalEmail(org.apache.oozie.action.email.TestEmailActionExecutor)
+testHDFSFileAttachment(org.apache.oozie.action.email.TestEmailActionExecutor)
+testLocalFileAttachmentError(org.apache.oozie.action.email.TestEmailActionExecutor)
+testSLA(org.apache.oozie.servlet.TestV2SLAServlet)
+testBundleSLA(org.apache.oozie.servlet.TestV2SLAServlet)
+testChmodRelativePath(org.apache.oozie.action.hadoop.TestFsActionExecutor)
+testChgrp(org.apache.oozie.action.hadoop.TestFsActionExecutor)
+testChmod(org.apache.oozie.action.hadoop.TestFsActionExecutor)
+testMkdir(org.apache.oozie.action.hadoop.TestFsActionExecutor)
+testMove(org.apache.oozie.action.hadoop.TestFsActionExecutor)
+testChmodWithGlob(org.apache.oozie.action.hadoop.TestFsActionExecutor)
+testvalidateSameNN(org.apache.oozie.action.hadoop.TestFsActionExecutor)
+testChmodRecursive(org.apache.oozie.action.hadoop.TestFsActionExecutor)
+testSetupMethods(org.apache.oozie.action.hadoop.TestFsActionExecutor)
+testMoveWithGlob(org.apache.oozie.action.hadoop.TestFsActionExecutor)
+testRecovery(org.apache.oozie.action.hadoop.TestFsActionExecutor)
+testDeleteWithGlob(org.apache.oozie.action.hadoop.TestFsActionExecutor)
+testSubmitWithNameNode(org.apache.oozie.action.hadoop.TestFsActionExecutor)
+testChgrpWithGlob(org.apache.oozie.action.hadoop.TestFsActionExecutor)
+testFileSchemeWildcard(org.apache.oozie.action.hadoop.TestFsActionExecutor)
+testMovetoTrash(org.apache.oozie.action.hadoop.TestFsActionExecutor)
+testDeleteHcat(org.apache.oozie.action.hadoop.TestFsActionExecutor)
+testDoOperations(org.apache.oozie.action.hadoop.TestFsActionExecutor)
+testDoOperationsWithNameNodeElement(org.apache.oozie.action.hadoop.TestFsActionExecutor)
+testDelete(org.apache.oozie.action.hadoop.TestFsActionExecutor)
+testResolveToFullPath(org.apache.oozie.action.hadoop.TestFsActionExecutor)
+testPermissionMask(org.apache.oozie.action.hadoop.TestFsActionExecutor)
+testDeleteHcatTable(org.apache.oozie.action.hadoop.TestFsActionExecutor)
+testSetRep(org.apache.oozie.action.hadoop.TestFsActionExecutor)
+testSubmit(org.apache.oozie.action.hadoop.TestFsActionExecutor)
+testTouchz(org.apache.oozie.action.hadoop.TestFsActionExecutor)
+testChgrpRelativePath(org.apache.oozie.action.hadoop.TestFsActionExecutor)
+testRetryOnAccessControlError(org.apache.oozie.action.hadoop.TestFsActionExecutor)
+testValidatePath(org.apache.oozie.action.hadoop.TestFsActionExecutor)
+testPurgeJar(org.apache.oozie.service.TestShareLibService)
+testCreateLauncherLibPath(org.apache.oozie.service.TestShareLibService)
+testShareLibLoadFilesFromHDFS(org.apache.oozie.service.TestShareLibService)
+testDuplicateJarsInDistributedCache(org.apache.oozie.service.TestShareLibService)
+testLoadMappingFilesFromDFSandLocalFs(org.apache.oozie.service.TestShareLibService)
+testShareLib(org.apache.oozie.service.TestShareLibService)
+testGetShareLibCompatible(org.apache.oozie.service.TestShareLibService)
+testRetentionOverflow(org.apache.oozie.service.TestShareLibService)
+testShareLibLoadFilesFromLocalFs(org.apache.oozie.service.TestShareLibService)
+testLoadfromDFS(org.apache.oozie.service.TestShareLibService)
+testPurgeShareLib(org.apache.oozie.service.TestShareLibService)
+testConfFileAddedToDistributedCache(org.apache.oozie.service.TestShareLibService)
+testGetShareLibPath(org.apache.oozie.service.TestShareLibService)
+testfailFast(org.apache.oozie.service.TestShareLibService)
+testShareLibLoadFileMultipleFile(org.apache.oozie.service.TestShareLibService)
+testMetafileSymlink(org.apache.oozie.service.TestShareLibService)
+testConfFileAddedToActionConf(org.apache.oozie.service.TestShareLibService)
+testMultipleLauncherCall(org.apache.oozie.service.TestShareLibService)
+testAddShareLib_pig(org.apache.oozie.service.TestShareLibService)
+testAddShareLibDistributedCache(org.apache.oozie.service.TestShareLibService)
+testPurgeLauncherJar(org.apache.oozie.service.TestShareLibService)
+testAddShareLib_pig_withVersion(org.apache.oozie.service.TestShareLibService)
+testRegisterUnregister(org.apache.oozie.service.TestZKUUIDService)
+testBulkJobForZKUUIDService(org.apache.oozie.service.TestZKUUIDService)
+testMultipleIDGeneration(org.apache.oozie.service.TestZKUUIDService)
+testFallback(org.apache.oozie.service.TestZKUUIDService)
+testMultipleIDGeneration_withMultiThread(org.apache.oozie.service.TestZKUUIDService)
+testResetSequence_withMultiThread(org.apache.oozie.service.TestZKUUIDService)
+testResetSequence(org.apache.oozie.service.TestZKUUIDService)
+testIDGeneration(org.apache.oozie.service.TestZKUUIDService)
+testSafeMode(org.apache.oozie.servlet.TestV1AdminServlet)
+testPurgeServiceV1(org.apache.oozie.servlet.TestV1AdminServlet)
+testOsEnv(org.apache.oozie.servlet.TestV1AdminServlet)
+testAvailableTimeZones(org.apache.oozie.servlet.TestV1AdminServlet)
+testConfiguration(org.apache.oozie.servlet.TestV1AdminServlet)
+testVersion(org.apache.oozie.servlet.TestV1AdminServlet)
+testInstrumentation(org.apache.oozie.servlet.TestV1AdminServlet)
+testJavaSysProps(org.apache.oozie.servlet.TestV1AdminServlet)
+testV1QueueDump(org.apache.oozie.servlet.TestV1AdminServlet)
+testStatus(org.apache.oozie.servlet.TestV1AdminServlet)
+testAuthorizationServiceForBundle(org.apache.oozie.service.TestAuthorizationService)
+testAdminUsersWithAdminFile(org.apache.oozie.service.TestAuthorizationService)
+testAdminUsersWithAdminGroup(org.apache.oozie.service.TestAuthorizationService)
+testAuthorizationServiceForCoord(org.apache.oozie.service.TestAuthorizationService)
+testAuthorizedSystemInfoSuccess(org.apache.oozie.service.TestAuthorizationService)
+testAuthorizationServiceUseDefaultGroup(org.apache.oozie.service.TestAuthorizationService)
+testDefaultGroup(org.apache.oozie.service.TestAuthorizationService)
+testAuthorizedSystemInfoFailure(org.apache.oozie.service.TestAuthorizationService)
+testWhenDefinedInAdminFileAndConfigurationThenAllowBothAdmins(org.apache.oozie.service.TestAuthorizationService)
+testAuthorizedSystemInfoDefaultSuccess(org.apache.oozie.service.TestAuthorizationService)
+testWhenDefinedInConfigurationThenAdminPrivilegesAllowed(org.apache.oozie.service.TestAuthorizationService)
+testErrors(org.apache.oozie.service.TestAuthorizationService)
+testAuthorizationServiceUseACLs(org.apache.oozie.service.TestAuthorizationService)
+testSubworkflowLib(org.apache.oozie.action.oozie.TestSubWorkflowActionExecutor)
+testParentGlobalConfWithConfigDefault(org.apache.oozie.action.oozie.TestSubWorkflowActionExecutor)
+testType(org.apache.oozie.action.oozie.TestSubWorkflowActionExecutor)
+testConfigPropagation(org.apache.oozie.action.oozie.TestSubWorkflowActionExecutor)
+testSubworkflowDepth(org.apache.oozie.action.oozie.TestSubWorkflowActionExecutor)
+testSubWorkflowSuspend(org.apache.oozie.action.oozie.TestSubWorkflowActionExecutor)
+testSubWorkflowRerun(org.apache.oozie.action.oozie.TestSubWorkflowActionExecutor)
+testSubWorkflowStart(org.apache.oozie.action.oozie.TestSubWorkflowActionExecutor)
+testSubWorkflowRecovery(org.apache.oozie.action.oozie.TestSubWorkflowActionExecutor)
+testConfigNotPropagation(org.apache.oozie.action.oozie.TestSubWorkflowActionExecutor)
+testParentGlobalConf(org.apache.oozie.action.oozie.TestSubWorkflowActionExecutor)
+testGetGroupFromParent(org.apache.oozie.action.oozie.TestSubWorkflowActionExecutor)
+testSubWorkflowConfCreation(org.apache.oozie.action.oozie.TestSubWorkflowActionExecutor)
+testMain(org.apache.oozie.action.hadoop.TestJavaMain)
+testSetupMethods(org.apache.oozie.action.hadoop.TestDistCpActionExecutor)
+testDistCpFile(org.apache.oozie.action.hadoop.TestDistCpActionExecutor)
+testVersion(org.apache.oozie.servlet.TestVersionServlet)
+testCoordActionRecoveryServiceForSuspended(org.apache.oozie.service.TestRecoveryService)
+testCoordCreateNotifyParentFailed(org.apache.oozie.service.TestRecoveryService)
+testWorkflowActionRecoveryService(org.apache.oozie.service.TestRecoveryService)
+testCoordActionRecoveryServiceForWaitingRegisterPartition(org.apache.oozie.service.TestRecoveryService)
+testBundleRecoveryCoordCreate(org.apache.oozie.service.TestRecoveryService)
+testCoordActionRecoveryServiceForKilled(org.apache.oozie.service.TestRecoveryService)
+testBundleRecoveryCoordExists(org.apache.oozie.service.TestRecoveryService)
+testCoordActionRecoveryServiceForResume(org.apache.oozie.service.TestRecoveryService)
+testCoordActionRecoveryServiceForSubmitted(org.apache.oozie.service.TestRecoveryService)
+testCoordActionRecoveryServiceForWaiting(org.apache.oozie.service.TestRecoveryService)
+testWorkflowActionRecoveryUserRetry(org.apache.oozie.service.TestRecoveryService)
+testBundleEngineReRun(org.apache.oozie.servlet.TestV1JobServletBundleEngine)
+testBundleEngineStart(org.apache.oozie.servlet.TestV1JobServletBundleEngine)
+testBundleEngineGetBundleJob(org.apache.oozie.servlet.TestV1JobServletBundleEngine)
+testBundleEngineStreamLog(org.apache.oozie.servlet.TestV1JobServletBundleEngine)
+testBundleEngineGetDefinition(org.apache.oozie.servlet.TestV1JobServletBundleEngine)
+testBundleEngineKill(org.apache.oozie.servlet.TestV1JobServletBundleEngine)
+testBundleEngineChange(org.apache.oozie.servlet.TestV1JobServletBundleEngine)
+testBundleEngineSuspend(org.apache.oozie.servlet.TestV1JobServletBundleEngine)
+testBundleEngineResume(org.apache.oozie.servlet.TestV1JobServletBundleEngine)
+testMkdir(org.apache.oozie.action.hadoop.TestFSPrepareActions)
+testDeleteWithGlob(org.apache.oozie.action.hadoop.TestFSPrepareActions)
+testForNullScheme(org.apache.oozie.action.hadoop.TestFSPrepareActions)
+testForInvalidScheme(org.apache.oozie.action.hadoop.TestFSPrepareActions)
+testDelete(org.apache.oozie.action.hadoop.TestFSPrepareActions)
+testDoOperationsWithValidXML(org.apache.oozie.action.hadoop.TestPrepareActionsDriver)
+testDoOperationsWithInvalidXML(org.apache.oozie.action.hadoop.TestPrepareActionsDriver)
+testDisableLogOverWS(org.apache.oozie.service.TestZKXLogStreamingService)
+testStreamingWithMultipleOozieServers_coordActionList(org.apache.oozie.service.TestZKXLogStreamingService)
+testNoDashInConversionPattern(org.apache.oozie.service.TestZKXLogStreamingService)
+testStreamingWithMultipleOozieServers(org.apache.oozie.service.TestZKXLogStreamingService)
+testTuncateLog(org.apache.oozie.service.TestZKXLogStreamingService)
+testRegisterUnregister(org.apache.oozie.service.TestZKXLogStreamingService)
+testStreamingWithMultipleOozieServers_errorLog(org.apache.oozie.service.TestZKXLogStreamingService)
+testELFunctionsReturningPigStats(org.apache.oozie.action.hadoop.TestHadoopELFunctions)
+testELFunctionsReturningMapReduceStats(org.apache.oozie.action.hadoop.TestHadoopELFunctions)
+testHadoopConfFunctions(org.apache.oozie.action.hadoop.TestHadoopELFunctions)
+testGetBundleJobs(org.apache.oozie.TestV1JobsServletBundleEngine)
+testActionCheck(org.apache.oozie.command.wf.TestActionCheckXCommand)
+testMain(org.apache.oozie.action.hadoop.TestMapReduceMain)
+testPurgeMissingDependencies(org.apache.oozie.service.TestHAPartitionDependencyManagerEhCache)
+testDependencyCacheWithHA(org.apache.oozie.service.TestHAPartitionDependencyManagerEhCache)
+testCheckAfterActionDelete(org.apache.oozie.service.TestHAPartitionDependencyManagerEhCache)
+testCallbackPost(org.apache.oozie.servlet.TestCallbackServlet)
+testCallbackGet(org.apache.oozie.servlet.TestCallbackServlet)
+testRollback(org.apache.oozie.sla.TestSLACalculationJPAExecutor)
+testInsert(org.apache.oozie.sla.TestSLACalculationJPAExecutor)
+testInsertUpdate(org.apache.oozie.sla.TestSLACalculationJPAExecutor)
+testActionKillCommandActionNumbers(org.apache.oozie.command.coord.TestCoordActionsKillXCommand)
+testSLAUpdateWithHA(org.apache.oozie.service.TestHASLAService)
+testSLAAlertCommandWithHA(org.apache.oozie.service.TestHASLAService)
+testNoDuplicateEventsInHA(org.apache.oozie.service.TestHASLAService)
+testSLAFailOverWithHA(org.apache.oozie.service.TestHASLAService)
+testExists(org.apache.oozie.dependency.TestFSURIHandler)
+testJobs(org.apache.oozie.servlet.TestJobsServlet)
+testDiffUser(org.apache.oozie.servlet.TestJobsServlet)
+testSubmit(org.apache.oozie.servlet.TestJobsServlet)
+testHbaseCredentials(org.apache.oozie.action.hadoop.TestCredentials)
+testShareLibWithHA(org.apache.oozie.service.TestHAShareLibService)
+testSetupLauncherInfoHadoop2_0_2_alphaWorkaround(org.apache.oozie.action.hadoop.TestLauncher)
+testSetupLauncherInfoWithNonEmptyPrepareXML(org.apache.oozie.action.hadoop.TestLauncher)
+testSetupMainClass(org.apache.oozie.action.hadoop.TestLauncher)
+testCopyFileMultiplex(org.apache.oozie.action.hadoop.TestLauncher)
+testSetupLauncherInfoWithEmptyPrepareXML(org.apache.oozie.action.hadoop.TestLauncher)
+testReentrantMultipleThread(org.apache.oozie.service.TestZKLocksService)
+testTimeoutWaitingWriteLockOozies(org.apache.oozie.service.TestZKLocksService)
+testWriteReadLockOozies(org.apache.oozie.service.TestZKLocksService)
+testTimeoutWaitingWriteLockThreads(org.apache.oozie.service.TestZKLocksService)
+testTimeoutTimingOutWriteLockOozies(org.apache.oozie.service.TestZKLocksService)
+testLocksAreReused(org.apache.oozie.service.TestZKLocksService)
+testWaitWriteLockOozies(org.apache.oozie.service.TestZKLocksService)
+testWaitWriteLockThreads(org.apache.oozie.service.TestZKLocksService)
+testReentrantMultipleCall(org.apache.oozie.service.TestZKLocksService)
+testLocksAreGarbageCollected(org.apache.oozie.service.TestZKLocksService)
+testLockRelease(org.apache.oozie.service.TestZKLocksService)
+testLockReaper(org.apache.oozie.service.TestZKLocksService)
+testRegisterUnregister(org.apache.oozie.service.TestZKLocksService)
+testReadLockOozies(org.apache.oozie.service.TestZKLocksService)
+testReadWriteLockOozies(org.apache.oozie.service.TestZKLocksService)
+testWriteReadLockThreads(org.apache.oozie.service.TestZKLocksService)
+testReadWriteLockThreads(org.apache.oozie.service.TestZKLocksService)
+testNoWaitWriteLockOozies(org.apache.oozie.service.TestZKLocksService)
+testTimeoutTimingOutWriteLockThreads(org.apache.oozie.service.TestZKLocksService)
+testReadLockThreads(org.apache.oozie.service.TestZKLocksService)
+testNoWaitWriteLockThreads(org.apache.oozie.service.TestZKLocksService)
+testRetriableRelease(org.apache.oozie.service.TestZKLocksService)
+testFsFailover(org.apache.oozie.action.TestActionFailover)
+
+{color:green}+1 DISTRO{color}
+.    {color:green}+1{color} distro tarball builds with the patch 
+
+----------------------------
+{color:red}*-1 Overall result, please check the reported -1(s)*{color}
+
+
+The full output of the test-patch run is available at
+
+. https://builds.apache.org/job/PreCommit-OOZIE-Build/655/
+
+
+
+The test errors seems unrelated. [~andras.piros], [~pbacsko] or anybody else who has the proper rights, could please start another pre commit build?
+
+[~kmarton] kicked off another Jenkins build.
+
+PreCommit-OOZIE-Build started
+
+
+
+Testing JIRA OOZIE-2791
+
+Cleaning local git workspace
+
+----------------------------
+
+{color:green}+1 PATCH_APPLIES{color}
+{color:green}+1 CLEAN{color}
+{color:green}+1 RAW_PATCH_ANALYSIS{color}
+.    {color:green}+1{color} the patch does not introduce any @author tags
+.    {color:green}+1{color} the patch does not introduce any tabs
+.    {color:green}+1{color} the patch does not introduce any trailing spaces
+.    {color:green}+1{color} the patch does not introduce any line longer than 132
+.    {color:green}+1{color} the patch adds/modifies 5 testcase(s)
+{color:green}+1 RAT{color}
+.    {color:green}+1{color} the patch does not seem to introduce new RAT warnings
+{color:green}+1 JAVADOC{color}
+{color:green}+1 JAVADOC{color}
+.    {color:green}+1{color} the patch does not seem to introduce new Javadoc warning(s)
+.    {color:red}WARNING{color}: the current HEAD has 100 Javadoc warning(s)
+.    {color:green}+1{color} the patch does not seem to introduce new Javadoc error(s)
+{color:green}+1 COMPILE{color}
+.    {color:green}+1{color} HEAD compiles
+.    {color:green}+1{color} patch compiles
+.    {color:green}+1{color} the patch does not seem to introduce new javac warnings
+{color:green}+1{color} There are no new bugs found in total.
+. {color:green}+1{color} There are no new bugs found in [examples].
+. {color:green}+1{color} There are no new bugs found in [webapp].
+. {color:green}+1{color} There are no new bugs found in [core].
+. {color:green}+1{color} There are no new bugs found in [tools].
+. {color:green}+1{color} There are no new bugs found in [fluent-job/fluent-job-api].
+. {color:green}+1{color} There are no new bugs found in [server].
+. {color:green}+1{color} There are no new bugs found in [docs].
+. {color:green}+1{color} There are no new bugs found in [sharelib/hive2].
+. {color:green}+1{color} There are no new bugs found in [sharelib/pig].
+. {color:green}+1{color} There are no new bugs found in [sharelib/streaming].
+. {color:green}+1{color} There are no new bugs found in [sharelib/hive].
+. {color:green}+1{color} There are no new bugs found in [sharelib/hcatalog].
+. {color:green}+1{color} There are no new bugs found in [sharelib/sqoop].
+. {color:green}+1{color} There are no new bugs found in [sharelib/oozie].
+. {color:green}+1{color} There are no new bugs found in [sharelib/distcp].
+. {color:green}+1{color} There are no new bugs found in [sharelib/spark].
+. {color:green}+1{color} There are no new bugs found in [client].
+{color:green}+1 BACKWARDS_COMPATIBILITY{color}
+.    {color:green}+1{color} the patch does not change any JPA Entity/Colum/Basic/Lob/Transient annotations
+.    {color:green}+1{color} the patch does not modify JPA files
+{color:green}+1 TESTS{color}
+.    Tests run: 2908
+{color:green}+1 DISTRO{color}
+.    {color:green}+1{color} distro tarball builds with the patch 
+
+----------------------------
+{color:green}*+1 Overall result, good!, no -1s*{color}
+
+{color:red}. There is at least one warning, please check{color}
+
+The full output of the test-patch run is available at
+
+. https://builds.apache.org/job/PreCommit-OOZIE-Build/656/
+
+
+
++1
+
+Thanks for the contribution [~kmarton] [~asasvari], and thanks for the review [~pbacsko]! Committed to {{master}}.
+
+Closing issue; Oozie 5.1.0 is released.
+

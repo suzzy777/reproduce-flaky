@@ -1,0 +1,220 @@
+I am hitting this one quite often. 
+
+Seen also here - [https://app.circleci.com/pipelines/github/driftx/cassandra/1050/workflows/72962ea6-8d12-4f59-b9f3-f3058a9af827/jobs/28651/tests]
+
+This test failure has likely been introduced in 5.0, since it doesn't seem to reproduce in 4.1: https://app.circleci.com/pipelines/github/adelapena/cassandra/3077/workflows/fb303d89-2196-490d-8e3b-8f6eb4fdc736
+
+I am bisecting this one - it started failing somewhere between b7eaa2d (not failing) and fb95112 (failing) commits. I will confirm exact commit later when my runs complete. 
+
+UPDATE: Clearly, this started failing with CASSANDRA-18311 - https://app.circleci.com/pipelines/github/ekaterinadimitrova2/cassandra/2505/workflows/765ed0e9-95e9-4b90-9a11-93f4c464f456/jobs/40029/tests
+It was not failing with the previous commit from CASSANDRA-16984 as it is visible in this run - https://app.circleci.com/pipelines/github/ekaterinadimitrova2/cassandra/2498/workflows/856b7f04-6899-470e-a867-292bc84d077c
+
+The patch from CASSANDRA-18311 was committed to 4.0, 4.1, and trunk, but as per [~adelapena]'s run, the test does not fail on 4.1.
+Probably there was some difference in 5.0
+[~jlewandowski], [~jtgrabowski], do you mind looking at this flaky test? The leak appears also in other tests, but most of the time with this one. Easy to reproduce and bisect to CASSANDRA-18311.
+
+
+
+I can see no relation between CASSANDRA-18311 and this flaky test.
+EDIT: the only way I think they can be related is that CASSANDRA-18311 modified a moment when gc is usually called, which made this problem more apparent.
+
+What I can see is that the test does something weird. It aims to fail the index build and it uses byteman to do that with the following rule:
+{noformat}
+RULE fail during index building
+CLASS org.apache.cassandra.db.compaction.CompactionManager
+METHOD submitIndexBuild
+AT ENTRY
+# set flag to only run this rule once.
+IF NOT flagged("done")
+DO
+   flag("done");
+   throw new java.lang.RuntimeException("Index building failure")
+ENDRULE
+{noformat}
+
+The rule executes on entry of this method:
+{code:java}
+    Future<?> submitIndexBuild(final SecondaryIndexBuilder builder, ActiveCompactionsTracker activeCompactions)
+    {
+        Runnable runnable = new Runnable()
+        {
+           ...
+        };
+
+        return secondaryIndexExecutor.submitIfRunning(runnable, "index build");
+    }
+{code}
+
+As I can see, it is very unlikely that any exception could even happen in this place - maybe when the executor is already shutdown. I suppose the original intention was to make the runnable fail its execution, in which case, instead of throwing an exception at entry, we should return a fixed failed future.
+
+I've managed to reproduce it locally and with enabled ref debugging, this is the stack trace of the offending reference creation:
+{noformat}
+  Thread[RMI TCP Connection(2)-127.0.0.1,5,RMI Runtime]
+        at java.base/java.lang.Thread.getStackTrace(Thread.java:1602)
+        at org.apache.cassandra.utils.concurrent.Ref$Debug.<init>(Ref.java:273)
+        at org.apache.cassandra.utils.concurrent.Ref$State.<init>(Ref.java:194)
+        at org.apache.cassandra.utils.concurrent.Ref.<init>(Ref.java:122)
+        at org.apache.cassandra.utils.concurrent.Ref.tryRef(Ref.java:159)
+        at org.apache.cassandra.utils.concurrent.Ref.ref(Ref.java:164)
+        at org.apache.cassandra.utils.concurrent.SharedCloseableImpl.<init>(SharedCloseableImpl.java:35)
+        at org.apache.cassandra.io.util.FileHandle.<init>(FileHandle.java:79)
+        at org.apache.cassandra.io.util.FileHandle.sharedCopy(FileHandle.java:123)
+        at org.apache.cassandra.io.sstable.format.big.BigTableKeyReader.create(BigTableKeyReader.java:77)
+        at org.apache.cassandra.io.sstable.format.big.BigTableReader.keyReader(BigTableReader.java:157)
+        at org.apache.cassandra.io.sstable.format.SSTableReader.keyIterator(SSTableReader.java:829)
+        at org.apache.cassandra.io.sstable.ReducingKeyIterator.<init>(ReducingKeyIterator.java:48)
+        at org.apache.cassandra.index.Index$CollatedViewIndexBuildingSupport.getIndexBuildTask(Index.java:195)
+        at org.apache.cassandra.index.SecondaryIndexManager.lambda$buildIndexesBlocking$7(SecondaryIndexManager.java:632)
+        at java.base/java.util.HashMap.forEach(HashMap.java:1337)
+        at org.apache.cassandra.index.SecondaryIndexManager.buildIndexesBlocking(SecondaryIndexManager.java:630)
+        at org.apache.cassandra.index.SecondaryIndexManager.rebuildIndexesBlocking(SecondaryIndexManager.java:423)
+        at org.apache.cassandra.db.ColumnFamilyStore.rebuildSecondaryIndex(ColumnFamilyStore.java:904)
+        at org.apache.cassandra.service.StorageService.rebuildSecondaryIndex(StorageService.java:6456)
+        at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+        at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:62)
+        at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+        at java.base/java.lang.reflect.Method.invoke(Method.java:566)
+        at sun.reflect.misc.Trampoline.invoke(MethodUtil.java:71)
+        at jdk.internal.reflect.GeneratedMethodAccessor1.invoke(Unknown Source)
+        at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+        at java.base/java.lang.reflect.Method.invoke(Method.java:566)
+        at java.base/sun.reflect.misc.MethodUtil.invoke(MethodUtil.java:260)
+        at java.management/com.sun.jmx.mbeanserver.StandardMBeanIntrospector.invokeM2(StandardMBeanIntrospector.java:112)
+        at java.management/com.sun.jmx.mbeanserver.StandardMBeanIntrospector.invokeM2(StandardMBeanIntrospector.java:46)
+        at java.management/com.sun.jmx.mbeanserver.MBeanIntrospector.invokeM(MBeanIntrospector.java:237)
+        at java.management/com.sun.jmx.mbeanserver.PerInterface.invoke(PerInterface.java:138)
+        at java.management/com.sun.jmx.mbeanserver.MBeanSupport.invoke(MBeanSupport.java:252)
+        at java.management/com.sun.jmx.interceptor.DefaultMBeanServerInterceptor.invoke(DefaultMBeanServerInterceptor.java:809)
+        at java.management/com.sun.jmx.mbeanserver.JmxMBeanServer.invoke(JmxMBeanServer.java:801)
+        at java.management.rmi/javax.management.remote.rmi.RMIConnectionImpl.doOperation(RMIConnectionImpl.java:1466)
+        at java.management.rmi/javax.management.remote.rmi.RMIConnectionImpl$PrivilegedOperation.run(RMIConnectionImpl.java:1307)
+        at java.management.rmi/javax.management.remote.rmi.RMIConnectionImpl.doPrivilegedOperation(RMIConnectionImpl.java:1399)
+        at java.management.rmi/javax.management.remote.rmi.RMIConnectionImpl.invoke(RMIConnectionImpl.java:827)
+        at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+        at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:62)
+        at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+        at java.base/java.lang.reflect.Method.invoke(Method.java:566)
+        at java.rmi/sun.rmi.server.UnicastServerRef.dispatch(UnicastServerRef.java:359)
+        at java.rmi/sun.rmi.transport.Transport$1.run(Transport.java:200)
+        at java.rmi/sun.rmi.transport.Transport$1.run(Transport.java:197)
+        at java.base/java.security.AccessController.doPrivileged(Native Method)
+        at java.rmi/sun.rmi.transport.Transport.serviceCall(Transport.java:196)
+        at java.rmi/sun.rmi.transport.tcp.TCPTransport.handleMessages(TCPTransport.java:562)
+        at java.rmi/sun.rmi.transport.tcp.TCPTransport$ConnectionHandler.run0(TCPTransport.java:796)
+        at java.rmi/sun.rmi.transport.tcp.TCPTransport$ConnectionHandler.lambda$run$0(TCPTransport.java:677)
+        at java.base/java.security.AccessController.doPrivileged(Native Method)
+        at java.rmi/sun.rmi.transport.tcp.TCPTransport$ConnectionHandler.run(TCPTransport.java:676)
+        at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1128)
+        at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:628)
+        at java.base/java.lang.Thread.run(Thread.java:829)
+{noformat}
+
+I'll keep working on it...
+
+
+It looks like there is a bug in the production code as well - {{SecondaryIndexBuilder}} is not expected to be closed. After creating it, if there are resources opened solely for it, those will be closed when {{build}} method is invoked. However, in this case, we do not even call {{build}}, so the resources are never closed.
+
+
+In order to reproduce it quite reliably on a local machine, it is enough to add a couple of {{System.gc()}} calls to the beginning of the {{finally}} block in {{org.apache.cassandra.index.SecondaryIndexManager#buildIndexesBlocking}}.
+
+
+I've prepared a test fix for this:
+https://github.com/apache/cassandra-dtest/pull/235
+
+In essence, the fix moves the exception throwing to the thread. This is more appropriate imho because there is almost no way the exception could be thrown before the thread is started.  In only possibility for the production code to fail with a leak is that the executor is shutdown and we cannot submit the job. In this case, the opened iterator will not be ever closed. However, I suppose this could happen only on the server tear down. 
+
+I'm not very happy with the solution. I think we should modify the code so that the iterator is opened only in the place where it can be closed - instead of passing the ad-hoc initialized key iterator to the builder and assuming that {{build}} method will be called, we should rather initialize the iterator inside the {{build}} method, where the iterator is closed in the {{finally}} block. 
+
+
+[~adelapena] - wdyt?
+
+https://app.circleci.com/pipelines/github/jacek-lewandowski/cassandra/943/workflows/3877e250-7bc6-48cf-9c52-c6d9bf828eb7 (/)
+
+The fix looks good to me. We will also need 500-iteration runs for all branches since 4.0, with and without vnodes.
+{quote}I'm not very happy with the solution. I think we should modify the code so that the iterator is opened only in the place where it can be closed - instead of passing the ad-hoc initialized key iterator to the builder and assuming that {{build}} method will be called, we should rather initialize the iterator inside the {{build}} method, where the iterator is closed in the {{finally}} block.
+{quote}
+Is it the plan to do it here or on a separate ticket?
+
+ 
+
+what vnodes have to do with it?
+
+Probably nothing, but there can always be surprises. That's why we run them with both configs on CI. The 500 runs can be divided with 250 in vnodes and 250 in no-vnodes.
+
+I'm not going to fix the original issue in this ticket; I can create one to try to fix it for 5.0 and on, but I think we should not touch pre 5.0. I'll verify if the issue exists in the previous versions
+
+[https://app.circleci.com/pipelines/github/jacek-lewandowski/cassandra/952/workflows/e61b7ff9-9003-4020-bc74-ad4349acf2ad]
+
+[https://app.circleci.com/pipelines/github/jacek-lewandowski/cassandra/950/workflows/7d2d3b23-04b0-4fb7-befd-20ef288f9d10]
+
+[https://app.circleci.com/pipelines/github/jacek-lewandowski/cassandra/951/workflows/84600429-680b-4676-8bb5-12d9ac550a1f]
+
+ 
+
+-The issue does not affect 4.0 and 4.1- 
+UPDATE: In 4.1 there is a bug in the code which the test helped to reveal
+
+
+In 4.1 {{ReducedKeyIterator}} is initialized lazily, that's why I've initially claimed that the flaky test does not affect 4.1. Though there is a problem with it:
+
+{code:java}
+    Future<?> submitIndexBuild(final SecondaryIndexBuilder builder, ActiveCompactionsTracker activeCompactions)
+    {
+        Runnable runnable = new Runnable()
+        {
+            public void run()
+            {
+                activeCompactions.beginCompaction(builder);
+                try
+                {
+                    builder.build();
+                }
+                finally
+                {
+                    activeCompactions.finishCompaction(builder);
+                }
+            }
+        };
+
+        return executor.submitIfRunning(runnable, "index build");
+    }
+{code}
+
+now - the {{builder.build()}} method is supposed to close the key iterator in finally block. Since the key iterator internally initialized lazily, it will not close if it was not initialized yet; then, {{activeCompactions.finishCompaction()}} accesses the key iterator and initializes it, and there is no place for it to be closed. In fact, if no exception is thrown, {{finishCompaction}} accesses a closed iterator, which imo bad anyway.
+
+
+new run for 4.1: https://app.circleci.com/pipelines/github/jacek-lewandowski/cassandra/953/workflows/281f3a9c-69b3-47f4-a905-c9266252bd7a
+
+https://github.com/apache/cassandra/pull/2749
+
+
+4.0 probably suffers from the same problem
+
+https://app.circleci.com/pipelines/github/jacek-lewandowski/cassandra/954/workflows/e1412dad-20e6-4fbc-a517-f18d984aa461
+
+https://github.com/apache/cassandra/pull/2751
+
+The patches look good to me. It seems that 4.0 has hit a couple of timeouts on index-related tests that probably aren't related. Nevertheless, I've started some repeated runs for them ([4.0|https://app.circleci.com/pipelines/github/adelapena/cassandra/3231/workflows/d64c5f22-93ca-4d12-9589-12aa6d37717e] and [4.1|https://app.circleci.com/pipelines/github/adelapena/cassandra/3230/workflows/219c52b8-6334-44c5-8cee-aecfde4a2af0]) in case we have to open separate tickets for them.
+
+That was my mistake :( I've confused if-branch levels... Nevertheless, the fix is pushed and tests are running for 4.0 - [https://app.circleci.com/pipelines/github/jacek-lewandowski/cassandra/964/workflows/2c5bfe26-2393-49ab-9a39-8ebf455d24b9] - if they are ok, I'll apply patch for 4.1 as well.
+
+ 
+
+Ok, summary:
+
+Fix in dtests:
+
+[https://github.com/apache/cassandra-dtest/pull/235]
+
+No fix for trunk, repeated run of the modified test link attached to the PR
+
+No fix for 5.0, repeated run of the modified test link attached to the PR
+
+ 
+
+Fix for 4.1: [https://github.com/apache/cassandra/pull/2749] with test links attached to the PR
+
+Fix for 4.0: [https://github.com/apache/cassandra/pull/2751] with test links attached to the PR
+
+Looks good to me, +1
+

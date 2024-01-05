@@ -1,0 +1,392 @@
+HBASE-21401 seems to be another failure. Causes IndexedKeyValue to fail to construct a KeyValue as our "faked" one doesn't match the sanity checks HBase is making.
+{noformat}
+[ERROR] testWithCompression(org.apache.hadoop.hbase.regionserver.wal.ReadWriteKeyValuesWithCodecTest) Time elapsed: 0.004 s <<< ERROR!
+java.lang.IllegalArgumentException: Overflow when reading key length at position=0, KeyValueBytesHex=row, offset=0, length=3
+at org.apache.hadoop.hbase.KeyValueUtil.checkKeyValueBytes(KeyValueUtil.java:531)
+at org.apache.hadoop.hbase.KeyValue.<init>(KeyValue.java:344)
+at org.apache.phoenix.hbase.index.wal.IndexedKeyValue.<init>(IndexedKeyValue.java:56)
+at org.apache.hadoop.hbase.regionserver.wal.ReadWriteKeyValuesWithCodecTest.getEdits(ReadWriteKeyValuesWithCodecTest.java:114)
+at org.apache.hadoop.hbase.regionserver.wal.ReadWriteKeyValuesWithCodecTest.testWithCompression(ReadWriteKeyValuesWithCodecTest.java:83){noformat}
+
+Thanks to [~busbey]. It seems like [~psomogyi] has been down this path as well in HBASE-22340.
+
+After complaining in Sean's direction, I think the "proper" fix is that we stop extending KeyValue and make our own Cell implementation for {{IndexedKeyValue}}.
+
+Anyone know a good reason why this wouldn't work?
+
+bq. I think the "proper" fix is that we stop extending KeyValue and make our own Cell implementation for IndexedKeyValue.
+
++1, that seems like the right direction. KeyValue is a class marked as Private so by contract is not supposed to be extended and we can break you at any time. Use Cell, which is a supported Public interface. 
+
+[~Jaanai], sorry, I was already working on this. Assigning it back to me.
+
+-HBASE-21158-   seems to be a new failure, it will effect DeleteFamily Cell during generating IndexUpdate.
+
+{code:java}
+java.lang.AssertionError: Had some index updates, though it should have been covered by the delete
+
+	at org.junit.Assert.fail(Assert.java:88)
+	at org.junit.Assert.assertTrue(Assert.java:41)
+	at org.junit.Assert.assertFalse(Assert.java:64)
+	at org.apache.phoenix.hbase.index.covered.TestCoveredColumnIndexCodec.ensureNoUpdatesWhenCoveredByDelete(TestCoveredColumnIndexCodec.java:244)
+	at org.apache.phoenix.hbase.index.covered.TestCoveredColumnIndexCodec.testGeneratedIndexUpdates(TestCoveredColumnIndexCodec.java:222)
+{code}
+
+{quote}KeyValue is a class marked as Private so by contract is not supposed to be extended and we can break you at any time. Use Cell, which is a supported Public interface.
+{quote}
+[~apurtell] IndexedKeyValue is used on the server side, I think we should implement ExtendedCell for the server side Cell, but ExtendedCell also is a Private class. I try to implement a IndexedKeyValue class using Cell interface, but some operations can't be supported on the server side. 
+{code:java}
+java.lang.UnsupportedOperationException: Cell is not of type org.apache.hadoop.hbase.ExtendedCell
+	at org.apache.hadoop.hbase.PrivateCellUtil.setSequenceId(PrivateCellUtil.java:2275)
+	at org.apache.hadoop.hbase.regionserver.wal.FSWALEntry.stampRegionSequenceId(FSWALEntry.java:118)
+	at org.apache.hadoop.hbase.regionserver.wal.AbstractFSWAL.stampSequenceIdAndPublishToRingBuffer(AbstractFSWAL.java:971)
+{code}
+
+
+{quote} I think we should implement ExtendedCell for the server side Cell, but ExtendedCell also is a Private class
+{quote}
+We'll have to do an unsafe cast for this, I think. I see in the LocalIndexing code, we have at least one place we call {{setSequenceId(long)}}. I've not yet gotten to the global indexing code yet, but assuem that we'll have something there.
+
+There's been a lot I've been able to unwind purely from assumptions Phoenix makes about how a KeyValue gets serialized (which is our biggest problem).
+
+[~Jaanai], sorry again for the confusion on this issue. Hope you didn't start to work on it.
+
+I just pushed a PR which is what I've been working on. The phoenix-core unit tests are passing, but I haven't started looking at the integration tests (specifically the indexing ones) which still make me worry :)
+
+Seeing some local IT failures (still working through a full suite):
+{noformat}
+[ERROR] Failures:
+[ERROR] UpgradeIT.testConcurrentUpgradeThrowsUprgadeInProgressException:456 One and only one thread should have acquired the mutex . Actual: true
+[ERROR] UpgradeIT.testMapTableToNamespaceDuringUpgrade:189->BaseTest.verifySequenceValue:1769->BaseTest.verifySequence:1791 expected:<-9223372036854775805> but was:<-9223372036854774707>
+[ERROR] HashJoinMoreIT.testBug2961:908
+[ERROR] Errors:
+[ERROR] RowValueConstructorIT.testQueryMoreWithLeadingPKColSkippedInRowValueConstructor:544->_testQueryMoreWithLeadingPKColSkippedInRowValueConstructor:584 » PhoenixIO
+[ERROR] RowValueConstructorIT.testQueryMoreWithLeadingPKColSkippedInRowValueConstructor_salted:549->_testQueryMoreWithLeadingPKColSkippedInRowValueConstructor:584 » PhoenixIO
+[ERROR] RowValueConstructorIT.testQueryMoreWithSubsetofPKColsInRowValueConstructor:472->_testQueryMoreWithSubsetofPKColsInRowValueConstructor:515 » PhoenixIO
+[ERROR] RowValueConstructorIT.testQueryMoreWithSubsetofPKColsInRowValueConstructor_salted:477->_testQueryMoreWithSubsetofPKColsInRowValueConstructor:515 » PhoenixIO
+[ERROR] StringIT.testValidStringConcatExpression:311 » PhoenixIO org.apache.phoenix.ex...
+[ERROR] MutableIndexSplitForwardScanIT.testSplitDuringIndexScan:30->MutableIndexSplitIT.testSplitDuringIndexScan:87->MutableIndexSplitIT.splitDuringScan:152 » StaleRegionBoundaryCache
+[ERROR] MutableIndexSplitForwardScanIT.testSplitDuringIndexScan:30->MutableIndexSplitIT.testSplitDuringIndexScan:87->MutableIndexSplitIT.splitDuringScan:152 » StaleRegionBoundaryCache{noformat}
+Some of these definitely look related to these changes. I'll have to dig into them.
+
+I think the eventual plan is to get rid of IndexedKeyValue. With the coming implementation of global secondary indexes (PHOENIX-5211, PHOENIX-5156) in theory there's no need to persist the index changes into the WAL of the main table, and we could remove IndexedKeyValue completely. [~kozdemir].
+
+ping [~elserj], are you still working on this?
+
+Hey [~tdsilva].
+
+I haven't been able to get back to it to dig into the IT failures above. I don't have a good idea how many of them are because of this change. I did just rebase my PR (linked here) if someone has the time to dig in :)
+
+So, I guess this needs to be picked up again to actually use a current HBase 2.x release (2.0 is EOM). Sounds like we'll have stable at either 2.1 or 2.2.
+
+For reference I have an hbase 2.2.1 branch on [https://github.com/stoty/phoenix/tree/master-hbase-2.2.1] that passes all ITs with only PermissionsCacheIT and UpgradeIT flaky. Should I submit a PR ?
+
+It is based on [~ankit@apache.org] 's downstream work.
+
+ 
+
+Another consideration: The latest Hbase that Tephra supports is 2.0, so running Phoenix on anything newer than that breaks Tephra. It is not uncovered by the tests, as the tephra implementation in MiniCluster masks this.
+
+bq. For reference I have an hbase 2.2.1 branch on https://github.com/stoty/phoenix/tree/master-hbase-2.2.1 that passes all ITs with only PermissionsCacheIT and UpgradeIT flaky. Should I submit a PR ?
+
+Please feel free!
+
+PR updated for HBase 2.2.2 and current phoenix master
+
+What is status of this issue? We upgrade to hbase 2.2.x now and plan to try phoenix. It will be great if phoenix support hbase 2.2.x. Thanks.
+
+Ping [~stoty] [~elserj].
+
+See the *Moving Phoenix master to Hbase 2.2*  thread on the phoenix-dev mailing list
+
+[https://lists.apache.org/thread.html/210c38fad6b42251bfac67d778577e356944dea7f9baa20526d64c76%40%3Cdev.phoenix.apache.org%3E]
+
+ 
+
+[https://github.com/apache/phoenix/pull/687]
+
+has a POC implementation of build time HBase compatibility modules for review.
+
+I expect to make another branch with runtime compatibility modules in the not too distant future.
+
+I have added the proposed patch for the compatibility module solution.
+
+The patch file is a little messy because I do not want to lose the history in the PR branch with a rebase/force-push. I will squash and clean up the commit message before commiting.
+
+ 
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12991986/PHOENIX-5268.master.v1.patch
+  against master branch at commit 41a24eb35244799bdd2f49ba157f29b40b3564e4.
+  ATTACHMENT ID: 12991986
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 29 new or modified tests.
+
+    {color:red}-1 patch{color}.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-PHOENIX-Build/3352//console
+
+This message is automatically generated.
+
+Jenkins doesn't like my patch file with multiple commits, adding squashed version.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12991999/PHOENIX-5268.master.v2.patch
+  against master branch at commit 41a24eb35244799bdd2f49ba157f29b40b3564e4.
+  ATTACHMENT ID: 12991999
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 12 new or modified tests.
+
+    {color:red}-1 javac{color}.  The applied patch generated 374 javac compiler warnings (more than the master's current 361 warnings).
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 lineLengths{color}.  The patch introduces the following lines longer than 100:
+    +                <argument>phoenix-client-${project.version}-${hbase.compat.version.string}.jar</argument>
++                <argument>phoenix-${project.version}-${hbase.compat.version.string}-client.jar</argument>
++      <directory>${project.basedir}/../phoenix-hbase-compat-${hbase.compat.version}/target/</directory>
++            List<? extends Permission> tablePermissions = userPermissions.get(regularUser1.getName());
++                        //With Hbase 2.2 the local index splits trigger longCompactions, and have to wait for an
++                    List<RegionInfo> mergeRegions = CompatUtil.getMergeRegions(ctx.getEnvironment().getConnection(),
++                        for (RegionInfo mergeRegion : mergeRegions.subList(1, mergeRegions.size())) {
++                            if (!CompatPermissionUtil.getPermissionFromUP(userPermission).implies(action)) {
++                            accessExists.addAll(Arrays.asList(CompatPermissionUtil.getPermissionFromUP(userPermission).getActions()));
++                                if (CompatPermissionUtil.getPermissionFromUP(userPermission).implies(action)) {
+
+     {color:red}-1 core tests{color}.  The patch failed these unit tests:
+     ./phoenix-core/target/failsafe-reports/TEST-org.apache.phoenix.end2end.IndexRebuildTaskIT
+
+Test results: https://builds.apache.org/job/PreCommit-PHOENIX-Build/3353//testReport/
+Console output: https://builds.apache.org/job/PreCommit-PHOENIX-Build/3353//console
+
+This message is automatically generated.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12992029/PHOENIX-5268.master.v3.patch
+  against master branch at commit 41a24eb35244799bdd2f49ba157f29b40b3564e4.
+  ATTACHMENT ID: 12992029
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 12 new or modified tests.
+
+    {color:red}-1 javac{color}.  The applied patch generated 374 javac compiler warnings (more than the master's current 361 warnings).
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 lineLengths{color}.  The patch introduces the following lines longer than 100:
+    +                                            if (CompatPermissionUtil.getPermissionFromUP(permToTable).implies(action)) {
++                                    accessExists.addAll(Arrays.asList(CompatPermissionUtil.getPermissionFromUP(permToTable).getActions()));
++                                if(AuthUtil.isGroupPrincipal(CompatPermissionUtil.getUserFromUP(userPermission))){
++                                    AUDITLOG.warn("Users of GROUP:" + CompatPermissionUtil.getUserFromUP(userPermission)
++                                handleRequireAccessOnDependentTable(request, CompatPermissionUtil.getUserFromUP(userPermission),
++                    && CompatPermissionUtil.authorizeUserTable(accessChecker, user, table, action)) {
++            List<UserPermission> permissionsForUser = getPermissionForUser(perms, user.getShortName());
++                    if (CompatPermissionUtil.getPermissionFromUP(permissionForUser).implies(action)) { return true; }
++                    if (CompatPermissionUtil.getPermissionFromUP(permissionForUser).implies(action)) { return true; }
++<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in .
+
+Test results: https://builds.apache.org/job/PreCommit-PHOENIX-Build/3354//testReport/
+Console output: https://builds.apache.org/job/PreCommit-PHOENIX-Build/3354//console
+
+This message is automatically generated.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12992139/PHOENIX-5268.master.v4.patch
+  against master branch at commit 3db8d5ea5e8dc2776a460656dffbcd734e47254c.
+  ATTACHMENT ID: 12992139
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 12 new or modified tests.
+
+    {color:red}-1 javac{color}.  The applied patch generated 374 javac compiler warnings (more than the master's current 361 warnings).
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 lineLengths{color}.  The patch introduces the following lines longer than 100:
+    +<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
++  xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in .
+
+Test results: https://builds.apache.org/job/PreCommit-PHOENIX-Build/3357//testReport/
+Console output: https://builds.apache.org/job/PreCommit-PHOENIX-Build/3357//console
+
+This message is automatically generated.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12992222/PHOENIX-5268.master.v5.patch
+  against master branch at commit b15f0196bb8d139caa1a93ac4ac8dca37c04c024.
+  ATTACHMENT ID: 12992222
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 12 new or modified tests.
+
+    {color:red}-1 javac{color}.  The applied patch generated 374 javac compiler warnings (more than the master's current 361 warnings).
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 lineLengths{color}.  The patch does not introduce lines longer than 100
+
+     {color:red}-1 core tests{color}.  The patch failed these unit tests:
+     ./phoenix-core/target/failsafe-reports/TEST-org.apache.phoenix.rpc.UpdateCacheConnectionLevelPropIT
+
+Test results: https://builds.apache.org/job/PreCommit-PHOENIX-Build/3363//testReport/
+Console output: https://builds.apache.org/job/PreCommit-PHOENIX-Build/3363//console
+
+This message is automatically generated.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12992237/PHOENIX-5268.master.v6.patch
+  against master branch at commit b15f0196bb8d139caa1a93ac4ac8dca37c04c024.
+  ATTACHMENT ID: 12992237
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 12 new or modified tests.
+
+    {color:red}-1 javac{color}.  The applied patch generated 363 javac compiler warnings (more than the master's current 361 warnings).
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 lineLengths{color}.  The patch does not introduce lines longer than 100
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in .
+
+Test results: https://builds.apache.org/job/PreCommit-PHOENIX-Build/3364//testReport/
+Console output: https://builds.apache.org/job/PreCommit-PHOENIX-Build/3364//console
+
+This message is automatically generated.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12992573/PHOENIX-5268.master.v7.patch
+  against master branch at commit c8e4990a7fcec1775e3bb252a8baec935762b826.
+  ATTACHMENT ID: 12992573
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 16 new or modified tests.
+
+    {color:red}-1 javac{color}.  The applied patch generated 363 javac compiler warnings (more than the master's current 361 warnings).
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 lineLengths{color}.  The patch introduces the following lines longer than 100:
+    +<b>[Apache Phoenix](http://phoenix.apache.org/)</b> is a SQL skin over HBase delivered as a client-embedded JDBC driver targeting low latency queries over HBase data. Visit the Apache Phoenix website <b>[here](http://phoenix.apache.org/)</b>.
++Phoenix may not build or work with older releases of HBase, or ones that were released after Phoenix,
++By default, Phoenix will be built for the latest supported HBase 2.x release. You can specify the targeted
++                     ("${hbase.compat.version}".equals("2.0.1") &amp;&amp; hbaseMinor == 0 &amp;&amp; hbasePatch &gt;=1 &amp;&amp; hbasePatch &lt;=4)
++                     || ("${hbase.compat.version}".equals("2.0.1") &amp;&amp; hbaseMinor == 1 &amp;&amp; hbasePatch &gt;=1 &amp;&amp; hbasePatch &lt;=2)
++                     || ("${hbase.compat.version}".equals("2.1.6") &amp;&amp; hbaseMinor == 1 &amp;&amp; hbasePatch &gt;=6)
++                     || ("${hbase.compat.version}".equals("2.2.1") &amp;&amp; hbaseMinor == 1 &amp;&amp; hbasePatch &gt;=3)
++                     || ("${hbase.compat.version}".equals("2.2.1") &amp;&amp; hbaseMinor == 2 &amp;&amp; hbasePatch &gt;=1)
+
+     {color:red}-1 core tests{color}.  The patch failed these unit tests:
+     
+
+Test results: https://builds.apache.org/job/PreCommit-PHOENIX-Build/3387//testReport/
+Console output: https://builds.apache.org/job/PreCommit-PHOENIX-Build/3387//console
+
+This message is automatically generated.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12992592/PHOENIX-5268.master.v8.patch
+  against master branch at commit c8e4990a7fcec1775e3bb252a8baec935762b826.
+  ATTACHMENT ID: 12992592
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 16 new or modified tests.
+
+    {color:red}-1 javac{color}.  The applied patch generated 363 javac compiler warnings (more than the master's current 361 warnings).
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 lineLengths{color}.  The patch does not introduce lines longer than 100
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in .
+
+Test results: https://builds.apache.org/job/PreCommit-PHOENIX-Build/3389//testReport/
+Console output: https://builds.apache.org/job/PreCommit-PHOENIX-Build/3389//console
+
+This message is automatically generated.
+
+One last jenkins pass before committing
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12992709/PHOENIX-5268.master.v9.patch
+  against master branch at commit 2aca0674c7373a2823f8b9214476ebb80426ab5c.
+  ATTACHMENT ID: 12992709
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 16 new or modified tests.
+
+    {color:red}-1 javac{color}.  The applied patch generated 363 javac compiler warnings (more than the master's current 361 warnings).
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 lineLengths{color}.  The patch does not introduce lines longer than 100
+
+     {color:red}-1 core tests{color}.  The patch failed these unit tests:
+     ./phoenix-core/target/failsafe-reports/TEST-org.apache.phoenix.end2end.IndexRebuildTaskIT
+
+Test results: https://builds.apache.org/job/PreCommit-PHOENIX-Build/3398//testReport/
+Console output: https://builds.apache.org/job/PreCommit-PHOENIX-Build/3398//console
+
+This message is automatically generated.
+
+Carrying over my +1 :)
+
+Merged.
+
+Thanks [~elserj] for your help in making this happen, and getting it polished.
+
+FAILURE: Integrated in Jenkins build PreCommit-PHOENIX-Build #3401 (See [https://builds.apache.org/job/PreCommit-PHOENIX-Build/3401/])
+PHOENIX-5268 HBase 2.1/2.2 compatibility (stoty: rev 28303260bc8187b4aa1ab5279d8719dfac97e81b)
+* (add) phoenix-hbase-compat-2.0.1/src/main/java/org/apache/phoenix/compat/hbase/test/DelegateCell.java
+* (edit) phoenix-pherf/pom.xml
+* (add) phoenix-hbase-compat-2.1.6/pom.xml
+* (edit) phoenix-core/src/main/java/org/apache/hadoop/hbase/regionserver/IndexHalfStoreFileReaderGenerator.java
+* (edit) phoenix-assembly/src/build/components/all-common-jars.xml
+* (edit) phoenix-tracing-webapp/pom.xml
+* (add) phoenix-hbase-compat-2.0.1/src/main/java/org/apache/phoenix/compat/hbase/OffsetCell.java
+* (add) phoenix-hbase-compat-2.0.1/pom.xml
+* (add) phoenix-hbase-compat-2.2.1/src/main/java/org/apache/phoenix/compat/hbase/test/DelegateCell.java
+* (add) phoenix-hbase-compat-2.0.1/src/main/java/org/apache/phoenix/compat/hbase/CompatPermissionUtil.java
+* (add) phoenix-hbase-compat-2.1.6/src/main/java/org/apache/phoenix/compat/hbase/OffsetCell.java
+* (add) BUILDING.md
+* (add) phoenix-hbase-compat-2.2.1/src/main/java/org/apache/phoenix/compat/hbase/CompatPhoenixRpcScheduler.java
+* (edit) pom.xml
+* (edit) phoenix-core/src/main/java/org/apache/phoenix/util/PhoenixKeyValueUtil.java
+* (add) phoenix-hbase-compat-2.1.6/src/main/java/org/apache/phoenix/compat/hbase/test/DelegateCell.java
+* (add) phoenix-hbase-compat-2.2.1/src/main/java/org/apache/phoenix/compat/hbase/OffsetCell.java
+* (edit) phoenix-core/src/it/java/org/apache/phoenix/end2end/PermissionsCacheIT.java
+* (edit) phoenix-core/src/it/java/org/apache/phoenix/end2end/index/MutableIndexSplitIT.java
+* (add) phoenix-hbase-compat-2.0.1/src/main/java/org/apache/phoenix/compat/hbase/CompatUtil.java
+* (edit) phoenix-core/src/main/java/org/apache/phoenix/util/IndexUtil.java
+* (delete) build.txt
+* (edit) phoenix-client/pom.xml
+* (edit) phoenix-core/src/main/java/org/apache/hadoop/hbase/ipc/PhoenixRpcScheduler.java
+* (add) phoenix-hbase-compat-2.2.1/src/main/java/org/apache/phoenix/compat/hbase/CompatPermissionUtil.java
+* (edit) phoenix-assembly/pom.xml
+* (edit) phoenix-core/pom.xml
+* (edit) phoenix-core/src/test/java/org/apache/phoenix/query/EncodedColumnQualifierCellsListTest.java
+* (add) phoenix-hbase-compat-2.1.6/src/main/java/org/apache/phoenix/compat/hbase/CompatUtil.java
+* (add) phoenix-hbase-compat-2.1.6/src/main/java/org/apache/phoenix/compat/hbase/CompatPermissionUtil.java
+* (add) phoenix-hbase-compat-2.0.1/src/main/java/org/apache/phoenix/compat/hbase/CompatPhoenixRpcScheduler.java
+* (edit) phoenix-core/src/main/java/org/apache/phoenix/coprocessor/PhoenixAccessController.java
+* (add) phoenix-hbase-compat-2.1.6/src/main/java/org/apache/phoenix/compat/hbase/CompatPhoenixRpcScheduler.java
+* (add) phoenix-hbase-compat-2.2.1/pom.xml
+* (add) phoenix-hbase-compat-2.2.1/src/main/java/org/apache/phoenix/compat/hbase/CompatUtil.java
+* (edit) phoenix-server/pom.xml
+
+

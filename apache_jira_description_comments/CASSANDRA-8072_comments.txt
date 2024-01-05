@@ -1,0 +1,370 @@
+FWIW, I know this is some kind of issue because I've both seen it in the wild and experienced it myself, but it only repros very rarely for me, so it's hard to troubleshoot.  AFAICT, everything in the code is fine so we need to get lower level on it to see what's going on.
+
+We encountered the same issue on a single node DSE Cassandra instance. This is a single node fresh install and we getting this error while starting up the service.
+
+[CASSANDRA-8274|https://issues.apache.org/jira/browse/CASSANDRA-8274] appears to me to be the root cause, in my situation at least, to [CASSANDRA-7292|https://issues.apache.org/jira/browse/CASSANDRA-7292]. I'm still not convinced that 7292 and 8072 are duplicate issues.
+
+This is a copy of a /var/log/cassandra/system.log file from a node that failed to provision from opscenter with a "Thrift timeout error".  DSC 2.0.10 was chosen for provisioning, using a version with an assert patch from Brandon Williams.
+
+I don't know what that FNFE is about, but it's not related to this ticket.
+
+So far in testing I'm unable to get much traction reproducing locally (using 2 containers on the same host machine). I can get the exception if I start one node about 10 seconds before the other, but I assume it's probably a normal exception in that case. Seems like perhaps this is ec2 specific or relates to some other connectivity flakiness that could be occurring between nodes on startup.
+
+bq. probably a normal exception in that case
+
+Depends on which one is the seed :)
+
+It's not ec-2 specific since I know Ryan Springer was using local VMs, and I've encountered it on rax.
+
+[~respringer] Can you help me better understand what's happening with the nodes (via opscenter) when this occurs? From what we talked about before it sounds like the nodes are started with little/no configuration and then are stopped, configured, and started up again with seeds configured.
+
+First startup:
+ - are any changes made to cassandra.yaml before this start?
+ - are nodes aware of each other as seeds?
+ - does the start happen serially or in parallel?
+ - is it possible to get sample config yaml for 2 nodes at this phase?
+
+Stopping:
+ - are the nodes stopped serially or in parallel?
+ - are the nodes able to complete startup before being stopped, or could they be getting interrupted during initial start?
+ - are the nodes stopped forcefully (like kill -9) or something nicer?
+
+Starting again with configurations completed:
+ - are nodes started serially or in parallel? (from what I know this would be parallel but just want to be sure)
+ - will this startup step wait for all nodes to be ready before launching in parallel? (or could one node get a significant head start if it completes the earlier steps first?)
+ - is it possible to get sample config yaml for 2 nodes at this point? (I grabbed yaml from a failed repro attempt but want to be sure I didn't get something wrong in that attempt)
+
+Finally, when provisioning in this way how do the (ec2) nodes refer to one another: public ip, private ip, or private dns?
+
+Thanks! And sorry for all the questions. I'm trying to close in on the issue and still having difficulty reproducing in a local container environment, so I'm trying to figure out what could be unique about the provisioning of these nodes that may account for triggering this issue.
+
+I have been able to reproduce this issue using the steps provided in CASSANDRA-8422.
+
+During one repro attempt I tried to run 'nodetool gossipinfo' in a loop on the non-seed node (just before the reported exception was expected to occur), and was surprised to see it complain about attempting to use a closed connection.
+
+Using netstat I had a look at the seed and the non-seed node, and can see a lingering CLOSE_WAIT connection on the seed node -- I'm wondering if cassandra could somehow be trying to reuse this stale connection, making the seed unable to connect back to the non-seed (and making it think the seed is unavailable).
+
+It may also be relevant that the non-seed node has a connection in state FIN_WAIT2 for approx. 10-15 seconds after stopping the cassandra process.
+
+No problem with all the questions.  The more information we have on this issue, the better.
+
+First Startup:
+
+- The DSC deb/rpm packages are installed by the agent.  Part of the scripts in the deb/rpm automatically starts DSC when the package is installed.
+- No changes are made to cassandra.yaml before this initial start from the packaged scripts.
+- Initially the nodes are not aware of each other as seeds, because the cassandra.yaml being used is the one from the package.
+- The initial install is made in parallel in batches of 20 nodes at a time ( configurable with the Opscenter install_throttle parameter.  )  However, I am seeing the problem with just 2 nodes in the cluster, so I don't think the throttle is involved.
+- I will do a run of 2 nodes and post the cassandra.yaml files.
+
+Stopping:
+
+- The nodes are stopped in parallel
+- It looks as though Opscenter waits for the "apt-get install" or equivalent rpm command to return from the DSC package installation and then Opscenter considers the node to be initially started.  Once the package install commands have finished for all nodes, then Opscenter begins to stop all of the DSC instances.  If the package install command returns before DSC is completely initialized, that could be related to this issue.
+- The nodes are stopped with: pkill -f CassandraDaemon
+
+Starting again
+
+- The DSC nodes are restarted serially, with the seed nodes being started before non-seed nodes.  The seeds are first sorted by string comparison and then started one at a time in that order.
+- Opscenter will wait for all DSC instances to have been started, then it will restart the agents, wait for them to reconnect to Opscenter, and then Opscenter considers the provisioning to be finished.
+- I will grab 2 cassandra.yaml configs for this stage as well.
+
+From my reading of the code, I believe the ec2 nodes will refer to each other using public IPs, but I will verify from a real run.
+
+Thanks very much.
+
+My suspicion is that we're not closing an incoming TCP connection cleanly, and thus the OS has to handle that for us.  In the time it takes for that to happen, the seed thinks it still has a connection when it doesn't, and is using that to attempt gossip, which of course fails.  I'm not entirely sure where this is occurring yet, however.
+
+Actually, I was wrong about Opscenter waiting until all of the nodes had installed the DSC package before stopping the nodes.  As soon as the package install has finished for a node, Opscenter will proceed and stop the running DSC instance for that node without waiting for other nodes to finish their installs.  Opscenter will also reconfigure nodes without waiting for all nodes to be stopped.
+
+It looks like the node install -> stop -> configure process runs independently for each node.  So we could theoretically have one node in a reconfigured but stopped state while another node is still installing the packages.  Opscenter will, however, wait until all nodes have been reconfigured before beginning to restarting DSC on the nodes.
+
+Also, Opscenter is using the ec2 private IPs, not the public ones.
+
+A few more notes here. I noticed testing today that running decommission on the non-seed node actually seems to properly close one connection (it waits for a few seconds after decommission is complete and disappears from the netstat output on the seed), but that another connection springs up in it's place. It's this connection established *after* decommission which seems to be lingering when the peer disappers, going into CLOSE_WAIT when the process is stopped. I did some testing with tcpkill to forcefully close this connection (which is a little tricky because it needs traffic flowing to work), and was able to confirm that when this connection is no longer open, a node can start without triggering the 'unable to gossip' exception.
+
+
+
+One correction here, the FIN_WAIT2 seems like it's actually lasting about one minute, so I think it's being removed when tcp_fin_timeout expires.
+
+Logs from cassandra cluster with logging set to TRACE.  This is from a new node launched and cassandra failed to start.
+This is for a cluster running on EC2 using the ec2multiregion snitch.
+I was able to reproduce this issue on a new cluster, decommissioned a node, shut it down, brought up a new node with the same EIP and this failed.
+
+
+Thanks for the logs! So, the relevant portion of these logs is here:
+
+{noformat}
+DEBUG 20:53:50,981 Starting shadow gossip round to check for endpoint collision
+ INFO 20:53:51,304 Starting Encrypted Messaging Service on SSL port 7001
+ INFO 20:53:51,312 Starting Messaging Service on port 7000
+ INFO 20:53:51,315 Loading settings from file:/etc/cassandra/conf/cassandra.yaml
+TRACE 20:53:51,336 /54.219.189.161 sending GOSSIP_DIGEST_SYN to 1@/54.219.189.162
+TRACE 20:53:51,353 /54.219.189.161 sending GOSSIP_DIGEST_SYN to 2@/54.219.189.163
+DEBUG 20:53:51,354 attempting to connect to /54.219.189.162
+TRACE 20:53:51,354 Assuming current protocol version for /54.219.189.162
+TRACE 20:53:51,355 Filtering org.apache.cassandra.db.ColumnFamilyStore$9@496cc7de for rows matching org.apache.cassandra.db.filter.ExtendedFilter$EmptyClauseFilter@4b5e57b
+DEBUG 20:53:51,359 attempting to connect to /54.219.189.163
+TRACE 20:53:51,360 Assuming current protocol version for /54.219.189.163
+ INFO 20:53:51,543 Handshaking version with cas-dev-dt-01-uw1-cassandra-seed02.localdomain-ext/54.219.189.163
+ INFO 20:53:51,544 Handshaking version with cas-dev-dt-01-uw1-cassandra-seed01.localdomain-ext/54.219.189.162
+DEBUG 20:53:51,583 Setting version 7 for cas-dev-dt-01-uw1-cassandra-seed02.localdomain-ext/54.219.189.163
+DEBUG 20:53:51,586 Setting version 7 for cas-dev-dt-01-uw1-cassandra-seed01.localdomain-ext/54.219.189.162
+TRACE 20:53:51,586 Upgrading OutputStream to be compressed
+TRACE 20:53:51,588 Upgrading OutputStream to be compressed
+TRACE 20:53:55,247 Expired 0 entries
+DEBUG 20:53:55,598 GC for ConcurrentMarkSweep: 71 ms for 1 collections, 240266176 used; max is 7935623168
+TRACE 20:54:00,248 Expired 0 entries
+TRACE 20:54:05,248 Expired 0 entries
+TRACE 20:54:10,249 Expired 0 entries
+TRACE 20:54:15,249 Expired 0 entries
+TRACE 20:54:20,250 Expired 0 entries
+ERROR 20:54:22,360 Exception encountered during startup
+java.lang.RuntimeException: Unable to gossip with any seeds
+{noformat}
+
+We can see that this node sent the SYN, which caused MS to connect to those nodes, and it successfully negotiated the version, so we know that everything worked as expected until this point.  What we don't know is why neither seed replied to the SYN, or if they even attempted to, or just never received the SYN for some reason.  Without TRACE from one of the seeds, we won't be able to tell.
+
+Wow, that was a quick response. :)  Thanks for looking into this.
+I cleaned out the log files, enabled trace on both seed nodes and the new node that is failing and started cassandra on the failing node.  Trace logs from each node are attached.
+
+
+Now we're getting somewhere.  It starts here, after the seed receives the dead state for the decommissioned node:
+
+{noformat}
+DEBUG [GossipStage:1] 2015-04-10 22:05:10,147 ReconnectableSnitchHelper.java (line 70) Intiated reconnect to an Internal IP /10.2.1.139 for the /54.219.189.161
+{noformat}
+
+Later, the seed receives the SYN and tries to send the ACK, but it tries to send over the previous internal IP:
+
+{noformat}
+DEBUG [ACCEPT-/10.2.0.71] 2015-04-10 22:06:45,576 MessagingService.java (line 917) Connection version 7 from /54.219.189.161
+DEBUG [Thread-11] 2015-04-10 22:06:45,621 MessagingService.java (line 780) Setting version 7 for /54.219.189.161
+DEBUG [Thread-11] 2015-04-10 22:06:45,621 IncomingTcpConnection.java (line 107) Set version for /54.219.189.161 to 7 (will use 7)
+TRACE [GossipStage:1] 2015-04-10 22:06:45,658 GossipDigestSynVerbHandler.java (line 40) Received a GossipDigestSynMessage from /54.219.189.161
+TRACE [GossipStage:1] 2015-04-10 22:06:45,660 Gossiper.java (line 768) local heartbeat version 179776 greater than 0 for /54.219.189.161
+TRACE [GossipStage:1] 2015-04-10 22:06:45,666 GossipDigestSynVerbHandler.java (line 84) Sending a GossipDigestAckMessage to /54.219.189.161
+TRACE [GossipStage:1] 2015-04-10 22:06:45,666 MessagingService.java (line 660) /54.219.189.162 sending GOSSIP_DIGEST_ACK to 399@/54.219.189.161
+DEBUG [WRITE-/54.219.189.161] 2015-04-10 22:06:45,666 OutboundTcpConnection.java (line 290) attempting to connect to /10.2.1.139
+{noformat}
+
+It seems like the 'new' 161 isn't binding this IP, which is fine depending on your circumstance, but at least one problem we have is we shouldn't be sending the onJoin event for a dead state which triggers the initial reconnect.  I can't think of any reason we'd want to send that event upon discovery of any dead state, so patch to only send it for live states.
+
+That said, I don't think this is the original cause, because when I've seen it I wasn't using INTERNAL_IP nor a reconnecting snitch.
+
+bq. I can't think of any reason we'd want to send that event upon discovery of any dead state, so patch to only send it for live states.
+
+Actually, I can.  In the case of a removal/decom during a partition, this is the only way the other side will remove it when the partition heals.  Patch to instead filter dead states in ReconnectableSnitchHelper.
+
+I agree. John Albert's logs seem more consistent with bug 7292(which I still maintain should not be marked as a duplicate) - https://issues.apache.org/jira/browse/CASSANDRA-7292
+
+Glad to see progress on this issue though. Thanks all.
+
+[~albertsj1] can you see if that patch fixes your scenario?
+
+[~brandon.williams] Absolutely.  I probably won't get a chance to test this until tomorrow.
+Thanks for the patch.
+
+
+FWIW, I am on OS X, v10.9.5 and was using JDK 8 and got a similar error though with subtly different stacktrace:
+{code}
+java.lang.RuntimeException: Unable to gossip with any seeds
+	at org.apache.cassandra.gms.Gossiper.doShadowRound(Gossiper.java:1222) ~[apache-cassandra-2.1.2.jar:2.1.2]
+	at org.apache.cassandra.service.StorageService.checkForEndpointCollision(StorageService.java:463) ~[apache-cassandra-2.1.2.jar:2.1.2]
+	at org.apache.cassandra.service.StorageService.prepareToJoin(StorageService.java:706) ~[apache-cassandra-2.1.2.jar:2.1.2]
+	at org.apache.cassandra.service.StorageService.initServer(StorageService.java:643) ~[apache-cassandra-2.1.2.jar:2.1.2]
+	at org.apache.cassandra.service.StorageService.initServer(StorageService.java:535) ~[apache-cassandra-2.1.2.jar:2.1.2]
+	at org.apache.cassandra.service.CassandraDaemon.setup(CassandraDaemon.java:324) [apache-cassandra-2.1.2.jar:2.1.2]
+	at org.apache.cassandra.service.CassandraDaemon.activate(CassandraDaemon.java:448) [apache-cassandra-2.1.2.jar:2.1.2]
+	at org.apache.cassandra.service.CassandraDaemon.main(CassandraDaemon.java:537) [apache-cassandra-2.1.2.jar:2.1.2]
+java.lang.RuntimeException: Unable to gossip with any seeds
+	at org.apache.cassandra.gms.Gossiper.doShadowRound(Gossiper.java:1222)
+	at org.apache.cassandra.service.StorageService.checkForEndpointCollision(StorageService.java:463)
+	at org.apache.cassandra.service.StorageService.prepareToJoin(StorageService.java:706)
+	at org.apache.cassandra.service.StorageService.initServer(StorageService.java:643)
+	at org.apache.cassandra.service.StorageService.initServer(StorageService.java:535)
+	at org.apache.cassandra.service.CassandraDaemon.setup(CassandraDaemon.java:324)
+	at org.apache.cassandra.service.CassandraDaemon.activate(CassandraDaemon.java:448)
+	at org.apache.cassandra.service.CassandraDaemon.main(CassandraDaemon.java:537)
+{code}
+
+This was cassandra 2.1.2 installed via brew. I uninstalled it, installed from the CLI using this:
+
+http://exponential.io/blog/2015/01/28/install-cassandra-2_1-on-mac-os-x/
+
+And still had the issue. Then I changed my JAVA_HOME to point back to Java7:
+
+{{export JAVA_HOME=/Library/Java/JavaVirtualMachines/jdk1.7.0_51.jdk/Contents/Home}}
+
+And now it starts fine.
+
+HTH.
+
+I'm going to guess that was just random luck since I highly doubt this is JVM-specific.
+
+Moving the patch for ec2/reconnectable snitches to CASSANDRA-7292 since it fits better there.
+
+After deep packet inspection, I believe I've found the root non-reconnectable snitch part of this issue.  When you decom a node, it never correctly tears down its ITC pools, which leaves the other side with a dead OTC pool:
+
+{noformat}
+tcp        1      0 10.208.8.123:33441      10.208.8.63:7000        CLOSE_WAIT  18401/java      
+{noformat}
+
+Now when you try to bootstrap with the same IP, the shadow syn is correctly sent and the ack reply is built and queued, but MS tries to use the now defunct OTC pool and the message never makes it back to the node, since it just sends TCP RSTs which finally kills the connection.  But since the gossip syn is only sent once, the seed has nothing else to send the node and never reestablishes the connection, leaving the bootstrapping node thinking it never talked to a seed and throwing this error.
+
+The reason this only manifests with shadow gossip is because shadow is the only time we send precisely one round, under normal gossip conditions we fire once per second, but probably lose the first message as well.
+
+Hello, I made following steps: I decom a 2.0.15 node with 128 vnodes and tried to bootstrap 2.1.6-R on the same node w/ 256 vnodes in write survey mode to test. 2.1.6 doesn't bootstrap because of the unable gossib exception but the old 2.0.15 does it w/o problems. Even if i use cassandra.yaml from 2.0.15 (deleted properties invalid for 2.1.6) it doesn't start. I have 14 nodes 2.0.15 running on Windows 7.
+{panel:title=system.log}
+ERROR [main] 2015-06-10 12:03:22,200 CassandraDaemon.java:553 - Exception encountered during startup
+java.lang.RuntimeException: Unable to gossip with any seeds
+	at org.apache.cassandra.gms.Gossiper.doShadowRound(Gossiper.java:1307) ~[apache-cassandra-2.1.6.jar:2.1.6]
+	at org.apache.cassandra.service.StorageService.checkForEndpointCollision(StorageService.java:530) ~[apache-cassandra-2.1.6.jar:2.1.6]
+	at org.apache.cassandra.service.StorageService.prepareToJoin(StorageService.java:774) ~[apache-cassandra-2.1.6.jar:2.1.6]
+	at org.apache.cassandra.service.StorageService.initServer(StorageService.java:711) ~[apache-cassandra-2.1.6.jar:2.1.6]
+	at org.apache.cassandra.service.StorageService.initServer(StorageService.java:602) ~[apache-cassandra-2.1.6.jar:2.1.6]
+	at org.apache.cassandra.service.CassandraDaemon.setup(CassandraDaemon.java:394) [apache-cassandra-2.1.6.jar:2.1.6]
+	at org.apache.cassandra.service.CassandraDaemon.activate(CassandraDaemon.java:536) [apache-cassandra-2.1.6.jar:2.1.6]
+	at org.apache.cassandra.service.CassandraDaemon.main(CassandraDaemon.java:625) [apache-cassandra-2.1.6.jar:2.1.6]
+WARN  [StorageServiceShutdownHook] 2015-06-10 12:03:22,200 Gossiper.java:1418 - No local state or state is in silent shutdown, not announcing shutdown
+INFO  [StorageServiceShutdownHook] 2015-06-10 12:03:22,200 MessagingService.java:708 - Waiting for messaging service to quiesce
+INFO  [ACCEPT-PC5771/10.2.0.61] 2015-06-10 12:03:22,200 MessagingService.java:958 - MessagingService has terminated the accept() thread
+{panel}
+
+I tried severel times to switch between 2.0.15 and 2.1.6 (start bootstr at 2.0.15, stop, copy data to 2.1.6) but 2.1.6 doesn't start probably. One time, 2.1.6 had seen only other nodes, not himself. Now I deleted all data again on that node, removed the node with nodetool and now the bootstrap w/ 2.0.15 works well in write survey mode. I'll wait until bootstrap finished and then I try to upgrade the same node to 2.1.6 w/ write survey as well. Seems like 2.1.6 is not backward compatible bootstrapping to a 2.0.x cluster. Can u confirm that behavior?
+
+I can easily reproduce this with my automated launcher  I even tried to better randomize when non-seed nodes come in to join.   I recently noticed that the seed node has a socket stuck in CLOSE_WAIT for the nodes that report can't gossip with any seeds.  Perhaps the solution lies in ensuring that both ends of the connection properly close the connection.  It's likely the client (the node asking to join) exceptions out and dies without elegantly closing the connection.   See Screenshot.  Also well-known port afs3-fileserver is 7000.
+
+Without having looked in much detail at this yet, it seems very similar to CASSANDRA-10205. It's worth trying out that patch to see if it solves this as well.
+
+Summary of 10205: after a node is decommissioned, its data wiped, and the node restarted, it never receives GOSSIP replies from seeds during the shadow round and fails to start. This is because the node is not marked as dead and the socket is not closed properly. Marking the node as dead even when the status is LEFT, closes the socket and the test of 10205 passes. The patch is for 3.0 but the same problem occurs on 2.0+.
+
+[~slowery23] Can you reproduce it in 2.1.latest?
+
+I am seeing this issue in 2.0.14. And it's reproducible. We are adding a node in a large vnode based cluster. All the other time we have successfully added the node in the past and this time around we are seeing this issue.
+
+Is there a work around for this situation? Any ideas?
+
+
+
+Upon enabling trace on the one seed node and re-bootstrapping the new node, I got the following exception on the node that was bootstrapping.
+{code}
+2015-11-02 17:34:52,150 [ACCEPT-/10.22.168.53] DEBUG MessagingService Error reading the socket Socket[addr=/10.xx.xx.xx,port=46678,localport=10xxx]
+java.net.SocketTimeoutException
+        at sun.nio.ch.SocketAdaptor$SocketInputStream.read(SocketAdaptor.java:229)
+        at sun.nio.ch.ChannelInputStream.read(ChannelInputStream.java:103)
+        at java.io.InputStream.read(InputStream.java:101)
+        at sun.nio.ch.ChannelInputStream.read(ChannelInputStream.java:81)
+        at java.io.DataInputStream.readInt(DataInputStream.java:387)
+        at org.apache.cassandra.net.MessagingService$SocketThread.run(MessagingService.java:916)
+{code}
+
+And then usual exception that this ticket is mentioning about
+{code}
+2015-11-02 17:34:55,526 [EXPIRING-MAP-REAPER:1] TRACE ExpiringMap Expired 0 entries
+2015-11-02 17:35:00,526 [EXPIRING-MAP-REAPER:1] TRACE ExpiringMap Expired 0 entries
+2015-11-02 17:35:05,527 [EXPIRING-MAP-REAPER:1] TRACE ExpiringMap Expired 0 entries
+2015-11-02 17:35:10,527 [EXPIRING-MAP-REAPER:1] TRACE ExpiringMap Expired 0 entries
+2015-11-02 17:35:11,982 [main] ERROR CassandraDaemon Exception encountered during startup
+java.lang.RuntimeException: Unable to gossip with any seeds
+        at org.apache.cassandra.gms.Gossiper.doShadowRound(Gossiper.java:1296)
+        at org.apache.cassandra.service.StorageService.checkForEndpointCollision(StorageService.java:457)
+        at org.apache.cassandra.service.StorageService.prepareToJoin(StorageService.java:671)
+        at org.apache.cassandra.service.StorageService.initServer(StorageService.java:623)
+        at org.apache.cassandra.service.StorageService.initServer(StorageService.java:515)
+        at org.apache.cassandra.service.CassandraDaemon.setup(CassandraDaemon.java:437)
+        at com.datastax.bdp.server.DseDaemon.setup(DseDaemon.java:423)
+        at org.apache.cassandra.service.CassandraDaemon.activate(CassandraDaemon.java:567)
+        at com.datastax.bdp.server.DseDaemon.main(DseDaemon.java:641)
+2015-11-02 17:35:11,986 [Thread-7] INFO DseDaemon DSE shutting down...
+2015-11-02 17:35:11,987 [StorageServiceShutdownHook] WARN Gossiper No local state or state is in silent shutdown, not announcing shutdown
+2015-11-02 17:35:11,987 [StorageServiceShutdownHook] INFO MessagingService Waiting for messaging service to quiesce
+2015-11-02 17:35:11,987 [StorageServiceShutdownHook] DEBUG MessagingService Closing accept() thread
+2015-11-02 17:35:11,988 [ACCEPT-/10.22.168.53] DEBUG MessagingService Asynchronous close seen by server thread
+2015-11-02 17:35:11,988 [ACCEPT-/10.22.168.53] INFO MessagingService MessagingService has terminated the accept() thread
+2015-11-02 17:35:12,068 [Thread-7] ERROR CassandraDaemon Exception in thread Thread[Thread-7,5,main]
+{code}
+
+I've reproduced it on 2.1 HEAD with this dtest, which follows the steps of CASSANDRA-8422:
+
+{code}
+def decommissioned_wiped_node_can_gossip_to_single_seed_test(self):
+        """
+        @jira_ticket CASSANDRA-8072
+        @jira_ticket CASSANDRA-8422
+        Test that if we decommission a node, kill it and wipe its data, it can join a cluster with a single
+        seed node.
+        """
+        cluster = self.cluster
+        cluster.populate(1)
+        cluster.start(wait_for_binary_proto=True)
+
+        # Add a new node, bootstrap=True ensures that it is not a seed
+        node2 = new_node(cluster, bootstrap=True)
+        node2.start(wait_for_binary_proto=True, wait_other_notice=True)
+
+        # Decommision the new node and kill it
+        node2.decommission()
+        node2.stop(gently=False)
+
+        # Wipe its data
+        data_dir = os.path.join(node2.get_path(), 'data')
+        commitlog_dir = os.path.join(node2.get_path(), 'commitlogs')
+        debug("Deleting {}".format(data_dir))
+        shutil.rmtree(data_dir)
+        shutil.rmtree(commitlog_dir)
+
+        # Now start it, it should be allowed to join
+        mark = node2.mark_log()
+        node2.start(wait_other_notice=False)
+        node2.watch_log_for("JOINING:", from_mark=mark)
+{code} 
+
+This results in the following exception in node2:
+
+{code}
+ERROR [main] 2015-12-18 16:21:07,357 CassandraDaemon.java:581 - Exception encountered during startup
+java.lang.RuntimeException: Unable to gossip with any seeds
+        at org.apache.cassandra.gms.Gossiper.doShadowRound(Gossiper.java:1337) ~[main/:na]
+        at org.apache.cassandra.service.StorageService.checkForEndpointCollision(StorageService.java:541) ~[main/:na]
+        at org.apache.cassandra.service.StorageService.prepareToJoin(StorageService.java:789) ~[main/:na]
+        at org.apache.cassandra.service.StorageService.initServer(StorageService.java:721) ~[main/:na]
+        at org.apache.cassandra.service.StorageService.initServer(StorageService.java:612) ~[main/:na]
+        at org.apache.cassandra.service.CassandraDaemon.setup(CassandraDaemon.java:389) [main/:na]
+        at org.apache.cassandra.service.CassandraDaemon.activate(CassandraDaemon.java:564) [main/:na]
+        at org.apache.cassandra.service.CassandraDaemon.main(CassandraDaemon.java:653) [main/:na]
+WARN  [StorageServiceShutdownHook] 2015-12-18 16:21:07,360 Gossiper.java:1454 - No local state or state is in silent shutdown, not announcing shutdown
+INFO  [StorageServiceShutdownHook] 2015-12-18 16:21:07,361 MessagingService.java:734 - Waiting for messaging service to quiesce
+INFO  [ACCEPT-/127.0.0.2] 2015-12-18 16:21:07,361 MessagingService.java:1018 - MessagingService has terminated the accept() thread
+{code}
+
+Building on [~brandon.williams] previous analysis but taking into account more recent changes where we do close sockets, the problem is still that the seed node is sending the ACK to the old socket, even after it has been closed by the decommissioned node. This is because we only send on these sockets, so we cannot know when they are closed until the send buffers are exceeded or unless we try to read from them as well. However, the problem should now only be true until the node is convicted, approx 10 seconds with a {{phi_convict_threshold}} of 8. I verified this by adding a sleep of 15 seconds in my test before restarting the node, and it restarted without problems. [~slowenthal] or [~rhatch] would you be able to confirm this with your tests?
+
+If we cannot detect when an outgoing socket is closed by its peer, then we need an out-of-bound notification. This could come from the departing node announcing its shutdown at the end of its decommission but the existing logic in {{Gossiper.stop()}} prevents this for the dead states (*removing, removed, left and hibernate*) or for *bootstrapping*. This was introduced by CASSANDRA-8336 and the same problem has already been raised in CASSANDRA-9630. Even if we undo CASSANDRA-8336 there is then another issue: since CASSANDRA-9765 we can no longer join a cluster in status SHUTDOWN and I believe this is correct. So the answer cannot be to announce a shutdown after decommission, not without significant changes to the Gossip protocol. Closing the socket earlier, say when we get the status LEFT notification, is not sufficient because during the RING_DELAY sleep period we may re-establish the connection to the node before it dies, typically for a Gossip update. 
+
+So I think we only have two options:
+
+* read from outgoing sockets purely to detect when they are closed
+* send a new GOSSIP flag indicating it is time to close the sockets to a node
+
+
+Forgot to mention also another obvious way to go around this, that is to extend the shadow round and to retry multiple times.
+
+In fact we don't need to extend the shadow round since RING_DELAY is already a pretty long time (30 seconds by default), we just need to retry perhaps every 5 seconds?
+
+Here is a patch that does that and that fixes my test:
+
+||2.1||
+|[patch|https://github.com/stef1927/cassandra/commits/8072-2.1]|
+|[testall|http://cassci.datastax.com/view/Dev/view/stef1927/job/stef1927-8072-2.1-testall/]|
+|[dtest|http://cassci.datastax.com/view/Dev/view/stef1927/job/stef1927-8072-2.1-dtest/]|
+
+
+Ping:  [~slowenthal], [~rhatch] - I cannot reproduce this if I wait for the restarting node to be convicted, typically a sleep of around 15 seconds. Are you able to reproduce this in any way beyond this period?
+
+[~Stefania] It's been a long while since I tested, but I vaguely remember that a long enough sleep would prevent the issue from happening when I was working to repro it consistently.
+
+Patch lgtm, thanks. I've committed to 2.1 in {{0f27d68fc23a942c0fa27ba4662621891939eaed}} and merged forwards. I didn't go as far as creating CI branches for all the targets, but I did verify that the new dtest passes on them all. That dtest needed a slight tweak following CASSANDRA-6696 and I've opened a PR for it [here|https://github.com/riptano/cassandra-dtest/pull/737]
+
+
+Thank you [~beobal] and [~rhatch].
+

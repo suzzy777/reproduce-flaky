@@ -1,0 +1,569 @@
+Hi [~sodonnell], this sounds like a great idea. We should also have a hard expiration beyond which an old entry will never be returned. It prevents indefinite use of stale mappings e.g. when the LDAP server is down. I don't know if the Guava cache makes this easy to do.
+
+I have uploaded a first cut of these changes for review and comments. One thing I am not sure about is whether we need to timeout calls to the OS that are blocking on the call to LDAP. In the current implementation, there is no timeout - they appear to block forever or until an exception occurs.
+
+[~arpitagarwal] I wonder if we totally expired keys when the LDAP server is down, would that undo the usefulness of this feature. I'd like this to stop NN crashes, but if LDAP was down, and we expired the HDFS groups, then the next call would find none and then block trying to do a 'first time load' leading to the same problem. It sort of feels like if LDAP is totally down, this feature can help shelter the cluster from it for a reasonable period.
+
+bq. I wonder if we totally expired keys when the LDAP server is down, would that undo the usefulness of this feature.
+That's a fair point. But IME the most common problem is transient performance issues with group lookup. Providing a grace period during which we use stale entries will address this. Whereas using a stale entry indefinitely could be considered a security issue. 
+
+Alternatively the admin can choose the behavior via a single config value like {{hadoop.security.groups.cache.reload.grace.period}} which is zero (disabled) or a small value by default. Setting it to a large value would cover the 'LDAP server indefinitely down' scenario. This setting can replace {{hadoop.security.groups.cache.background.reload}}.
+
+[~arpitagarwal] I looked into this a bit further. In the current implementation the Guava cache is setup to request that a key is:
+
+1) Refreshed after HADOOP_SECURITY_GROUPS_CACHE_SECS since the last write (default setting is 5 minutes)
+
+2) Evicted after 10 * HADOOP_SECURITY_GROUPS_CACHE_SECS since the last write (default is therefore 50 minutes)
+
+I tested this scenario - if a refresh fails, it doesn't update the write time, so if you have refresh failing over and over, eventually the key will get evicted.
+
+So, in the current implementation, if LDAP is down and the key is older than HADOOP_SECURITY_GROUPS_CACHE_SECS but less that HADOOP_SECURITY_GROUPS_CACHE_SECS * 10, the thread that attempts to do the refresh will fail to update the cache, but it will return the old value, as will all other threads. After HADOOP_SECURITY_GROUPS_CACHE_SECS * 10, the key will have been evicted and the call to getGroups will throw an exception.
+
+The background refresh introduced by this patch behaves basically in the same way:
+
+1) If the background refresh repeaditly fails (eg LDAP is down), the old values in the cache returned are returned until 10 * HADOOP_SECURITY_GROUPS_CACHE_SECS at which point they will be evicted.
+
+2) If LDAP is still throwing errors after eviction, then a call to getGroups will throw an exception that will propagate up through the code.
+
+So with respect to expiring entries during a long LDAP outage, both solutions will do that in the same way.
+
+Does that sound acceptable?
+
+Thanks for the explanation. So the difference in behavior is that after HADOOP_SECURITY_GROUPS_CACHE_SECS we do a blocking refresh today whereas it will be a non-blocking refresh with your patch? If so, this sounds correct to me. 
+
+I will review your patch.
+
+??So the difference in behavior is that after HADOOP_SECURITY_GROUPS_CACHE_SECS we do a blocking refresh today whereas it will be a non-blocking refresh with your patch??
+
+Yea, that's basically it.
+
+The patch looks good, thanks for contributing it.
+
+A few comments:
+# We should set keepAliveTime for thread pool threads so we don't always pay the fixed cost. e.g. [via this constructor|https://docs.oracle.com/javase/7/docs/api/java/util/concurrent/ThreadPoolExecutor.html#ThreadPoolExecutor(int,%20int,%20long,%20java.util.concurrent.TimeUnit,%20java.util.concurrent.BlockingQueue)]. I'd suggest [newCachedThreadPool|https://docs.oracle.com/javase/7/docs/api/java/util/concurrent/Executors.html#newCachedThreadPool()] but it doesn't appear to support maximum number of threads.
+# Can you avoid using the static block in {{GroupCacheLoader}}? The thread pool can be instantiated at the first async reload.
+# Perhaps the default should be 3-5 threads instead of 1. With keepAliveTime these threads won't be using up memory all the time.
+# I don't think there can be a generic way for {{reload}} to timeout the {{Future}} since we don't require the {{GroupMappingServiceProvider}} implementations to support one so we can remove this comment.
+{code}
+     // call? If so, do we need a way of timing out the future
+     // so all the threads don't get blocked?
+{code}
+
+Couple of counters Groups can expose now or later in another. These could be NameNode metrics later.
+# The number of pending cache reloads blocked on executors i.e. counter incremented just before {{executorService#submit}} and decremented when the call is invoked.
+# Number of load operations currently in progress.
+
+Thanks for the review. I have implemented 1 - 4, plus added a couple of further tests I used to figure things out during our earlier discussion.
+
+For the counters, should these just be public int on the group class? It probably makes sense to have 3:
+
+1. Pending
+2. In Progress
+3. Failed with an exception
+
+Yes they can be private members of the Groups class, exposed via a getter. If we are adding "Failed with an exception", we can also add "Total succeeded" so administrators can estimate what fraction of calls failed.
+
+It would be perfectly fine to add the counters in a separate Jira since your background reload changes are valuable on their own.
+
+[~arpitagarwal] I have attached a version 2 of the patch, which has:
+
+1. Changes based on review - please check them and make sure they are what you were thinking
+2. A few extra tests
+3. Counters for the 4 metrics - queued, running, success, exception. If you had something different in mind for the counters let me know and I can change them. Once we know they are good I can add a couple of tests to cover that part off too.
+
+
+Thank you for the updated patch [~sodonnell]. This is looking good. A few comments:
+# We can use [AtomicLong|https://docs.oracle.com/javase/7/docs/api/java/util/concurrent/atomic/AtomicLong.html] in place of {{Counter}}.
+# The {{if (executorService == null)}} check in reload should be protected with a synchronized block.
+# This exception block in {{reload}} exists just to increment the counter. Instead you can have a boolean {{success}} that is set to true at the end of the try block. You can increment {{backgroundRefreshException}} in {{finally}} if the boolean is false.
+# Nitpick: {{new LinkedBlockingQueue<Runnable>()}} can be replaced with {{new LinkedBlockingQueue<>()}}.
+
+Rest lgtm. I am still reviewing the tests (thank you for the extensive new tests!).
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 27s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  7m  8s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  8m 25s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 25s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m  6s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 15s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 39s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 47s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 43s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} compile {color} | {color:red}  2m 27s{color} | {color:red} root in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} javac {color} | {color:red}  2m 27s{color} | {color:red} root in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red}  0m 27s{color} | {color:red} hadoop-common-project/hadoop-common: The patch generated 85 new + 216 unchanged - 0 fixed = 301 total (was 216) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 57s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 11s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:red}-1{color} | {color:red} findbugs {color} | {color:red}  1m 46s{color} | {color:red} hadoop-common-project/hadoop-common generated 3 new + 0 unchanged - 0 fixed = 3 total (was 0) {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 46s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 17m 25s{color} | {color:red} hadoop-common in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 17s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 45m 53s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| FindBugs | module:hadoop-common-project/hadoop-common |
+|  |  Should org.apache.hadoop.security.Groups$Counter be a _static_ inner class?  At Groups.java:inner class?  At Groups.java:[lines 249-263] |
+|  |  Increment of volatile field org.apache.hadoop.security.Groups$Counter.value in org.apache.hadoop.security.Groups$Counter.decr()  At Groups.java:in org.apache.hadoop.security.Groups$Counter.decr()  At Groups.java:[line 262] |
+|  |  Increment of volatile field org.apache.hadoop.security.Groups$Counter.value in org.apache.hadoop.security.Groups$Counter.incr()  At Groups.java:in org.apache.hadoop.security.Groups$Counter.incr()  At Groups.java:[line 258] |
+| Failed junit tests | hadoop.metrics2.impl.TestGangliaMetrics |
+| Timed out junit tests | org.apache.hadoop.http.TestHttpServerLifecycle |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:e2f6409 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12811219/HADOOP-13263.002.patch |
+| JIRA Issue | HADOOP-13263 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 884937add4bd 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 2800695 |
+| Default Java | 1.8.0_91 |
+| findbugs | v3.0.0 |
+| compile | https://builds.apache.org/job/PreCommit-HADOOP-Build/9818/artifact/patchprocess/patch-compile-root.txt |
+| javac | https://builds.apache.org/job/PreCommit-HADOOP-Build/9818/artifact/patchprocess/patch-compile-root.txt |
+| checkstyle | https://builds.apache.org/job/PreCommit-HADOOP-Build/9818/artifact/patchprocess/diff-checkstyle-hadoop-common-project_hadoop-common.txt |
+| findbugs | https://builds.apache.org/job/PreCommit-HADOOP-Build/9818/artifact/patchprocess/new-findbugs-hadoop-common-project_hadoop-common.html |
+| unit | https://builds.apache.org/job/PreCommit-HADOOP-Build/9818/artifact/patchprocess/patch-unit-hadoop-common-project_hadoop-common.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/9818/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common U: hadoop-common-project/hadoop-common |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/9818/console |
+| Powered by | Apache Yetus 0.4.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Thanks for the further review [~arpitagarwal]. Nice spot on the missing synchronized block and thanks for pointing out the AtomicLong - I had not come across it before. I uploaded a 3rd version of the patch incorporating the second round of review comments and 1 more test to check the counters.
+
+I spotted the compile error in the QA run, and I got the same one when I ran the compile from the top level - looks like I removed the 'public' from one of the constructors by mistake, so I have fixed that too.
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 41s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  8m 19s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  7m 52s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 25s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 57s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 13s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 22s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 45s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 38s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  7m  7s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  7m  7s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red}  0m 27s{color} | {color:red} hadoop-common-project/hadoop-common: The patch generated 93 new + 216 unchanged - 0 fixed = 309 total (was 216) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 57s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 13s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:red}-1{color} | {color:red} findbugs {color} | {color:red}  1m 35s{color} | {color:red} hadoop-common-project/hadoop-common generated 1 new + 0 unchanged - 0 fixed = 1 total (was 0) {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 45s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  7m  8s{color} | {color:green} hadoop-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 25s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 40m 33s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| FindBugs | module:hadoop-common-project/hadoop-common |
+|  |  Inconsistent synchronization of org.apache.hadoop.security.Groups$GroupCacheLoader.executorService; locked 66% of time  Unsynchronized access at Groups.java:66% of time  Unsynchronized access at Groups.java:[line 334] |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:e2f6409 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12811466/HADOOP-13263.003.patch |
+| JIRA Issue | HADOOP-13263 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux fe6b7590ae89 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 2800695 |
+| Default Java | 1.8.0_91 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HADOOP-Build/9819/artifact/patchprocess/diff-checkstyle-hadoop-common-project_hadoop-common.txt |
+| findbugs | https://builds.apache.org/job/PreCommit-HADOOP-Build/9819/artifact/patchprocess/new-findbugs-hadoop-common-project_hadoop-common.html |
+|  Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/9819/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common U: hadoop-common-project/hadoop-common |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/9819/console |
+| Powered by | Apache Yetus 0.4.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Hi [~sodonnell], the v3 patch lgtm.
+
+Can you please fix the issues flagged by checkstyle? Also I think the findbugs warning is spurious but we should keep findbugs happy. It can probably be suppressed by taking a local reference to the executorService within the lock so we make use of the local reference outside the lock. +1 with checkstyle and findbugs addressed.
+
+Some of new the tests rely on events occurring with expected delays. We've seen such tests can be flaky especially on slower hardware like under-provisioned VMs. We can file a follow up jira to make the tests more resilient.
+
+Updated patch to fix find bugs and checkstyle issues
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 18s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  7m  0s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  7m 14s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 28s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m  4s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 13s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 31s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 48s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 40s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  7m 23s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  7m 23s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red}  0m 25s{color} | {color:red} hadoop-common-project/hadoop-common: The patch generated 28 new + 216 unchanged - 0 fixed = 244 total (was 216) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 52s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 13s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} whitespace {color} | {color:red}  0m  0s{color} | {color:red} The patch has 1 line(s) that end in whitespace. Use git apply --whitespace=fix. {color} |
+| {color:red}-1{color} | {color:red} findbugs {color} | {color:red}  1m 29s{color} | {color:red} hadoop-common-project/hadoop-common generated 1 new + 0 unchanged - 0 fixed = 1 total (was 0) {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 44s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 18m  4s{color} | {color:red} hadoop-common in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 20s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 49m 30s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| FindBugs | module:hadoop-common-project/hadoop-common |
+|  |  Inconsistent synchronization of org.apache.hadoop.security.Groups$GroupCacheLoader.executorService; locked 66% of time  Unsynchronized access at Groups.java:66% of time  Unsynchronized access at Groups.java:[line 340] |
+| Timed out junit tests | org.apache.hadoop.http.TestHttpServerLifecycle |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:e2f6409 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12811990/HADOOP-13263.004.patch |
+| JIRA Issue | HADOOP-13263 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 09bbfa1ed99e 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 8c1f81d |
+| Default Java | 1.8.0_91 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HADOOP-Build/9837/artifact/patchprocess/diff-checkstyle-hadoop-common-project_hadoop-common.txt |
+| whitespace | https://builds.apache.org/job/PreCommit-HADOOP-Build/9837/artifact/patchprocess/whitespace-eol.txt |
+| findbugs | https://builds.apache.org/job/PreCommit-HADOOP-Build/9837/artifact/patchprocess/new-findbugs-hadoop-common-project_hadoop-common.html |
+| unit | https://builds.apache.org/job/PreCommit-HADOOP-Build/9837/artifact/patchprocess/patch-unit-hadoop-common-project_hadoop-common.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/9837/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common U: hadoop-common-project/hadoop-common |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/9837/console |
+| Powered by | Apache Yetus 0.4.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Additional patch to address style issues
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 17s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  1s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  6m 57s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  6m 55s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 26s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 57s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 13s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 20s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 48s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 37s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  6m 48s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  6m 48s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 24s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 53s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 12s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:red}-1{color} | {color:red} findbugs {color} | {color:red}  1m 35s{color} | {color:red} hadoop-common-project/hadoop-common generated 1 new + 0 unchanged - 0 fixed = 1 total (was 0) {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 47s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 21m 31s{color} | {color:red} hadoop-common in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 21s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 51m 44s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| FindBugs | module:hadoop-common-project/hadoop-common |
+|  |  Inconsistent synchronization of org.apache.hadoop.security.Groups$GroupCacheLoader.executorService; locked 66% of time  Unsynchronized access at Groups.java:66% of time  Unsynchronized access at Groups.java:[line 342] |
+| Timed out junit tests | org.apache.hadoop.http.TestHttpServerLifecycle |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:e2f6409 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12812316/HADOOP-13263.005.patch |
+| JIRA Issue | HADOOP-13263 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux fe600a1facfd 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / d8107fc |
+| Default Java | 1.8.0_91 |
+| findbugs | v3.0.0 |
+| findbugs | https://builds.apache.org/job/PreCommit-HADOOP-Build/9847/artifact/patchprocess/new-findbugs-hadoop-common-project_hadoop-common.html |
+| unit | https://builds.apache.org/job/PreCommit-HADOOP-Build/9847/artifact/patchprocess/patch-unit-hadoop-common-project_hadoop-common.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/9847/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common U: hadoop-common-project/hadoop-common |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/9847/console |
+| Powered by | Apache Yetus 0.4.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Moved synchronized block into a constructor
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 30s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  6m 55s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  7m  5s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 32s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 56s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 13s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 27s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 45s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 39s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  7m 10s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  7m 10s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 25s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 54s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 12s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 32s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 46s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}  7m 47s{color} | {color:red} hadoop-common in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 20s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 38m 55s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.metrics2.impl.TestGangliaMetrics |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:e2f6409 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12812457/HADOOP-13263.006.patch |
+| JIRA Issue | HADOOP-13263 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  |
+| uname | Linux 7ab561abc2a1 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / d433b16 |
+| Default Java | 1.8.0_91 |
+| findbugs | v3.0.0 |
+| unit | https://builds.apache.org/job/PreCommit-HADOOP-Build/9851/artifact/patchprocess/patch-unit-hadoop-common-project_hadoop-common.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/9851/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common U: hadoop-common-project/hadoop-common |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/9851/console |
+| Powered by | Apache Yetus 0.4.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+[~arpitagarwal] I got the style issues sorted, and I also removed the synchronized block that was causing problems with find bugs and put it into the class constructor. Not sure why I didn't do that originally, as I think that is the best place for it. All my tests pass locally and from the last Hadoop QA run it seems there is only 1 test failure that appears to be unrelated to this patch:
+
+{code}
+Tests run: 2, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.551 sec <<< FAILURE! - in org.apache.hadoop.metrics2.impl.TestGangliaMetrics
+testGangliaMetrics2(org.apache.hadoop.metrics2.impl.TestGangliaMetrics)  Time elapsed: 0.327 sec  <<< FAILURE!
+java.lang.AssertionError: Missing metrics: test.s1rec.Xxx
+	at org.junit.Assert.fail(Assert.java:88)
+	at org.junit.Assert.assertTrue(Assert.java:41)
+	at org.apache.hadoop.metrics2.impl.TestGangliaMetrics.checkMetrics(TestGangliaMetrics.java:161)
+	at org.apache.hadoop.metrics2.impl.TestGangliaMetrics.testGangliaMetrics2(TestGangliaMetrics.java:139)
+{code}
+
+Assuming you are happy with the initialization of the executor happening in the constructor I think this one is complete.
+
+Do we need to raise a documentation jira to mentioned the new parameters to enable the feature? You also mentioned an additional jira to remove delays from the tests, making them more robust. Some of the original tests had delays in them too, so that is something that should look over that entire test class I guess.
+
+Hi [~sodonnell], I will review the updated patch.
+
+bq. Do we need to raise a documentation jira to mentioned the new parameters to enable the feature?
+We should add the settings to hdfs-default.xml at a minimum. I don't think we have any site documentation for setting up group mapping.
+
+bq. Some of the original tests had delays in them too, so that is something that should look over that entire test class I guess.
+I agree. Any tests that depend on predictable timing of events are likely to be flaky. We have many such tests in our code base unfortunately.
+
+Thanks [~sodonnell] this is a good idea, and thanks [~arpiagariu] for initial reviews.
+I have a few quick comments:
+
+ [~sodonnell] 
+What's the purpose of {{getBackgroundRefreshSuccess()}}, {{getBackgroundRefreshException}}, {{getBackgroundRefreshQueued}}, {{getBackgroundRefreshRunning}} in Group class?
+If they are used by tests only, they should not be {{public}} (most likely package-private), and they should be annotated with {{@VisibleForTesting}}.
+
+[~arpiagariu]
+bq. We should add the settings to hdfs-default.xml at a minimum. I don't think we have any site documentation for setting up group mapping.
+The new properties should go into core-default.xml. And there's a GroupsMapping.md under hadoop-common-project/hadoop-common/src/site/markdown. It would be really nice if we could get this groups mapping resolution feature described in this doc.
+
+I also wonder if the new properties should be defined in {{CommonConfigurationKeys}} instead, because {{CommonConfigurationKeysPublic}} has a javadoc that says:
+{code}
+/** 
+ * This class contains constants for configuration keys used
+ * in the common code.
+ *
+ * It includes all publicly documented configuration keys. In general
+ * this class should not be used directly (use CommonConfigurationKeys
+ * instead)
+ *
+ */
+{code}
+
+[~weichiu] Thanks for the review.
+
+{quote}
+What's the purpose of getBackgroundRefreshSuccess(), getBackgroundRefreshException, getBackgroundRefreshQueued, getBackgroundRefreshRunning in Group class?
+{quote}
+
+[~arpitagarwal] suggested that we put some counters in that can be exposed as Namenode metrics in a further Jira. I think it makes sense, otherwise it will be impossible to know in a running system if the refresh queue is getting very large, or if refreshes are hitting an exception frequently.
+
+{quote}
+I also wonder if the new properties should be defined in CommonConfigurationKeys instead
+{quote}
+I am happy to move these if you want. I found the existing group cache parameters in `CommonConfigurationKeysPublic` so I kept them together. Let me know if you want me to move them and I can submit another patch version.
+
+Do you want me to update the GroupsMapping.md and core-default.xml within this Jira so it all gets committed together, or should we do docs separately? I've got the following ready to go:
+
+{code}
+<property>
+  <name>hadoop.security.groups.cache.background.reload</name>
+  <value>false</value>
+  <description>
+    Whether to reload expired user->group mappings using a background thread
+    pool. If set to true, a pool of
+    hadoop.security.groups.cache.background.reload.threads is created to
+    update the cache in the background.
+  </description>
+</property>
+
+<property>
+  <name>hadoop.security.groups.cache.background.reload.threads</name>
+  <value>3</value>
+  <description>
+    Only relevant if hadoop.security.groups.cache.background.reload is true.
+    Controls the number of concurrent background user->group cache entry
+    refreshes. Pending refresh requests beyond this value are queued and
+    processed when a thread is free.
+  </description>
+</property>
+{code}
+
+And for the groupMapping.md:
+
+{quote}
+With the default caching implementation, after `hadoop.security.groups.cache.secs` when the cache entry expires, the next thread to request group membership will query the group mapping service provider to lookup the current groups for the user. While this lookup is running, the thread that initiated it will block, while any other threads requesting groups for the same user will retrieve the previously cached values. If the refresh fails, the thread performing the refresh will throw an exception and the process will repeat for the next thread that requests a lookup for that value. If the lookup repeatedly fails, and the cache is not updated, after `hadoop.security.groups.cache.secs * 10` seconds the cached entry will be evicted and all threads will block until a successful reload is performed.
+
+To avoid any threads blocking when the cached entry expires, set `hadoop.security.groups.cache.background.reload` to true. This enables a small thread pool of `hadoop.security.groups.cache.background.reload.threads` threads having 3 threads by default. With this setting, when the cache is queried for an expired entry, the expired result is returned immediately and a task is queued to refresh the cache in the background. If the background refresh fails a new refresh operation will be queued by the next request to the cache, until `hadoop.security.groups.cache.secs * 10` when the cached entry will be evicted and all threads will block for that user until a successful reload occurs.
+{quote}
+
+If you give this a quick review and let me know if it should be in this patch I can get a new version pushed up pretty quickly.
+
+Thanks for the quick response.
+
+Re: metrics
+Thanks for clarification. That makes sense to me and I'm happy to see a followup jira to add metrics and to have more visibility into group resolution.
+
+Re: CommonConfigurationKeys
+I don't have preference. It looks like people add new property keys into both classes regardless of what the Javadoc says.
+
+The core-default.xml and GroupsMapping.md looks good to me too.
+
+This patch contains the core-default.xml and GroupsMapping.md changes - no code changes since the 006 patch.
+
+| (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 26s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  7m  3s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  7m  7s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 27s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 34s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 13s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 22s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 45s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 39s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  7m 10s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  7m 10s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 26s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 54s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 12s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} xml {color} | {color:green}  0m  2s{color} | {color:green} The patch has no ill-formed XML file. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 30s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 46s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  8m 21s{color} | {color:green} hadoop-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 21s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 40m 51s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:85209cc |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12813391/HADOOP-13263.007.patch |
+| JIRA Issue | HADOOP-13263 |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  findbugs  checkstyle  xml  |
+| uname | Linux f58597c29a39 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / d328e66 |
+| Default Java | 1.8.0_91 |
+| findbugs | v3.0.0 |
+|  Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/9878/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common U: hadoop-common-project/hadoop-common |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/9878/console |
+| Powered by | Apache Yetus 0.4.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
++1 for the v7 patch. Thanks for working through the patch iterations [~sodonnell].
+
+I will commit this fix later today.
+
+Committed for 2.8.0.
+
+Thanks for contributing the improvement [~sodonnell] and thanks for the review [~weichiu]!
+
+SUCCESS: Integrated in Hadoop-trunk-Commit #10021 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/10021/])
+HADOOP-13263. Reload cached groups in background after expiry. (arp: rev 9683eab0e1ee42c159cf678254c464d97bc3ff57)
+* hadoop-common-project/hadoop-common/src/site/markdown/GroupsMapping.md
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/security/Groups.java
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/CommonConfigurationKeysPublic.java
+* hadoop-common-project/hadoop-common/src/main/resources/core-default.xml
+* hadoop-common-project/hadoop-common/src/test/java/org/apache/hadoop/security/TestGroupsCaching.java
+
+
+[~sodonnell] can you please review the release note for correctness and fix it if necessary?
+
+[~arpitagarwal] Looks good to me.
+
+Just committed this to branch-2.7. Thanks.
+

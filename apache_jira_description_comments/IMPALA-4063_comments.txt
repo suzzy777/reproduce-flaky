@@ -1,0 +1,276 @@
+I think we should consider going even further:
+1) Drive it from the coordinator side (though probably still need a message initiated from executor to eliminate 'done' latency).
+2) Make it per-host message. i.e. one RPC can carry info for all active queries between the (coordinator, executor) pair.
+3) Should also address IMPALA-2990 (though if we reverse the protocol with #1, timeout would occur on executor side).
+
++Ideas for ReportExecStatus():  +
+
++How it works now:+
+
+* ReportExecStatusAux() calls ReportExecStatus RPC.
+* ReportExecStatusAux() called during instance startup failure (without a FIS, to indicate entire query failure), and by FragmentInstanceState::SendReport().
+* SendReport() called by ReportProfileThread() periodically. And also called by FIS::Finalize() when the fragment is done.
+* ReportProfileThread() started in FIS::Prepare().
+
+
++*Push based approach:*+
+
+* Still have push based reporting.
+* Start a Report status thread per QueryState instead of per FIS.
+* Change ReportExecStatusAux to loop through all the FISes and fill in the TReportExecStatusParams thrift struct.
+* Change Coordinator::UpdateBackendExecStatus() to loop through TReportExecStatusParams.fragment_instance_ctxs and call ApplyExecStatusReport() on each backend. 
+  For thrift do it on the same RPC thread.
+  For KRPC, give it away to a separate thread pool to avoid holding up the service pool threads, since there’s a lot of computation.
+
++Pros:+
+* Reduced network traffic.
+* Reduced contention on Coordinator::lock_, which Mostafa’s runs show to be a frequent point of contention.
+* Reduced contention on client_request_state_map_lock_.
+* IMPALA-2990 becomes very less likely due to reduced load on coordinator.
+* *Lower risk due to network protocol staying the same, so we’re not introducing new failure modes.*
+
++Cons:+
+* Reporting is still push based, so IMPALA-2990 can still occur if we stress the coordinator way more than currently possible.
+
+
++*Pull based:*+
+
++Pros:+
+* Reduced network traffic.
+* Reduced contention on Coordinator::lock_, which Mostafa’s runs show to be a frequent point of contention.
+* Reduced contention on client_request_state_map_lock_.
+* IMPALA-2990 is eliminated. (But we have reverse 2990, as I’ve mentioned in the cons below)
+
++Cons:+
+* Need to change thrift structures since statuses now go in the Thrift response instead of the request.
+* Need to hold “last report” in memory all the time, since when a coordinator report request comes in, we need to be able to give it immediately.
+* Alternatively, if we compute reports on demand, the coordinator could have to wait a long time to get the report back.
+* Still need to do push based RPC from the backends to the coordinator for when a query completes in the backend, else the coordinator might request for a status too late and have the client waiting unnecessarily.
+* If we have message initiated from the executor to eliminate the above ‘done’ latency, in the general case, we have twice the network traffic than we would have with the above push based mechanism.
+* *Higher risk* since code changes a lot, so many new failure modes possible. 
+  Eg: How does a node detect if the coordinator is actually down ? Timeout, but how do we empirically find an appropriate timeout? 
+  Reverse IMPALA-2990, what happens to the fragments on an executor when the coordinator cannot reach that executor N times?
+  Unanticipated random code bugs due to a lot of the code changing.
+
+
+
+I've probably not through it as some of the others have, but from the above, I arrive at the fact that Push based is low risk and would be a good first step, given the limited time we have. Let me know if I've missed thinking about certain points.
+
+Commit cbc8c63ef0446550bd080e226b38307c4de967eb in impala's branch refs/heads/master from [~sailesh]
+[ https://git-wip-us.apache.org/repos/asf?p=impala.git;h=cbc8c63 ]
+
+IMPALA-7163: Implement a state machine for the QueryState class
+
+This patch adds a state machine for the QueryState class. The motivation
+behind this patch is to make the query lifecycle from the point of
+view of an executor much easier to reason about and this patch is key
+for a follow on patch for IMPALA-2990 where the status reporting will
+be per-query rather than per-fragment-instance. Currently, the state
+machine provides no other purpose, and it will mostly be used for
+IMPALA-2990.
+
+We introduce 5 possible states for the QueryState which include 3
+terminal states (FINISHED, CANCELLED and ERROR) and 2 non-terminal
+states (PREPARING, EXECUTING). The transition from one state to the
+next is always handled by a single thread which is also the QueryState
+thread. This thread will additionally bear the purpose of sending
+periodic updates after IMPALA-4063, which is the primary reason behind
+having only this thread modify the state of the query.
+
+Counting barriers are introduced to keep a count of how many fragment
+instances have finished Preparing and Executing. These barriers also
+block until all the fragment instances have finished a respective state.
+The fragment instances update the query wide query status if an error is
+hit and unblocks the barrier if it is in the EXECUTING state. The
+PREPARING state blocks regardless of whether a fragment instance hit an
+error or not, until all the fragment instances have completed
+successfully or unsuccessfully, to maintain the invariant that fragment
+instances cannot be cancelled until the entire QueryState has finished
+PREPARING.
+
+The status reporting protocol has not been changed and remains exactly
+as it was.
+
+Testing:
+- Added 3 failure points in the query lifecycle using debug actions
+  and added tests to validate the same (extension of IMPALA-7376).
+- Ran 'core' and 'exhaustive' tests.
+
+Future related work:
+1) IMPALA-2990: Make status reporting per-query.
+2) Try to logically align the FIS states with the QueryState states.
+3) Consider mirroring the QueryState state machine to
+CoordinatorBackendState
+
+Change-Id: Iec5670a7db83ecae4656d7bb2ea372d3767ba7fe
+Reviewed-on: http://gerrit.cloudera.org:8080/10813
+Reviewed-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+Tested-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+
+
+Commit 941038229ae7073ddf7b9c6f58e9eaf866b89b2c in impala's branch refs/heads/master from Michael Ho
+[ https://git-wip-us.apache.org/repos/asf?p=impala.git;h=9410382 ]
+
+IMPALA-4063: Merge report of query fragment instances per executor
+
+Previously, each fragment instance executing on an executor will
+independently report its status to the coordinator periodically.
+This creates a huge amount of RPCs to the coordinator under highly
+concurrent workloads, causing lock contention in the coordinator's
+backend states when multiple fragment instances send them at the
+same time. In addition, due to the lack of coordination between query
+fragment instances, a query may end without collecting the profiles
+from all fragment instances when one of them hits an error before
+another fragment instance manages to finish Prepare(), leading to
+missing profiles for certain fragment instances.
+
+This change fixes the problem above by making a thread per QueryState
+(started by QueryExecMgr) to be responsible for periodically reporting
+the status and profiles of all fragment instances of a query running
+on a backend. As part of this refactoring, each query fragment instance
+will not report their errors individually. Instead, there is a cumulative
+status maintained per QueryState. It's set to the error status of the first
+fragment instance which hits an error or any general error (e.g. failure
+to start a thread) when starting fragment instances. With this change,
+the status reporting threads are also removed.
+
+Testing done: exhaustive tests
+
+This patch is based on a patch by Sailesh Mukil
+
+Change-Id: I5f95e026ba05631f33f48ce32da6db39c6f421fa
+Reviewed-on: http://gerrit.cloudera.org:8080/11615
+Reviewed-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+Tested-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+
+
+The proposed release of Impala 3.1.0 will not include the fix of IMPALA-7213 which the fix of this Jira is dependent on. So marking the fix version as 3.2.0 for now.
+
+Commit d1aa1c009f62500ae2ee8cd915751b0d42bee911 in impala's branch refs/heads/master from Michael Ho
+[ https://git-wip-us.apache.org/repos/asf?p=impala.git;h=d1aa1c0 ]
+
+IMPALA-7828: A temporary workaround for flaky UDF test (test_mem_leak())
+
+Before IMPALA-4063, the error message detected during
+FragmentInstanceState::Close() was always lost. After
+IMPALA-4063, we may sometimes get the error message in
+FragmentInstanceState::Close(). It's non-deterministic
+as the fragment instance thread may race with the query
+state thread which reports the final status. The UDF test
+currently tries to handle this non-determinism by using
+"row_regex:.*" in the ERRORS section but it doesn't
+always seem to work.
+
+This change workarounds the issue by commenting out the
+ERRORS section in udf-no-expr-rewrite.text for now.
+The actual fix will be done in IMPALA-7829.
+
+Change-Id: I6a55d5ad1a5a7278e7390f60854a8df28c1b9f28
+Reviewed-on: http://gerrit.cloudera.org:8080/11900
+Reviewed-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+Tested-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+
+
+Commit d1aa1c009f62500ae2ee8cd915751b0d42bee911 in impala's branch refs/heads/master from Michael Ho
+[ https://git-wip-us.apache.org/repos/asf?p=impala.git;h=d1aa1c0 ]
+
+IMPALA-7828: A temporary workaround for flaky UDF test (test_mem_leak())
+
+Before IMPALA-4063, the error message detected during
+FragmentInstanceState::Close() was always lost. After
+IMPALA-4063, we may sometimes get the error message in
+FragmentInstanceState::Close(). It's non-deterministic
+as the fragment instance thread may race with the query
+state thread which reports the final status. The UDF test
+currently tries to handle this non-determinism by using
+"row_regex:.*" in the ERRORS section but it doesn't
+always seem to work.
+
+This change workarounds the issue by commenting out the
+ERRORS section in udf-no-expr-rewrite.text for now.
+The actual fix will be done in IMPALA-7829.
+
+Change-Id: I6a55d5ad1a5a7278e7390f60854a8df28c1b9f28
+Reviewed-on: http://gerrit.cloudera.org:8080/11900
+Reviewed-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+Tested-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+
+
+Commit d4019be2a259b6f5bc14da3261fac36e07f771ad in impala's branch refs/heads/master from Michael Ho
+[ https://git-wip-us.apache.org/repos/asf?p=impala.git;h=d4019be ]
+
+IMPALA-7852: Fix some flakiness in test_hash_join_timer.py
+
+test_hash_join_timer.py aims to verify the timers in the
+join nodes are functioning correctly. It does so by parsing
+the query profile for certain patterns after the query has
+finished.
+
+Before IMPALA-4063, each individual fragment instance will
+post its profile to the coordinator upon completion. After
+IMPALA-4063, the profiles of all fragment instances are sent
+together periodically and the final profile is sent once all
+fragment instances on a backend are done.
+
+The problem with the existing implementation of the test is
+that it doesn't actually fetch results before closing the
+query. As a result of it, the coordinator fragment never gets
+a chance to complete as it will block forever when inserting
+into the plan root sink. The lack of completion of the
+coordinator fragment causes the final profiles of fragment
+instances on the coordinator to be not sent before the query
+is closed. As a result, the profile of a fragment instance
+on the coordinator could be stale if it completes between
+two periodic updates, leading to random test failure.
+
+This change fixes the flankiness by always fetching results
+before closing the query. Ideally, if we fix IMPALA-539 and
+wait for all backends' final profiles before completing query
+unregistration, we should get the final profile from the
+coordinator fragment too.
+
+Change-Id: I851824dffb78c7731e60793d90f1e57050c54955
+Reviewed-on: http://gerrit.cloudera.org:8080/11964
+Reviewed-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+Tested-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+
+
+Commit d4019be2a259b6f5bc14da3261fac36e07f771ad in impala's branch refs/heads/master from Michael Ho
+[ https://git-wip-us.apache.org/repos/asf?p=impala.git;h=d4019be ]
+
+IMPALA-7852: Fix some flakiness in test_hash_join_timer.py
+
+test_hash_join_timer.py aims to verify the timers in the
+join nodes are functioning correctly. It does so by parsing
+the query profile for certain patterns after the query has
+finished.
+
+Before IMPALA-4063, each individual fragment instance will
+post its profile to the coordinator upon completion. After
+IMPALA-4063, the profiles of all fragment instances are sent
+together periodically and the final profile is sent once all
+fragment instances on a backend are done.
+
+The problem with the existing implementation of the test is
+that it doesn't actually fetch results before closing the
+query. As a result of it, the coordinator fragment never gets
+a chance to complete as it will block forever when inserting
+into the plan root sink. The lack of completion of the
+coordinator fragment causes the final profiles of fragment
+instances on the coordinator to be not sent before the query
+is closed. As a result, the profile of a fragment instance
+on the coordinator could be stale if it completes between
+two periodic updates, leading to random test failure.
+
+This change fixes the flankiness by always fetching results
+before closing the query. Ideally, if we fix IMPALA-539 and
+wait for all backends' final profiles before completing query
+unregistration, we should get the final profile from the
+coordinator fragment too.
+
+Change-Id: I851824dffb78c7731e60793d90f1e57050c54955
+Reviewed-on: http://gerrit.cloudera.org:8080/11964
+Reviewed-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+Tested-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+
+

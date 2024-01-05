@@ -1,0 +1,322 @@
+[~ximz] I think you forgot to attach the data set.
+
+The results returned should be consistent, so seems like a bug.
+
+I'll assign it to myself for now until we can repro and triage it.
+
+Thanks [~tarmstrong] I use a sample dataset without NULL values to make the reproduction easier, that Impala is wrong if query returns rows.
+
+I used below DDL to create the tests after copying the attached sample data to '/tmp/data'
+
+ 
+{code:java}
+cat | beeline -u  jdbc:hive2://localhost:11050/ <<EOF
+CREATE DATABASE IF NOT EXISTS wide_test;
+USE wide_test;
+DROP TABLE IF EXISTS wide;
+CREATE TABLE IF NOT EXISTS wide(
+id INT,
+col2 STRING,
+col3 STRING,
+col4 STRING,
+col5 STRING,
+col6 STRING,
+col7 STRING,
+col8 STRING,
+col9 STRING,
+col10 STRING,
+col11 STRING,
+col12 STRING,
+col13 STRING,
+col14 STRING,
+col15 STRING,
+col16 STRING,
+col17 STRING,
+col18 STRING,
+col19 STRING,
+col20 STRING,
+col21 STRING,
+col22 STRING,
+col23 STRING
+)
+ROW FORMAT DELIMITED FIELDS TERMINATED BY '|'
+STORED AS TEXTFILE
+LOCATION '/test-warehouse/wide/';
+LOAD DATA LOCAL INPATH '/tmp/data' OVERWRITE INTO TABLE wide;
+EOF{code}
+ 
+
+Then I can reproduce in impala-shell:
+
+ 
+{code:java}
+cat | impala-shell.sh <<EOF
+invalidate metadata;
+set mem_limit=70m;
+select id from wide_test.wide L1 where not exists (
+select 1 from wide_test.wide L2 where L1.id = L2.id
+and L1.col2 = L2.col2
+and L1.col3 = L2.col3
+and L1.col4 = L2.col4
+and L1.col5 = L2.col5
+and L1.col6 = L2.col6
+and L1.col7 = L2.col7
+and L1.col8 = L2.col8
+and L1.col9 = L2.col9
+and L1.col10 = L2.col10
+and L1.col11 = L2.col11
+and L1.col12 = L2.col12
+and L1.col13 = L2.col13
+and L1.col14 = L2.col14
+and L1.col15 = L2.col15
+and L1.col16 = L2.col16
+and L1.col17 = L2.col17
+and L1.col18 = L2.col18
+and L1.col19 = L2.col19
+and L1.col20 = L2.col20
+and L1.col21 = L2.col21
+and L1.col22 = L2.col22
+and L1.col23 = L2.col23
+) order by id;
+set mem_limit=80m;
+select id from wide_test.wide L1 where not exists (
+select 1 from wide_test.wide L2 where L1.id = L2.id
+and L1.col2 = L2.col2
+and L1.col3 = L2.col3
+and L1.col4 = L2.col4
+and L1.col5 = L2.col5
+and L1.col6 = L2.col6
+and L1.col7 = L2.col7
+and L1.col8 = L2.col8
+and L1.col9 = L2.col9
+and L1.col10 = L2.col10
+and L1.col11 = L2.col11
+and L1.col12 = L2.col12
+and L1.col13 = L2.col13
+and L1.col14 = L2.col14
+and L1.col15 = L2.col15
+and L1.col16 = L2.col16
+and L1.col17 = L2.col17
+and L1.col18 = L2.col18
+and L1.col19 = L2.col19
+and L1.col20 = L2.col20
+and L1.col21 = L2.col21
+and L1.col22 = L2.col22
+and L1.col23 = L2.col23
+) order by id;
+EOF
+{code}
+With mem_limit=70m, query returns 20+ rows which is incorrect. But with mem_limit=80m, it returns zero row instead.
+
+I checked the profiles, and the only difference is the bad query has spills.
+
+Thanks, i can reproduce this now.
+
+This also works. Interestingly, varying the batch size seems to change the rows returned.
+
+{noformat}
+set mt_dop=1; 
+set disable_codegen=1;
+set num_nodes=1;
+set mem_limit=100m;
+select id from wide_test.wide L1 where not exists (
+select 1 from wide_test.wide L2 where L1.id = L2.id
+and L1.col2 = L2.col2
+and L1.col3 = L2.col3
+and L1.col4 = L2.col4
+and L1.col5 = L2.col5
+and L1.col6 = L2.col6
+and L1.col7 = L2.col7
+and L1.col8 = L2.col8
+and L1.col9 = L2.col9
+and L1.col10 = L2.col10
+and L1.col11 = L2.col11
+and L1.col12 = L2.col12
+and L1.col13 = L2.col13
+and L1.col14 = L2.col14
+and L1.col15 = L2.col15
+and L1.col16 = L2.col16
+and L1.col17 = L2.col17
+and L1.col18 = L2.col18
+and L1.col19 = L2.col19
+and L1.col20 = L2.col20
+and L1.col21 = L2.col21
+and L1.col22 = L2.col22
+and L1.col23 = L2.col23
+) order by id
+{noformat}
+
+Looks like some kind of boundary condition with row batches and the expr values cache. I think this particular query might be triggering it because it is joining on a lot of columns and the exprs values cache is smaller than the row batch size.
+
+I.e. the trigger for this is both the spilling and a wide join key.
+
+I'm pretty sure that this logic has been broken since IMPALA-3286.
+
+I posted a code review on gerrit. I wrote up the problem in the commit message, might as well include it here because it describes the specific conditions where this can happen.
+{noformat}
+The control flow was broken if the join operator hit
+the end of the expression values cache before the end
+of the probe batch, immediately after processing a row
+for a spilled partition. In NextProbeRow(), the problematic
+code path was:
+* The last row in the expression values cache was for a
+  spilled partition, so skip_row=true and it falls out
+  of the loop with 'current_probe_row_' pointing to that
+  row.
+* probe_batch_iterator->AtEnd() is false, because
+  the expression value cache is smaller than the probe batch,
+  so 'current_probe_row_' is not nulled out.
+
+Thus we end up in a state where where 'current_probe_row_' is
+set, but 'hash_table_iterator_' is unset.
+
+In the case of a left anti join, this was interpreted by
+ProcessProbeRowLeftSemiJoins() as meaning that there was
+no hash table match for 'current_probe_row_', and it
+therefore returned the row.
+
+This bug could only occur under specific circumstances:
+* The join key takes up > 256 bytes in the expression values
+  cache (assuming the default batch size of 1024).
+* The join spilled.
+* The join operator returns rows that where unmatched in
+  the right input, i.e. LEFT OUTER JOIN, LEFT ANTI JOIN,
+  FULL OUTER JOIN.
+{noformat}
+
+Commit fcf08d18228dd07c2371a89e3b0788791cb03dfa in impala's branch refs/heads/master from Tim Armstrong
+[ https://gitbox.apache.org/repos/asf?p=impala.git;h=fcf08d1 ]
+
+IMPALA-9725: incorrect spilling join results for wide keys
+
+The control flow was broken if the join operator hit
+the end of the expression values cache before the end
+of the probe batch, immediately after processing a row
+for a spilled partition. In NextProbeRow(), the problematic
+code path was:
+* The last row in the expression values cache was for a
+  spilled partition, so skip_row=true and it falls out
+  of the loop with 'current_probe_row_' pointing to that
+  row.
+* probe_batch_iterator->AtEnd() is false, because
+  the expression value cache is smaller than the probe batch,
+  so 'current_probe_row_' is not nulled out.
+
+Thus we end up in a state where 'current_probe_row_' is
+set, but 'hash_table_iterator_' is unset.
+
+In the case of a left anti join, this was interpreted by
+ProcessProbeRowLeftSemiJoins() as meaning that there was
+no hash table match for 'current_probe_row_', and it
+therefore returned the row.
+
+This bug could only occur under specific circumstances:
+* The join key takes up > 256 bytes in the expression values
+  cache (assuming the default batch size of 1024).
+* The join spilled.
+* The join operator returns rows that were unmatched in
+  the right input, i.e. LEFT OUTER JOIN, LEFT ANTI JOIN,
+  FULL OUTER JOIN.
+
+The core of the fix is to null out 'current_probe_row_' when
+falling out the bottom of the loop in NextProbeRow(). Related
+DCHECKS were fixed and some control flow was slightly
+simplified.
+
+Testing:
+Added a test query on TPC-H that reproduces the problem reliably.
+
+Ran exhaustive tests.
+
+Change-Id: I9d7e5871c35a90e8cf24b8dded04775ee1eae9d8
+Reviewed-on: http://gerrit.cloudera.org:8080/15904
+Reviewed-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+Tested-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+
+
+Commit b71187dbf90b2bc7ea5c2aeac255c0a4a8bd0e9e in impala's branch refs/heads/3.x from Tim Armstrong
+[ https://gitbox.apache.org/repos/asf?p=impala.git;h=b71187d ]
+
+IMPALA-9725: incorrect spilling join results for wide keys
+
+The control flow was broken if the join operator hit
+the end of the expression values cache before the end
+of the probe batch, immediately after processing a row
+for a spilled partition. In NextProbeRow(), the problematic
+code path was:
+* The last row in the expression values cache was for a
+  spilled partition, so skip_row=true and it falls out
+  of the loop with 'current_probe_row_' pointing to that
+  row.
+* probe_batch_iterator->AtEnd() is false, because
+  the expression value cache is smaller than the probe batch,
+  so 'current_probe_row_' is not nulled out.
+
+Thus we end up in a state where 'current_probe_row_' is
+set, but 'hash_table_iterator_' is unset.
+
+In the case of a left anti join, this was interpreted by
+ProcessProbeRowLeftSemiJoins() as meaning that there was
+no hash table match for 'current_probe_row_', and it
+therefore returned the row.
+
+This bug could only occur under specific circumstances:
+* The join key takes up > 256 bytes in the expression values
+  cache (assuming the default batch size of 1024).
+* The join spilled.
+* The join operator returns rows that were unmatched in
+  the right input, i.e. LEFT OUTER JOIN, LEFT ANTI JOIN,
+  FULL OUTER JOIN.
+
+The core of the fix is to null out 'current_probe_row_' when
+falling out the bottom of the loop in NextProbeRow(). Related
+DCHECKS were fixed and some control flow was slightly
+simplified.
+
+Testing:
+Added a test query on TPC-H that reproduces the problem reliably.
+
+Ran exhaustive tests.
+
+Change-Id: I9d7e5871c35a90e8cf24b8dded04775ee1eae9d8
+Reviewed-on: http://gerrit.cloudera.org:8080/15904
+Reviewed-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+Tested-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+(cherry picked from commit fcf08d18228dd07c2371a89e3b0788791cb03dfa)
+
+
+Commit 873fe2e5241c5714dfd94a186d524edc1cbad0ad in impala's branch refs/heads/master from Riza Suminto
+[ https://gitbox.apache.org/repos/asf?p=impala.git;h=873fe2e ]
+
+IMPALA-11135: Deflake LEFT ANTI JOIN test case in test_spilling.py
+
+TestSpillingDebugActionDimensions.test_spilling has been flaky because a
+test case from IMPALA-9725 sometimes does not spill its hash join
+partition. This patch lowers the buffer_pool_limit of this test from
+110MB to 105MB, just slightly above its Max Per-Host Resource
+Reservation (104.61MB), to ensure consistent spilling behavior.
+
+Testing:
+After lowering the buffer pool limit, I loop the test 1000 times, and
+all spill consistently in fragment "HASH_JOIN_NODE (id=14)".
+To be specific, these are the num of SpilledPartitions of the first
+instance (ending with "000d") of "Hash Join Builder (join_node_id=14)"
+fragment across 1000 query runs:
+
++--------------------+----------+
+| #SpilledPartitions | #Queries |
++--------------------+----------+
+|                  2 |       30 |
+|                  3 |       96 |
+|                  4 |      674 |
+|                  5 |       52 |
+|                  6 |      146 |
+|                  7 |        2 |
++--------------------+----------+
+
+Change-Id: Idad9fc6ec6a0ba7fc70e0701e567da7165e40e83
+Reviewed-on: http://gerrit.cloudera.org:8080/18261
+Reviewed-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+Tested-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+
+

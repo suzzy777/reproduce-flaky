@@ -1,0 +1,687 @@
+[~Mmuzaf], do you plan to work on this issue?
+
+[~sboikov],
+
+Currently, I've haven't started working on this issue yet. 
+If you want to - I can move it to unassigned. Will you?
+
+[~Mmuzaf], yes, please move to unassigned. Thank you!
+
+{panel:title=Branch: [ignite-11704] Base: [master] : Possible Blockers (3)|borderStyle=dashed|borderColor=#ccc|titleBGColor=#F7D6C1}
+{color:#d04437}Cache 9{color} [[tests 1|https://ci.ignite.apache.org/viewLog.html?buildId=4432456]]
+* IgniteCacheTestSuite9: CacheRemoveWithTombstonesLoadTest.testRemoveAndRebalanceWithPersistence - New test duration 79s is more that 1 minute
+
+{color:#d04437}MVCC Cache 9{color} [[tests 2|https://ci.ignite.apache.org/viewLog.html?buildId=4432458]]
+* IgniteCacheMvccTestSuite9: CacheRemoveWithTombstonesLoadTest.testRemoveAndRebalance - New test duration 81s is more that 1 minute
+* IgniteCacheMvccTestSuite9: CacheRemoveWithTombstonesLoadTest.testRemoveAndRebalanceWithPersistence - New test duration 113s is more that 1 minute
+
+{panel}
+[TeamCity *--&gt; Run :: All* Results|https://ci.ignite.apache.org/viewLog.html?buildId=4423153&amp;buildTypeId=IgniteTests24Java8_RunAll]
+
+{panel:title=Branch: [ignite-11704] Base: [master] : No blockers found!|borderStyle=dashed|borderColor=#ccc|titleBGColor=#D6F7C1}{panel}
+[TeamCity *--&gt; Run :: All* Results|https://ci.ignite.apache.org/viewLog.html?buildId=4423153&amp;buildTypeId=IgniteTests24Java8_RunAll]
+
+Implemented initial support for tombstones, changes in branch ignite-11704 (tombstones are created for tx cache while rebalance is in progress):
+ * to do not change data storage format tombstones are stored as a regular rows where value is CacheObject containing marshaled null (1 byte array with binary marshaller). Nulls should not be stored in cache, so it always possible to distinguish tombstones and regular values
+ * tombstones are created for cache removes while partition is MOVING, and asynchronously removed when partition becomes OWNING
+ * tombstones cleanup should  not consume too much resources, in this regard it is similar to partition eviction, so I reused PartitionsEvictManager for tombstones cleanup tasks
+ * added special cache store iteration mode for tombstone cleanup (RowData.TOMBSTONES) to read as little data as possible for non-tombstone entries
+ * added per-cache metrics - number of tombstone entries 
+
+Further tasks (going to add separate JIRAs for this):
+ * when persistence is enabled, can write tombstones on incomplete baseline, then include tombstones in rebalance when node returns, and in this case full partition cleanup on joining node won't be needed
+ * for ATOMIC cache 'deferredDelete' is used to prevent race on backups vs concurrent remove and put. So for atomic caches need some other logic to understand when it is safe to remove tombstones 
+
+[~sboikov]
+Thank you for contribution.
+I have a couple of questions and suggestions regarding the change:
+1) I think we should remain org.apache.ignite.internal.processors.cache.IgniteCacheOffheapManager#partitionIterator with default behaviour (withTombstones=false). It can help to avoid making changes in existing code using partitionIterator previous behavior.
+2) Unnecessary brackets in org/apache/ignite/internal/processors/cache/GridCacheMapEntry.java:1715
+3) Why double-check in org/apache/ignite/internal/processors/cache/GridCacheMapEntry.java:1723 is needed?
+4) Broken javadoc in org/apache/ignite/internal/processors/cache/GridCacheMapEntry.java:5859
+
+The main concern about change is that tombstones can remain in partition forever if partition CASed to OWNING state and immediately shut down. In this case after node return back it can never clear tombstones. I think "tombstoneCreated" flag should be reflected in partition meta information and saved during a checkpoint. The same information should be added to the appropriate WAL delta record. During recovery, we can notice that partition has tombstones and run the cleaning process. Also, this flag is never reset looking to code.
+
+[~sboikov] If you don't mind I'll take the ticket for finishing.
+
+{panel:title=Branch: [pull/6931/head] Base: [master] : No blockers found!|borderStyle=dashed|borderColor=#ccc|titleBGColor=#D6F7C1}{panel}
+[TeamCity *--&gt; Run :: All* Results|https://ci.ignite.apache.org/viewLog.html?buildId=4657057&amp;buildTypeId=IgniteTests24Java8_RunAll]
+
+Changes have done:
+Tombstones count persisted to page memory to cover failover scenario when a node with OWNING partition and tombstones inside are shutdown.
+In this case after recovery and join to topology tombstones from that partition will be cleared.
+[~ascherbakov] Could you please review it?
+
+[~jokser] [~sboikov]
+
+I've reviewed changes. Overall looks good, but still I have some questions.
+
+1. My main concern is regarding the necessity of tombstoneBytes 5-bytes object. Seems it's possible to implement tombstone by treating absence of value as a tombstone.
+For example, valLen=0 could be treated as tombstone presense. Doing so we can get rid of 5 bytes comparison, and instead do null check:
+{noformat}
+private Boolean isTombstone(ByteBuffer buf, int offset) {
+    int valLen = buf.getInt(buf.position() + offset);
+    if (valLen != tombstoneBytes.length)
+        return Boolean.FALSE;
+...
+}
+{noformat}
+
+Instead we can do something like {{if (valLen == 0) return Boolean.TRUE}}
+
+2. With new changes in PartitionsEvictManager it's possible to have two tasks of different types for the same partition.
+Consider a scenario: 
+* node finished rebalancing and starts to clear thombstones
+* another node joins topology and become an owner for clearing partition.
+* eviction is started for already clearing partition.
+
+Probably this should not be allowed.
+
+3. I see changes having no obvious relation to contribution, for example: 
+static String cacheGroupMetricsRegistryName(String cacheGrp)
+DropCacheContextDuringEvictionTest.java
+GridCommandHandlerIndexingTest.java
+
+What's the purpose of these ?
+
+4. Could you clarify the change in org.apache.ignite.internal.processors.cache.GridCacheMapEntry#initialValue:
+
+update0 |= (!preload && val == null); ?
+
+
+
+5. I would add one more load test scenario:
+Start a node, backups=1.
+Load many keys (like 100k).
+Join another node triggering rebalance.
+Delay each batch. Remove keys supplied in the batch. Release batch.
+Validate cache is empty and tombstones are cleared.
+
+
+6. GridDhtLocalPartition.clearTombstones looks very similar to GridDhtLocalPartition.clearAll. 
+Could we avoid code duplication ?
+
+[~ascherbakov]
+I've fixed several of your concerns others are commented:
+1. Tombstone object storing has optimized: 
+Any object (key or value) has a header (object len + object type). The object type can be regular, binary or byte array. In the previous version, the tombstone will be regular cache object with marshalled "null" value. In current version, I introduced a special type of object - Tombstone that doesn't store any value, only header. All checking for the tombstone has optimized.
+2. I think it's fine. Every clear tombstone task periodically check is partition become in not OWNING state. In this case, a clear tombstones operation is stopped. Yes, there can be a window of time where both clear tombstones and eviction can happen, but it shouldn't be long.
+3. DropCacheContextDuringEvictionTest is reworked due to reuse test PartitionsEvictManagerAbstractTest for checking tomstones failure.
+cacheGroupMetricsRegistryName is added as a utility method as part of cache group tombstone metrics.
+GridCommandHandlerIndexingTest - merge artifact, should be ignored.
+4. I've added a comment when this condition is true.
+5. This test already exists (org.apache.ignite.internal.processors.cache.distributed.CacheRemoveWithTombstonesTest#testRemoveAndRebalanceRaceTx)
+6. I've reworked code and now clearAll and clearTombstones have a common codebase.
+
+Could you please review it again?
+
+[~jokser]
+
+4. Typo in the comment. My understanding is the code will be called when datastreamer initiates first update for an entry, is it true ?
+6. 
+* Looks like it's not necessary to preload 256k keys for historical rebalance, you need only one update in each partition. 
+* Test looks similar but my idea is to delay each batch and remove all containing keys in the batch, then release batch. Such scenario should bring all partition keys to tombstones and looks interesting.
+
+In other aspects looks good.
+
+
+{panel:title=Branch: [pull/6931/head] Base: [master] : No blockers found!|borderStyle=dashed|borderColor=#ccc|titleBGColor=#D6F7C1}{panel}
+[TeamCity *--&gt; Run :: All* Results|https://ci.ignite.apache.org/viewLog.html?buildId=4701586&amp;buildTypeId=IgniteTests24Java8_RunAll]
+
+[~ascherbakov] Test for historical rebalance adjusted to remove all keys that will be sent in the supply batch. Comment in GridCacheMapEntry#initialValue is fixed.
+
+[~jokser]
+
+Looks good.
+
+[~ascherbakov] Thank you for review. Merged to master.
+
+Flaky failure with corrupted B+Tree in the master branch.
+https://ci.ignite.apache.org/viewLog.html?buildId=4807946&tab=buildResultsDiv&buildTypeId=IgniteTests24Java8_Cache9#testNameId1910487508546147692
+
+{code:java}
+class org.apache.ignite.internal.processors.cache.persistence.tree.CorruptedTreeException: B+Tree is corrupted [pages(groupId, pageId)=[IgniteBiTuple [val1=1544803905, val2=844420635196573]], msg=Runtime failure on cursor iteration]
+	at org.apache.ignite.internal.processors.cache.persistence.tree.BPlusTree.corruptedTreeException(BPlusTree.java:5927)
+	at org.apache.ignite.internal.processors.cache.persistence.tree.BPlusTree$AbstractForwardCursor.nextPage(BPlusTree.java:5438)
+	at org.apache.ignite.internal.processors.cache.persistence.tree.BPlusTree$ForwardCursor.next(BPlusTree.java:5661)
+	at org.apache.ignite.internal.processors.cache.IgniteCacheOffheapManagerImpl$CacheDataStoreImpl$1.next(IgniteCacheOffheapManagerImpl.java:3020)
+	at org.apache.ignite.internal.processors.cache.distributed.dht.topology.GridDhtLocalPartition$2.hasNextX(GridDhtLocalPartition.java:1226)
+	at org.apache.ignite.internal.util.lang.GridIteratorAdapter.hasNext(GridIteratorAdapter.java:45)
+	at org.apache.ignite.internal.processors.cache.distributed.dht.topology.GridDhtLocalPartition.doClear(GridDhtLocalPartition.java:1295)
+	at org.apache.ignite.internal.processors.cache.distributed.dht.topology.GridDhtLocalPartition.clearTombstones(GridDhtLocalPartition.java:1242)
+	at org.apache.ignite.internal.processors.cache.distributed.dht.topology.PartitionsEvictManager$ClearTombstonesTask.run0(PartitionsEvictManager.java:673)
+	at org.apache.ignite.internal.processors.cache.distributed.dht.topology.PartitionsEvictManager$AbstractEvictionTask.run(PartitionsEvictManager.java:587)
+	at org.apache.ignite.internal.util.IgniteUtils.wrapThreadLoader(IgniteUtils.java:7061)
+	at org.apache.ignite.internal.processors.closure.GridClosureProcessor$1.body(GridClosureProcessor.java:827)
+	at org.apache.ignite.internal.util.worker.GridWorker.run(GridWorker.java:120)
+	at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1149)
+	at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:624)
+	at java.lang.Thread.run(Thread.java:748)
+Caused by: java.lang.AssertionError: Key is not ready: CacheDataRowAdapter [key=null, val=null, expireTime=-1, ver=null, cacheId=0, link=0001003c000077d8]
+	at org.apache.ignite.internal.processors.cache.persistence.CacheDataRowAdapter.key(CacheDataRowAdapter.java:837)
+	at org.apache.ignite.internal.processors.cache.tree.CacheDataTree.compare(CacheDataTree.java:382)
+	at org.apache.ignite.internal.processors.cache.tree.CacheDataTree.compare(CacheDataTree.java:63)
+	at org.apache.ignite.internal.processors.cache.persistence.tree.BPlusTree.compare(BPlusTree.java:5200)
+	at org.apache.ignite.internal.processors.cache.persistence.tree.BPlusTree$AbstractForwardCursor.findLowerBound(BPlusTree.java:5317)
+	at org.apache.ignite.internal.processors.cache.persistence.tree.BPlusTree$ForwardCursor.fillFromBuffer0(BPlusTree.java:5588)
+	at org.apache.ignite.internal.processors.cache.persistence.tree.BPlusTree$AbstractForwardCursor.fillFromBuffer(BPlusTree.java:5376)
+	at org.apache.ignite.internal.processors.cache.persistence.tree.BPlusTree$AbstractForwardCursor.nextPage(BPlusTree.java:5428)
+	... 14 more {code}
+
+Commit reverted as discussed on dev-list.
+The issue reopened.
+
+Better to store a full log in case of TC history cleanup.
+
+{noformat}
+java.lang.AssertionError: Failed to wait for tombstone cleanup: distributed.CacheRemoveWithTombstonesLoadTest2 expected:<0> but was:<1>
+	at org.apache.ignite.internal.processors.cache.distributed.CacheRemoveWithTombstonesLoadTest.waitTombstoneCleanup(CacheRemoveWithTombstonesLoadTest.java:335)
+	at org.apache.ignite.internal.processors.cache.distributed.CacheRemoveWithTombstonesLoadTest.removeAndRebalance(CacheRemoveWithTombstonesLoadTest.java:250)
+------- Stdout: -------
+[12:28:21]    __________  ________________ 
+[12:28:21]   /  _/ ___/ |/ /  _/_  __/ __/ 
+[12:28:21]  _/ // (7 7    // /  / / / _/   
+[12:28:21] /___/\___/_/|_/___/ /_/ /___/  
+[12:28:21] 
+[12:28:21] ver. 2.8.0-SNAPSHOT#20191203-sha1:DEV
+[12:28:21] 2019 Copyright(C) Apache Software Foundation
+[12:28:21] 
+[12:28:21] Ignite documentation: http://ignite.apache.org
+[12:28:21] 
+[12:28:21] Quiet mode.
+[12:28:21]   ^-- Logging by 'GridTestLog4jLogger [quiet=true, config=null]'
+[12:28:21]   ^-- To see **FULL** console log here add -DIGNITE_QUIET=false or "-v" to ignite.{sh|bat}
+[12:28:21] 
+[12:28:21] OS: Linux 4.15.0-54-generic amd64
+[12:28:21] VM information: Java(TM) SE Runtime Environment 1.8.0_212-b10 Oracle Corporation Java HotSpot(TM) 64-Bit Server VM 25.212-b10
+[12:28:21] Configured plugins:
+[12:28:21]   ^-- StanByClusterTestProvider 1.0
+[12:28:21]   ^-- null
+[12:28:21] 
+[12:28:21]   ^-- PageMemory tracker plugin 1.0
+[12:28:21]   ^-- 
+[12:28:21] 
+[12:28:21]   ^-- TestDistibutedConfigurationPlugin 1.0
+[12:28:21]   ^-- 
+[12:28:21] 
+[12:28:21]   ^-- NodeValidationPluginProvider 1.0
+[12:28:21]   ^-- 
+[12:28:21] 
+[12:28:21] Configured failure handler: [hnd=NoOpFailureHandler [super=AbstractFailureHandler [ignoredFailureTypes=UnmodifiableSet [SYSTEM_WORKER_BLOCKED, SYSTEM_CRITICAL_OPERATION_TIMEOUT]]]]
+[12:28:21] Message queue limit is set to 0 which may lead to potential OOMEs when running cache operations in FULL_ASYNC or PRIMARY_SYNC modes due to message queues growth on sender and receiver sides.
+[12:28:21] Security status [authentication=off, tls/ssl=off]
+[12:28:21] To start Console Management & Monitoring run ignitevisorcmd.{sh|bat}
+[12:28:21] Data Regions Configured:
+[12:28:21]   ^-- default [initSize=256.0 MiB, maxSize=18.9 GiB, persistence=false, lazyMemoryAllocation=true]
+[12:28:21] 
+[12:28:21] Ignite node started OK (id=a34d6c79, instance name=distributed.CacheRemoveWithTombstonesLoadTest0)
+[12:28:21] Topology snapshot [ver=1, locNode=a34d6c79, servers=1, clients=0, state=ACTIVE, CPUs=5, offheap=19.0GB, heap=2.0GB]
+[12:28:23]    __________  ________________ 
+[12:28:23]   /  _/ ___/ |/ /  _/_  __/ __/ 
+[12:28:23]  _/ // (7 7    // /  / / / _/   
+[12:28:23] /___/\___/_/|_/___/ /_/ /___/  
+[12:28:23] 
+[12:28:23] ver. 2.8.0-SNAPSHOT#20191203-sha1:DEV
+[12:28:23] 2019 Copyright(C) Apache Software Foundation
+[12:28:23] 
+[12:28:23] Ignite documentation: http://ignite.apache.org
+[12:28:23] 
+[12:28:23] Quiet mode.
+[12:28:23]   ^-- Logging by 'GridTestLog4jLogger [quiet=true, config=null]'
+[12:28:23]   ^-- To see **FULL** console log here add -DIGNITE_QUIET=false or "-v" to ignite.{sh|bat}
+[12:28:23] 
+[12:28:23] OS: Linux 4.15.0-54-generic amd64
+[12:28:23] VM information: Java(TM) SE Runtime Environment 1.8.0_212-b10 Oracle Corporation Java HotSpot(TM) 64-Bit Server VM 25.212-b10
+[12:28:23] Configured plugins:
+[12:28:23]   ^-- StanByClusterTestProvider 1.0
+[12:28:23]   ^-- null
+[12:28:23] 
+[12:28:23]   ^-- PageMemory tracker plugin 1.0
+[12:28:23]   ^-- 
+[12:28:23] 
+[12:28:23]   ^-- TestDistibutedConfigurationPlugin 1.0
+[12:28:23]   ^-- 
+[12:28:23] 
+[12:28:23]   ^-- NodeValidationPluginProvider 1.0
+[12:28:23]   ^-- 
+[12:28:23] 
+[12:28:23] Configured failure handler: [hnd=NoOpFailureHandler [super=AbstractFailureHandler [ignoredFailureTypes=UnmodifiableSet [SYSTEM_WORKER_BLOCKED, SYSTEM_CRITICAL_OPERATION_TIMEOUT]]]]
+[12:28:23] Message queue limit is set to 0 which may lead to potential OOMEs when running cache operations in FULL_ASYNC or PRIMARY_SYNC modes due to message queues growth on sender and receiver sides.
+[12:28:23] Security status [authentication=off, tls/ssl=off]
+[12:28:23] Joining node doesn't have encryption data [node=3205dca1-2c61-4f76-8475-e0c5c0f00001]
+[12:28:23] Topology snapshot [ver=2, locNode=a34d6c79, servers=2, clients=0, state=ACTIVE, CPUs=5, offheap=19.0GB, heap=2.0GB]
+[12:28:29] To start Console Management & Monitoring run ignitevisorcmd.{sh|bat}
+[12:28:29] Data Regions Configured:
+[12:28:29]   ^-- default [initSize=256.0 MiB, maxSize=18.9 GiB, persistence=false, lazyMemoryAllocation=true]
+[12:28:29] 
+[12:28:29] Ignite node started OK (id=3205dca1, instance name=distributed.CacheRemoveWithTombstonesLoadTest1)
+[12:28:29] Topology snapshot [ver=2, locNode=3205dca1, servers=2, clients=0, state=ACTIVE, CPUs=5, offheap=19.0GB, heap=2.0GB]
+[12:28:31]    __________  ________________ 
+[12:28:31]   /  _/ ___/ |/ /  _/_  __/ __/ 
+[12:28:31]  _/ // (7 7    // /  / / / _/   
+[12:28:31] /___/\___/_/|_/___/ /_/ /___/  
+[12:28:31] 
+[12:28:31] ver. 2.8.0-SNAPSHOT#20191203-sha1:DEV
+[12:28:31] 2019 Copyright(C) Apache Software Foundation
+[12:28:31] 
+[12:28:31] Ignite documentation: http://ignite.apache.org
+[12:28:31] 
+[12:28:31] Quiet mode.
+[12:28:31]   ^-- Logging by 'GridTestLog4jLogger [quiet=true, config=null]'
+[12:28:31]   ^-- To see **FULL** console log here add -DIGNITE_QUIET=false or "-v" to ignite.{sh|bat}
+[12:28:31] 
+[12:28:31] OS: Linux 4.15.0-54-generic amd64
+[12:28:31] VM information: Java(TM) SE Runtime Environment 1.8.0_212-b10 Oracle Corporation Java HotSpot(TM) 64-Bit Server VM 25.212-b10
+[12:28:31] Configured plugins:
+[12:28:31]   ^-- StanByClusterTestProvider 1.0
+[12:28:31]   ^-- null
+[12:28:31] 
+[12:28:31]   ^-- PageMemory tracker plugin 1.0
+[12:28:31]   ^-- 
+[12:28:31] 
+[12:28:31]   ^-- TestDistibutedConfigurationPlugin 1.0
+[12:28:31]   ^-- 
+[12:28:31] 
+[12:28:31]   ^-- NodeValidationPluginProvider 1.0
+[12:28:31]   ^-- 
+[12:28:31] 
+[12:28:31] Configured failure handler: [hnd=NoOpFailureHandler [super=AbstractFailureHandler [ignoredFailureTypes=UnmodifiableSet [SYSTEM_WORKER_BLOCKED, SYSTEM_CRITICAL_OPERATION_TIMEOUT]]]]
+[12:28:31] Message queue limit is set to 0 which may lead to potential OOMEs when running cache operations in FULL_ASYNC or PRIMARY_SYNC modes due to message queues growth on sender and receiver sides.
+[12:28:31] Security status [authentication=off, tls/ssl=off]
+[12:28:31] Joining node doesn't have encryption data [node=29f97d83-c488-44cc-95ad-cf9777a00002]
+[12:28:31] Topology snapshot [ver=3, locNode=a34d6c79, servers=3, clients=0, state=ACTIVE, CPUs=5, offheap=19.0GB, heap=2.0GB]
+[12:28:31] Topology snapshot [ver=3, locNode=3205dca1, servers=3, clients=0, state=ACTIVE, CPUs=5, offheap=19.0GB, heap=2.0GB]
+[12:28:34] To start Console Management & Monitoring run ignitevisorcmd.{sh|bat}
+[12:28:34] Data Regions Configured:
+[12:28:34]   ^-- default [initSize=256.0 MiB, maxSize=18.9 GiB, persistence=false, lazyMemoryAllocation=true]
+[12:28:34] 
+[12:28:34] Ignite node started OK (id=29f97d83, instance name=distributed.CacheRemoveWithTombstonesLoadTest2)
+[12:28:34] Topology snapshot [ver=3, locNode=29f97d83, servers=3, clients=0, state=ACTIVE, CPUs=5, offheap=19.0GB, heap=2.0GB]
+[12:29:06] Topology snapshot [ver=4, locNode=3205dca1, servers=2, clients=0, state=ACTIVE, CPUs=5, offheap=19.0GB, heap=2.0GB]
+[12:29:06] Coordinator changed [prev=TcpDiscoveryNode [id=a34d6c79-3bd7-4748-83da-51805b700000, consistentId=distributed.CacheRemoveWithTombstonesLoadTest0, addrs=ArrayList [127.0.0.1], sockAddrs=HashSet [/127.0.0.1:47500], discPort=47500, order=1, intOrder=1, lastExchangeTime=1575365303240, loc=false, ver=2.8.0#20191203-sha1:00000000, isClient=false], cur=TcpDiscoveryNode [id=3205dca1-2c61-4f76-8475-e0c5c0f00001, consistentId=distributed.CacheRemoveWithTombstonesLoadTest1, addrs=ArrayList [127.0.0.1], sockAddrs=HashSet [/127.0.0.1:47501], discPort=47501, order=2, intOrder=2, lastExchangeTime=1575365346714, loc=true, ver=2.8.0#20191203-sha1:00000000, isClient=false]]
+[12:29:06] Topology snapshot [ver=4, locNode=29f97d83, servers=2, clients=0, state=ACTIVE, CPUs=5, offheap=19.0GB, heap=2.0GB]
+[12:29:06] Coordinator changed [prev=TcpDiscoveryNode [id=a34d6c79-3bd7-4748-83da-51805b700000, consistentId=distributed.CacheRemoveWithTombstonesLoadTest0, addrs=ArrayList [127.0.0.1], sockAddrs=HashSet [/127.0.0.1:47500], discPort=47500, order=1, intOrder=1, lastExchangeTime=1575365311262, loc=false, ver=2.8.0#20191203-sha1:00000000, isClient=false], cur=TcpDiscoveryNode [id=3205dca1-2c61-4f76-8475-e0c5c0f00001, consistentId=distributed.CacheRemoveWithTombstonesLoadTest1, addrs=ArrayList [127.0.0.1], sockAddrs=HashSet [/127.0.0.1:47501], discPort=47501, order=2, intOrder=2, lastExchangeTime=1575365311262, loc=false, ver=2.8.0#20191203-sha1:00000000, isClient=false]]
+[12:29:06] Ignite node stopped OK [name=distributed.CacheRemoveWithTombstonesLoadTest0, uptime=00:00:44.905]
+[12:29:06] Topology snapshot [ver=5, locNode=29f97d83, servers=1, clients=0, state=ACTIVE, CPUs=5, offheap=19.0GB, heap=2.0GB]
+[12:29:06] Coordinator changed [prev=TcpDiscoveryNode [id=3205dca1-2c61-4f76-8475-e0c5c0f00001, consistentId=distributed.CacheRemoveWithTombstonesLoadTest1, addrs=ArrayList [127.0.0.1], sockAddrs=HashSet [/127.0.0.1:47501], discPort=47501, order=2, intOrder=2, lastExchangeTime=1575365311262, loc=false, ver=2.8.0#20191203-sha1:00000000, isClient=false], cur=TcpDiscoveryNode [id=29f97d83-c488-44cc-95ad-cf9777a00002, consistentId=distributed.CacheRemoveWithTombstonesLoadTest2, addrs=ArrayList [127.0.0.1], sockAddrs=HashSet [/127.0.0.1:47502], discPort=47502, order=3, intOrder=3, lastExchangeTime=1575365346765, loc=true, ver=2.8.0#20191203-sha1:00000000, isClient=false]]
+[12:29:06] Ignite node stopped OK [name=distributed.CacheRemoveWithTombstonesLoadTest1, uptime=00:00:37.249]
+[12:29:06] Ignite node stopped OK [name=distributed.CacheRemoveWithTombstonesLoadTest2, uptime=00:00:32.485]
+------- Stderr: -------
+[2019-12-03 12:28:21,801][WARN ][test-runner-#74792%distributed.CacheRemoveWithTombstonesLoadTest%][G] Ignite work directory is not provided, automatically resolved to: /opt/buildagent/work/7bc1c54bc719b67c/work
+[2019-12-03 12:28:21,807][WARN ][test-runner-#74792%distributed.CacheRemoveWithTombstonesLoadTest%][CacheRemoveWithTombstonesLoadTest0] Peer class loading is enabled (disable it in production for performance and deployment consistency reasons)
+[2019-12-03 12:28:21,813][WARN ][test-runner-#74792%distributed.CacheRemoveWithTombstonesLoadTest%][TcpCommunicationSpi] Message queue limit is set to 0 which may lead to potential OOMEs when running cache operations in FULL_ASYNC or PRIMARY_SYNC modes due to message queues growth on sender and receiver sides.
+[2019-12-03 12:28:21,816][WARN ][test-runner-#74792%distributed.CacheRemoveWithTombstonesLoadTest%][GridCollisionManager] Collision resolution is disabled (all jobs will be activated upon arrival).
+[2019-12-03 12:28:21,821][WARN ][test-runner-#74792%distributed.CacheRemoveWithTombstonesLoadTest%][IgniteCacheDatabaseSharedManager] DataRegionConfiguration.maxWalArchiveSize instead DataRegionConfiguration.walHistorySize would be used for removing old archive wal files
+[2019-12-03 12:28:23,190][WARN ][async-callable-runner-1][G] Ignite work directory is not provided, automatically resolved to: /opt/buildagent/work/7bc1c54bc719b67c/work
+[2019-12-03 12:28:23,198][WARN ][async-callable-runner-1][CacheRemoveWithTombstonesLoadTest1] Peer class loading is enabled (disable it in production for performance and deployment consistency reasons)
+[2019-12-03 12:28:23,209][WARN ][async-callable-runner-1][TcpCommunicationSpi] Message queue limit is set to 0 which may lead to potential OOMEs when running cache operations in FULL_ASYNC or PRIMARY_SYNC modes due to message queues growth on sender and receiver sides.
+[2019-12-03 12:28:23,212][WARN ][async-callable-runner-1][GridCollisionManager] Collision resolution is disabled (all jobs will be activated upon arrival).
+[2019-12-03 12:28:31,217][WARN ][async-callable-runner-1][G] Ignite work directory is not provided, automatically resolved to: /opt/buildagent/work/7bc1c54bc719b67c/work
+[2019-12-03 12:28:31,227][WARN ][async-callable-runner-1][CacheRemoveWithTombstonesLoadTest2] Peer class loading is enabled (disable it in production for performance and deployment consistency reasons)
+[2019-12-03 12:28:31,234][WARN ][async-callable-runner-1][TcpCommunicationSpi] Message queue limit is set to 0 which may lead to potential OOMEs when running cache operations in FULL_ASYNC or PRIMARY_SYNC modes due to message queues growth on sender and receiver sides.
+[2019-12-03 12:28:31,238][WARN ][async-callable-runner-1][GridCollisionManager] Collision resolution is disabled (all jobs will be activated upon arrival).
+[2019-12-03 12:28:34,240][ERROR][sys-#74938%distributed.CacheRemoveWithTombstonesLoadTest2%][IgniteTestResources] Critical system error detected. Will be handled accordingly to configured handler [hnd=NoOpFailureHandler [super=AbstractFailureHandler [ignoredFailureTypes=UnmodifiableSet [SYSTEM_WORKER_BLOCKED, SYSTEM_CRITICAL_OPERATION_TIMEOUT]]], failureCtx=FailureContext [type=CRITICAL_ERROR, err=class o.a.i.i.processors.cache.persistence.tree.CorruptedTreeException: B+Tree is corrupted [pages(groupId, pageId)=[IgniteBiTuple [val1=1544803905, val2=844420635196573]], msg=Runtime failure on cursor iteration]]]
+class org.apache.ignite.internal.processors.cache.persistence.tree.CorruptedTreeException: B+Tree is corrupted [pages(groupId, pageId)=[IgniteBiTuple [val1=1544803905, val2=844420635196573]], msg=Runtime failure on cursor iteration]
+	at org.apache.ignite.internal.processors.cache.persistence.tree.BPlusTree.corruptedTreeException(BPlusTree.java:5927)
+	at org.apache.ignite.internal.processors.cache.persistence.tree.BPlusTree$AbstractForwardCursor.nextPage(BPlusTree.java:5438)
+	at org.apache.ignite.internal.processors.cache.persistence.tree.BPlusTree$ForwardCursor.next(BPlusTree.java:5661)
+	at org.apache.ignite.internal.processors.cache.IgniteCacheOffheapManagerImpl$CacheDataStoreImpl$1.next(IgniteCacheOffheapManagerImpl.java:3020)
+	at org.apache.ignite.internal.processors.cache.distributed.dht.topology.GridDhtLocalPartition$2.hasNextX(GridDhtLocalPartition.java:1226)
+	at org.apache.ignite.internal.util.lang.GridIteratorAdapter.hasNext(GridIteratorAdapter.java:45)
+	at org.apache.ignite.internal.processors.cache.distributed.dht.topology.GridDhtLocalPartition.doClear(GridDhtLocalPartition.java:1295)
+	at org.apache.ignite.internal.processors.cache.distributed.dht.topology.GridDhtLocalPartition.clearTombstones(GridDhtLocalPartition.java:1242)
+	at org.apache.ignite.internal.processors.cache.distributed.dht.topology.PartitionsEvictManager$ClearTombstonesTask.run0(PartitionsEvictManager.java:673)
+	at org.apache.ignite.internal.processors.cache.distributed.dht.topology.PartitionsEvictManager$AbstractEvictionTask.run(PartitionsEvictManager.java:587)
+	at org.apache.ignite.internal.util.IgniteUtils.wrapThreadLoader(IgniteUtils.java:7061)
+	at org.apache.ignite.internal.processors.closure.GridClosureProcessor$1.body(GridClosureProcessor.java:827)
+	at org.apache.ignite.internal.util.worker.GridWorker.run(GridWorker.java:120)
+	at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1149)
+	at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:624)
+	at java.lang.Thread.run(Thread.java:748)
+Caused by: java.lang.AssertionError: Key is not ready: CacheDataRowAdapter [key=null, val=null, expireTime=-1, ver=null, cacheId=0, link=0001003c000077d8]
+	at org.apache.ignite.internal.processors.cache.persistence.CacheDataRowAdapter.key(CacheDataRowAdapter.java:837)
+	at org.apache.ignite.internal.processors.cache.tree.CacheDataTree.compare(CacheDataTree.java:382)
+	at org.apache.ignite.internal.processors.cache.tree.CacheDataTree.compare(CacheDataTree.java:63)
+	at org.apache.ignite.internal.processors.cache.persistence.tree.BPlusTree.compare(BPlusTree.java:5200)
+	at org.apache.ignite.internal.processors.cache.persistence.tree.BPlusTree$AbstractForwardCursor.findLowerBound(BPlusTree.java:5317)
+	at org.apache.ignite.internal.processors.cache.persistence.tree.BPlusTree$ForwardCursor.fillFromBuffer0(BPlusTree.java:5588)
+	at org.apache.ignite.internal.processors.cache.persistence.tree.BPlusTree$AbstractForwardCursor.fillFromBuffer(BPlusTree.java:5376)
+	at org.apache.ignite.internal.processors.cache.persistence.tree.BPlusTree$AbstractForwardCursor.nextPage(BPlusTree.java:5428)
+	... 14 more
+[2019-12-03 12:28:34,248][ERROR][sys-#74938%distributed.CacheRemoveWithTombstonesLoadTest2%][FailureProcessor] A critical problem with persistence data structures was detected. Please make backup of persistence storage and WAL files for further analysis. Persistence storage path: null WAL path: db/wal WAL archive path: db/wal/archive
+[2019-12-03 12:28:34,250][WARN ][sys-#74938%distributed.CacheRemoveWithTombstonesLoadTest2%][CacheDiagnosticManager] Page locks dump:
+
+Thread=[name=rebalance-#74947%distributed.CacheRemoveWithTombstonesLoadTest2%, id=94924], state=TIMED_WAITING
+Locked pages = []
+Locked pages log: name=rebalance-#74947%distributed.CacheRemoveWithTombstonesLoadTest2% time=(1575365314249, 2019-12-03 12:28:34.249)
+
+
+Thread=[name=rebalance-#74949%distributed.CacheRemoveWithTombstonesLoadTest2%, id=94926], state=TIMED_WAITING
+Locked pages = []
+Locked pages log: name=rebalance-#74949%distributed.CacheRemoveWithTombstonesLoadTest2% time=(1575365314249, 2019-12-03 12:28:34.249)
+
+
+Thread=[name=rebalance-#74951%distributed.CacheRemoveWithTombstonesLoadTest2%, id=94928], state=TIMED_WAITING
+Locked pages = []
+Locked pages log: name=rebalance-#74951%distributed.CacheRemoveWithTombstonesLoadTest2% time=(1575365314249, 2019-12-03 12:28:34.249)
+
+
+Thread=[name=rebalance-#74952%distributed.CacheRemoveWithTombstonesLoadTest2%, id=94929], state=TIMED_WAITING
+Locked pages = []
+Locked pages log: name=rebalance-#74952%distributed.CacheRemoveWithTombstonesLoadTest2% time=(1575365314249, 2019-12-03 12:28:34.249)
+
+
+Thread=[name=sys-#74933%distributed.CacheRemoveWithTombstonesLoadTest2%, id=94910], state=TIMED_WAITING
+Locked pages = []
+Locked pages log: name=sys-#74933%distributed.CacheRemoveWithTombstonesLoadTest2% time=(1575365314249, 2019-12-03 12:28:34.249)
+
+
+Thread=[name=sys-#74934%distributed.CacheRemoveWithTombstonesLoadTest2%, id=94911], state=TIMED_WAITING
+Locked pages = []
+Locked pages log: name=sys-#74934%distributed.CacheRemoveWithTombstonesLoadTest2% time=(1575365314249, 2019-12-03 12:28:34.249)
+
+
+Thread=[name=sys-#74936%distributed.CacheRemoveWithTombstonesLoadTest2%, id=94913], state=TIMED_WAITING
+Locked pages = []
+Locked pages log: name=sys-#74936%distributed.CacheRemoveWithTombstonesLoadTest2% time=(1575365314249, 2019-12-03 12:28:34.249)
+
+
+Thread=[name=sys-#74937%distributed.CacheRemoveWithTombstonesLoadTest2%, id=94914], state=TIMED_WAITING
+Locked pages = []
+Locked pages log: name=sys-#74937%distributed.CacheRemoveWithTombstonesLoadTest2% time=(1575365314249, 2019-12-03 12:28:34.249)
+
+
+Thread=[name=sys-#74938%distributed.CacheRemoveWithTombstonesLoadTest2%, id=94915], state=RUNNABLE
+Locked pages = []
+Locked pages log: name=sys-#74938%distributed.CacheRemoveWithTombstonesLoadTest2% time=(1575365314249, 2019-12-03 12:28:34.249)
+
+
+Thread=[name=sys-#74939%distributed.CacheRemoveWithTombstonesLoadTest2%, id=94916], state=TIMED_WAITING
+Locked pages = []
+Locked pages log: name=sys-#74939%distributed.CacheRemoveWithTombstonesLoadTest2% time=(1575365314249, 2019-12-03 12:28:34.249)
+
+
+Thread=[name=sys-#74940%distributed.CacheRemoveWithTombstonesLoadTest2%, id=94917], state=TIMED_WAITING
+Locked pages = []
+Locked pages log: name=sys-#74940%distributed.CacheRemoveWithTombstonesLoadTest2% time=(1575365314249, 2019-12-03 12:28:34.249)
+
+
+Thread=[name=sys-#74941%distributed.CacheRemoveWithTombstonesLoadTest2%, id=94918], state=TIMED_WAITING
+Locked pages = []
+Locked pages log: name=sys-#74941%distributed.CacheRemoveWithTombstonesLoadTest2% time=(1575365314249, 2019-12-03 12:28:34.249)
+
+
+Thread=[name=sys-stripe-0-#74896%distributed.CacheRemoveWithTombstonesLoadTest2%, id=94862], state=WAITING
+Locked pages = []
+Locked pages log: name=sys-stripe-0-#74896%distributed.CacheRemoveWithTombstonesLoadTest2% time=(1575365314249, 2019-12-03 12:28:34.249)
+
+
+Thread=[name=sys-stripe-1-#74897%distributed.CacheRemoveWithTombstonesLoadTest2%, id=94863], state=WAITING
+Locked pages = []
+Locked pages log: name=sys-stripe-1-#74897%distributed.CacheRemoveWithTombstonesLoadTest2% time=(1575365314249, 2019-12-03 12:28:34.249)
+
+
+Thread=[name=sys-stripe-2-#74898%distributed.CacheRemoveWithTombstonesLoadTest2%, id=94864], state=WAITING
+Locked pages = []
+Locked pages log: name=sys-stripe-2-#74898%distributed.CacheRemoveWithTombstonesLoadTest2% time=(1575365314249, 2019-12-03 12:28:34.249)
+
+
+Thread=[name=sys-stripe-3-#74899%distributed.CacheRemoveWithTombstonesLoadTest2%, id=94865], state=WAITING
+Locked pages = []
+Locked pages log: name=sys-stripe-3-#74899%distributed.CacheRemoveWithTombstonesLoadTest2% time=(1575365314249, 2019-12-03 12:28:34.249)
+
+
+Thread=[name=sys-stripe-4-#74900%distributed.CacheRemoveWithTombstonesLoadTest2%, id=94866], state=WAITING
+Locked pages = []
+Locked pages log: name=sys-stripe-4-#74900%distributed.CacheRemoveWithTombstonesLoadTest2% time=(1575365314249, 2019-12-03 12:28:34.249)
+
+
+Thread=[name=sys-stripe-5-#74901%distributed.CacheRemoveWithTombstonesLoadTest2%, id=94867], state=WAITING
+Locked pages = []
+Locked pages log: name=sys-stripe-5-#74901%distributed.CacheRemoveWithTombstonesLoadTest2% time=(1575365314249, 2019-12-03 12:28:34.249)
+
+
+Thread=[name=sys-stripe-6-#74902%distributed.CacheRemoveWithTombstonesLoadTest2%, id=94868], state=WAITING
+Locked pages = []
+Locked pages log: name=sys-stripe-6-#74902%distributed.CacheRemoveWithTombstonesLoadTest2% time=(1575365314249, 2019-12-03 12:28:34.249)
+
+
+Thread=[name=sys-stripe-7-#74903%distributed.CacheRemoveWithTombstonesLoadTest2%, id=94869], state=WAITING
+Locked pages = []
+Locked pages log: name=sys-stripe-7-#74903%distributed.CacheRemoveWithTombstonesLoadTest2% time=(1575365314249, 2019-12-03 12:28:34.249)
+
+
+
+[2019-12-03 12:28:34,261][ERROR][sys-#74938%distributed.CacheRemoveWithTombstonesLoadTest2%][PartitionsEvictManager] Partition eviction failed.
+class org.apache.ignite.IgniteException: B+Tree is corrupted [pages(groupId, pageId)=[IgniteBiTuple [val1=1544803905, val2=844420635196573]], msg=Runtime failure on cursor iteration]
+	at org.apache.ignite.internal.util.lang.GridIteratorAdapter.hasNext(GridIteratorAdapter.java:48)
+	at org.apache.ignite.internal.processors.cache.distributed.dht.topology.GridDhtLocalPartition.doClear(GridDhtLocalPartition.java:1295)
+	at org.apache.ignite.internal.processors.cache.distributed.dht.topology.GridDhtLocalPartition.clearTombstones(GridDhtLocalPartition.java:1242)
+	at org.apache.ignite.internal.processors.cache.distributed.dht.topology.PartitionsEvictManager$ClearTombstonesTask.run0(PartitionsEvictManager.java:673)
+	at org.apache.ignite.internal.processors.cache.distributed.dht.topology.PartitionsEvictManager$AbstractEvictionTask.run(PartitionsEvictManager.java:587)
+	at org.apache.ignite.internal.util.IgniteUtils.wrapThreadLoader(IgniteUtils.java:7061)
+	at org.apache.ignite.internal.processors.closure.GridClosureProcessor$1.body(GridClosureProcessor.java:827)
+	at org.apache.ignite.internal.util.worker.GridWorker.run(GridWorker.java:120)
+	at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1149)
+	at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:624)
+	at java.lang.Thread.run(Thread.java:748)
+Caused by: class org.apache.ignite.internal.processors.cache.persistence.tree.CorruptedTreeException: B+Tree is corrupted [pages(groupId, pageId)=[IgniteBiTuple [val1=1544803905, val2=844420635196573]], msg=Runtime failure on cursor iteration]
+	at org.apache.ignite.internal.processors.cache.persistence.tree.BPlusTree.corruptedTreeException(BPlusTree.java:5927)
+	at org.apache.ignite.internal.processors.cache.persistence.tree.BPlusTree$AbstractForwardCursor.nextPage(BPlusTree.java:5438)
+	at org.apache.ignite.internal.processors.cache.persistence.tree.BPlusTree$ForwardCursor.next(BPlusTree.java:5661)
+	at org.apache.ignite.internal.processors.cache.IgniteCacheOffheapManagerImpl$CacheDataStoreImpl$1.next(IgniteCacheOffheapManagerImpl.java:3020)
+	at org.apache.ignite.internal.processors.cache.distributed.dht.topology.GridDhtLocalPartition$2.hasNextX(GridDhtLocalPartition.java:1226)
+	at org.apache.ignite.internal.util.lang.GridIteratorAdapter.hasNext(GridIteratorAdapter.java:45)
+	... 10 more
+Caused by: java.lang.AssertionError: Key is not ready: CacheDataRowAdapter [key=null, val=null, expireTime=-1, ver=null, cacheId=0, link=0001003c000077d8]
+	at org.apache.ignite.internal.processors.cache.persistence.CacheDataRowAdapter.key(CacheDataRowAdapter.java:837)
+	at org.apache.ignite.internal.processors.cache.tree.CacheDataTree.compare(CacheDataTree.java:382)
+	at org.apache.ignite.internal.processors.cache.tree.CacheDataTree.compare(CacheDataTree.java:63)
+	at org.apache.ignite.internal.processors.cache.persistence.tree.BPlusTree.compare(BPlusTree.java:5200)
+	at org.apache.ignite.internal.processors.cache.persistence.tree.BPlusTree$AbstractForwardCursor.findLowerBound(BPlusTree.java:5317)
+	at org.apache.ignite.internal.processors.cache.persistence.tree.BPlusTree$ForwardCursor.fillFromBuffer0(BPlusTree.java:5588)
+	at org.apache.ignite.internal.processors.cache.persistence.tree.BPlusTree$AbstractForwardCursor.fillFromBuffer(BPlusTree.java:5376)
+	at org.apache.ignite.internal.processors.cache.persistence.tree.BPlusTree$AbstractForwardCursor.nextPage(BPlusTree.java:5428)
+	... 14 more
+[2019-12-03 12:28:34,268][ERROR][sys-#74938%distributed.CacheRemoveWithTombstonesLoadTest2%][IgniteTestResources] Critical system error detected. Will be handled accordingly to configured handler [hnd=NoOpFailureHandler [super=AbstractFailureHandler [ignoredFailureTypes=UnmodifiableSet [SYSTEM_WORKER_BLOCKED, SYSTEM_CRITICAL_OPERATION_TIMEOUT]]], failureCtx=FailureContext [type=SYSTEM_WORKER_TERMINATION, err=class o.a.i.IgniteException: B+Tree is corrupted [pages(groupId, pageId)=[IgniteBiTuple [val1=1544803905, val2=844420635196573]], msg=Runtime failure on cursor iteration]]]
+class org.apache.ignite.IgniteException: B+Tree is corrupted [pages(groupId, pageId)=[IgniteBiTuple [val1=1544803905, val2=844420635196573]], msg=Runtime failure on cursor iteration]
+	at org.apache.ignite.internal.util.lang.GridIteratorAdapter.hasNext(GridIteratorAdapter.java:48)
+	at org.apache.ignite.internal.processors.cache.distributed.dht.topology.GridDhtLocalPartition.doClear(GridDhtLocalPartition.java:1295)
+	at org.apache.ignite.internal.processors.cache.distributed.dht.topology.GridDhtLocalPartition.clearTombstones(GridDhtLocalPartition.java:1242)
+	at org.apache.ignite.internal.processors.cache.distributed.dht.topology.PartitionsEvictManager$ClearTombstonesTask.run0(PartitionsEvictManager.java:673)
+	at org.apache.ignite.internal.processors.cache.distributed.dht.topology.PartitionsEvictManager$AbstractEvictionTask.run(PartitionsEvictManager.java:587)
+	at org.apache.ignite.internal.util.IgniteUtils.wrapThreadLoader(IgniteUtils.java:7061)
+	at org.apache.ignite.internal.processors.closure.GridClosureProcessor$1.body(GridClosureProcessor.java:827)
+	at org.apache.ignite.internal.util.worker.GridWorker.run(GridWorker.java:120)
+	at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1149)
+	at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:624)
+	at java.lang.Thread.run(Thread.java:748)
+Caused by: class org.apache.ignite.internal.processors.cache.persistence.tree.CorruptedTreeException: B+Tree is corrupted [pages(groupId, pageId)=[IgniteBiTuple [val1=1544803905, val2=844420635196573]], msg=Runtime failure on cursor iteration]
+	at org.apache.ignite.internal.processors.cache.persistence.tree.BPlusTree.corruptedTreeException(BPlusTree.java:5927)
+	at org.apache.ignite.internal.processors.cache.persistence.tree.BPlusTree$AbstractForwardCursor.nextPage(BPlusTree.java:5438)
+	at org.apache.ignite.internal.processors.cache.persistence.tree.BPlusTree$ForwardCursor.next(BPlusTree.java:5661)
+	at org.apache.ignite.internal.processors.cache.IgniteCacheOffheapManagerImpl$CacheDataStoreImpl$1.next(IgniteCacheOffheapManagerImpl.java:3020)
+	at org.apache.ignite.internal.processors.cache.distributed.dht.topology.GridDhtLocalPartition$2.hasNextX(GridDhtLocalPartition.java:1226)
+	at org.apache.ignite.internal.util.lang.GridIteratorAdapter.hasNext(GridIteratorAdapter.java:45)
+	... 10 more
+Caused by: java.lang.AssertionError: Key is not ready: CacheDataRowAdapter [key=null, val=null, expireTime=-1, ver=null, cacheId=0, link=0001003c000077d8]
+	at org.apache.ignite.internal.processors.cache.persistence.CacheDataRowAdapter.key(CacheDataRowAdapter.java:837)
+	at org.apache.ignite.internal.processors.cache.tree.CacheDataTree.compare(CacheDataTree.java:382)
+	at org.apache.ignite.internal.processors.cache.tree.CacheDataTree.compare(CacheDataTree.java:63)
+	at org.apache.ignite.internal.processors.cache.persistence.tree.BPlusTree.compare(BPlusTree.java:5200)
+	at org.apache.ignite.internal.processors.cache.persistence.tree.BPlusTree$AbstractForwardCursor.findLowerBound(BPlusTree.java:5317)
+	at org.apache.ignite.internal.processors.cache.persistence.tree.BPlusTree$ForwardCursor.fillFromBuffer0(BPlusTree.java:5588)
+	at org.apache.ignite.internal.processors.cache.persistence.tree.BPlusTree$AbstractForwardCursor.fillFromBuffer(BPlusTree.java:5376)
+	at org.apache.ignite.internal.processors.cache.persistence.tree.BPlusTree$AbstractForwardCursor.nextPage(BPlusTree.java:5428)
+	... 14 more
+[2019-12-03 12:28:34,275][ERROR][sys-#74938%distributed.CacheRemoveWithTombstonesLoadTest2%][FailureProcessor] A critical problem with persistence data structures was detected. Please make backup of persistence storage and WAL files for further analysis. Persistence storage path: null WAL path: db/wal WAL archive path: db/wal/archive
+[2019-12-03 12:28:34,277][WARN ][sys-#74938%distributed.CacheRemoveWithTombstonesLoadTest2%][CacheDiagnosticManager] Page locks dump:
+
+Thread=[name=rebalance-#74947%distributed.CacheRemoveWithTombstonesLoadTest2%, id=94924], state=TIMED_WAITING
+Locked pages = []
+Locked pages log: name=rebalance-#74947%distributed.CacheRemoveWithTombstonesLoadTest2% time=(1575365314276, 2019-12-03 12:28:34.276)
+
+
+Thread=[name=rebalance-#74949%distributed.CacheRemoveWithTombstonesLoadTest2%, id=94926], state=TIMED_WAITING
+Locked pages = []
+Locked pages log: name=rebalance-#74949%distributed.CacheRemoveWithTombstonesLoadTest2% time=(1575365314276, 2019-12-03 12:28:34.276)
+
+
+Thread=[name=rebalance-#74951%distributed.CacheRemoveWithTombstonesLoadTest2%, id=94928], state=TIMED_WAITING
+Locked pages = []
+Locked pages log: name=rebalance-#74951%distributed.CacheRemoveWithTombstonesLoadTest2% time=(1575365314276, 2019-12-03 12:28:34.276)
+
+
+Thread=[name=rebalance-#74952%distributed.CacheRemoveWithTombstonesLoadTest2%, id=94929], state=TIMED_WAITING
+Locked pages = []
+Locked pages log: name=rebalance-#74952%distributed.CacheRemoveWithTombstonesLoadTest2% time=(1575365314276, 2019-12-03 12:28:34.276)
+
+
+Thread=[name=sys-#74933%distributed.CacheRemoveWithTombstonesLoadTest2%, id=94910], state=TIMED_WAITING
+Locked pages = []
+Locked pages log: name=sys-#74933%distributed.CacheRemoveWithTombstonesLoadTest2% time=(1575365314276, 2019-12-03 12:28:34.276)
+
+
+Thread=[name=sys-#74934%distributed.CacheRemoveWithTombstonesLoadTest2%, id=94911], state=TIMED_WAITING
+Locked pages = []
+Locked pages log: name=sys-#74934%distributed.CacheRemoveWithTombstonesLoadTest2% time=(1575365314276, 2019-12-03 12:28:34.276)
+
+
+Thread=[name=sys-#74936%distributed.CacheRemoveWithTombstonesLoadTest2%, id=94913], state=TIMED_WAITING
+Locked pages = []
+Locked pages log: name=sys-#74936%distributed.CacheRemoveWithTombstonesLoadTest2% time=(1575365314276, 2019-12-03 12:28:34.276)
+
+
+Thread=[name=sys-#74937%distributed.CacheRemoveWithTombstonesLoadTest2%, id=94914], state=TIMED_WAITING
+Locked pages = []
+Locked pages log: name=sys-#74937%distributed.CacheRemoveWithTombstonesLoadTest2% time=(1575365314276, 2019-12-03 12:28:34.276)
+
+
+Thread=[name=sys-#74938%distributed.CacheRemoveWithTombstonesLoadTest2%, id=94915], state=RUNNABLE
+Locked pages = []
+Locked pages log: name=sys-#74938%distributed.CacheRemoveWithTombstonesLoadTest2% time=(1575365314276, 2019-12-03 12:28:34.276)
+
+
+Thread=[name=sys-#74939%distributed.CacheRemoveWithTombstonesLoadTest2%, id=94916], state=TIMED_WAITING
+Locked pages = []
+Locked pages log: name=sys-#74939%distributed.CacheRemoveWithTombstonesLoadTest2% time=(1575365314276, 2019-12-03 12:28:34.276)
+
+
+Thread=[name=sys-#74940%distributed.CacheRemoveWithTombstonesLoadTest2%, id=94917], state=TIMED_WAITING
+Locked pages = []
+Locked pages log: name=sys-#74940%distributed.CacheRemoveWithTombstonesLoadTest2% time=(1575365314276, 2019-12-03 12:28:34.276)
+
+
+Thread=[name=sys-#74941%distributed.CacheRemoveWithTombstonesLoadTest2%, id=94918], state=TIMED_WAITING
+Locked pages = []
+Locked pages log: name=sys-#74941%distributed.CacheRemoveWithTombstonesLoadTest2% time=(1575365314276, 2019-12-03 12:28:34.276)
+
+
+Thread=[name=sys-stripe-0-#74896%distributed.CacheRemoveWithTombstonesLoadTest2%, id=94862], state=WAITING
+Locked pages = []
+Locked pages log: name=sys-stripe-0-#74896%distributed.CacheRemoveWithTombstonesLoadTest2% time=(1575365314276, 2019-12-03 12:28:34.276)
+
+
+Thread=[name=sys-stripe-1-#74897%distributed.CacheRemoveWithTombstonesLoadTest2%, id=94863], state=WAITING
+Locked pages = []
+Locked pages log: name=sys-stripe-1-#74897%distributed.CacheRemoveWithTombstonesLoadTest2% time=(1575365314276, 2019-12-03 12:28:34.276)
+
+
+Thread=[name=sys-stripe-2-#74898%distributed.CacheRemoveWithTombstonesLoadTest2%, id=94864], state=WAITING
+Locked pages = []
+Locked pages log: name=sys-stripe-2-#74898%distributed.CacheRemoveWithTombstonesLoadTest2% time=(1575365314276, 2019-12-03 12:28:34.276)
+
+
+Thread=[name=sys-stripe-3-#74899%distributed.CacheRemoveWithTombstonesLoadTest2%, id=94865], state=WAITING
+Locked pages = []
+Locked pages log: name=sys-stripe-3-#74899%distributed.CacheRemoveWithTombstonesLoadTest2% time=(1575365314276, 2019-12-03 12:28:34.276)
+
+
+Thread=[name=sys-stripe-4-#74900%distributed.CacheRemoveWithTombstonesLoadTest2%, id=94866], state=WAITING
+Locked pages = []
+Locked pages log: name=sys-stripe-4-#74900%distributed.CacheRemoveWithTombstonesLoadTest2% time=(1575365314276, 2019-12-03 12:28:34.276)
+
+
+Thread=[name=sys-stripe-5-#74901%distributed.CacheRemoveWithTombstonesLoadTest2%, id=94867], state=WAITING
+Locked pages = []
+Locked pages log: name=sys-stripe-5-#74901%distributed.CacheRemoveWithTombstonesLoadTest2% time=(1575365314276, 2019-12-03 12:28:34.276)
+
+
+Thread=[name=sys-stripe-6-#74902%distributed.CacheRemoveWithTombstonesLoadTest2%, id=94868], state=WAITING
+Locked pages = []
+Locked pages log: name=sys-stripe-6-#74902%distributed.CacheRemoveWithTombstonesLoadTest2% time=(1575365314276, 2019-12-03 12:28:34.276)
+
+
+Thread=[name=sys-stripe-7-#74903%distributed.CacheRemoveWithTombstonesLoadTest2%, id=94869], state=WAITING
+Locked pages = []
+Locked pages log: name=sys-stripe-7-#74903%distributed.CacheRemoveWithTombstonesLoadTest2% time=(1575365314276, 2019-12-03 12:28:34.276)
+
+
+
+[2019-12-03 12:29:06,839][ERROR][main][root] Test failed.
+java.lang.AssertionError: Failed to wait for tombstone cleanup: distributed.CacheRemoveWithTombstonesLoadTest2 expected:<0> but was:<1>
+	at org.junit.Assert.fail(Assert.java:88)
+	at org.junit.Assert.failNotEquals(Assert.java:743)
+	at org.junit.Assert.assertEquals(Assert.java:118)
+	at org.junit.Assert.assertEquals(Assert.java:555)
+	at org.apache.ignite.testframework.junits.JUnitAssertAware.assertEquals(JUnitAssertAware.java:114)
+	at org.apache.ignite.internal.processors.cache.distributed.CacheRemoveWithTombstonesLoadTest.waitTombstoneCleanup(CacheRemoveWithTombstonesLoadTest.java:335)
+	at org.apache.ignite.internal.processors.cache.distributed.CacheRemoveWithTombstonesLoadTest.removeAndRebalance(CacheRemoveWithTombstonesLoadTest.java:250)
+	at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:62)
+	at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	at java.lang.reflect.Method.invoke(Method.java:498)
+	at org.junit.runners.model.FrameworkMethod$1.runReflectiveCall(FrameworkMethod.java:47)
+	at org.junit.internal.runners.model.ReflectiveCallable.run(ReflectiveCallable.java:12)
+	at org.junit.runners.model.FrameworkMethod.invokeExplosively(FrameworkMethod.java:44)
+	at org.junit.internal.runners.statements.InvokeMethod.evaluate(InvokeMethod.java:17)
+	at org.junit.internal.runners.statements.RunBefores.evaluate(RunBefores.java:26)
+	at org.junit.internal.runners.statements.RunAfters.evaluate(RunAfters.java:27)
+	at org.apache.ignite.testframework.junits.GridAbstractTest$7.run(GridAbstractTest.java:2090)
+{noformat}
+
+[~ascherbakov]
+
+Hello, should we expect this issue to be included into 2.10 release?
+
+[~mmuzaf]
+
+I have plans to merge it in early december.
+
+The issue has moved to the next release. Please, let me know if we still should include it to the 2.10
+
+{panel:title=Branch: [pull/9249/head] Base: [master] : Possible Blockers (9)|borderStyle=dashed|borderColor=#ccc|titleBGColor=#F7D6C1}
+{color:#d04437}Control Utility (Zookeeper){color} [[tests 0 TIMEOUT , Exit Code |https://ci.ignite.apache.org/viewLog.html?buildId=6084190]]
+
+{color:#d04437}Platform .NET (Long Running){color} [[tests 1|https://ci.ignite.apache.org/viewLog.html?buildId=6084174]]
+* exe: CacheTest.TestCacheWithExpiryPolicyOnAccess - Test has low fail rate in base branch 0,0% and is not flaky
+
+{color:#d04437}Basic 1{color} [[tests 2|https://ci.ignite.apache.org/viewLog.html?buildId=6084136]]
+* IgniteBasicTestSuite: WALRecordTest.testAllTestWalRecordBuilderConfigured - Test has low fail rate in base branch 0,0% and is not flaky
+* IgniteBasicTestSuite: WALRecordSerializationTest.testAllWalRecordsSerializedAndDeserializedSuccessfully - Test has low fail rate in base branch 0,0% and is not flaky
+
+{color:#d04437}Platform .NET (Core Linux){color} [[tests 0 Exit Code |https://ci.ignite.apache.org/viewLog.html?buildId=6084172]]
+
+{color:#d04437}Java Client{color} [[tests 0 TIMEOUT , Exit Code |https://ci.ignite.apache.org/viewLog.html?buildId=6084115]]
+
+{color:#d04437}Cache (Failover) 1{color} [[tests 0 TIMEOUT , Exit Code |https://ci.ignite.apache.org/viewLog.html?buildId=6084144]]
+
+{color:#d04437}Platform .NET{color} [[tests 1|https://ci.ignite.apache.org/viewLog.html?buildId=6084171]]
+* exe: DataStorageMetricsTest.TestDataStorageMetrics - Test has low fail rate in base branch 0,0% and is not flaky
+
+{color:#d04437}Thin client: PHP{color} [[tests 0 Exit Code |https://ci.ignite.apache.org/viewLog.html?buildId=6084193]]
+
+{panel}
+{panel:title=Branch: [pull/9249/head] Base: [master] : New Tests (3)|borderStyle=dashed|borderColor=#ccc|titleBGColor=#D6F7C1}
+{color:#00008b}PDS (Indexing){color} [[tests 3|https://ci.ignite.apache.org/viewLog.html?buildId=6084165]]
+* {color:#013220}IgnitePdsWithIndexingTestSuite: RenameIndexTreeTest.testNotPersistRenamingIndexRootPage - PASSED{color}
+* {color:#013220}IgnitePdsWithIndexingTestSuite: RenameIndexTreeTest.testPersistRenamingIndexRootPage - PASSED{color}
+* {color:#013220}IgnitePdsWithIndexingTestSuite: RenameIndexTreeTest.testRenamingIndexRootPage - PASSED{color}
+
+{panel}
+[TeamCity *--&gt; Run :: All* Results|https://ci.ignite.apache.org/viewLog.html?buildId=6084197&amp;buildTypeId=IgniteTests24Java8_RunAll]
+
+TC run above is for https://github.com/apache/ignite/pull/9249: "IGNITE-11704 Add PARTITION_META_PAGE_DELTA_RECORD_V4 WALRecord type placeholder"
+
+Merged to master: 97edc893d5c6bcd458364746c5624a0bf9d1ae81
+

@@ -1,0 +1,80 @@
+[patch|https://github.com/krummas/cassandra/commits/marcuse/previewrepairfix], [cci|https://circleci.com/workflow-run/9ee445fb-8ac7-44e3-b74e-345734b312c3]
+
+Patch includes sstables from finalized sessions in the repaired set. Also adds a state change listener interface to `LocalSessions` which preview repair `RepairSession` listens to to fail any intersecting preview repairs. 
+
+looks good, I just have a few minor things:
+
+ 
+ * CassandraValidationIterator.java:61 - stray whitespace at top of class def
+ * LocalSessions$Listener - it would be nice to have a more descriptive method name `onIncrementalStateChange` or something. We have at least a few listeners with generic `onStateChange` methods
+ *  RepairSession#stateChange - we should return after forcingShutdown. Alternatively, we could use {{Iterables.any(ranges(), r -> r.intersects(session.ranges)}} instead of iterating over the ranges.
+ * RepairSession#involvesTables - includesSSTables or containsSSTables might be a better name
+
+Took a look and had to look closer at IR messaging, what I see is the following
+
+IR messaging is fire-and-forget pattern, so any ephemeral issues lead to messages not being seen (tests show this CASSANDRA-15564 and have been reported as issues with current repair CASSANDRA-15566).  This patch relies on the FINALIZE_COMMIT_MSG being seen on the coordinator of the IR preview repair in order to detect conflict, but the message is seen asynchronously so may see this on the participants while validation is running and seen on the coordinator after all validations have been seen on the coordinator (so session is already complete); in this case you have the same issue as reported by this JIRA.
+
+This patch also affectively blocks preview and IR running for the same range as the preview will fail with conflict*, so IR should stop scheduling if preview is running, and preview should not be scheduled while IR is running (else we waste the resources on validation); effectively what ever is scheduling the repairs will have to be enhanced to handle this which adds more complexity to operators.
+
+I actually wonder if we can remove this restriction.  What it looks like to me is that repairedAt is system time (aka, could have drift, could roll backwards, etc.), but we could keep track of largest one and make sure this counter is monotonic.  With a data structure of 
+
+* largest contiguous commit (long)
+* inFlight (array of long)
+* committed but not contagious (array of longs, its to represent cases where inFlight commits out of order)
+
+We could make sure that we (coordinator) always produce a repairedAt larger than any we know of, and this lets preview take a snapshot of the state at the start of coordination. With this snapshot, we filter for repaired and repairedAt <= largest contiguous commit snapshot; this should give preview repair effectively snapshot isolation (assuming compaction also maintains repairedAt).
+
+* In CASSANDRA-15564 I show that preview doesn't properly check session failures, run [this test|https://github.com/apache/cassandra/pull/446/files#diff-af4a07a2b44695f510dddb0c102e1953R28] and [this one|https://github.com/apache/cassandra/pull/446/files#diff-ca9f3b43ad8ff955d6ddd2ef4d2b6904R28] without the change in the JIRA to see it.  The reason your tests are different is because you don't use nodetool and directly monitor notifications.
+
+{quote}assuming compaction also maintains repairedAt
+{quote}
+not in a way that would make this possible. Once an sstable gets into the repaired bucket, it will be compacted with other repaired sstables, potentially with different repaired at timestamps (and keeping the min timestamp, I believe) .
+
+Yeah, that complicates things a little bit, would need to think about it more.
+
+If compaction only compacted <= "largest contiguous" then it would work, the big risk is if there are bugs in IR where we can't promote that because of gaps (caused by ephemeral issues such as message loss, so would require CASSANDRA-15566)
+
+bq. CassandraValidationIterator.java:61 - stray whitespace at top of class def
+
+https://github.com/krummas/cassandra/commit/142d11c1539ed677dfd4e1f21fb09a6fd68b79fc
+
+bq. LocalSessions$Listener - it would be nice to have a more descriptive method name `onIncrementalStateChange` or something. We have at least a few listeners with generic `onStateChange` methods
+
+https://github.com/krummas/cassandra/commit/c4248ddce35a14549e617379fc2fabdd275ee3a1 (made it {{onIRStateChange}})
+
+bq. RepairSession#stateChange - we should return after forcingShutdown. Alternatively, we could use Iterables.any(ranges(), r -> r.intersects(session.ranges) instead of iterating over the ranges.
+
+https://github.com/krummas/cassandra/commit/dd8cafea5debfb9cf90794ed3f9cc4a258681717
+
+bq. RepairSession#involvesTables - includesSSTables or containsSSTables might be a better name
+
+https://github.com/krummas/cassandra/commit/8f212ad77e53c0823a56fbc0d7da04f085200f56 ({{includesTables}} - we are not dealing with sstables here)
+
+Pushed another [commit|https://github.com/krummas/cassandra/commit/b28d63aed8b09f49936b06b7ec436c53ca3e5ec9] which should handle the case where FINALIZE_COMMIT_MSG is lost or delayed - if we encounter any pending non-finalized intersecting sstables we fail the preview repair.
+
+Spoke to Marcus.  I am fine with this patch failing preview rather than producing a false positive match for mismatch, though we should also improve it so we can remove this restriction later (just not this JIRA).
+
+Ill try to look at the update later today
+
++1, and thanks for addressing each point in it's own commit. Makes it way easier to review the changes
+
+I like the use of blocking filters, glad we don't transfer them =D
+
+Some of the tests make assumptions about time using thread.sleep; this could make them flaky.  With CASSANDRA-15564 I setup utilities for querying repair state, so if that does end up happening we can always block waiting until the repair table is updating.
+
+I made the comment that the tests only pass because we look at the notifications, but with CASSANDRA-15564 that will be fixed so can ignore that comment.
+
+A test that would be good to add would be
+1) run preview
+2) delay the merle tree so the coordinator doesn't see it yet
+3) run IR, wait for it to complete
+4) unblock merle tree's
+
+If I am reading this correctly, the preview will fail even though the validation wouldn't.
+
+I am +1
+
+Blake and I both gave +1, so moving to ready to commit.
+
+and committed, thanks!
+

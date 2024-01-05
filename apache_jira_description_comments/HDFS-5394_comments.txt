@@ -1,0 +1,572 @@
+* move {{munmap}} to {{NativeIO.POSIX}}, to avoid duplicating the logic in both {{ClientMmap}} and {{MappableBlock}}
+
+* {{munmap}} needs to be done asynchronously on the volume Executor, not inline.  This is because {{munmap}} may involve revoking a client's mmap access to the block (see HDFS-5182).  It's OK to unlink a block which is still cached, so deferring {{munmap}} is easy.
+
+* rather than only stored completely cached replicas in {{FsDatasetCache}}, store replicas in various states.  When a {{cache}} or {{uncache}} request comes in, do the right thing based on the current state of the replica.  This fixes the races.
+
+* we don't need to use {{compareAndSet}} to subtract from {{usedBytes}}; we just use a normal atomic add of a negative number.  There is never a situation where reducing {{usedBytes}} can fail.
+
+* take {{visibleLength}} from the {{replicaMap}}, rather than getting it from the length of the block file itself.
+
+* add more printouts at the {{debug}} level
+
+* {{MappableBlock}} should close the block file and metadata file after mmaping the block.  That way, we keep open only 1 file descriptor, instead of 3.
+
+* {{TestFsDatasetCache}}: use {{GenericTestUtils#waitFor}} instead of hand-rolled polling loops.  It's a bit easier to read and gives a stack trace of where the timeout occurred when things go bad, rather than just displaying a generic test timeout message.
+
+* {{TestFsDatasetCache}}: add a new test that we can {{uncache}} files that haven't yet completed caching.
+
+fix compile
+
+rebase after recent patches hit
+
+Hi Colin, good catch on these races. There's definitely some sloppiness we can prevent here, and some of your other code cleanups look good too.
+
+High-level comments:
+
+* This state machine logic seems like overkill. It's cool how we can do all this with atomic swaps, but synchronization isn't a big overhead as this isn't a hot path, there aren't that many states, and this the transitions aren't that complicated. I think it'd be simpler to just use a couple different maps: {{replicasMap}} for cached replicas and {{pendingCache}} / {{pendingUncache}} for in-progress replicas.
+** {{CACHING_CANCELLED}} could be indicated by just moving it from {{pendingCache}} to {{pendingUncache}}
+** Removes the need to worry about "visibility" via {{shouldAdvertise}}
+* I like the idea of {{UncachingTask}}, it's good future-proofing. However, I don't think it should be using the same executor as {{CachingTask}}, since the executor is currently capped at 4 threads per volume in the interest of disk contention. Uncaching tasks do no I/O, and we wouldn't want stuck uncaching tasks to stop other work. It might be better to instead have a background sweeper thread that goes through {{pendingUncache}} (kicked on-demand as necessary). This works well with a separate {{pendingUncache}} map too.
+
+Lower-level:
+
+* NativeIO: should move the comment up to be javadoc instead
+* Nit: FsDatasetCache comment should read "was cancelled" not "got cancelled"
+* A remark, this only sets {{nextValue}} to null, which is okay here, but seeing it did make me check that it's not an error:
+{code}
+    Value prevValue, nextValue = null;
+{code}
+* I don't see a method named "startUncaching", need to update the exception text
+* trailing whitespace:
+{code}
+    if (nextValue.state != State.CACHING_CANCELLED) { 
+{code}
+* Would be good to refer to the JIRA # in the {{UncachingTask}} TODO
+* Javadoc for MappableBlock#getVisibleLength and MappableBlock constructor
+* Javadoc for MappableBlock#load refers to "visibleLeng" instead of "visibleLength"
+* Would be nice to drop a comment in {{uncacheBlock}} about the purpose of the do while for atomic swaps
+* Why is it called "visibleLength" instead of just just "length"? We don't support partial caching, reading of blocks open for append, or cached reads of blocks that are being cached, so mention of "visibility" threw me off. That's why I wanted javadoc above.
+* Could we keep {{FsDatasetImpl#validToCache}} method separate rather than inlining it in {{cacheBlock}}?
+* Don't we need to remove a {{CACHING_CANCELLED}} {{MappableBlock}} from the replicaMap when the swap check in {{CachingTask}} fails?
+
+bq. This state machine logic seems like overkill. It's cool how we can do all this with atomic swaps, but synchronization isn't a big overhead as this isn't a hot path, there aren't that many states, and this the transitions aren't that complicated. I think it'd be simpler to just use a couple different maps: replicasMap for cached replicas and pendingCache / pendingUncache for in-progress replicas.
+
+I think the state machine makes things easier to understand, and is more efficient as well.  A "big lock" architecture would end up being just as complex, due to the fact that we can't do long-running operations under the lock.  You'd have to carefully check the state of everything after taking the big lock again, which ends up being just as complex as the compare-and-swap here.
+
+Whether to advertise a block is a different issue than state machine vs. ad hoc.  Currently, we only advertise blocks in the {{CACHING}} state, meaning blocks that have been completely cached and not scheduled for uncaching.  Originally I had a state which was "uncaching but visible" but it seemed like that wasn't a good idea because work might be scheduled on the node in the erroneous belief that the block would stay cached, etc.
+
+bq. I like the idea of UncachingTask, it's good future-proofing. However, I don't think it should be using the same executor as CachingTask, since the executor is currently capped at 4 threads per volume in the interest of disk contention. Uncaching tasks do no I/O, and we wouldn't want stuck uncaching tasks to stop other work. It might be better to instead have a background sweeper thread that goes through pendingUncache (kicked on-demand as necessary). This works well with a separate pendingUncache map too.
+
+It's not really possible for Uncaching tasks to "get stuck" currently, since all they do is munmap.  Although that's technically a blocking system call, since the mmap is not dirty it won't take long.  We could have a separate executor, I suppose, to prevent caching tasks from blocking uncaching ones.
+
+In the long term, we are not going to have threads blocking waiting for clients.  Instead, we'll have tasks that reschedule themselves with some fixed period to poll whether the client has released the mmap.  It would be nice to think of a way to edge-trigger this, but that's probably an optimization for later.
+
+In any case, I'll create another executor to prevent mmap from blocking munmap.
+
+bq. NativeIO: should move the comment up to be javadoc instead
+
+OK.
+
+bq. A remark, this only sets nextValue to null, which is okay here, but seeing it did make me check that it's not an error:
+
+The Java compiler complains about local variables that are used before initialization.  So you don't need to check.
+
+See http://developer.nokia.com/Community/Wiki/Initializing_local_variables_in_Java:
+bq. In Java, it is a fixed rule that you may not read the value from a local variable unless the compiler can prove that the variable will have been initialized. Otherwise, the code will not compile. This is the "definite assignment" rule.
+
+bq. I don't see a method named "startUncaching", need to update the exception text
+
+OK.
+
+bq. Why is it called "visibleLength" instead of just just "length"? We don't support partial caching, reading of blocks open for append, or cached reads of blocks that are being cached, so mention of "visibility" threw me off. That's why I wanted javadoc above.
+
+Yes, but we plan on supporting those things in the future.  So we should be clear about what we're measuring, which is not the length of the block file, but the length of the block file that the client is allowed to see.
+
+bq. Could we keep FsDatasetImpl#validToCache method separate rather than inlining it in cacheBlock?
+
+The issue is that {{ConcurrentHashMap}} has a method for atomically adding a value for the given key if one is not already present.  If this were a separate method to check the map and then another to add to it, we would have a race condition.  Plus, we'd be checking the map two times, which is inefficient.  Given that it's only 2 or 3 lines, I don't think a separate method makes sense here.
+
+bq. Don't we need to remove a CACHING_CANCELLED MappableBlock from the replicaMap when the swap check in CachingTask fails?
+
+Fixed, thanks.
+
+Hey Colin, thanks for the responding promptly,
+
+bq. I think the state machine makes things easier to understand, and is more efficient as well...
+
+I think my proposal really isn't that different conceptually from what's already there. It's essentially a simple dataflow pipeline: we have work queues (the pending maps) that feed workers (the cache/uncache executors). I think having a few maps is very clear and self-evident.
+
+What we have now isn't pure state machine enough to make me happy. This style works best when the state object has all the transition logic, with very well defined transitions. Here, we have a bunch of different methods reaching into the replicasMap and doing things with the MappableBlocks based on external input and shared data, which is not pure. Also, like I said before, this is pretty simple state transition graph, so it's not like the state machine is helping clarify recursive behavior or something.
+
+The efficiency argument isn't convincing to me, since the swap/retry stuff does complicate the code when this isn't even a hot path. 
+
+bq. Whether to advertise a block is a different issue than state machine vs. ad hoc...
+
+I was trying to say that this would be more concise with a dedicated {{cachedReplicas}} map.
+
+bq. It's not really possible for Uncaching tasks to "get stuck" currently, since all they do is munmap...In the long term, we are not going to have threads blocking waiting for clients.
+
+I was thinking of when we are trying to do client revocation, where a client could stall the uncaching. Good point about the reverse situation too though, thanks for pulling the executors apart.
+
+bq. Instead, we'll have tasks that reschedule themselves with some fixed period to poll whether the client has released the mmap.
+
+This sounds kind of like my background sweeper thread idea. I don't think we need a whole thread pool to do the munmaps since (as you said) it should be basically free if it's ready to be uncached.
+
+bq. bq. Why is it called "visibleLength" instead of just just "length"? 
+
+Could we do that rename to "visibleLength" when we actually support said functionality? :) thanks
+
+With patch version 4, {{TestFsDatasetCache}} would not apply cleanly to my HDFS-4949 branch, so I assume there is still rebasing in progress.
+
+I don't have a strong opinion on the discussion of atomic state machine transitions vs. explicit locking, so I just went ahead and reviewed the code as-is.
+
+* {{FsDatasetCache#Key#equals}}: This uses a string comparison of the class name.  Should it do a reference-equals of the {{Class}} objects instead?
+* {{FsDatasetCache#getCachedBlocks}}: This method is no longer filtering by block pool.  The {{bpid}} argument is unused.
+* {{FsDatasetCache#cacheBlock}}: Does it make sense to move all I/O, including opening the streams, behind the {{CachingTask}}?  If so, then this would also simplify the error handling, because you wouldn't need to decrement {{usedBytes}} and close the streams here.
+* {{MappableBlock#mlocker}}: Can you please annotate this as {{@VisibleForTesting}}?
+* {{MappableBlock#load}}: Regarding the null check of {{blockChannel}}, is it actually possible for {{FileInputStream#getChannel}} to return null, or was this done for defensive coding purposes?  (No objection if it's just defensive coding.  I'm just curious if you know of a particular condition that causes this.)
+* {{MappableBlock#verifyChecksum}}: This is now passing a hard-coded file name to {{DataChecksum#verifyChunkedSums}}.  Should this be switched back to the block file name?
+* {{TestFsDatasetCache#testUncachingBlocksBeforeCachingFinishes}}: I believe we want to release the threads blocked on mlock after sending the uncache command, so that {{replicaMap}} gets updated and triggers the cancellation logic inside {{CachingTask}}.  Calling {{countDown}} before the uncache causes a race condition such that the caching tasks could resume and complete before the uncache, and then the test wouldn't cover the cancellation logic.
+
+
+Andrew, if I understand your proposal correctly, you're proposing to split the {{replicaMap}} into three maps: {{beingCachedReplicaMap}}, {{cachedReplicaMap}}, and {{beingUncachedReplicaMap}}, and protect all three with a big lock.  It seems like this will actually result in more code, since we'll have to check multiple maps in many cases (i.e., we don't want to advertise something that is being uncached, and we don't want to start caching something that is already cached or currently being uncached.).  We could combine it into 2 maps with some funky booleans, but I think it would be get pretty confusing.  I really just wanted a unified map that tells me where everything is, not 2 or 3 maps.
+
+From an efficiency point of view, 3 maps is also worse than 1.. as you know :)  This is particularly annoying with {{HashMap}}, since its memory consumption never shrinks, but only grows as needed.
+
+I think a big part of why the complexity exists today is that we have to drop the (conceptual) lock when doing the mmap or munmap operation.  This is a requirement, since they are potentially long-running operations.  This in turn results in some complexity since once we finish the mmap, we have to retake the lock and figure out if the world changed underneath us.  For example, someone could have cancelled the caching operation while we released the lock and started doing our thing.  This complexity doesn't go away when you split the maps-- in fact, it gets worse, since you have to remember to check all of them.  If you think the compare-and-swap stuff is too complex, I could use a mutex for that, but again, it's going to be a similar amount of code, since it's doing a similar thing.
+
+Re: background sweeper thread.  Isn't that pretty much equivalent to having a single Executor in {{FsDatasetCache}} like this patch adds?  I kind of like the {{Executor}} approach since it will tear down the thread after a few minutes of inactivity.  But perhaps I could be convinced otherwise.  Anyway, I'd rather do that refactoring later if possible.
+
+bq. FsDatasetCache#Key#equals: This uses a string comparison of the class name. Should it do a reference-equals of the Class objects instead?
+
+Sure.
+
+bq. FsDatasetCache#getCachedBlocks: This method is no longer filtering by block pool. The bpid argument is unused.
+
+Fixed.
+
+bq. FsDatasetCache#cacheBlock: Does it make sense to move all I/O, including opening the streams, behind the CachingTask? If so, then this would also simplify the error handling, because you wouldn't need to decrement usedBytes and close the streams here.
+
+I think that's a good idea.  I'll see if I can reorganize it along those lines.
+
+bq. MappableBlock#mlocker: Can you please annotate this as @VisibleForTesting?
+
+OK
+
+bq. MappableBlock#load: Regarding the null check of blockChannel, is it actually possible for FileInputStream#getChannel to return null, or was this done for defensive coding purposes? (No objection if it's just defensive coding. I'm just curious if you know of a particular condition that causes this.)
+
+I checked out the JDK source, and I don't think {{FileInputStream#getChannel}} can ever return null.  I guess when I wrote this, I was thinking of the {{Socket}} API, where {{getChannel}} sometimes does return null.  It's probably best to remove this null check since the API documentation is pretty clear, and Java catches such conditions anyway.
+
+bq. MappableBlock#verifyChecksum: This is now passing a hard-coded file name to DataChecksum#verifyChunkedSums. Should this be switched back to the block file name?
+
+I was having some difficulty getting at the block file name.  It's not provided by {{getBlockInputStream}} or {{getMetaDataInputStream}}.  It turns out that it's available through the {{ReplicaInfo}}, though.  Will fix.
+
+bq. {{TestFsDatasetCache#testUncachingBlocksBeforeCachingFinishes}}...
+
+I guess I don't really have a great solution to this.  The problem is that we currently don't really know when the {{DNA_UNCACHE}} messages reach the DN.  Setting the heartbeat responses is one thing, but these responses won't be sent until the DN sends its own heartbeat to the NN.  It's an async process.  We could perhaps hook into the heartbeat handling code in the DN, but a simpler solution might just be using a delay 2x or 3x longer than the configured heartbeat.  In practice that would be 3 seconds or so.
+
+* renamed visibleLength to length
+
+* removed {{ConcurrentHashMap}} in favor of {{HashMap}} plus locking.
+
+* do all I/O in caching task, not in caller.
+
+* print the name of the block file, not just a static string
+
+* unit test fixup: use a delay rather than countdown latch.
+
+* some more debug logs.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12610931/HDFS-5394.005.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 1 new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs:
+
+                  org.apache.hadoop.hdfs.server.datanode.TestFsDatasetCache
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/5308//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/5308//artifact/trunk/patchprocess/newPatchFindbugsWarningshadoop-hdfs.html
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/5308//console
+
+This message is automatically generated.
+
+* fix findbugs warning
+
+* in unit test, be more careful about waiting for munlocks to happen.  Add more debug printouts on failure.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12611994/HDFS-5394.006.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs:
+
+                  org.apache.hadoop.hdfs.server.balancer.TestBalancerWithNodeGroup
+                  org.apache.hadoop.hdfs.server.datanode.TestFsDatasetCache
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/5328//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/5328//console
+
+This message is automatically generated.
+
+Looks like the issue is an environment issue on the build machines.  They only have 64k of available mlock space:
+
+{code}
+2013-11-04 20:34:51,387 WARN  impl.FsDatasetCache (FsDatasetCache.java:run(329)) - Failed to cache block 1073741842 in BP-1183768563-67.195.138.24-1383597287811
+ENOMEM: Cannot allocate memory
+    at org.apache.hadoop.io.nativeio.NativeIO$POSIX.mlock_native(Native Method)
+    at org.apache.hadoop.io.nativeio.NativeIO$POSIX.mlock(NativeIO.java:255)
+    at org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.MappableBlock$PosixMlocker.mlock(MappableBlock.java:54)
+    at org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.MappableBlock.load(MappableBlock.java:99)
+    at org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.FsDatasetCache$CachingTask.run(FsDatasetCache.java:321)
+    at java.util.concurrent.ThreadPoolExecutor$Worker.runTask(ThreadPoolExecutor.java:886)
+    at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:908)
+    at java.lang.Thread.run(Thread.java:662)
+2013-11-04 20:34:51,388 WARN  impl.FsDatasetCache (FsDatasetCache.java:run(329)) - Failed to cache block 1073741841 in BP-1183768563-67.195.138.24-1383597287811
+ENOMEM: Cannot allocate memory
+    at org.apache.hadoop.io.nativeio.NativeIO$POSIX.mlock_native(Native Method)
+    at org.apache.hadoop.io.nativeio.NativeIO$POSIX.mlock(NativeIO.java:255)
+    at org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.MappableBlock$PosixMlocker.mlock(MappableBlock.java:54)
+    at org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.MappableBlock.load(MappableBlock.java:99)
+    at org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.FsDatasetCache$CachingTask.run(FsDatasetCache.java:321)
+    at java.util.concurrent.ThreadPoolExecutor$Worker.runTask(ThreadPoolExecutor.java:886)
+    at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:908)
+    at java.lang.Thread.run(Thread.java:662)
+2013-11-04 20:34:51,543 INFO  datanode.TestFsDatasetCache (TestFsDatasetCache.java:get(190)) - 
+{code}
+
+and then later...
+{code}
+verifyExpectedCacheUsage: expected 65535, got 60074; memlock limit = 65536.  Waiting...
+{code}
+
+I'm not sure why we can't seem to get up to 65535, considering the ulimit is supposed to be just higher than that.  I'll see if I can reproduce locally.
+
+Sorry for leaving this for so long, got tied up in a variety of different things. Thanks for bumping it based on feedback thus far, I think we're close.
+
+* I like the test stub for mlock
+
+Nits:
+
+* Unused imports in FsDatasetImpl and FsVolumeImpl
+* Do we still need to rename {{getExecutor}} to {{getCacheExecutor}} in FsVolumeImpl?
+* {{State#isUncaching()}} is unused
+* Could use a core pool size of 0 for {{uncachingExecutor}}, I don't think it's that latency sensitive
+* usedBytes javadoc: "more things to cache that we can't actually do because of" is an awkward turn of phrase, maybe say "assign more blocks than we can actually cache because of" instead
+* MappableBlock#load javadoc: visibleLeng parameter should be renamed to length. The return value is now also a MappableBlock, not a boolean.
+* Key: rename {{id}} to {{blockId}} for clarity? or add a bit of javadoc
+* Naming the HashMap {{replicaMap}} is confusing since there's already a datanode {{ReplicaMap}} class. Maybe {{mappableBlockMap}} instead?
+
+Impl:
+* Caching can fail if the underlying block is invalidated in between getting the block's filename and running the CacheTask. It'd be nice to distinguish this race from a real error for when we do metrics (and also quash the exception).
+* If we get a {{DNA_CACHE}} for a block that is currently being uncached, shouldn't we try to cancel the uncache and re-cache it? The NN will resend the command, but it'd be better to not have to wait for that.
+{code}
+          if ((value == null) || (value.state != State.CACHING)) {
+{code}
+* Could this be written with {{value.state == State.CACHING_CANCELLED}} instead? Would be clearer, and I believe equivalent since {{uncacheBlock}} won't set the state to {{UNCACHING}} if it's {{CACHING}} or {{CACHING_CANCELLED}}.
+* Even better would be interrupting a {{CachingTask}} on uncache since it'll save us I/O and CPU.
+* Could we combine {{CACHING_CANCELLED}} into {{UNCACHING}}? It seems like {{CachingTask}} could check for {{UNCACHING}} in that if statement at the end and uncache, same sort of change for {{uncacheBlock}}.
+* I think using a switch/case on the prevValue.state in uncacheBlock would be clearer
+
+Test:
+* 6,000,000 milliseconds seem like very long test timeouts :) Can we change them to say, 60,000?
+* Are these new log prints for sanity checking? Maybe we can just remove them.
+* Some of the comments seem to refer to a previous patch version that used a countdown latch.
+* It's unclear what this is testing beyond caching and then uncaching a bunch of blocks. Can we check for log prints to see that it's actually cancelling as expected? Any other ideas for definitively hitting cancellation?
+
+
+OK, I figured out the test failure.  It seems that when computing how much data we can mlock, we must round up mmap'ed regions to the operating system page size.  In the case of Linux, that is almost always 4096.  The reason behind this is because the OS manages memory in units of 4096 bytes.  It is simply impossible to lock at a finer granularity than that.  So we should take this into account in our statistics.  I adjusted the test to take this into account, and also added a skip if we don't have enough lockable memory available.
+
+bq. Unused imports in FsDatasetImpl and FsVolumeImpl
+
+removed
+
+bq. Do we still need to rename getExecutor to getCacheExecutor in FsVolumeImpl?
+
+Well, the name of the variable is {{cacheExecutor}}; shouldn't the getter be {{getCacheExecutor}}?
+
+bq. State#isUncaching() is unused
+
+removed
+
+bq. Could use a core pool size of 0 for uncachingExecutor, I don't think it's that latency sensitive
+
+agreed
+
+bq. usedBytes javadoc: "more things to cache that we can't actually do because of" is an awkward turn of phrase, maybe say "assign more blocks than we can actually cache because of" instead
+
+ok
+
+bq. MappableBlock#load javadoc: visibleLeng parameter should be renamed to length. The return value is now also a MappableBlock, not a boolean.
+
+fixed
+
+bq. Key: rename id to blockId for clarity? or add a bit of javadoc
+
+added javadoc
+
+bq. Naming the HashMap replicaMap is confusing since there's already a datanode ReplicaMap class. Maybe mappableBlockMap instead?
+
+ok
+
+bq. Caching can fail if the underlying block is invalidated in between getting the block's filename and running the CacheTask. It'd be nice to distinguish this race from a real error for when we do metrics (and also quash the exception).
+
+I just added a catch block for the {{FileNotFound}} exception which both {{getBlockInputStream}} and {{getMetaDataInputStream}} can throw.  I still think we want to log this exception, but at INFO rather than WARN.  We will retry sending the {{DNA_CACHE}} command (once 5366 is committed), so hitting this narrow race if a block is being moved is just a temporary setback.
+
+bq. If we get a DNA_CACHE for a block that is currently being uncached, shouldn't we try to cancel the uncache and re-cache it? The NN will resend the command, but it'd be better to not have to wait for that.
+
+We don't know how far along the uncaching process is.  We can't cancel it if we already called {{munmap}}.  We could allow cancellation of pending uncaches by splitting {{UNCACHING}} into {{UNCACHING_SCHEDULED}} and {{UNCACHING_IN_PROGRESS}}, and only allowing cancellation on the former.  This might be a good improvement to make as part of 5182.  But for now, the uncaching process is really quick, so let's keep it simple.
+
+bq. Could this be written with value.state == State.CACHING_CANCELLED instead? Would be clearer, and I believe equivalent since uncacheBlock won't set the state to UNCACHING if it's CACHING or CACHING_CANCELLED.
+
+well, if value is null, you don't want to be dereferencing that, right?
+
+bq. Even better would be interrupting a CachingTask on uncache since it'll save us I/O and CPU.
+
+That kind of interruption logic gets complex quickly.  I'd rather save that for a potential performance improvement JIRA later down the line.  I also think that if we're thrashing (cancelling caching requests right and left) the real fix might be on the NameNode anyway...
+
+bq. Could we combine CACHING_CANCELLED into UNCACHING? It seems like CachingTask could check for UNCACHING in that if statement at the end and uncache, same sort of change for uncacheBlock.
+
+I would rather not do that, since right now we can look at entries in the map and instantly know that anything in state {{UNCACHING}} has an associated {{Runnable}} scheduled in the {{Executor}}.  cancelled is not really the same thing as uncaching since in the former case, there is actually nothing to do!
+
+bq. I think using a switch/case on the prevValue.state in uncacheBlock would be clearer
+
+ok
+
+bq. 6,000,000 milliseconds seem like very long test timeouts  Can we change them to say, 60,000?
+
+the general idea is to do stuff that can time out in {{GenericTestUtils#waitFor}} blocks.  The waitFor blocks actually give useful backtraces and messages when they time out, unlike the generic test timeouts.  I wanted to avoid the scenario where the test-level timeouts kick in, but out of paranoia, I set the overall test timeout to 10 minutes in case there was some other unexpected timeout.  I wanted to avoid the issues we've had with zombie tests in Jenkins causing heisenfailures.
+
+bq. Are these new log prints for sanity checking? Maybe we can just remove them.
+
+it's more so you can see what's going on in the sea of log messages.  otherwise, it becomes hard to debug.
+
+bq. Some of the comments seem to refer to a previous patch version that used a countdown latch.
+
+fixed
+
+bq. It's unclear what this is testing beyond caching and then uncaching a bunch of blocks. Can we check for log prints to see that it's actually cancelling as expected? Any other ideas for definitively hitting cancellation?
+
+we could add callback hooks to more points in the system, and set up a bunch of countdown latches (or similar), but it might be overkill here.  I have looked at the logs and I do see cancellation.  you'd have to hit a GC or something to avoid it in this test, I think
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12612314/HDFS-5394.007.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+      {color:red}-1 javac{color}.  The applied patch generated 1548 javac compiler warnings (more than the trunk's current 1547 warnings).
+
+    {color:red}-1 javadoc{color}.  The javadoc tool appears to have generated 1 warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs:
+
+                  org.apache.hadoop.hdfs.server.namenode.TestPathBasedCacheRequests
+                  org.apache.hadoop.hdfs.server.datanode.TestFsDatasetCache
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/5343//testReport/
+Javac warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/5343//artifact/trunk/patchprocess/diffJavacWarnings.txt
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/5343//console
+
+This message is automatically generated.
+
+I just tested with patch version 7, and the datanode didn't uncache previously cached blocks after receiving the DNA_CACHE message.  Debug logging shows that it's due to the following logic in {{FsDatasetCache#uncacheBlock}}.  I assume {{case CACHED}} should be doing the same as the {{default}} block and submitting an {{UncachingTask}}.
+
+{code}
+    case CACHED:
+      if (LOG.isDebugEnabled()) {
+        LOG.debug("Block with id " + blockId + ", pool " + bpid + " " +
+            "does not need to be uncached, because it is " +
+            "in state " + prevValue.state + ".");
+      }
+      break;
+{code}
+
+
+Good catch.  That was a bug introduced by the latest round of shuffling everything around.  the default and CACHED cases were switched.
+
+fix uncaching issue discovered by chris
+
+Thanks for bumping Colin, basically just rollup in this review:
+
+bq. Could this be written with value.state == State.CACHING_CANCELLED instead?
+
+My point here was about the logic, since I did a "find usages" on CACHING_CANCELLED in Eclipse and only saw it being set. Right now it checks "not CACHED" which should be equivalent to "is CACHING_CANCELLED" because of the state transition invariants, and ideally with this kind of logic, we transition based on being *in* a state rather than *not being* in a state.
+
+bq. I would rather not do that, since right now we can look at entries in the map and instantly know that anything in state UNCACHING has an associated Runnable scheduled in the Executor.
+
+I guess this makes sense in light of HDFS-5182, since uncaching might require waiting for clients while cancelling caching shouldn't. In either case though, something needs to happen, it's just that instead of deferring the work to an UncachingTask, it's deferred to the end of the CachingTask.
+
+bq. <waitFor>
+
+Makes sense, though I'll note that 6,000,000 is 100 minutes, not ten minutes :) Overkill.
+
+bq. <catching FileNotFoundException>
+
+This is better, thanks. As a general comment, I'd like to avoid relying on NN retries if possible, but I guess it's okay for now.
+
+Test:
+* Do we need that {{Preconditions}} check in {{setUp}}? There's already an assumeTrue for the same thing right above it, so I don't think it'll do anything.
+* I'd like to see the {{LogVerificationAppender}} used in {{testUncachingBlocksBeforeCachingFinishes}} too. This seems like it might be flaky though. What was wrong with the old approach that used a barrier to force ordering?
+
+Also need to run through the Jenkins stuff still. The javac warning is fine (the new usage of Unsafe to get the page size) but the rest needs to be touched up. Not sure about the test failure.
+
+bq. CACHING_CANCELLED discussion
+
+yeah, it does make more sense to explicitly check for the states we expect to be in, rather than having a catch-all.  I have changed this to use {{Precondition}} to assert that we are in the correct state, since that seemed more appropriate, and also to be clearer about needing to be in the {{CACHING}} or {{CACHING_CANCELLED}} state there.
+
+bq. Makes sense, though I'll note that 6,000,000 is 100 minutes, not ten minutes  Overkill.
+
+Noted.  Reduced this to 10 minutes, which should be ample.
+
+bq. Do we need that Preconditions check in setUp? There's already an assumeTrue for the same thing right above it, so I don't think it'll do anything.
+
+No, it's a repeat of the previous one.  Removed.
+
+bq. I'd like to see the LogVerificationAppender used in testUncachingBlocksBeforeCachingFinishes too. This seems like it might be flaky though. What was wrong with the old approach that used a barrier to force ordering?
+
+The problem is we don't have a barrier in all the places we would need it.  We'd need to know that the DN had received the DN_CACHE heartbeat response and initiated caching during the 3-second window it has to do so, in order to know that we would later see a log message about cancellation.  To check for the log message would be, as you guessed, flaky and we don't need another flaky test.
+
+I'd like to keep a LogVerificationAppender for this test in mind as a future improvement, but still get this fix committed soon since HDFS-5366, HDFS-5320, HDFS-5451, and HDFS-5431 all depend on this patch to some extent.  Perhaps we can roll a test improvement for this into HDFS-5451, since that JIRA is all about debuggability and logging.
+
+rebase on trunk
+
+reduce test timeouts
+
+add preconditions
+
++1 pending Jenkins, thanks Colin. I'll cross-post the LogVerificationAppender improvement ot HDFS-5451, agree we should get rolling on the rest.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12612725/HDFS-5394.009.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 1 new or modified test files.
+
+      {color:red}-1 javac{color}.  The applied patch generated 1545 javac compiler warnings (more than the trunk's current 1544 warnings).
+
+    {color:red}-1 javadoc{color}.  The javadoc tool appears to have generated 1 warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/5357//testReport/
+Javac warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/5357//artifact/trunk/patchprocess/diffJavacWarnings.txt
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/5357//console
+
+This message is automatically generated.
+
+Thanks for the +1, will commit shortly.
+
+As mentioned earlier, the javac and the javadoc warning are about the use of {{sun.misc.Unsafe}}, which we can't really avoid here.  I will increase {{OK_JAVADOC_WARNINGS}} in {{test-patch.sh}} to prevent warning spew.  The javac warning will be ignored automatically on the next build after submission.
+
+SUCCESS: Integrated in Hadoop-trunk-Commit #4704 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/4704/])
+HDFS-5394: Fix race conditions in DN caching and uncaching (cmccabe) (cmccabe: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1539909)
+* /hadoop/common/trunk/dev-support/test-patch.sh
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/nativeio/NativeIO.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/client/ClientMmap.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeManager.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetCache.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsVolumeImpl.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/MappableBlock.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestFsDatasetCache.java
+
+
+SUCCESS: Integrated in Hadoop-Yarn-trunk #386 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/386/])
+HDFS-5394: Fix race conditions in DN caching and uncaching (cmccabe) (cmccabe: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1539909)
+* /hadoop/common/trunk/dev-support/test-patch.sh
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/nativeio/NativeIO.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/client/ClientMmap.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeManager.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetCache.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsVolumeImpl.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/MappableBlock.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestFsDatasetCache.java
+
+
+FAILURE: Integrated in Hadoop-Mapreduce-trunk #1603 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/1603/])
+HDFS-5394: Fix race conditions in DN caching and uncaching (cmccabe) (cmccabe: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1539909)
+* /hadoop/common/trunk/dev-support/test-patch.sh
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/nativeio/NativeIO.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/client/ClientMmap.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeManager.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetCache.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsVolumeImpl.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/MappableBlock.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestFsDatasetCache.java
+
+
+SUCCESS: Integrated in Hadoop-Hdfs-trunk #1577 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/1577/])
+HDFS-5394: Fix race conditions in DN caching and uncaching (cmccabe) (cmccabe: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1539909)
+* /hadoop/common/trunk/dev-support/test-patch.sh
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/io/nativeio/NativeIO.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/client/ClientMmap.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/DatanodeManager.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetCache.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsVolumeImpl.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/MappableBlock.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestFsDatasetCache.java
+
+
+Closing tickets that are already part of a release.
+

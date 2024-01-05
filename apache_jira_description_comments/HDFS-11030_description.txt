@@ -1,0 +1,61 @@
+TestDataNodeVolumeFailure#testVolumeFailure fails a volume and verifies the blocks and files are replicated correctly.
+
+# To fail a volume, it deletes all the blocks and sets the data dir read only.
+{code:title=testVolumeFailure() snippet}
+    // fail the volume
+    // delete/make non-writable one of the directories (failed volume)
+    data_fail = new File(dataDir, "data3");
+    failedDir = MiniDFSCluster.getFinalizedDir(dataDir, 
+        cluster.getNamesystem().getBlockPoolId());
+    if (failedDir.exists() &&
+        //!FileUtil.fullyDelete(failedDir)
+        !deteteBlocks(failedDir)
+        ) {
+      throw new IOException("Could not delete hdfs directory '" + failedDir + "'");
+    }
+    data_fail.setReadOnly();
+    failedDir.setReadOnly();
+{code}
+However, there are two bugs here, which make the blocks not deleted.
+#- The {{failedDir}} directory for finalized blocks is not calculated correctly. It should use {{data_fail}} instead of {{dataDir}} as the base directory.
+#- When deleting block files in {{deteteBlocks(failedDir)}}, it assumes that there is no subdirectories in the data dir. This assumption was also noted in the comments.
+{quote}
+    // we use only small number of blocks to avoid creating subdirs in the data dir..
+{quote}
+This is not true. On my local cluster and MiniDFSCluster, there will be subdir0/subdir0/ two level directories regardless of the number of blocks.
+# Meanwhile, to fail a volume, it also needs to trigger the DataNode removing the volume and send block report to NN. This is basically in the {{triggerFailure()}} method.
+{code}
+  private void triggerFailure(String path, long size) throws IOException {
+    NamenodeProtocols nn = cluster.getNameNodeRpc();
+    List<LocatedBlock> locatedBlocks =
+      nn.getBlockLocations(path, 0, size).getLocatedBlocks();
+    
+    for (LocatedBlock lb : locatedBlocks) {
+      DatanodeInfo dinfo = lb.getLocations()[1];
+      ExtendedBlock b = lb.getBlock();
+      try {
+        accessBlock(dinfo, lb);
+      } catch (IOException e) {
+        System.out.println("Failure triggered, on block: " + b.getBlockId() +  
+            "; corresponding volume should be removed by now");
+        break;
+      }
+    }
+  }
+{code}
+Accessing those blocks will not trigger failures if the directory is read-only (while the block files are all there). I ran the tests multiple times without triggering this failure. We have to write new block files to the data directories, or we should have deleted the blocks correctly. I think we need to add some assertion code after triggering the volume failure. The assertions should check the datanode volume failure summary explicitly to make sure a volume failure is triggered (and noticed).
+# To make sure the NameNode be aware of the volume failure, the code explictily send block reports to NN.
+{code:title=TestDataNodeVolumeFailure#testVolumeFailure()}
+    cluster.getNameNodeRpc().blockReport(dnR, bpid, reports,
+        new BlockReportContext(1, 0, System.nanoTime(), 0, false));
+{code}
+Generating block report code is complex, which is actually the internal logic of {{BPServiceActor}}. We may have to update this code it changes. In fact, the volume failure is now sent by DataNode via heartbeats. We should trigger a heartbeat request here; and make sure the NameNode handles the heartbeat before we verify the block states.
+# When verifying via {{verify()}}, it counts the real block files and assert that real block files plus underreplicated blocks should cover all blocks. Before counting underreplicated blocks, it triggered the {{BlockManager}} to compute the datanode work:
+{code}
+    // force update of all the metric counts by calling computeDatanodeWork
+    BlockManagerTestUtil.getComputedDatanodeWork(fsn.getBlockManager());
+{code}
+However, counting physical block files and underreplicated blocks are not atomic. The NameNode will inform of the DataNode the computed work at next heartbeat. So I think this part of code may fail when some blocks are replicated and the number of physical block files is made stale. To avoid this case, I think we should keep the DataNode from sending the heartbeat after that. A simple solution is to set {{dfs.heartbeat.interval}} long enough.
+
+
+This unit test has been there for years and it seldom fails, just because it's never triggered a real volume failure.

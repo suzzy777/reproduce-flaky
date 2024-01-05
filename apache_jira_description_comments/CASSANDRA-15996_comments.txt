@@ -1,0 +1,125 @@
+[~dcapwell] The linked CI run is on 3.11. I haven't been able to reproduce this on trunk, and there is no evidence of flakiness in [ci-cassandra|https://ci-cassandra.apache.org/job/Cassandra-trunk/33/testReport/dtest-novnode.ttl_test/TestTTL/test_expiration_overflow_policy_capnowarn/]. For now I'm going to leave this open, but drop it from 4.0. Please let me know if you disagree.
+
+works for me.
+
+David encountered a failure in a variant of this test on trunk:
+https://app.circleci.com/pipelines/github/dcapwell/cassandra/622/workflows/adcd463c-156a-43c7-a9bc-7f3e4938dbe8/jobs/3514 
+
+Adding 4.0 fixver back on.
+
+I have been focusing on this one today and I want to share my findings. Here is the stdout from David's test for the record:
+
+{noformat}
+AssertionError: Log message should be print for CAP and CAP_NOWARN policy assert []
+self = <ttl_test.TestTTL object at 0x7f3cf857ccf8>
+
+    @since('2.1')
+    def test_expiration_overflow_policy_cap(self):
+>       self._base_expiration_overflow_policy_test(default_ttl=False, policy='CAP')
+
+ttl_test.py:343: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <ttl_test.TestTTL object at 0x7f3cf857ccf8>, default_ttl = False
+policy = 'CAP'
+
+    def _base_expiration_overflow_policy_test(self, default_ttl, policy):
+        """
+            Checks that expiration date overflow policy is correctly applied
+            @jira_ticket CASSANDRA-14092
+            """
+        MAX_TTL = 20 * 365 * 24 * 60 * 60  # 20 years in seconds
+        default_time_to_live = MAX_TTL if default_ttl else None
+        self.prepare(default_time_to_live=default_time_to_live)
+    
+        # Restart node with expiration_date_overflow_policy
+        self.cluster.stop()
+        self.cluster.start(jvm_args=['-Dcassandra.expiration_date_overflow_policy={}'.format(policy)])
+        self.session1 = self.patient_cql_connection(self.cluster.nodelist()[0])
+        self.session1.execute("USE ks;")
+    
+        # Try to insert data, should only fail if policy is REJECT
+        query = 'INSERT INTO ttl_table (key, col1) VALUES (%d, %d)' % (1, 1)
+        if not default_time_to_live:
+            query = query + "USING TTL %d" % (MAX_TTL)
+        try:
+            result = self.session1.execute_async(query + ";")
+            result.result()
+            if policy == 'REJECT':
+                self.fail("should throw InvalidRequest")
+            if self.cluster.version() >= '3.0':  # client warn only on 3.0+
+                if policy == 'CAP':
+                    logger.debug("Warning is {}", result.warnings[0])
+                    assert 'exceeds maximum supported expiration' in result.warnings[0], 'Warning not found'
+                else:
+                    assert not result.warnings, "There should be no warnings"
+    
+        except InvalidRequest as e:
+            if policy != 'REJECT':
+                self.fail("should not throw InvalidRequest")
+    
+        self.cluster.flush()
+        # Data should be present unless policy is reject
+        assert_row_count(self.session1, 'ttl_table', 0 if policy == 'REJECT' else 1)
+    
+        # Check that warning is always logged, unless policy is REJECT
+        if policy != 'REJECT':
+            node1 = self.cluster.nodelist()[0]
+            prefix = 'default ' if default_ttl else ''
+            warning = node1.grep_log("Request on table {}.{} with {}ttl of {} seconds exceeds maximum supported expiration"
+                                     .format('ks', 'ttl_table', prefix, MAX_TTL))
+>           assert warning, 'Log message should be print for CAP and CAP_NOWARN policy'
+E           AssertionError: Log message should be print for CAP and CAP_NOWARN policy
+E           assert []
+
+ttl_test.py:410: AssertionError
+{noformat}
+
+As we can see from the code above we're being called with policy 'CAP'. And following the test code we make it through to line 392 where we [check|https://github.com/apache/cassandra-dtest/blob/master/ttl_test.py#L392] there was a client warning indeed. So the TTL 'business logic' is happening and it's correct. The only bit missing is that being logged which falls on {{NoSpamLogger}}'s shoulders. I can only think of some edge case on {{NoSpamLogger}} missing to log, which would explain why it happens so seldom, why it hasn't been repro'ed so far and why I didn't manage to repro either even on a thinned down machine.
+
+[~Bereng] I noticed that too. I've been staring at NoSpam logger for a bit and haven't seen a way that it should fail in this way with a single request in flight. What did you have in mind for an edge case? 
+
+I looked a bit at the logs from the other failure and noticed one anomaly. I'm not sure how it could be related, but I noticed that server never emits the "Startup complete" message. We only have one example of this.
+
+The logs from the test run on this ticket are expired out of Circle. I was coming here to ask [~dcapwell] or anyone if they have other examples of this failing where the log files are still retained?
+
+The only 2 things that came to my mind are:
+- On node start, instead of relying on the patient cql connection, lets add flags to wait for the binary protocol and other startup stuff to complete i.e . But this is just a stab in the dark based on previous experience fixing tests. Just in case there is some esoteric race at startup.
+- {{NoSpamLogger}} has some shuffling of instances around that _maybe_ have a concurrency hole, _maybe_ I am just imagining things. I have to look at it for a while a bit longer to make up my mind. In any case I didn't see how that could affect in this particular case were usage is pretty straightforward and not multithreaded. So I am also at a loss here so far as well.
+
+
+
+bq. instead of relying on the patient cql connection, lets add flags to wait for the binary protocol and other startup stuff to complete
+The test already waits for binary protocol log-wise, and the connection is established after that. I'm not sure what else we would add. 
+
+bq. NoSpamLogger has some shuffling of instances around that maybe have a concurrency hole, maybe I am just imagining things. 
+I've stared at this quite a bit and I am reasonably confident there is not an issue with those mappings. Reasoning in part is as we have mentioned there is only a single request in-flight. The other is that no matter what kind of race we could come up with, worst case scenario is we create new wrappers -- there are no runtime errors and it's still using the same logger internally (if it was even the same key). Incidentally I have also never seen another {{NoSpamLogger}} message across thousands of runs of this test.
+
+With that in mind I stared a bit more at the [other thing|https://github.com/apache/cassandra/blob/699a1f74fcc1da1952da6b2b0309c9e2474c67f4/src/java/org/apache/cassandra/utils/NoSpamLogger.java#L78-L82] that could cause this not to be logged. {{minIntervalNanos}} is coming from a [static field|https://github.com/apache/cassandra/blob/699a1f74fcc1da1952da6b2b0309c9e2474c67f4/src/java/org/apache/cassandra/db/ExpirationDateOverflowHandling.java#L39] and guaranteed to be set to a known value. {{expected}} is the default zero-initialized value of an AtomicInteger. {{nowNanos}}, on the other hand, is coming from [{{System.nanoTime}}|https://github.com/apache/cassandra/blob/699a1f74fcc1da1952da6b2b0309c9e2474c67f4/src/java/org/apache/cassandra/utils/NoSpamLogger.java#L59-L62], which (TIL) can be [negative|https://docs.oracle.com/javase/8/docs/api/java/lang/System.html#nanoTime--]:
+
+bq. This method can only be used to measure elapsed time and is not related to any other notion of system or wall-clock time. The value returned represents nanoseconds since some fixed but arbitrary origin time (perhaps in the future, so values may be negative). 
+
+I haven't found a way to prove it, but presently this is my only plausible theory. I think we should switch NoSpamLogger to use {{currentTimeMillis}}. We know its non monotonic and may be less precise, but I think it fits the bill for the spirit of this class, where callers are specifying intervals on the order of whole seconds and minutes.
+
+Please let me know if anyone has thoughts on that.
+
+bq. I think we should switch NoSpamLogger to use currentTimeMillis.
+
+This, or we could initialize the {{NoSpamLogStatement}} to {{Long.MIN_VALUE}} instead of zero. I have the changes for either.
+
+Created two patches for consideration
+|[currentTimeMillis|https://github.com/aholmberg/cassandra/pull/13/files#diff-e2c5319b6d6b31133eb6f8daf05716ee2358471ae66ac8dedb1df5fd669e088b]|[ci|https://app.circleci.com/pipelines/github/aholmberg/cassandra?branch=CASSANDRA-15996]|
+|[Long.MIN_VALUE|https://github.com/aholmberg/cassandra/pull/14]|[ci|https://app.circleci.com/pipelines/github/aholmberg/cassandra?branch=CASSANDRA-15996-alt]|
+
+(also fixing what I believe to be incorrect behavior shown in one of the unit tests)
+
+That could be it indeed imo. Given NoSpamLogger is to be used in hot paths and 'currentTimeMillis' resolution issues I'd got for the 'Long.MIN_VALUE' route. Also that keeps things within the 'nanotime()' world, sort to speak, so we don't inadvertently introduce some perf profile change . Also [this|https://stackoverflow.com/a/54566928/3432945] read was interesting.
+
+I have +1'ed the 'Long.MIN_VALUE' PR pending sbdy that knows about the upgrade test failures confirming they are indeed unrelated. Nice catch either if it turn out to be it or not! :-)
+
+I guess that's just the state of upgrade tests right now. I wasn't sure because I hadn't been running them.
+
+https://ci-cassandra.apache.org/job/Cassandra-trunk-dtest-upgrade/lastBuild/
+
+Committed the min value patch to trunk.  Upgrade tests have been like some time now.
+

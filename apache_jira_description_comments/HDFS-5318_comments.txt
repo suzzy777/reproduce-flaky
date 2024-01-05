@@ -1,0 +1,500 @@
+Currently core Hadoop probably does not require this functionality. Should we consider pluggable interface to enable this?
+
+bq. Currently core Hadoop probably does not require this functionality. Should we consider pluggable interface to enable this?
+
+That seems reasonable.  I'll look at what the right level of abstraction should be for this and take a first cut at a patch.
+
+Attaching design document for pluggable replica counting.
+
+Thanks for posting a design doc. I will take a look at it today.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12619589/HDFS-5318.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 5 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:red}-1 javadoc{color}.  The javadoc tool appears to have generated -14 warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+        {color:red}-1 release audit{color}.  The applied patch generated 1 release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-hdfs-project/hadoop-hdfs:
+
+                  org.apache.hadoop.hdfs.TestClientReportBadBlock
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/5768//testReport/
+Release audit warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/5768//artifact/trunk/patchprocess/patchReleaseAuditProblems.txt
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/5768//console
+
+This message is automatically generated.
+
+Eric, your patch is implementing existing NN functionality via SPIs and not adding the proposed duplicate replica detection correct?
+
+I'll use logical replicas to refer to multiple views of the same physical replica on different DNs. I have some questions about the mechanics of exposing one storage via multiple DataNodes.
+# Is the Jira description still accurate i.e. will the storages have the same {{StorageID}} regardless of which DN exposes it? If this is true then there will be multiple {{DatanodeStorageInfo}} objects with the same {{StorageID}} on the NameNode.
+# Are you assuming that at most one DataNode will present the same physical storage as being read-write? (It looks like you are)
+# Which DataNode will be responsible for block reports/incremental block reports for a given storage? I am not sure how block report processing will be affected.
+# Will {{BlockInfo}} have one triplet for each logical replica? This means that the {{BlockInfo}} will have multiple {{DatanodeStorage}} entries which have the same {{StorageID}}. I am not sure this will work.
+# What is your intended behavior of {{getLocatedBlocks}}? Should one located block be exposed for each logical replica?
+
+I am concerned that we have not caught all the locations in the NameNode code where you will need to plug in, and catching them all will increase code complexity for the common case. As you mentioned in your doc to get this working we'd ideally need to fix the BlockManager to detect physical replicas by the target {{StorageID}}.
+
+Suresh and I had a quick chat about this offline. If there is just one read-write logical replica for a given physical replica at a time we may be able to support this more easily without needing pluggable interface, with the following assumptions:
+# Each DataNode presents a different {{StorageID}} for the same physical storage.
+# Read-only replicas don't count towards excess replicas. In fact read-only replicas of incomplete blocks should probably not be counted towards satisfying the target replication factor.
+# Per (2), incomplete blocks with just read-only replicas are corrupt since there is no append path to the block.
+# Read-only replicas cannot be pruned.
+# Read-only replicas are not included in the write pipeline.
+# Read-only storages will not be used for block placement.
+
+Some of these conditions should be already enforced by the NameNode today, we can fix the rest.
+
+bq. Eric, your patch is implementing existing NN functionality via SPIs and not adding the proposed duplicate replica detection correct?
+Correct - using a plugin interface to support this was requested by Suresh.  I will attach my current implementation of the SPI for reference.
+
+bq. 1. Is the Jira description still accurate i.e. will the storages have the same StorageID regardless of which DN exposes it? If this is true then there will be multiple DatanodeStorageInfo objects with the same StorageID on the NameNode.
+Yes, this is our current design and implementation.  The combination of ({{DatanodeUUID}}, {{StorageID}}) is a unique key.
+
+bq. 2. Are you assuming that at most one DataNode will present the same physical storage as being read-write? (It looks like you are)
+Short term - yes.  The initial implementation of our plugin will only report the same physical storage as read-write from one DataNode.
+Longer term - no.  In order to support a resilient pipeline for append (i.e. multi-node pipeline with repcount=1), we propose exposing the same storage as read-write via multiple DataNodes.  As mentioned in HDFS-5434, this will require out-of-band coordination within our {{FsDataset}} plugin to persist replicas to the shared storage in a consistent manner.
+
+bq. 3. Which DataNode will be responsible for block reports/incremental block reports for a given storage? I am not sure how block report processing will be affected.
+All the DataNodes that share the storage send block reports for that storage.  This makes the NameNode aware of the alternate read paths for the block, which it can then provide to clients via {{getBlockLocations()}} to spread I/O load.
+
+bq. 4. Will BlockInfo have one triplet for each logical replica? This means that the BlockInfo will have multiple DatanodeStorage entries which have the same StorageID. I am not sure this will work.
+Yes.  This seems to work fairly robustly in our test environment.  Taking a cursory look at the code, it appears that triplet lookup is done by {{DatanodeDescriptor}} and not {{StorageID}}:
+{code:title=BlockInfo.java}
+boolean addStorage(DatanodeStorageInfo) {
+    int idx = findDatanode(storage.getDatanodeDescriptor());
+}
+{code}
+I did note though that the initial sizing of the triplets array as {{3*replication}} will be off in our case (that's OK since it will get resized when necessary later).
+
+bq. 5. What is your intended behavior of getLocatedBlocks? Should one located block be exposed for each logical replica?
+Yes, the goal of replica sharing is to expose multiple DataNode read paths for a shared-replica to clients.
+
+bq. I am concerned that we have not caught all the locations in the NameNode code where you will need to plug in, and catching them all will increase code complexity for the common case.
+This is a fair concern.  Refactoring the {{BlockManager}} data structures to track physical replicas _directly_ as "first class objects" instead of via the DataNode that exposes them is a somewhat invasive change.  I think that it could be done in a manner that does not complicate the common case.  The pluggable replica "normalizer" is a first step at that.  I guess the questions are:
+# Is having shared replicas something HDFS wants to eventually support _directly_ (example use cases being non-local-disk blob storage backends like OpenStack Swift or Amazon S3)
+# If not directly supported by HDFS, is having a pluggable interface that allows for shared replica semantics worthwhile?
+
+Deferring this decision/work is reasonable, but I would like to revisit the broader change in the longer term (with a more comprehensive design doc and analysis).  Thoughts?
+
+bq. If there is just one read-write logical replica for a given physical replica at a time we may be able to support this more easily without needing pluggable interface
+
+This seems workable.  The basic design would be:
+* The R/W logical replica is used for all BlockManager processing (counting, tagging as excess/corrupt/decommissioned, etc.)
+* R/O logical replicas are considered only as possible block locations for reads (both for clients and inter-datanode replication).
+
+I'm not sure I understand the definition of an "incomplete" block.  Does that mean a finalized block whose length is less than the block size (i.e., a block with free capacity potential for append)?
+
+bq. Read-only replicas don't count towards excess replicas. In fact read-only replicas of incomplete blocks should probably not be counted towards satisfying the target replication factor.
+Read-only replicas should never count towards the target replication factor regardless of "complete" or "incomplete" right?  In the following scenario, the block should be classified as under replicated, right?
+* desired replication = 2 : NameNode has 1 R/O logical replica, 1 R/W logical replica
+
+bq. Incomplete blocks with just read-only replicas are corrupt since there is no append path to the block.
+I don't fully understand the implications here.  In a repcount=1 situation, when there is a single R/W logical replica and the DataNode that's hosting it goes offline, what happens?  I would propose the following:
+* replication count goes to 0
+* NameNode detects block as under replicated, triggers a replication from one of the (still online) R/O replicas to a new DataNode
+* replication count goes to 1
+* DataNode hosting the original R/W replica comes back online
+* replication count goes to 2
+* NameNode detects block as over-replicated, prunes one of the R/W replicas
+
+bq. Some of these conditions should be already enforced by the NameNode today, we can fix the rest.
+OK - the only place I see {{DatanodeStorageInfo.getState()}} currently referenced is in {{BlockPlacementPolicyDefault}}:
+{code:title=BlockPlacementPolicyDefault.java}
+    if (storage.getState() == State.READ_ONLY) {
+      logNodeIsNotChosen(storage, "storage is read-only");
+      return false;
+    }
+{code}
+
+{quote}
+I'm not sure I understand the definition of an "incomplete" block. Does that mean a finalized block whose length is less than the block size (i.e., a block with free capacity potential for append)?
+{quote}
+That is what I meant, sorry about the confusion.
+
+{quote}
+Read-only replicas should never count towards the target replication factor regardless of "complete" or "incomplete" right? In the following scenario, the block should be classified as under replicated, right?
+{quote}
+It is fair to count read-only replicas of complete blocks towards the target replication factor in general. However for your case since it is the same physical replica I guess it makes sense not to count it. If no one else is using r/o storages we can do this. Suresh had suggested the same yesterday.
+
+{quote}
+I don't fully understand the implications here. In a repcount=1 situation, when there is a single R/W logical replica and the DataNode that's hosting it goes offline, what happens? I would propose the following:
+{quote}
+I am not very familiar with how replica recovery works. Let me understand that and get back to you by next week.
+
+Arpit - have you had a chance to think any more on this?
+
+I agree that using "writability" of a replica as a proxy for deducing whether or not that replica is shared is a bit awkward.  However, I understand yours and Suresh's points and concerns raised above. 
+
+Should we proceed with the R/O approach as you outlined above and table the goal of more robustly introducing the concept of "logical" vs. "physical" replicas until the future?
+
+I am not opposed to inferring shared replicas from the read/write state. However you raised a question about recovery which I need to understand better. Will take a look this week.
+
+Hi Eric, I took a look at pipeline recovery today. It looks like the following cases are of interest:
+# Block is finalized, r/w replica is lost, r/o replica is available. In this case the existing NN replication mechanisms will cause an extra replica to be created (q. what happens if a client attempts to append before the replication happens? Client probably needs to be fixed to handle this).
+# Block is RBW. r/w replica is lost, r/o replica is available. In the usual case DFSClientOutputStream will recover the write pipeline by selecting another DN, transferring block contents to the new DN and inserting it in the write pipeline. However pipeline recovery will not work when the single replica in the pipeline is lost, as you guys already mentioned on HDFS-5318. I think you can use either the client side setting or block placement policy option in that case that is being discussed there.
+
+Updating the suggested approach:
+# Each DataNode presents a different StorageID for the same physical storage.
+# Read-only replicas are not counted towards satisfying the replication factor. This assumes that read-only replicas are 'shared' (i.e. what you called using "writability" of a replica as a proxy for deducing whether or not that replica is shared).
+# Read-only replicas cannot be pruned (follows from (2)).
+# Client should be able to bootstrap a write pipeline with read-only replicas.
+# Read-only storages will not be used for block placement.
+
+I am not sure if there are any special conditions wrt lease recovery that also need to be considered.
+
+I will work on a patch that addresses your points above and update the JIRA.
+
+bq. 1. Block is finalized, r/w replica is lost, r/o replica is available. In this case the existing NN replication mechanisms will cause an extra replica to be created
+Isn't this case equivalent to the case where the R/W replica is offline in general (i.e. not just for pipeline recovery)?  
+
+bq. q. what happens if a client attempts to append before the replication happens?
+Independent of how replicas are counted, whenever a R/W replica is offline, appends will not be possible (in the current implementation) until a new R/W replica is created (via inter-datanode replication from a R/O replica).  Are you proposing a solution to this (ability to create an append pipeline from only R/O replicas)?
+
+bq. 4. Client should be able to bootstrap a write pipeline with read-only replicas.
+Not sure I fully understand here.  Is this how you envision solving the append problem when R/W replica is offline?
+
+Yes, we must allow support starting pipeline when read-only replicas in case the r/w replica is offline else append will be broken. One way to do it is to generate a copy of the replica on a read-write storage and then kick off the pipeline.
+
+There is some precedence for doing so ({{DFSOutputStream#addDatanode2ExistingPipeline}}).
+
+Arpit - are you ok if I create a sub-JIRA for the append case?
+
+Yes of course.
+
+Patch file implementing changes as discussed in JIRA.
+* Exclude {{READ_ONLY}} storages in some code paths in {{BlockManager}}
+* Use {{BlockManager.countNodes}} in {{NamenodeFsck}} instead of read locations from client API.
+* Add {{TestReadOnlyStorages}} JUnit test.
+** Enhance {{SimulatedFSDataset}} with ability to read storage state from configuration.
+** Enhance {{MiniDFSCluster}} with ability to overlay configuration parameters for individual DataNodes in the mini-cluster.
+** Enhance {{Configuration}} with ability to overlay another {{Configuration}} object.
+
+The patch was generated against {{branch-2}}.
+
+I have created HDFS-5769 for bootstrapping a pipeline using r/o replicas.  As I wrote in that JIRA, I believe this can be applied to both the append and initial write cases.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12622971/HDFS-5318a-branch-2.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 4 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs:
+
+                  org.apache.hadoop.hdfs.server.balancer.TestBalancerWithNodeGroup
+                  org.apache.hadoop.hdfs.server.namenode.ha.TestHASafeMode
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/5871//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/5871//console
+
+This message is automatically generated.
+
+Hi Arpit - would appreciate any feedback you have on the patch when you get a chance.
+Also, as far as I can tell, the test failures is not related to the patch ({{testBlocksAddedWhileStandbyIsDown()}} passes in my environment and {{TestBalancerWithNodeGroup}} seems flaky -- see HDFS-4376).
+
+Hi Eric, thanks for the new patch. I will try to review it by the weekend.
+
+Update patch.  
+Add overload to {{BlocksMap.getStorages()}} that filters returned Iterable by storage state.  Use that overload in {{BlockManager}} instead of if...continue in loops.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12623422/HDFS-5318b-branch-2.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 4 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs:
+
+                  org.apache.hadoop.hdfs.server.balancer.TestBalancerWithNodeGroup
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/5899//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/5899//console
+
+This message is automatically generated.
+
+Hi Eric, initial feedback below.
+
+# BlockManager.java#chooseSourceDatanode
+#* Fix {{assert containingLiveReplicasNodes.size() == numReplicas.liveReplicas()}} in {{BlockManager#dumpBlockMeta}}.
+# MiniDFSCluster#startDataNodes
+#* Document what the new parameter {{dnConfOverlays}} is doing.
+# General:
+#* I think it would be a good idea to rename READ_ONLY to READ_ONLY_SHARED everywhere (including comments) and document the meaning. What do you think? Also we can document that replicas on READ_ONLY_SHARED storages are not counted towards live replicas.
+#* Remove lines with whitespace-only changes.
+# Testing
+#* Add test case for replication factor = 1, bring down read-write replica. Check metric counts. Is read-only replica used to replicate to  a read-write storage?
+#* rename function {{#test()}} to something better e.g. {{testReplicaCounting}}
+
+I am not sure if this change affects lease recovery. It would be good if someone familiar with how lease recovery works can take a quick look at the approach. We don't want read-only replicas to participate in recovery. What if all read-write replicas are unavailable?
+
+Arpit - thanks for the quick feedback.
+
+Unless otherwise specified, I have made the changes as you suggested.
+
+bq. I think it would be a good idea to rename READ_ONLY to READ_ONLY_SHARED everywhere (including comments) and document the meaning. What do you think?
+I agree, and have made the change in my new patch.
+
+bq. Remove lines with whitespace-only changes.
+I only saw one such instance (in {{SimulatedFsDataset}}) and have corrected it.
+
+bq. I am not sure if this change affects lease recovery. It would be good if someone familiar with how lease recovery works can take a quick look at the approach. We don't want read-only replicas to participate in recovery. What if all read-write replicas are unavailable?
+In our {{FsDatasetSpi}} plugin implementation, replicas are not exposed from {{READ_ONLY_SHARED}} storages until they are _finalized_ (by "exposed" I mean returned from incremental and full block reports).  This skirts many issues around lease recovery.  However:
+* The NameNode should not rely on this implementation detail of our {{FsDatasetSpi}} plugin
+* Finalized replicas can still participate in certain lease recovery scenarios
+
+I looked a bit into how the recovery locations are chosen.  The locations used in lease recovery come from {{BlockInfoUnderConstruction.getExpectedStorageLocations()}}.  That list is potentially updated with {{READ_ONLY_SHARED}} locations when a {{BLOCK_RECEIVED}} is processed from a {{READ_ONLY_SHARED}} storage.  
+
+It is fairly simple to exclude read-only replicas when {{DatanodeManager}} builds the {{BlockRecoveryCommand}} (much like stale locations are handled).  However, (as you point out), it's unclear what to do here if there are *zero* read-write replicas available.  I believe the desired behavior is for recovery to fail and the block be discarded (we can't really make any better guarantees due to lack of fsync()d data available on read/only nodes).  I think we would need to shortcircuit recovery earlier in this case (perhaps in {{FSNamesystem.internalReleaseLease()}}) since it's probably too late by the time {{DatanodeManager}} builds the {{BlockRecoveryCommand}}.  Am I wrong here?
+
+Another alternative is to skip read/only storages in {{BlockInfoUnderConstruction.addReplicaIfNotPresent}} (though this may have the undesired effect of no-opping block-received messages from read/only storages...  Thoughts?
+
+
+Hi Eric, I'm going to think about this some more.
+
+My first thought is that your plugin implementation is doing the right thing and there is no good reason for reporting {{READ_ONLY_SHARED}} replicas to NN unless finalized. However if not done right this could result in reported blocks being 'lost' and as you mentioned, skipping ROS storages in {{BlockInfoUnderConstruction.addReplicaIfNotPresent}} is a bad idea.
+
+I'm sure you are following HDFS-5194. FsDatasetSpi implementers are required to know too much 'out-of-band' knowledge of about the NN-DN protocol. Ideally the interface could be redone to avoid these problems. For now it may be an acceptable solution to just document this.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12624805/HDFS-5318c-branch-2.patch
+  against trunk revision .
+
+    {color:red}-1 patch{color}.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/5970//console
+
+This message is automatically generated.
+
+I am +1 on this approach. I think it's fine to document the requirement around reporting non-finalized replicas.
+
+Unless anyone else has objections I'll review the latest patch this week.
+
+Arpit - have you had a chance to review the patch?  Let me know if you need me to regenerate the patch against the latest branch-2.
+
+Yes could you please attach a current trunk patch, the latest one fails to apply.
+
+Regenerated patch file against trunk.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12627687/HDFS-5318-trunk.patch
+  against trunk revision .
+
+    {color:red}-1 patch{color}.  Trunk compilation may be broken.
+
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/6074//console
+
+This message is automatically generated.
+
+@Eric Sirianni could you post a rebased patch? I reviewed this today and the changes look mostly fine.
+
+A couple of questions:
+# It looks like read-only storages don't get returned to clients for read. Is this intentional?
+# It would be nice to have an additional test to verify corrupt blocks on read-only storages don't get counted towards corrupt blocks.
+
+Tag [~sirianni]
+
+bq. It looks like read-only storages don't get returned to clients for read. Is this intentional?
+Can you elaborate?  As far as I can see read-only storages _are_ returned to clients for read.  Also, the {{TestReadOnlySharedStorage}} JUnit validates that {{client.getLocatedBlocks()}} returns the read-only locations in addition to the normal ones.
+
+bq. It would be nice to have an additional test to verify corrupt blocks on read-only storages don't get counted towards corrupt blocks.
+I will look into adding this test case to {{TestReadOnlySharedStorage}}.
+
+Updated patch based on Arpit's feedback.
+
+You're right.
+
++1 pending Jenkins.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12629623/HDFS-5318-trunkb.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 4 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs:
+
+                  org.apache.hadoop.hdfs.server.balancer.TestBalancerWithNodeGroup
+                  org.apache.hadoop.hdfs.server.namenode.TestCacheDirectives
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/6169//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/6169//console
+
+This message is automatically generated.
+
+[~sirianni] are these failures related to the patch?
+
+For {{TestCacheDirectives.testCacheManagerRestart}}, the failure is in a comparison of BlockPool IDs:
+{noformat}
+Inconsistent checkpoint fields.
+LV = -52 namespaceID = 173186898 cTime = 0 ; clusterId = testClusterID ; blockpoolId = BP-447030995-67.195.138.22-1392762420027.
+Expecting respectively: -52; 2; 0; testClusterID; BP-2140913546-67.195.138.22-1392762411177.
+{noformat}
+I don't see how that could be related to my change.  That test also passes in my environment.
+
+For {{TestBalancerWithNodeGroup}}, the failure may be related to my change to {{MiniDFSCluster}} method signatures to allow for overlaying {{Configurations}} on individual {{DataNode}} objects.  I'm currently investigating and will update soon.
+
+
+Both of these are known flakies, so I'd be inclined just to go ahead and commit.
+
+Updated patch with fix for {{TestBalancerWithNodeGroup}}.
+
+Thanks [~andrew.wang].  I suspected the same thing after reading some JIRAs about {{TestBalancerWithNodeGroup}}.  However, it turns out I did actually introduce a bug there :).  The updated patch should fix it.
+
+Thanks for the heads up Andrew.
+
++1 pending Jenkins again. Verified {{TestBalancerWithNodeGroup}} passes with the latest patch.
+
+{color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12629857/HDFS-5318-trunk-c.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 4 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs.
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/6175//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/6175//console
+
+This message is automatically generated.
+
+I committed this to trunk, branch-2 and branch-2.4. Thanks for the contribution [~sirianni] and also thanks to [~sureshms] for suggesting this approach!
+
+SUCCESS: Integrated in Hadoop-trunk-Commit #5192 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/5192/])
+HDFS-5318. Support read-only and read-write paths to shared replicas. (Contributed by Eric Sirianni) (arp: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1569951)
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/conf/Configuration.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/PBHelper.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyDefault.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlocksMap.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeFsck.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/protocol/DatanodeStorage.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/DatanodeProtocol.proto
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSCluster.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSClusterWithNodeGroup.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/SimulatedFSDataset.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestReadOnlySharedStorage.java
+
+
+SUCCESS: Integrated in Hadoop-Yarn-trunk #487 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/487/])
+HDFS-5318. Support read-only and read-write paths to shared replicas. (Contributed by Eric Sirianni) (arp: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1569951)
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/conf/Configuration.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/PBHelper.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyDefault.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlocksMap.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeFsck.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/protocol/DatanodeStorage.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/DatanodeProtocol.proto
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSCluster.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSClusterWithNodeGroup.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/SimulatedFSDataset.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestReadOnlySharedStorage.java
+
+
+SUCCESS: Integrated in Hadoop-Hdfs-trunk #1679 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/1679/])
+HDFS-5318. Support read-only and read-write paths to shared replicas. (Contributed by Eric Sirianni) (arp: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1569951)
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/conf/Configuration.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/PBHelper.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyDefault.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlocksMap.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeFsck.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/protocol/DatanodeStorage.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/DatanodeProtocol.proto
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSCluster.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSClusterWithNodeGroup.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/SimulatedFSDataset.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestReadOnlySharedStorage.java
+
+
+SUCCESS: Integrated in Hadoop-Mapreduce-trunk #1704 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/1704/])
+HDFS-5318. Support read-only and read-write paths to shared replicas. (Contributed by Eric Sirianni) (arp: http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1569951)
+* /hadoop/common/trunk/hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/conf/Configuration.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/protocolPB/PBHelper.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockManager.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlockPlacementPolicyDefault.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/blockmanagement/BlocksMap.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NamenodeFsck.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/protocol/DatanodeStorage.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/proto/DatanodeProtocol.proto
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSCluster.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSClusterWithNodeGroup.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/SimulatedFSDataset.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestReadOnlySharedStorage.java
+
+

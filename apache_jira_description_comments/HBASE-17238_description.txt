@@ -1,0 +1,104 @@
+In HBase 1.x, if HMaster#assignMeta() assigns a non-DEFAULT_REPLICA_ID hbase:meta region, it would wrongly update the DEFAULT_REPLICA_ID hbase:meta region in-memory.  This caused the in-memory region state has wrong RS information for default replica hbase:meta region.  One of the problem we saw is a wrong type of SSH could be chosen and causing problems.
+
+{code}
+void assignMeta(MonitoredTask status, Set<ServerName> previouslyFailedMetaRSs, int replicaId)
+      throws InterruptedException, IOException, KeeperException {
+    // Work on meta region
+    ...
+    if (replicaId == HRegionInfo.DEFAULT_REPLICA_ID) {
+      status.setStatus("Assigning hbase:meta region");
+    } else {
+      status.setStatus("Assigning hbase:meta region, replicaId " + replicaId);
+    }
+    // Get current meta state from zk.
+    RegionStates regionStates = assignmentManager.getRegionStates();
+    RegionState metaState = MetaTableLocator.getMetaRegionState(getZooKeeper(), replicaId);
+    HRegionInfo hri = RegionReplicaUtil.getRegionInfoForReplica(HRegionInfo.FIRST_META_REGIONINFO,
+        replicaId);
+    ServerName currentMetaServer = metaState.getServerName();
+    ...
+    boolean rit = this.assignmentManager.
+      processRegionInTransitionAndBlockUntilAssigned(hri);
+    boolean metaRegionLocation = metaTableLocator.verifyMetaRegionLocation(
+      this.getConnection(), this.getZooKeeper(), timeout, replicaId);
+    ...
+        } else {
+      // Region already assigned. We didn't assign it. Add to in-memory state.
+      regionStates.updateRegionState(
+        HRegionInfo.FIRST_META_REGIONINFO, State.OPEN, currentMetaServer); <<--- Wrong region to update -->>
+      this.assignmentManager.regionOnline(
+        HRegionInfo.FIRST_META_REGIONINFO, currentMetaServer); <<--- Wrong region to update -->>
+    }
+    ...
+{code}
+
+Here is the problem scenario:
+Step 1: master failovers (or starts could have the same issue) and find default replica of hbase:meta is in rs1.
+{noformat}
+2016-11-26 00:06:36,590 INFO org.apache.hadoop.hbase.master.ServerManager: AssignmentManager hasn't finished failover cleanup; waiting
+2016-11-26 00:06:36,591 INFO org.apache.hadoop.hbase.master.HMaster: hbase:meta with replicaId 0 assigned=0, rit=false, location=rs1,60200,1480103147220
+{noformat}
+Step 2: master finds that replica 1 of hbase:meta is unassigned, therefore, HMaster#assignMeta() is called and assign the replica 1 region to rs2, but at the end, it wrongly updates the in-memory state of default replica to rs2
+
+{noformat}
+2016-11-26 00:08:21,741 DEBUG org.apache.hadoop.hbase.master.RegionStates: Onlined 1588230740 on rs2,60200,1480102993815 {ENCODED => 1588230740, NAME => 'hbase:meta,,1', STARTKEY => '', ENDKEY => ''}
+2016-11-26 00:08:21,741 INFO org.apache.hadoop.hbase.master.RegionStates: Offlined 1588230740 from rs1,60200,1480103147220
+2016-11-26 00:08:21,741 INFO org.apache.hadoop.hbase.master.HMaster: hbase:meta with replicaId 1 assigned=0, rit=false, location=rs2,60200,1480102993815
+{noformat}
+
+Step 3: now rs1 is down, master needs to choose which SSH to call (MetaServerShutdownHandler or normal ServerShutdownHandler) - in this case, MetaServerShutdownHandler should be chosen; however, due to wrong in-memory location, normal ServerShutdownHandler was chosen:
+
+{noformat}
+2016-11-26 00:08:33,995 INFO org.apache.hadoop.hbase.zookeeper.RegionServerTracker: RegionServer ephemeral node deleted, processing expiration [rs1,60200,1480103147220]
+2016-11-26 00:08:33,998 DEBUG org.apache.hadoop.hbase.master.AssignmentManager: based on AM, current region=hbase:meta,,1.1588230740 is on server=rs2,60200,1480102993815 server being checked: rs1,60200,1480103147220
+2016-11-26 00:08:34,001 DEBUG org.apache.hadoop.hbase.master.ServerManager: Added=rs1,60200,1480103147220 to dead servers, submitted shutdown handler to be executed meta=false
+{noformat}
+
+Step 4: Wrong SSH was chosen. Due to accessing hbase:meta failure, the SSH failed after retries.  Now the dead server was not processed; regions in that server remains un-usable (We have a solution that resolve this issue, but is undesirable: restarting master to cleanup the wrong in-memory state would make this problem go away):
+
+{noformat}
+2016-11-26 00:11:46,550 INFO org.apache.hadoop.hbase.master.handler.ServerShutdownHandler: Received exception accessing hbase:meta during server shutdown of rs1,60200,1480103147220, retrying hbase:meta read
+org.apache.hadoop.hbase.client.RetriesExhaustedException: Failed after attempts=351, exceptions:
+Sat Nov 26 00:11:46 EST 2016, null, java.net.SocketTimeoutException: callTimeout=60000, callDuration=68188: row '' on table 'hbase:meta' at region=hbase:meta,,1.1588230740, hostname=rs1,60200,1480103147220, seqNum=0
+
+	at org.apache.hadoop.hbase.client.RpcRetryingCallerWithReadReplicas.throwEnrichedException(RpcRetryingCallerWithReadReplicas.java:271)
+	at org.apache.hadoop.hbase.client.ScannerCallableWithReplicas.call(ScannerCallableWithReplicas.java:203)
+	at org.apache.hadoop.hbase.client.ScannerCallableWithReplicas.call(ScannerCallableWithReplicas.java:60)
+	at org.apache.hadoop.hbase.client.RpcRetryingCaller.callWithoutRetries(RpcRetryingCaller.java:200)
+	at org.apache.hadoop.hbase.client.ClientScanner.call(ClientScanner.java:320)
+	at org.apache.hadoop.hbase.client.ClientScanner.nextScanner(ClientScanner.java:295)
+	at org.apache.hadoop.hbase.client.ClientScanner.initializeScannerInConstruction(ClientScanner.java:160)
+	at org.apache.hadoop.hbase.client.ClientScanner.<init>(ClientScanner.java:155)
+	at org.apache.hadoop.hbase.client.HTable.getScanner(HTable.java:794)
+	at org.apache.hadoop.hbase.MetaTableAccessor.fullScan(MetaTableAccessor.java:602)
+	at org.apache.hadoop.hbase.MetaTableAccessor.fullScan(MetaTableAccessor.java:156)
+	at org.apache.hadoop.hbase.MetaTableAccessor.getServerUserRegions(MetaTableAccessor.java:555)
+	at org.apache.hadoop.hbase.master.handler.ServerShutdownHandler.process(ServerShutdownHandler.java:177)
+	at org.apache.hadoop.hbase.executor.EventHandler.run(EventHandler.java:129)
+	at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1142)
+	at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:617)
+	at java.lang.Thread.run(Thread.java:745)
+Caused by: java.net.SocketTimeoutException: callTimeout=60000, callDuration=68188: row '' on table 'hbase:meta' at region=hbase:meta,,1.1588230740, hostname=rs1,60200,1480103147220, seqNum=0
+	at org.apache.hadoop.hbase.client.RpcRetryingCaller.callWithRetries(RpcRetryingCaller.java:159)
+	at org.apache.hadoop.hbase.client.ResultBoundedCompletionService$QueueingFuture.run(ResultBoundedCompletionService.java:65)
+	... 3 more
+Caused by: java.io.IOException: Call to rs1/123.45.67.890:60200 failed on local exception: org.apache.hadoop.hbase.ipc.FailedServerException: This server is in the failed servers list: rs1/123.45.67.890:60200
+	at org.apache.hadoop.hbase.ipc.RpcClientImpl.wrapException(RpcClientImpl.java:1261)
+	at org.apache.hadoop.hbase.ipc.RpcClientImpl.call(RpcClientImpl.java:1229)
+	at org.apache.hadoop.hbase.ipc.AbstractRpcClient.callBlockingMethod(AbstractRpcClient.java:213)
+	at org.apache.hadoop.hbase.ipc.AbstractRpcClient$BlockingRpcChannelImplementation.callBlockingMethod(AbstractRpcClient.java:287)
+	at org.apache.hadoop.hbase.protobuf.generated.ClientProtos$ClientService$BlockingStub.scan(ClientProtos.java:32651)
+	at org.apache.hadoop.hbase.client.ScannerCallable.openScanner(ScannerCallable.java:372)
+	at org.apache.hadoop.hbase.client.ScannerCallable.call(ScannerCallable.java:199)
+	at org.apache.hadoop.hbase.client.ScannerCallable.call(ScannerCallable.java:62)
+	at org.apache.hadoop.hbase.client.RpcRetryingCaller.callWithoutRetries(RpcRetryingCaller.java:200)
+	at org.apache.hadoop.hbase.client.ScannerCallableWithReplicas$RetryingRPC.call(ScannerCallableWithReplicas.java:356)
+	at org.apache.hadoop.hbase.client.ScannerCallableWithReplicas$RetryingRPC.call(ScannerCallableWithReplicas.java:330)
+	at org.apache.hadoop.hbase.client.RpcRetryingCaller.callWithRetries(RpcRetryingCaller.java:126)
+	... 4 more
+Caused by: org.apache.hadoop.hbase.ipc.FailedServerException: This server is in the failed servers list: rs1/123.45.67.890:60200
+	at org.apache.hadoop.hbase.ipc.RpcClientImpl$Connection.setupIOstreams(RpcClientImpl.java:701)
+	at org.apache.hadoop.hbase.ipc.RpcClientImpl$Connection.writeRequest(RpcClientImpl.java:887)
+	at org.apache.hadoop.hbase.ipc.RpcClientImpl$Connection.tracedWriteRequest(RpcClientImpl.java:856)
+	at org.apache.hadoop.hbase.ipc.RpcClientImpl$Connection$CallSender.run(RpcClientImpl.java:266)
+{noformat}

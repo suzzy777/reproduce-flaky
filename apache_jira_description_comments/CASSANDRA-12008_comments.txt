@@ -1,0 +1,309 @@
+In this specific case it seems the streaming failed due to low {{streaming_socket_timeout}} value. We just found out our previous default of 1 hour was too low, and raised that to 24 hours on CASSANDRA-11840, on 3.0.7. Could you try increasing that and see if it helps with failed decommissions?
+
+That seems to have helped, the decommission I tried finished nicely.
+
+As for "nodetool decommission resume", can we have that? :)
+
+bq. As for "nodetool decommission resume", can we have that?
+
+It's definitely possible, so I will update the ticket to reflect that.
+
+I'm working on this ticket, currently decommission is not resumable after failure due to:
+
+- Node state is changed to {{LEAVING}} after decommission starts, and current source code prevents all states different from {{NORMAL}} to restart a decommission operation.
+- Streamed ranges are unknown for decommission node, thus although we could resume decommission, this operation will stream again all ranges.
+
+For solving them I propose the following initial approach:
+# Add a new {{isDecommissionMode}} flag.
+# Add a new {{SystemKeyspace.streamedRanges}} for storing transferred ranges.
+# Add a new {{SystemKeyspace.updateStreamedRanges}}.
+# Modify {{StorageService.streamRanges}}.
+
+2. and 3. may not be necessary because {{StreamStateStore.handleStreamEvent}} always updates {{SystemKeyspace.availableＲanges}} using {{SystemKeyspace.updateAvailableＲanges}} no matter if the session transferred or received ranges (Although received ranges is stored, current source code is not using this functionality), if we want to keep another keyspace for transferred ranges, we will still need to use {{SystemKeyspace.updateStreamedRanges}} which will be identical than {{SystemKeyspace.updateAvailableＲanges}}. So maybe we should adapt {{StorageService.streamRanges}} to use RangeStreamer that already has all implemented. WDYT [~pauloricardomg] and [~yukim]?
+
+Here's the source code of [StreamStateStore.handleＳtreamEvent|https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/dht/StreamStateStore.java#L62]
+
+Overall your approach looks good. thanks. See comments below:
+
+bq. Node state is changed to LEAVING after decommission starts, and current source code prevents all states different from NORMAL to restart a decommission operation.
+
+We can change that to allow starting a decommission operation only if state is {{NORMAL}} or {{LEAVING}}, and in addition to that have an {{isDecommissioning}} flag (similar to {{isRebuilding}} to prevent starting a deccommision while one is still running. We should unset that flag when the decommission finishes or fails.
+
+bq. So maybe we should adapt StorageService.streamRanges to use RangeStreamer that already has all implemented.
+
+I agree we can probably reuse the {{available_ranges}} table to store already transferred ranges during decommission, so let's start with that then since it's simpler. But we will probably need to truncate the table in the beginning of deccommision to cleanup previous state from bootstrap/rebuild. we will also need to update the table description to say that it's also used by decommission.
+
+bq. 2. and 3. may not be necessary because StreamStateStore.handleStreamEvent always updates SystemKeyspace.availableＲanges using SystemKeyspace.updateAvailableＲanges no matter if the session transferred or received ranges
+
+The problem is that {{RangeStreamer}} is used to receive ranges, while {{StorageService.streamRanges}} is used to send ranges, so I think adapting {{RangeStreamer}} to send ranges will be non-trivial. So it will probably easier to adapt {{StorageService.streamRanges}} to register the {{StreamStateStore}} as a {{StreamPlan}} listener so it will automatically store already transferred ranges during unbootstrap.
+
+A working skeleton is now available, you check it via https://github.com/apache/cassandra/compare/trunk...kdmu:trunk-12008
+
+Now we can relaunch decommission if it failed previously and {{AvailableRanges}} will be truncated according to {{OperationMode}}, but it seems {{StreamStateStore}} is not recording properly transferred ranges (nothing is recorded), I did a test with 3 nodes, decommissioning node2 and interrupting node1, i.e only node3 stream session will be completed, after partial decommission I manually checked {{AvailableRanges}} with {{SELECT * FROM system.available_ranges;}} which returned an empty result. I guess everything is set-up correctly, would you mind to taking a look?
+
+Thanks.
+
+bq. it seems StreamStateStore is not recording properly transferred ranges (nothing is recorded). I guess everything is set-up correctly, would you mind to taking a look?
+
+It seems {{SessionCompleteEvent}} currently only exposes [requested ranges|https://github.com/apache/cassandra/blob/3dcbe90e02440e6ee534f643c7603d50ca08482b/src/java/org/apache/cassandra/streaming/StreamEvent.java#L49], which will be empty since decommission does not request any ranges, but instead transfer its ranges to other nodes. 
+
+But it seems adding transferred ranges to {{SessionCompleteEvent}} will not be sufficient, as it is possible for a leaving node to transfer a range to multiple nodes (if there are 2 nodes leaving the ring at the same time, for example), so we cannot mark the range as transferred when a session completes with a particular peer. While this seem highly unlikely, it is a possible scenario so we should probably protect against that. WDYT [~yukim] ?
+
+My suggestion is to create a new system table {{streamed_ranges}} with the following schema:
+{noformat}
+CREATE TABLE streamed_ranges (
+operation text,
+peer inet,
+keyspace_name text,
+ranges set<blob>,
+PRIMARY KEY ((operation, keyspace_name), peer))
+{noformat}
+
+In this table we can store received or transferred ranges from any operation (rebuild, bootstrap, stream) per peer, and deprecate the {{available_ranges}} table in favor of this new table. With this we will be able to know if we can skip streaming a particular range to/from a specific peer, and account for the case where we stream a range to multiple peer, such as in decommission.
+
+After that, we will probaby need to add transferred ranges to {{StreamTransferTask}} so the transferred ranges can be added to {{SessionCompleteEvent}}, so we can mark them in the {{streamed_ranges}} table.
+
+Here's 3 operations I'm proposing for STREAMED_RANGES:
+- updateStreamedRanges(String description, InetAddress endpoint, String keyspace, Set<Range<Token>> range)
+- Set<Range<Token>> getAvailableRanges(String keyspace, InetAdress newReplica, IPartitioner partitioner)
+- void resetAvailableRanges()
+
+Briefly the flow is:
+# StreamPlan.transferRanges(InetAddress to, InetAddress connecting, String keyspace, Collection<Range<Token>> ranges)
+# StreamSession.addTransferRanges(String keyspace, Collection<Range<Token>> ranges, Collection<String> columnFamilies, boolean flushTables, long repairedAt)
+# StreamSession.addTransferFiles(Collection<SSTableStreamingSections> sstableDetails) which will create a new StreamTransferTask and add it to the Set<StreamTransferTask>, this set will be used for updating STREAMED_RANGES in StreamStateStore.
+
+As you can see {{updateStreamedRanges}} will need description, endpoint, keyspace and range, and when we reached 4, from each StreamTransferTask we can only obtain description and endpoint from {{StreamTransferTask.session}}, therefore some information is "lost" and {{updateStreamedRanges}} cannot be accomplished. Thus additionally I propose modify or add a new {{StreamSession.addTransferFiles}} to receive ranges and keyspace since it's where {{StreamTransferTask}} is created and {{StreamTransferTask}}.recordＴransferInformation(Collection<Range<Token>> range, Keyspace keyspace)
+
+WDYT? [~pauloricardomg] [~yukim]
+
+
+
+Here's a WIP patch of what I've proposed in last comment
+https://github.com/apache/cassandra/compare/trunk...kdmu:trunk-12008?expand=1
+
+Thanks for the patch! Overall the approach looks good, see improvement suggestions below:
+* We can probably add description and keyspace to {{StreamTransferTask}} constructor, and they don't need to be passed as argument to {{addTransferFilesAndRecord}} since they can be retrieved from: {{StreamSession.description()}} and {{details.ref.get().metadata.getKeyspaceName()}}.
+* As for the ranges each {{StreamTransferTask}} must store a {{Set<Range<Token>>}}, and each time a new transfer file is added via {{StreamTransferTask.addTransferFile}} its ranges are added to this set.
+** In order to not change the signature of {{StreamSession.addTransferFiles}} we can add a {{Collection<Range<Token>>}} to {{SSTableStreamingSections}} so it will be automatically added to {{StreamTransferTask}}.
+* You need to add description to {{getStreamedRanges}} otherwise the query will not work, since it's part of the partition key.
+* {{getChangedRangesForLeaving}} is used by other operations (such as removeNode or restoreReplica), so you should probably skip already streamed ranges on {{streamRanges}} instead.
+* With this new table design we no longer need to {{resetStreamedRanges}}, since there will be a row key for each operation/keyspace.
+** You will also need to modify bootstrap to use the {{streamed_ranges}} table instead of {{available_ranges}}, and since that table will become useless you can probably remove it.
+
+After that you can probably start working on dtests. Thanks!
+
+New WIP patch uploaded: https://github.com/apache/cassandra/compare/trunk...kdmu:trunk-12008?expand=1
+
+bq. In order to not change the signature of StreamSession.addTransferFiles we can add a Collection<Range<Token>> to SSTableStreamingSections so it will be automatically added to StreamTransferTask.
+Not sure if I did it correctly, but as I [did|https://github.com/apache/cassandra/compare/trunk...kdmu:trunk-12008?expand=1#diff-b397cc5438b1a4be20f026c9ec9ecd6eR367], all {{StreamTransferTask}} from {{getSSTableSectionsForRanges}} will have same ranges, so maybe it's redundant to add its ranges each time we invoke {{StreamTransferTask.addTransferFile}}
+
+bq. You will also need to modify bootstrap to use the streamed_ranges table instead of available_ranges, and since that table will become useless you can probably remove it.
+If you don't mind I'll leave it for later, I'll create another JIRA ticket for re-factoring existing resumable bootstrap code once this one is done.
+
+Thanks!
+
+I've been testing with current implementation. The set-up is 3 nodes, decommissioning node2 and interrupting node1 at beginning, i.e decommission failed, but all ranges streamed to node3 should be updated. It seems there's two problems:
+* If we are running decommission for first time, getStreamedRanges is still invoked raising a nodetool exception "Undefined column name operation", for solving that we probably should modify isDecommisioning flag behaviour, add a new flag indicating we are resuming or running for first time or add a new resumeDecommission method.
+* STREAMED_RANGES table is not updated, maybe is due to {{handleStreamEvent}} only updates the table if {{event.eventType == StreamEvent.Type.STREAM_COMPLETE}} and it seems that our StreamEvent status is FAILED, we may need to change this to also update the table when event failed.
+
+WDYT [~pauloricardomg] [~yukim]]
+
+Thanks for the patch, looking good! See comments below:
+
+bq. Not sure if I did it correctly, but as I did, all StreamTransferTask from getSSTableSectionsForRanges will have same ranges, so maybe it's redundant to add its ranges each time we invoke StreamTransferTask.addTransferFile
+
+You're right. In this case, let's just store a {{Map<String, Set<Range<Token>> transferredRangesPerKeyspace}} on {{StreamSession}} (populated by {{addTransferRanges}}) and used that instead on {{StreamStateStoreTest.handleStreamEvent}}, so we can get everything from the {{StreamSession}} itself. 
+
+bq. If you don't mind I'll leave it for later, I'll create another JIRA ticket for re-factoring existing resumable bootstrap code once this one is done.
+
+Sounds good! :-)
+
+bq. If we are running decommission for first time, getStreamedRanges is still invoked raising a nodetool exception "Undefined column name operation", for solving that we probably should modify isDecommisioning flag behaviour, add a new flag indicating we are resuming or running for first time or add a new resumeDecommission method.
+
+It seems {{getStreamedRanges}} is querying the [AVAILABLE_RANGES|https://github.com/kdmu/cassandra/blob/d546a0a855ef7c7060974920dd321caec4dbd2af/src/java/org/apache/cassandra/db/SystemKeyspace.java#L1328] table instead of {{STREAMED_RANGES}}, that's why is generating the {{Undefined column name operation}} error.
+
+bq. STREAMED_RANGES table is not updated, maybe is due to handleStreamEvent only updates the table if event.eventType == StreamEvent.Type.STREAM_COMPLETE and it seems that our StreamEvent status is FAILED, we may need to change this to also update the table when event failed.
+
+Maybe it's not working because of the previous error?  Perhaps it would help to add a unit test on {{StreamStateStoreTest}} to verify that {{updateStreamedRanges}} and {{getStreamedRanges}} is being populated correctly and working as expected. You can also add debug logs to troubleshoot.
+
+Minor nits:
+
+* Remove {{resetStreamedRanges()}} method
+* {{SystemKeyspace.getStreamedRanges}} is being called from inside a for-loop what may be inefficient, it's maybe better to retrieve it before and re-use it inside the loop.
+
+bq. It seems getStreamedRanges is querying the AVAILABLE_RANGES table instead of STREAMED_RANGES, that's why is generating the Undefined column name operation error.
+
+Unbelievable, but yes it was the error, already fixed it, thanks!
+
+bq. Maybe it's not working because of the previous error? Perhaps it would help to add a unit test on StreamStateStoreTest to verify that updateStreamedRanges and getStreamedRanges is being populated correctly and working as expected. You can also add debug logs to troubleshoot.
+
+
+Another stupid error, wasn't adding {{StreamTransferTask}} to {{SessionCompleteEvent}}, fixed.
+
+bq. SystemKeyspace.getStreamedRanges is being called from inside a for-loop what may be inefficient, it's maybe better to retrieve it before and re-use it inside the loop.
+
+I've added a new strategy, please let me know what do you think about it.
+
+Some additional modifications, we are not going to pass description to {{StreamTransferTask}} constructor, if we do so it will raise an error because when task is created {{StreamResultFuture}} is not initialized yet, thus {{StreamSession.description()}} will return a null value at creation time. So instead we will obtain {{StreamSession}} from {{StreamTransferTask.getSession()}} when each {{StreamTransferTask}} is complete i.e when {{StreamStateStore.handleStreamEvent}} is invoked. All these means that we are going to only pass its responsible keyspace.
+
+Some minor details：
+Don't know if there's some problem with current implementation or there's something weird in the set-up, but it skips twice the same range:
+{quote}
+DEBUG [RMI TCP Connection(9)-127.0.0.1] 2016-07-29 12:48:36,301 StorageService.java:4556 - Range (3074457345618258602,-9223372036854775808] already in /127.0.0.3, skipping
+DEBUG [RMI TCP Connection(9)-127.0.0.1] 2016-07-29 12:48:36,301 StorageService.java:4556 - Range (3074457345618258602,-9223372036854775808] already in /127.0.0.3, skipping
+{quote}
+I think it's the set-up itself since {{StorageService.getChangedRangesForLeaving}} is also returning the same range twice
+{quote}
+DEBUG [RMI TCP Connection(9)-127.0.0.1] 2016-07-29 12:48:36,289 StorageService.java:2526 - Range (3074457345618258602,-9223372036854775808] will be responsibility of /127.0.0.3
+DEBUG [RMI TCP Connection(9)-127.0.0.1] 2016-07-29 12:48:36,294 StorageService.java:2526 - Range (3074457345618258602,-9223372036854775808] will be responsibility of /127.0.0.3
+{quote}
+
+You can find latest working patch via: https://github.com/apache/cassandra/compare/trunk...kdmu:trunk-12008?expand=1
+
+
+Thanks for the update! See follow-up below:
+
+bq. I've added a new strategy, please let me know what do you think about it.
+
+Instead of building a {{streamedRangesPerEndpoints Map<InetAddress, Set<Range<Token>>}} manually, maybe it's better to modify {{getStreamedRanges}} to take a description and keyspace as argument an return a {{Map<InetAddress, Set<Range<Token>>}} by querying {{"SELECT * FROM system.streamed_ranges WHERE operation = ? AND keyspace_name = ?"}}.
+
+This way you can query {{getStreamedRanges}} directly to filter already transferred ranges when iterating {{rangesToStreamByKeyspace}}.
+
+bq. So instead we will obtain StreamSession from StreamTransferTask.getSession() when each StreamTransferTask is complete i.e when StreamStateStore.handleStreamEvent is invoked. All these means that we are going to only pass its responsible keyspace.
+
+I think we can simplify that and instead of adding {{transferTasks}} to {{SessionCompleteEvent}} we can simply add the session description and {{transferredRangesPerKeyspace}}, and that's all we will need to populate the streamed ranges on {{StreamStateStore}}.
+
+A minor nit is that the transferred ranges are always being overriden on {{addTransferRanges}} while you should append to the existing set if it's already present on {{transferredRangesPerKeyspace}}.
+
+bq. Don't know if there's some problem with current implementation or there's something weird in the set-up, but it skips twice the same range:
+
+this is for different keyspaces, so you should add the keyspace name in the log message so it's not confusing.
+
+bq. I think it's the set-up itself since StorageService.getChangedRangesForLeaving is also returning the same range twice
+
+that's probably for the same reason as above, maybe it would be a good idea to add the keyspace name in that log as well.
+
+Thanks for the review! A new patch is available: https://github.com/apache/cassandra/compare/trunk...kdmu:trunk-12008?expand=1
+
+Now everything is inside StreamCompleteEvent and keyspace is reflected in the log.
+
+Decommission dtests is available: https://github.com/kdmu/cassandra-dtest/commit/fd5c95f1b582155f969d4d6e52fc4a4bf46046b1
+
+Both tests are working properly, but I found that streamed range skipping behaviour log check-up is not working due log capacity (?), i.e. part of log is overwritten. I tried to test it by running another thread checking skipping behaviour alongside the main thread and it can find correctly the keyword, but it doesn't work if I do a watch_log_for as [L61|https://github.com/kdmu/cassandra-dtest/commit/fd5c95f1b582155f969d4d6e52fc4a4bf46046b1#diff-e726e64e1cbe236026689bfb926669cfR61] 
+
+Thanks for the update. This is looking better and we're nearly done, see follow up below:
+* Code
+** Fix indentation of {{logger.debug("DECOMMISSIONING")}} 
+** The {{isDecommissioning.get()}} should use a {{compareAndSet}} to avoid starting simultaneous decommision sessions. See the {{isRebuilding}} check. Also, add a test to verify it's not possible to start multiple decommission simultaneously based on the solution on CASSANDRA-11687 to avoid test flakiness.
+** on {{SessionCompleteEvent}} use {{Collections.unmodifiableMap}} when copying the {{transferredRangesPerKeyspace}} map to avoid modifications to the ma
+** In order to avoid allocating a {{HashSet}} when it's not necessary, change this {noformat}
+            Set<Range<Token>> toBeUpdated = new HashSet<>();
+            if (transferredRangesPerKeyspace.containsKey(keyspace))
+            {
+                toBeUpdated = transferredRangesPerKeyspace.get(keyspace);
+            }
+{noformat} with this: {noformat}
+            Set<Range<Token>> toBeUpdated = transferredRangesPerKeyspace.get(keyspace)
+            if (toBeUpdated == null)
+            {
+                toBeUpdated = new HashSet<>();
+            }
+{noformat}
+** {{Error while decommissioning node}} is never printed  because the {{ExecutionException}} is being wrapped in a {{RuntimeException}} on {{unbootstrap}}, so perhaps you can modify {{unbootstrap}} to throw {{ExecutionException | InterruptedException}} and catch that on {{decomission}} to wrap in {{RuntimeException}}.
+
+* dtests
+** Simply running {{stress read}} will not fail if the keys are not there, you need to either compare the retrieved keys or check that there was no failure on the stress process (see {{bootstrap_test}} for examples).
+** When verifying if the retrieved data is correct on {{resumable_decommission_test}}, you need to stop either node1 or node3 when querying the other otherwise the data may be in only one of these nodes (while it must be in both nodes, since RF=2 and N=2).
+** Perhaps reduce the number of keys to 10k so the test will be faster.
+** On {{resumable_decommission_test}} set {{stream_throughput_outbound_megabits_per_sec}} to {{1}} to the streaming will be slower and allow more time for interrupting.
+** Perhaps it's better for {{InterruptDecommission}} to watch on {{rebuild from dc}} since this is print before {{"Executing streaming plan for Unbootstrap"}}
+** Instead of counting for {{decommission_error}} you can add a {{self.fail("second rebuild should fail")}} after {{node2.nodetool('decommission')}} and on the {{except}} part perhaps check that the following message is being print on logs {{Error while decommissioning node}} - see new version of {{simple_rebuild_test}} from CASSANDRA-11687.
+** bq. I found that streamed range skipping behaviour log check-up is not working
+*** This is probably because the {{Range (-2556370087840976503,-2548250017122308073] already in /127.0.0.3, skipping}} message is only being print on {{debug.log}} so you should pass a {{filename='debug.log'}} to {{watch_log_for}}.
+
+When you modify {{StreamStateStore}} to {{updateStreamedRanges}} for requested ranges (ie. bootstrap), there could be a collision between received and transferred ranges for the same peer. While this collision will not show up in decommission, bootstrap and rebuild, since we only transfer in one direction, this may be confusing and source of problems in the future, so in order to avoid creating another table to support that in the future, I think we can modify {{streamed_ranges}} to include an {{outgoing}} boolean primary key field indicating if it's an incoming or outgoing transfer. WDYT [~yukim] [~kdmu]?
+
+Isn't the name {{streamed_ranges}} already indicate outgoing only?
+The source of {{streamed_ranges}} is {{transferredRangesPerKeyspace}} and it should be only appear when there is outgoing stream.
+
+New dtests patch: https://github.com/riptano/cassandra-dtest/compare/master...kdmu:cassandra-12008?expand=1
+New implementation patch: https://github.com/apache/cassandra/compare/trunk...kdmu:trunk-12008?expand=1
+
+bq. Error while decommissioning node is never printed because the ExecutionException is being wrapped in a RuntimeException on unbootstrap, so perhaps you can modify unbootstrap to throw ExecutionException | InterruptedException and catch that on decomission to wrap in RuntimeException.
+Now ExecutionException ｜ InterruptedException is handled directly by unbootstrap.
+
+bq. When verifying if the retrieved data is correct on resumable_decommission_test, you need to stop either node1 or node3 when querying the other otherwise the data may be in only one of these nodes (while it must be in both nodes, since RF=2 and N=2).
+Instead of stopping and starting nodes, I changed stress read with a CL=TWO, in this way I guess we can ensure that node1 and node3 is "replying" to the request. Also if we do stop and restart node, it seems the restarted node will raise an error due to it is looking on node2 log that restarting node is alive which such operation is not possible since node2 is decommissioned.
+
+bq. Instead of counting for decommission_error you can add a self.fail("second rebuild should fail") after node2.nodetool('decommission') and on the except part perhaps check that the following message is being print on logs Error while decommissioning node
+I guess I'll use insetead  assertRaises which seems more suitable to ensure NodetoolError is raised. WDYT [~pauloricardomg] [~yukim]?
+
+Thanks for the update, [~kdmu].  Great job! I think the patch is ready to be committed, can you double check [~yukim]?
+
+In order to prepare for commit, squash and rebase to latest trunk, add an entry on the top of {{CHANGES.txt}} and set the commit message to the following format:
+{noformat}
+Allow updating DynamicEndpointSnitch properties via JMX
+   
+patch by sankalp kohli; reviewed by Robert Stupp for CASSANDRA-12179
+{noformat}
+
+minor nit: typo on {{transfereedRangePerKeyspace}} (should be transferredRangesPerKeyspace).
+
+I submitted a CI and multiplexer run with the current tests:
+||trunk||dtest||
+|[branch|https://github.com/apache/cassandra/compare/trunk...pauloricardomg:trunk-12008]|[branch|https://github.com/riptano/cassandra-dtest/compare/master...pauloricardomg:12008]|
+|[testall|http://cassci.datastax.com/view/Dev/view/paulomotta/job/pauloricardomg-trunk-12008-testall/lastCompletedBuild/testReport/]|
+|[dtest|http://cassci.datastax.com/view/Dev/view/paulomotta/job/pauloricardomg-trunk-12008-dtest/lastCompletedBuild/testReport/]|
+|[multiplexer 100x|https://cassci.datastax.com/view/Parameterized/job/parameterized_dtest_multiplexer/215/]|
+
+The dtest is nearly done but need a little bit more working:
+
+* Changing the CL to TWO is not sufficient since the data will be present in one of the nodes, after decommission you need to stop one of the nodes and then do the query (see {{bootstrap_test.py}} for reference).
+* Set {{stream_throughput_outbound_megabits_per_sec=1}} on {{simple_decommission_test}} and {{node2.watch_log_for('DECOMMISSIONING')}} before starting the second decommission to avoid the race of CASSANDRA-11687.
+* Make the skipped range check more specific, you can probably use wildcards in {{grep_log_for}}, something like {{"Skipping transferred range .* of keyspace keyspace1, endpoint /127.0.0.3"}}.
+* Check that {{Error while decommissioning node}} is being print on node2 on {{resumable_decommission_test}}
+* Move the tests to {{topology_test.py}} since decommission tests are present there (there is already a {{simple_decommission_test}} so rename yours to some other name)
+
+After those are addressed you can go ahead and submit the pull request for the dtests and post the link here. Thanks!
+
+It seems the CI dtests failed I think due to some recent changes in dtest that probably require a update/rebase in your branch. 
+
+Now that CASSANDRA-12377 will add byteman support to 2.2+, can you modify {{simple_decommission_test}} to use byteman to abort the stream session since that's more reliable? Thanks!
+
+Thanks for the review!
+Implementation patch: https://github.com/apache/cassandra/compare/trunk...kdmu:trunk-12008?expand=1
+Dtests patch: https://github.com/riptano/cassandra-dtest/compare/cassandra-12008...kdmu:cassandra-12008?expand=1
+
+Brief summary: 
+* Move tests inside of topology_test
+* Use insert_c1c2 and query_c1c2 instead of stress w/r
+* simple_decommission_test -> concurrent_decommission_not_allowed_test
+* Byteman injection instead of log look-up
+* Fixed nits
+
+If everything looks good, I'll open a PR.
+
+bq. It seems the CI dtests failed I think due to some recent changes in dtest that probably require a update/rebase in your branch. 
+You mean that I have to rebase my remote branch?
+
+Thanks for the update. I think it looks good now! I submitted a few test runs (below), and if these look good you can go ahead and open the PR.
+
+bq. You mean that I have to rebase my remote branch?
+
+yes, normally before committing you do a git-rebase on top of the updated remote branch and also squash multiple commits into a single commit. I did this in the implementation and dtests branches below, and also submitted cstar test runs:
+
+||trunk||dtest||
+|[branch|https://github.com/apache/cassandra/compare/trunk...pauloricardomg:trunk-12008]|[branch|https://github.com/riptano/cassandra-dtest/compare/master...pauloricardomg:12008]|
+|[testall|http://cassci.datastax.com/view/Dev/view/paulomotta/job/pauloricardomg-trunk-12008-testall/lastCompletedBuild/testReport/]|
+|[dtest|http://cassci.datastax.com/view/Dev/view/paulomotta/job/pauloricardomg-trunk-12008-dtest/lastCompletedBuild/testReport/]|
+|[multiplexer resumable_decommission_test|https://cassci.datastax.com/view/Parameterized/job/parameterized_dtest_multiplexer/219/]|
+|[multiplexer concurrent_decommission_not_allowed_test|https://cassci.datastax.com/view/Parameterized/job/parameterized_dtest_multiplexer/220/]|
+
+I've opened a pr: https://github.com/riptano/cassandra-dtest/pull/1192
+
+dtests and multiplexer runs for [resumable_decommission_test|https://cassci.datastax.com/view/Parameterized/job/parameterized_dtest_multiplexer/230/] and [concurrent_decommission_not_allowed_test|https://cassci.datastax.com/view/Parameterized/job/parameterized_dtest_multiplexer/242/] look good, marking as ready to commit.
+
+Commmitted as {{fa4255f06b0cc37051a69be20fd20e8e57798702}}.
+Nice work!
+

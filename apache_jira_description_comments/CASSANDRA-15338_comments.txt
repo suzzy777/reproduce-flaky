@@ -1,0 +1,138 @@
+cc [~ifesdjeen]
+
+
+
+The test failure reported here is caused by the flaky {{testAcquireReleaseOutbound}} in CASSANDRA-15308. 
+After fixing {{testAcquireReleaseOutbound}}, all tests in {{ConnectionTest}} can pass happily. 
+
+The repeated local runs of {{ConnectionTest}} using either Java 8 and 11 proved the test failure as described in this ticket did not show up. 
+
+{code:java}
+Switched to Java 8
+12:42:00 in cassandra on CASSANDRA-15308
+➜ while [[ "$(ant testclasslist -Dtest.classlistfile=<(echo org/apache/cassandra/net/ConnectionTest.java) | grep -c 'BUILD SUCCESSFUL')" == "1" ]]; do echo "It was a good run."; done
+It was a good run.
+It was a good run.
+It was a good run.
+It was a good run.
+It was a good run.
+It was a good run.
+It was a good run.
+It was a good run.
+It was a good run.
+It was a good run.
+It was a good run.
+It was a good run.
+It was a good run.
+It was a good run.
+It was a good run.
+It was a good run.
+It was a good run.
+It was a good run.
+It was a good run.
+It was a good run.
+It was a good run.
+It was a good run.
+^C%
+13:10:47 in cassandra on CASSANDRA-15308 took 28m 39s
+➜ j11
+Switched to Java 11
+13:10:49 in cassandra on CASSANDRA-15308
+➜  while [[ "$(ant testclasslist -Dtest.classlistfile=<(echo org/apache/cassandra/net/ConnectionTest.java) -Duse.jdk11=true | grep -c 'BUILD SUCCESSFUL')" == "1" ]]; do echo "It was a good run."; done
+It was a good run.
+It was a good run.
+It was a good run.
+It was a good run.
+It was a good run.
+It was a good run.
+It was a good run.
+It was a good run.
+It was a good run.
+It was a good run.
+It was a good run.
+^C%
+{code}
+ 
+
+The test failure was not able to be reproduced when simply running it from my laptop. 
+ 
+However, it can be easily reproduced when running in a docker container with limited CPUs (i.e., 2). 
+ 
+After multiple runs, the observation was that the test runs only failed when testing with LargeMessage. It indicated that the failures were probably related with {{LargeMessageDelivery}}. 
+ 
+The following is what I think have happened. 
+# When the {{inbound}} just opened and the first message gets queued into the {{outbound}}, handshake happens and the execution was deferred once the connection was established (executeAgain). 
+# Since enqueue is not blocking, the next line, {{unsafeRunOnDelivery}} runs immediately. The effect is that the runnable gets registered, but not run yet. 
+# Connection is established, so we {{executeAgain()}}. Because the runnable {{stopAndRun}} is present, and at this point, the {{inProgress}} flag is still false. The test runs the runnable, which counts down {{deliveryDone}} unexpectedly. 
+# Delivery proceeds to flush the message. In {{LargeMessageDelivery}}, the flush is async and race condition can happen.
+   ## when the inbound has received message (and countdown receiveDone)
+   ## {{LargeMessageDelivery}} is still polling for the completion of flush, so not yet release capacity. 
+
+Therefore, the assertion on the pendingCount failed. 
+ 
+There are 2 places in the test flow are (or can go) wrong. See step 3 and step 4. 
+
+Regarding step 3, the runnable {{stopAndRun}} should not be registered when establishing the connection. In production, is there a case that a {{stopAndRun}} being registered this early? Probably not.
+
+Regarding step 4, the {{outbound}} has no knowledge about whether the {{inbound}} has received any message. Test should register the runnable {{stopAndRun}} at the message handler to count down the {{deliveryDone}}. Therefore, the runnable can correctly wait for the current delivery to complete. Then it runs. 
+ 
+PR is here: https://github.com/apache/cassandra/pull/466
+
+As mentioned, I reproduced using the docker. Here is the bundle that one can simply download and run.  [^CASS-15338-Docker.zip] It runs {{ConnectionTest}} repeatedly until failures.
+I have included the patch within the image too. 
+
+To reproduce, run
+{code:bash}
+bash build_and_run.sh
+{code}
+
+To see the runs with the patch, run
+{code:bash}
+bash build_and_run.sh patched
+{code}
+
+[~yifanc] [~dcapwell] [~ifesdjeen] is anyone reviewing this one?
+
+not started yet, looked at the other one only.
+
+[~benedict][~dcapwell], do you want to take a look?
+
+I have a few things on my plate, I should be able to look end of the week?
+
+I [~dcapwell] are you still on that?
+
+nope, still too much on my plate.  This patch requires me to review closer which I am struggling with the time on atm =(
+
+[~dcapwell] I can start reviewing this one tomorrow, if it's ok with you
+
+Sounds great thanks!
+
+Looks good to me. [~yifanc] do you need me to commit it?
+
+Thanks [~adelapena]. That will be great. Please proceed. 
+
+Committed to trunk as [753b40eb0f570fc88b5211b9bcea04761a240071|https://github.com/apache/cassandra/commit/753b40eb0f570fc88b5211b9bcea04761a240071].
+
+[~yifanc] this test is still flakey, but now hitting TimeoutException: https://app.circleci.com/pipelines/github/dcapwell/cassandra/362/workflows/c04020b0-d13e-4e18-ae27-0277e636b73d/jobs/1858
+
+
+Thanks for reporting, [~dcapwell].
+
+The test failure in the link is timeout (30 seconds) when closing the inbound connection. I will take a closer look later. 
+
+Just took another look. The exception is not expected. Pasting the stack trace.
+{code:java}
+java.util.concurrent.TimeoutException
+	at org.apache.cassandra.net.AsyncPromise.get(AsyncPromise.java:258)
+	at org.apache.cassandra.net.FutureDelegate.get(FutureDelegate.java:143)
+	at org.apache.cassandra.net.ConnectionTest.doTestManual(ConnectionTest.java:268)
+	at org.apache.cassandra.net.ConnectionTest.testManual(ConnectionTest.java:236)
+	at org.apache.cassandra.net.ConnectionTest.testMessagePurging(ConnectionTest.java:679)
+{code}
+
+In the test, testMessagePurging, it already closed the inbound connection. The test does not throw at that line, so I would assume that inbound is closed successfully. 
+
+If so, we should not see the Timeout exception from {{doTestManual(ConnectionTest.java:268)}}. Because the inbound is closed already. 
+
+I suspect that there might be some hidden issue in the {{close()}} method. I will open a new ticket if it is. 
+

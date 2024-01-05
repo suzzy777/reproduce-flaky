@@ -1,0 +1,656 @@
+Hi [~ben.roling], 
+
+I think I know about the problem you are talking about. We know about this issue, but we try to solve it from another end. 
+
+In a nutshell: We have a When using S3 with S3Guard, ALL of the clients using the S3Guarded bucket should use the same Dynamo table. When you don't use S3Guard or use the S3 bucket with another dynamo table, and you do modifications and no just read that's an {{out of band operation}}. We don't support this now.
+
+We created the following Jira for this: HADOOP-15999, and I'm currently working on it to fix this - to give {{authoritative mode = true}} additional meaning when you MUST use the same dynamo table, but if you set {{authoritative mode = false}} S3 will be queried all the time for changes.
+
+[~gabor.bota] thanks for the response.  You are hitting on a different issue than I was trying to get at.  The problem I am referencing (assuming I understand the system well enough myself) is present even if all parties are always using S3Guard with the same config.
+
+Consider a process writes s3a://my-bucket/foo.txt with content "abc".  Another process comes along later and does an overwrite of s3a://my-bucket/foo.txt with "def".  Finally, a reader process reads s3a://my-bucket/foo.txt.  S3Guard ensures the reader knows that s3a://my-bucket/foo.txt exists and that the reader sees something, but does nothing to ensure the reader sees "def" instead of "abc" as the content.
+
+That was a contrived example.  One place I see this as likely to occur is during failure and retry scenarios of multi-stage ETL pipelines.  Stage 1 runs, writing to s3://my-bucket/output, but fails after writing only some of the output files that were supposed to go into that directory.  The stage is re-run with the same output directory in an overwrite mode such that the original output is deleted and the job is rerun with the same s3://my-bucket/output target directory.  This time the run is successful, so the ETL continues to Stage 2, passing s3://my-bucket/output as the input.  When Stage 2 runs, S3Guard ensures it sees the correct listing of files within s3://my-bucket/output, but does nothing to ensure it reads the correct version of each of these files if the output happened to vary in any way between the first and second execution of Stage 1.
+
+One way to avoid this is to suggest that a re-run of a pipeline stage should always use a new output directory, but that is not always practical.
+
+What you've described is a different issue what I answered in my first comment. It could be new a feature in S3Guard, and as I can see [~stevel@apache.org] already moved this to the uber jira.
+
+Thanks for the feedback.  I've went ahead and started drafting a patch.  I'll appreciate any review you can provide when it is ready.
+
+Hi guys. We've thought about this issue a little in the past. You are right that S3Guard mostly focuses on metadata consistency. There is some degree of data consistency added (e.g. it stops you from reading deleted files or from missing recently created ones), but we don't store etags or object versions today.
+
+Working on a patch would be a good learning experience for the codebase, which I encourage. Also feel free to send S3Guard questions our way (even better ask on the email list and cc: us so others can learn as well.) The implementation would need to consider some things (off the top of my head) below. Not necessary for an RFC patch but hope it helps with the concepts.
+ - Should be zero extra round trips when turned off (expense in $ and performance).
+ - Would want to figure out where we'd need additional round trips and decide if it is worth it. Tests that assert certain number of S3 ops will need to be made aware, and documentation should outline the marginal cost of the feature).
+ - What is the conflict resolution policy and how is it configured? If we get an unexpected etag/version on read, what do we do? (e.g. retry policy then give up, or retry then serve non-matching data. In latter case, do we update the S3Guard MetadataStore with the etag/version we ended up getting from S3?)
+ - The racing writer issue. IIRC two writers racing to write the same object (path) in S3 cannot tell which of them will actually have their version materialized, unless versioning is turned on. This means if we supported this feature without versioning (just etags) it would be prone to the same sort of concurrent modification races that S3 has today. We at least need to document the behavior.
+ - Backward / forward compatible with existing S3Guarded buckets and Dynamo tables.
+ - Understand and document any interactions with MetadataStore expiry (related jira). In general, data can be expired or purged from the MetadataStore and the only negative consequence should be falling back to raw-S3 like consistency temporarily. This allows demand-loading the MetadataStore and implementing caching with the same APIs.
+ - Another semi-related Jira to check out [here|https://issues.apache.org/jira/browse/HADOOP-15779].
+
+Thanks for the thoughts [~fabbri].  I have an initial patch that I will upload soon.  The patch stores object versionId and as such only provides read-after-overwrite protection if object versioning is enabled.  If object versioning is not enabled on the bucket, things would function the same as before.
+
+I hadn't really considered storing eTags instead.  I'll look at the feasibility of doing that as it could remove the dependency on enabling object versioning to make the feature more broadly applicable.  I think my organization is likely to enable object versioning anyway, but if S3Guard doesn't depend on it then more folks may benefit.
+
+Thanks for your list of considerations.  Here are some responses:
+ * The feature is always enabled and adds zero round trips.  versionId was available already on the PutObject response so I'm just capturing it and storing it.  This is the way it is in my patch anyway.  I'm curious for feedback if you believe there should be a capability to toggle the feature on or off?
+ * There isn't really a conflict resolution policy.  If we have versionId in the metadata, we provide it on the GetObject request.  We either get back what we are looking for or a 404.  I'm guessing 404s are not going to happen (except if the object is deleted outside the context of S3Guard, but that's outside the scope of this).  I assume read-after-overwrite inconsistencies in general with S3 happen due to cache hits on the old version, but when the version (eTag or versionId) is explicitly specified there should be no cache hit and we would get the same read-after-write consistency as you get on an initial PUT (no overwrite).  Even if I am wrong, the worst case is you get a FileNotFoundException, which is much better than an inconsistent read and no error.  Retries could be added on 404, but maybe wait until it is proven they are necessary.
+ * I'm not trying to protect against a racing writer issue.  I can add something to the documentation about it.
+ * The changes are backward and forward compatible with existing buckets and tables.  The new versionId attribute is optional.
+ * MetadataStore expiry should be fine.  The versionId is optional.  If it isn't there, no problem.  The only risk of inconsistent read-after-overwrite is if the metadata is purged more quickly than S3 itself becomes read-after-overwrite consistent for the object being read.  I can update documentation to mention this.
+ * I guess with regard to HADOOP-15779, there could be a new type of S3Guard metadata inconsistency.  If an object is overwritten outside of S3Guard, S3Guard will not have the correct eTag or versionId and the reader may end up seeing either a 404 or the old content.  Prior to this, the reader would see whatever content S3 returns on a GET that is not qualified by eTag or versionId.
+
+I've attached my first version of the patch.  It's based on 3.2.0 rather than trunk.  I was having a bit of trouble with the build and running the tests when I was working off master and I switched over to 3.2.0.  I need to port it back over to trunk but there are some conflicts I need to resolve in doing so.  Anyway, if anyone wants to have a look at the initial patch it should give you a general idea of the changes.  It's not terribly complicated.
+
+Bear in mind, I am still also evaluating switching over to etags instead of versionId.
+
+the enemy here is eventual consistency. Which is of course the whole reason S3Guard was needed. 
+
+What issues are we worrying about
+
+# mixed writer: some not going with s3guard, some doing. Even in nonauth mode, I worry about delete tombstones.
+# failure during large operations and so s3 not being in sync with the store.
+# failure during a workflow with one or more GET calls on the second attempt picking up the old version.
+
+HADOOP-15625 is going to address the changes within an open file through etag comparison, but without the etag being cached in the S3Guard repo, it's not going to detect inconsistencies between the version expected and the version read.
+
+Personally, I'm kind of reluctant to rely on S3Guard for being the sole defence against this problem. 
+
+bq.  a re-run of a pipeline stage should always use a new output directory,
+
+if you use the S3A committers for your work, and the default mode -insert a guid into the filename- then filenames are always created unique. It becomes impossible to get a RAW inconsistency. This is essentially where we are going, along with Apache Iceberg (incubating). Rather than jump through hoop-after-hoop of workarounds for S3s apparent decision to never deliver consistent views, come up with data structures which only need one point of consistency (you need to know the unique filename of the latest iceberg file).
+
+Putting that aside, yes, keeping version markers would be good. I like etags because they are exposed in getFileChecksum(); their flaw is that they can be very large on massive MPUs (32bytes/block uploaded). 
+
+
+BTW, if you are worried about how observable is eventual consistency, generally its delayed listings over actual content. There's a really good paper with experimental data which does measure how often you can observe RAW inconsistencies http://www.aifb.kit.edu/images/8/8d/Ic2e2014.pdf
+
+
+Thanks for submitting a patch [~ben.roling]. Haven't had a chance to do a full review yet, but one of [~fabbri]'s comments was also high on my list of things to watch out for:
+{quote}Backward / forward compatible with existing S3Guarded buckets and Dynamo tables.{quote}
+Specifically, we need to gracefully deal with any row missing an object version. The other direction is easy - if this simply adds a new field, old code will ignore it and we'll continue to get the current behavior.
+
+My other concern is that this requires enabling object versioning. I know [~fabbri] has done some testing with that and I think eventually hit issues. Was it just a matter of the space all the versions were taking up, or was it actually a performance problem once there was enough overhead?
+
+Thanks for keeping the feedback coming!
+
+ 
+
+[~stevel@apache.org]
+{quote}if you use the S3A committers for your work, and the default mode -insert a guid into the filename- then filenames are always created unique.  It becomes impossible to get a RAW inconsistency. This is essentially where we are going, along with Apache Iceberg (incubating).
+{quote}
+Most of our processing is currently in Apache Crunch, for which the S3A committers don't really seem to apply at the moment.
+
+I've seen the Apache Iceberg project and it does look quite interesting.  It's not practical for us to get everything to Iceberg before moving things to S3 though.  We'll probably look at it closer in the future.
+{quote}I like etags because they are exposed in getFileChecksum(); their flaw is that they can be very large on massive MPUs (32bytes/block uploaded).
+{quote}
+I'm not sure what you mean about getFileChecksum()?  I would expect to pull the etags from PutObjectResult.getETag() and CompleteMultipartUploadResult.getETag().  It doesn't seem necessary to me to track etag per block uploaded.  Is there something I am missing?
+{quote}BTW, if you are worried about how observable is eventual consistency, generally its delayed listings over actual content. There's a really good paper with experimental data which does measure how often you can observe RAW inconsistencies [http://www.aifb.kit.edu/images/8/8d/Ic2e2014.pdf]
+{quote}
+Thanks for the reference.  I happened upon a link to that from [are-we-consistent-yet|https://github.com/gaul/are-we-consistent-yet] as well.  I need to have a full read through it.
+
+ 
+
+[~mackrorysd]
+{quote}we need to gracefully deal with any row missing an object version. The other direction is easy - if this simply adds a new field, old code will ignore it and we'll continue to get the current behavior.
+{quote}
+I don't think this is too much of a problem.  I believe the code in my patch already handles it.
+
+ 
+{quote}My other concern is that this requires enabling object versioning. I know [~fabbri] has done some testing with that and I think eventually hit issues. Was it just a matter of the space all the versions were taking up, or was it actually a performance problem once there was enough overhead?
+{quote}
+I'd like to hear more about this.  From a space perspective, the [S3 documentation|https://docs.aws.amazon.com/AmazonS3/latest/dev/ObjectVersioning.html] says object version can be up to 1024 characters but in my experience it looks like they are 32 (the same length as etag).  As I mentioned before, I'm looking at switching the patch over to use etag instead of object version anyway though.  I haven't gotten around to the code changes for it yet but it doesn't seem like it would be that much.  It's just a different field on PutObjectResult, CompleteMultipartUploadResult, and GetObjectRequest.
+
+ 
+
+ 
+
+{quote}object version can be up to 1024 characters{quote}
+I'm less concerned about the space taken up in the metadata store - the problems I'm trying to remember were due to the amount of space in the S3 bucket itself. It was with repeated test runs, so there were similar filenames used many, many times (which is not that realistic, but the more you care about read-after-update consistency, the more this would impact you), so many versions had been kept.
+
+[~mackrorysd] Looks like it's possible to create a [bucket lifecycle rule|https://docs.aws.amazon.com/AmazonS3/latest/user-guide/create-lifecycle.html] to automatically purge out old object versions after some specified expiration time, which would be helpful to keep the S3 space from indefinitely growing if the same file paths are being continually overwritten.
+
+Oh, I see.  For us overwrites would be rare but we would want protection against an inconsistent read afterwards nonetheless.  We would implement lifecycle policy to get rid of old versions.
+
+{quote}My other concern is that this requires enabling object versioning. I know Aaron Fabbri has done some testing with that and I think eventually hit issues. Was it just a matter of the space all the versions were taking up, or was it actually a performance problem once there was enough overhead?{quote}
+
+Yeah I had  "broken" certain paths (keys) on an s3 bucket by leaving versioning enabled on a dev bucket where I'd frequently delete and recreate the same keys.  There appeared to be some scalability limit on the number of versions a particular key can have.  So the lifecycle policy to purge old versions would be important I think.
+
+I share [~stevel@apache.org]'s hesitation on doing this all in S3Guard.  Just from experience with all the corner cases and S3 flakiness. I'm glad you are looking into it and prototyping, though; we want more people to learn this codebase.
+
+
+I've uploaded a new patch based on trunk and storing eTag in S3Guard instead of versionId.  The existing and my new tests pass, but there are a few things worth mentioning.
+
+I'll start with the simplest one.  I changed S3AFileSystem.getFileStatus() to return S3AFileStatus instead of vanilla FileStatus.  I'm honestly not 100% sure if that creates any sort of compatibility problem or is in any other way objectionable.  If so, I could cast the status where necessary instead.
+
+The next thing is that there is a slight behavior change with seek() if there are concurrent readers and writers (a problematic thing anyway).  With my changes, a seek() backwards will always result in EOFException on the next read within the S3AInputStream.  This happens because my changes pin the S3AInputStream to an eTag.  A seek() backwards causes a re-open and since the eTag on S3 will have changed with a new write, a read with the old eTag will fail.  I think this is actually desirable, but still worthy of mention.  The prior code would silently switch over to reading the new version of the file within the context of the same S3AInputStream.  Only if the new version of the file is shorter would an EOFException potentially happen when it seeks past the length of the new version of the file.
+
+Finally is the worst of the issues.  I realized that if an overwrite of a file succeeds on S3 but fails during the S3Guard update (e.g. exception communicating with Dynamo), from the client's perspective the update was successful.  S3AFileSystem.finishedWrite() simply logs an error for the S3Guard issue and moves on.  However, any subsequent read of the file will fail.  The read will fail because S3Guard still has the old eTag and any read is going to use the S3Guard eTag when calling through to GetObject on S3.  This will not return anything as the eTag doesn't match.
+
+This led me to thinking I should update the exception handling in S3AFileSystem.finishedWrite() to allow the IOException on S3Guard update to propagate rather than be caught and logged.  This should at least trigger the writer to realize something went wrong and take some action.  Really all it seems the writer can do to resolve the situation is write the file again.  Assuming the new write goes through, S3Guard will get the correct new eTag and all will be well again.  I have not made this update yet though.  Thoughts on that?
+
+bq.   I changed S3AFileSystem.getFileStatus() to return S3AFileStatus instead of vanilla FileStatus.  I'm honestly not 100% sure if that creates any sort of compatibility problem or is in any other way objectionable.  If so, I could cast the status where necessary instead.
+
+Probably Better to cast. The mocking used in some of the tests contains assumptions. A more subtle issue is that during benchmarking and things people add their own wrapper around a store (e.g. set fs.s3a.impl = wrapperclass). If any code ever assumes that the output of a filesystem created off an s3a URL is always S3AFileStatus, one day they'll be disappointed.
+
+For code in that org.apache.hadoop.fs.s3a module itself, different story. Tighter coupling is allowed
+
+
+h3. *serialization*. 
+
+S3AFileStatus needs to be serializable; {{S3ATestUtils.roundTrip}} should verify that things round trip. As well as adding tests to verify etags come that way, the deser probably needs to handle the case that it came from an older version. (or we set a serialVersionUID, subclass Writable to check as part of the deserialization. 
+
+Real {{FileStatus}} is marshalled between Namenode and clients a lot, hence all its protobuf representation. S3AFileStatus doesn't get marshalled that way but I know that I pass them around in Spark jobs, and so others may too. In that kind of use, we won't worry about handling cross-version wire formats, but at least recognising the problem would be good. (i.e for java serialization, change serialization ID; for Writable marshalling, well, who knows? Either leave out or add and fail badly if its not there).
+
+
+bq, The next thing is that there is a slight behavior change with seek() if there are concurrent readers and writers (a problematic thing anyway).  With my changes, a seek() backwards will always result in EOFException on the next read within the S3AInputStream.  This happens because my changes pin the S3AInputStream to an eTag.  A seek() backwards causes a re-open and since the eTag on S3 will have changed with a new write, a read with the old eTag will fail.  I think this is actually desirable, but still worthy of mention.  The prior code would silently switch over to reading the new version of the file within the context of the same S3AInputStream.  Only if the new version of the file is shorter would an EOFException potentially happen when it seeks past the length of the new version of the file.
+
+This is the same change as with HADOOP-15625, which I think I'm going to complete/merge in first, as its the simplest first step: detect and react to a change in versions during the duration of a read. 
+
+All the hadoop fs specs are very ambiguous about what happens to a a source file which is changed while it is open, because every FS behaves differently. Changes may be observable to clients with an open handle, or they may not. And if it is observable, then exactly when the changes become visible is undefined. IMO, failing because a file has been overwritten is fine, but ideally it should fail with a meaningful error, not EOF, as that can be mapped to a -1 on a read, and so get treated specially. (remember, read(), read()) can trigger a new GET in random IO mode, so it may just be a read() call. What's interesting about S3 and Swift is that as you seek around, *older versions of the data may become visible*. I've actually seen that on swift, never on s3, though their CRUD consistency model allows for it.
+
+Actually, this has got me thinking a lot more about some of the nuances here, and what that means for testing. For this & HADOOP-15625, some tests will be needed for random IO, lazy seek, overwrite the data with something shorter, brief wait for stability and then call read(), expecting a more detailed error than just -1, which is what you'd see today.
+
+Other failure cases to create in tests, doing these before any changes just to see what happens today
+
+* file deleted after input stream opened but before first read; then between positioned reads
+* seek to EOF-1, overwrite file with longer, do 1+ read() to see what happens
+* file overwritten with 0 byte file after open & before first read. That's always one of the corner cases which breaks things.
+
+
+w.r.t finished write, yes, sounds like a failure is the right approach. We may want to think more about how to do some fault injection with S3Guard IO; the LocalMetadataStore would be the safest place to add this.
+
+One of the committer tests is going to have to be extended for this, and/or the multipart upload contract tests, to verify that updates to a file uploaded that way has s3guard's etags updated. Should be a matter of getting the etags from that completed write (how?) and then verifying. (actually, we could include that etag list in the listing provided in the _SUCCESS) file, so you could read that and then know the exact version of every file generated in a job. it could make for a very-much-bigger file though, so it would have to be optional. Good for testing.
+
+Returning to the patch then, 
+
+# how about we start with HADOOP-15625 to make the input stream use etag to detect failures in a file, with tests to create those conditions
+# then this patch becomes the next step: S3Guard to track the etags.
+
+Thanks for the feedback [~stevel@apache.org].
+
+With respect to the S3AFileSystem.getFileStatus() change I should have been a bit clearer.  I changed only the method signature, not the real type being returned.  S3AFileSystem.getFileStatus() is just a wrapper over innerGetFileStatus() which was already returning S3AFileStatus.  As such, it doesn't seem to me that it should have introduced any new serialization concerns, right?  I'll avoid the method signature change though and use casts where necessary instead.
+{quote}IMO, failing because a file has been overwritten is fine, but ideally it should fail with a meaningful error, not EOF
+{quote}
+Fair point.  I was thinking to ask for feedback on the exception type in this scenario anyway but failed to do so with my last comment.  I chose EOFException to match the current behavior in the seek() after overwrite scenario and because I was having trouble choosing a better exception type.  I thought about possibly FileNotFoundException, but that didn't really feel right as the file does still exist.  I was thinking something more like ConcurrentModificationException, but that's more Java Collections oriented and not an IOException.  I wondered if there was an IOException similar to that defined somewhere but couldn't find one.  Another option I considered was creating a new IOException type within the S3A package.  I browsed other available IOException types and didn't see a good fit.  Did you have any specific suggestions?
+{quote}One of the committer tests is going to have to be extended for this
+{quote}
+Ah, yeah, I'll need to dig deeper on that subject to better understand how those work and the updates that would be needed.
+ # 
+{quote}how about we start with HADOOP-15625 to make the input stream use etag to detect failures in a file, with tests to create those conditions{quote}
+
+Sure, that sounds reasonable.  I'll create a patch for that.
+
+I commented on HADOOP-15625:
+
+https://issues.apache.org/jira/browse/HADOOP-15625?focusedCommentId=16765486&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-16765486
+
+ 
+
+As mentioned there, I have a patch for that issue.  I'm having trouble uploading it for some reason though.  It is as though I don't have permission.  The attachment area of the Jira doesn't look like it does on this issue where I AM allowed to upload.
+
+In that patch I elected to just use a vanilla IOException for the exception type.  Alternative suggestions are welcome.
+
+adding use of etags in copy operation is a pre-req to actually tracking it in DDB. 
+
+With HADOOP-15625 now complete, I've been preparing a new patch for this rebased on that work.  The biggest changes since my previous patch are:
+ * with the configurable change detection source supporting ETag or versionId, I store both in the DynamoDB table
+ * use the S3Guard ETag or versionId in the CopyObjectRequest during rename() to ensure the object copied is the expected one
+
+Propagating the eTag and versionId for each contained file during a directory rename() took a few changes.  My latest patch introduces an S3LocatedFileStatus class to carry this.  innerListFiles() returns RemoteIterator<S3LocatedFileStatus> instead of vanilla LocatedFileStatus.
+
+One challenge I'm bumping into is that ETag sometimes changes on copy (depending on encryption algorithm).  Also versionId seems to always change with copy.  What I mean is the new object produced by the copy has a different ETag or versionId than the copied object.  This means that a client-side check to ensure the copied object is the object that was expected is not really feasible.  Also, supposing the change detection mode is server, it's not possible to do a client-side check to detect the condition where the server doesn't support/honor the ETag/versionId specified on the CopyObjectRequest.
+
+Suppose, for example, a writer overwrites "foo.txt" with some new text, and then renames to "bar.txt".  After this operation, the contents of "bar.txt" may be from the original "foo.txt", not the new "foo.txt".  It could happen if the server is not honoring the specified ETag or versionId.  This could go through without a RemoteFileChangedException or any other such error.  The ETag or versionId passed on the CopyObjectRequest would reflect the correct "foo.txt" version, but if the server fails to honor it, we cannot catch it.  We cannot look at the ETag or versionId on "bar.txt" because we don't know what value to expect.
+
+I'm going to go ahead and post my current version of the patch, which demonstrates this problem through failing rename() tests when fs.s3a.change.detection.source=versionid or source=etag and the test uses an encryption type where etag is not the MD5 digest of the object data (SSE-C or SSE-KMS).  See [here|https://docs.aws.amazon.com/AmazonS3/latest/API/RESTCommonResponseHeaders.html].
+
+I still have more work to do on this:
+
+* update copy handling to skip client-side check
+* update documentation to warn that change.detection.mode=client has this vulnerability with rename()
+* update documentation to warn 3rd-party S3 implementation users of this potential vulnerability with rename() if the implementation doesn't honor the qualification
+* improve documentation further in general
+* improve the tests.  Existing tests are passing with the exception of the copy/rename issues mentioned, but I need to consider adding some additional tests.  Also, I need to revisit the TestObjectETag test that I had added in the last patch.  With versionId and eTag support I need something that tests both.  Also, I'll consider if there is a more effective or simpler way to test that the S3Guard metadata is being captured on write and honored on read.
+
+I'm going to be unavailable next week.  I might make a little more progress with this today but after that I will end up coming back to it on Monday, 3/25.
+
+I should also note that the new patch implements a getObjectMetadata() based check on ETag or versionId before starting the read for select().  This is not a full guarantee that select() will read the correct version of the file or generate an exception.  It could read the wrong file version without exception if:
+
+* S3 eventual consistency manifests in a way where one read sees the new version and the next read sees the old version.  This seems unlikely but I don't think there is any guarantee it couldn't happen.
+* After reading the correct new version, another overwrite comes through writing an even newer version.  The select() sees the newest version.  Perhaps that's not problematic though.
+
+In change.detection.mode=client we could do the same thing in rename(), making a getObjectMetadata() request before the copy and checking that the response has the expected ETag or versionId and if not throwing RemoteFileChangedException.  It would have the same risk I just mentioned.  That can be mentioned in the documentation.  It will make rename() in this mode more expensive though as it will require the extra getObjectMetadata() call per file being copied.
+
+Hi [~ben.roling]! Thanks for working on this.
+
+h3. TestPathMetadataDynamoDBTranslation.java
+I started to review the patch, and I found when we added a new field last time to dynamo we made tests in the {{TestPathMetadataDynamoDBTranslation}} to see if the field is ignored the implementation still works. Please add tests for ETAG and VERSION_ID - if these fields are ignored the {{PathMetadataDynamoDBTranslation}} will still function as expected. We could even create a parametrized test for this which takes the ignored lists of fields and tests if the fields are not there yet in ddb the translation will still work. We need to provide these tests to show that the improvement is backward compatible so no need to do any update manually.
+
+h3. TestDirListingMetadata.java
+Nit: in {{TestPathMetadataDynamoDBTranslation}} you defined TEST_ETAG and TEST_VERSION_ID. In TestDirListingMetadata you use string literals instead. Please define the constants here as well for readability and consistency.
+
+h3. site/markdown/tools/hadoop-aws/s3guard.md
+Please add the description of this feature to the docs. Please describe what kind of, and how inconsistencies are handled. The currently added part is ok, but I think it needs to be extended.
+
+I will run another round on review and run some tests.
+
+I've got a short term patch for HADOOP-16190 which I'd like reviewed and in first, as it includes instructions on testing setup and is straightforward to backport. Reviews encouraged: https://github.com/apache/hadoop/pull/606
+
+the tracking of etag/version in s3guard should line up with it.
+
+bq. We need to provide these tests to show that the improvement is backward compatible so no need to do any update manually.
+
+we wouldn't be able to run mixed clients without it, and that's going to happen. Which is something to bear in mind: old clients will be adding files without etags or version markers. If you can do a unified roll out of clients (e.g. its an EC2 hosted cluster where all VMs are on the same image, all will be well, but in a more heterogenous cluster, that can't hold. Be good to test for that with some workflow of
+
+* create a file, versioned
+* remove the version column values for that entry (may need some s3guard test methods here
+* work with the file again
+
+That's to simulate an overwrite.
+
+bq. S3 eventual consistency manifests in a way where one read sees the new version and the next read sees the old version. This seems unlikely but I don't think there is any guarantee it couldn't happen.
+
+seen that happen with openstack swift. It's why all our contract tests set to have unique names across test cases....accidental contamination of subsequent tests with the data from old runs. For s3 select, well, users will just have to deal with it. "Don't overwrite a file you are querying"
+
+
+
+
+
+
+
+I posted a PR with my latest progress:
+https://github.com/apache/hadoop/pull/646
+
+I'll continue there rather than doing patch uploads to the JIRA.  Hopefully that transitions smoothly.  It's my first experience with a PR for a Hadoop Common JIRA.
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 21s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 18 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 18m 11s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 30s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 23s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 35s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 12m 44s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 49s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 22s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 29s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 28s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} javac {color} | {color:red}  0m 28s{color} | {color:red} hadoop-tools_hadoop-aws generated 1 new + 15 unchanged - 0 fixed = 16 total (was 15) {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 19s{color} | {color:orange} hadoop-tools/hadoop-aws: The patch generated 43 new + 57 unchanged - 2 fixed = 100 total (was 59) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 32s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} whitespace {color} | {color:red}  0m  0s{color} | {color:red} The patch has 2 line(s) that end in whitespace. Use git apply --whitespace=fix <<patch_file>>. Refer https://git-scm.com/docs/git-apply {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 12m 50s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:red}-1{color} | {color:red} findbugs {color} | {color:red}  0m 52s{color} | {color:red} hadoop-tools/hadoop-aws generated 1 new + 0 unchanged - 0 fixed = 1 total (was 0) {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 22s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  4m 42s{color} | {color:green} hadoop-aws in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} asflicense {color} | {color:red}  0m 25s{color} | {color:red} The patch generated 1 ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 56m 17s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| FindBugs | module:hadoop-tools/hadoop-aws |
+|  |  org.apache.hadoop.fs.s3a.S3LocatedFileStatus doesn't override org.apache.hadoop.fs.LocatedFileStatus.equals(Object)  At S3LocatedFileStatus.java:At S3LocatedFileStatus.java:[line 1] |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce base: https://builds.apache.org/job/hadoop-multibranch/job/PR-646/1/artifact/out/Dockerfile |
+| GITHUB PR | https://github.com/apache/hadoop/pull/646 |
+| JIRA Issue | HADOOP-16085 |
+| Optional Tests |  dupname  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  |
+| uname | Linux 63e0c6f06812 4.4.0-138-generic #164~14.04.1-Ubuntu SMP Fri Oct 5 08:56:16 UTC 2018 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | personality/hadoop.sh |
+| git revision | trunk / ce4bafd |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_191 |
+| findbugs | v3.1.0-RC1 |
+| javac | https://builds.apache.org/job/hadoop-multibranch/job/PR-646/1/artifact/out/diff-compile-javac-hadoop-tools_hadoop-aws.txt |
+| checkstyle | https://builds.apache.org/job/hadoop-multibranch/job/PR-646/1/artifact/out/diff-checkstyle-hadoop-tools_hadoop-aws.txt |
+| whitespace | https://builds.apache.org/job/hadoop-multibranch/job/PR-646/1/artifact/out/whitespace-eol.txt |
+| findbugs | https://builds.apache.org/job/hadoop-multibranch/job/PR-646/1/artifact/out/new-findbugs-hadoop-tools_hadoop-aws.html |
+|  Test Results | https://builds.apache.org/job/hadoop-multibranch/job/PR-646/1/testReport/ |
+| asflicense | https://builds.apache.org/job/hadoop-multibranch/job/PR-646/1/artifact/out/patch-asflicense-problems.txt |
+| Max. process+thread count | 339 (vs. ulimit of 5500) |
+| modules | C: hadoop-tools/hadoop-aws U: hadoop-tools/hadoop-aws |
+| Console output | https://builds.apache.org/job/hadoop-multibranch/job/PR-646/1/console |
+| Powered by | Apache Yetus 0.9.0 http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+| (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 27s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 18 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 18m 59s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 36s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 24s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 37s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 12m 37s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 45s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 22s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 30s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 27s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 27s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 19s{color} | {color:orange} hadoop-tools/hadoop-aws: The patch generated 23 new + 56 unchanged - 3 fixed = 79 total (was 59) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 32s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 13m  1s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 50s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 25s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  4m 31s{color} | {color:green} hadoop-aws in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 26s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 56m 54s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce base: https://builds.apache.org/job/hadoop-multibranch/job/PR-646/2/artifact/out/Dockerfile |
+| GITHUB PR | https://github.com/apache/hadoop/pull/646 |
+| JIRA Issue | HADOOP-16085 |
+| Optional Tests |  dupname  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  |
+| uname | Linux 819ff5509e9b 4.4.0-139-generic #165~14.04.1-Ubuntu SMP Wed Oct 31 10:55:11 UTC 2018 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | personality/hadoop.sh |
+| git revision | trunk / b226958 |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_191 |
+| findbugs | v3.1.0-RC1 |
+| checkstyle | https://builds.apache.org/job/hadoop-multibranch/job/PR-646/2/artifact/out/diff-checkstyle-hadoop-tools_hadoop-aws.txt |
+|  Test Results | https://builds.apache.org/job/hadoop-multibranch/job/PR-646/2/testReport/ |
+| Max. process+thread count | 340 (vs. ulimit of 5500) |
+| modules | C: hadoop-tools/hadoop-aws U: hadoop-tools/hadoop-aws |
+| Console output | https://builds.apache.org/job/hadoop-multibranch/job/PR-646/2/console |
+| Powered by | Apache Yetus 0.9.0 http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+| (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 23s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 21 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 17m 41s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 31s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 22s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 34s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 12m 35s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 51s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 22s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 33s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 31s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 31s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 19s{color} | {color:orange} hadoop-tools/hadoop-aws: The patch generated 23 new + 57 unchanged - 3 fixed = 80 total (was 60) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 35s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 14m  6s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 54s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 21s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  4m 30s{color} | {color:green} hadoop-aws in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 25s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 57m  7s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce base: https://builds.apache.org/job/hadoop-multibranch/job/PR-646/3/artifact/out/Dockerfile |
+| GITHUB PR | https://github.com/apache/hadoop/pull/646 |
+| JIRA Issue | HADOOP-16085 |
+| Optional Tests |  dupname  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  |
+| uname | Linux 2d88dc5cb77e 4.4.0-139-generic #165~14.04.1-Ubuntu SMP Wed Oct 31 10:55:11 UTC 2018 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | personality/hadoop.sh |
+| git revision | trunk / 9cd6619 |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_191 |
+| findbugs | v3.1.0-RC1 |
+| checkstyle | https://builds.apache.org/job/hadoop-multibranch/job/PR-646/3/artifact/out/diff-checkstyle-hadoop-tools_hadoop-aws.txt |
+|  Test Results | https://builds.apache.org/job/hadoop-multibranch/job/PR-646/3/testReport/ |
+| Max. process+thread count | 340 (vs. ulimit of 5500) |
+| modules | C: hadoop-tools/hadoop-aws U: hadoop-tools/hadoop-aws |
+| Console output | https://builds.apache.org/job/hadoop-multibranch/job/PR-646/3/console |
+| Powered by | Apache Yetus 0.9.0 http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 26s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 22 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 16m 48s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 30s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 24s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 36s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 11m 25s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 41s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 20s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 29s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 26s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 26s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 17s{color} | {color:orange} hadoop-tools/hadoop-aws: The patch generated 24 new + 62 unchanged - 3 fixed = 86 total (was 65) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 29s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} whitespace {color} | {color:red}  0m  0s{color} | {color:red} The patch has 1 line(s) that end in whitespace. Use git apply --whitespace=fix <<patch_file>>. Refer https://git-scm.com/docs/git-apply {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 11m 27s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  0m 48s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 22s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  4m 30s{color} | {color:green} hadoop-aws in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 29s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 51m 36s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce base: https://builds.apache.org/job/hadoop-multibranch/job/PR-646/4/artifact/out/Dockerfile |
+| GITHUB PR | https://github.com/apache/hadoop/pull/646 |
+| JIRA Issue | HADOOP-16085 |
+| Optional Tests |  dupname  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  |
+| uname | Linux 98128039d9c4 4.4.0-138-generic #164-Ubuntu SMP Tue Oct 2 17:16:02 UTC 2018 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | personality/hadoop.sh |
+| git revision | trunk / 9cd6619 |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_191 |
+| findbugs | v3.1.0-RC1 |
+| checkstyle | https://builds.apache.org/job/hadoop-multibranch/job/PR-646/4/artifact/out/diff-checkstyle-hadoop-tools_hadoop-aws.txt |
+| whitespace | https://builds.apache.org/job/hadoop-multibranch/job/PR-646/4/artifact/out/whitespace-eol.txt |
+|  Test Results | https://builds.apache.org/job/hadoop-multibranch/job/PR-646/4/testReport/ |
+| Max. process+thread count | 444 (vs. ulimit of 5500) |
+| modules | C: hadoop-tools/hadoop-aws U: hadoop-tools/hadoop-aws |
+| Console output | https://builds.apache.org/job/hadoop-multibranch/job/PR-646/4/console |
+| Powered by | Apache Yetus 0.9.0 http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m  0s{color} | {color:blue} Docker mode activated. {color} |
+| {color:red}-1{color} | {color:red} patch {color} | {color:red}  0m  8s{color} | {color:red} https://github.com/apache/hadoop/pull/646 does not apply to trunk. Rebase required? Wrong Branch? See https://wiki.apache.org/hadoop/HowToContribute for help. {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| GITHUB PR | https://github.com/apache/hadoop/pull/646 |
+| JIRA Issue | HADOOP-16085 |
+| Console output | https://builds.apache.org/job/hadoop-multibranch/job/PR-646/5/console |
+| Powered by | Apache Yetus 0.9.0 http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m  0s{color} | {color:blue} Docker mode activated. {color} |
+| {color:red}-1{color} | {color:red} patch {color} | {color:red}  0m  7s{color} | {color:red} https://github.com/apache/hadoop/pull/646 does not apply to trunk. Rebase required? Wrong Branch? See https://wiki.apache.org/hadoop/HowToContribute for help. {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| GITHUB PR | https://github.com/apache/hadoop/pull/646 |
+| JIRA Issue | HADOOP-16085 |
+| Console output | https://builds.apache.org/job/hadoop-multibranch/job/PR-646/6/console |
+| Powered by | Apache Yetus 0.9.0 http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+I just logged HADOOP-16221 which is somewhat related to this.  Without it, there is still risk of a job starting with an inconsistent read of its expected input.  As indicated in HADOOP-16221, that risk exists without any overwrites occurring, which is why it is broader than just this JIRA.  The risk does apply after an overwrite as well though.  The overwrite may succeed while the corresponding metadata update fails, leaving the incorrect ETag and versionId in the metadata store.  The processing pipeline would proceed with the next job reading the wrong version of the input file.
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m  0s{color} | {color:blue} Docker mode activated. {color} |
+| {color:red}-1{color} | {color:red} patch {color} | {color:red}  0m  7s{color} | {color:red} https://github.com/apache/hadoop/pull/646 does not apply to trunk. Rebase required? Wrong Branch? See https://wiki.apache.org/hadoop/HowToContribute for help. {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| GITHUB PR | https://github.com/apache/hadoop/pull/646 |
+| JIRA Issue | HADOOP-16085 |
+| Console output | https://builds.apache.org/job/hadoop-multibranch/job/PR-646/7/console |
+| Powered by | Apache Yetus 0.9.0 http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Left some feedback in-line on the pull-request (and for HADOOP-16221 too). Some more general thoughts:
+* Have been discussing with [~stevel@apache.org] whether or not the FileStatus -> S3AFileStatus and schema changes should be separated out from the enforcement. I think the best argument for that is that it's a smaller change to get older clients to notify newer clients of changes whereas only the newer ones will enforce. The other factor mentioned is the desire for keeping S3Guard relatively storage-agnostic, but I honestly just don't see how we can do that and still have a robust solution. S3 is popular enough to warrant a custom solution that really does fix all the holes. Personally, I think we should just keep this change together.
+* I don't suppose there's an interface we can rely on to provide getETag() and getVersionId(), is there? This is where Go's duck-typing would be nice so we could eliminate 2 (or more) or the args to every constructor call. Not a big deal. I have a small to do list of other little things to look into but as you'll see on the PR, the overwhelming majority of my feedback is pretty mechanical. I think overall this is looking like a good solid patch.
+
+I am also getting some unit test failures running this in CDH. Will do some more test runs on the upstream base and with various parameters to see if I can narrow it down. I assume you've been running the tests with no problems?
+
+bq. Have been discussing with Steve Loughran whether or not the FileStatus -> S3AFileStatus and schema changes should be separated out from the enforcement. I think the best argument for that is that it's a smaller change to get older clients to notify newer clients of changes whereas only the newer ones will enforce. The other factor mentioned is the desire for keeping S3Guard relatively storage-agnostic, but I honestly just don't see how we can do that and still have a robust solution. S3 is popular enough to warrant a custom solution that really does fix all the holes. Personally, I think we should just keep this change together.
+
+I'm going to leave this one alone.  If you guys feel strongly about it let me know.
+
+bq. I don't suppose there's an interface we can rely on to provide getETag() and getVersionId(), is there? This is where Go's duck-typing would be nice so we could eliminate 2 (or more) or the args to every constructor call.
+
+I'm not aware of one.  I'll leave it alone unless you guys want me to create a class package those two attributes (suggested name welcome if so).  There are definitely times I wish I was working in an environment with duck-typing.
+
+bq. I am also getting some unit test failures running this in CDH. Will do some more test runs on the upstream base and with various parameters to see if I can narrow it down. I assume you've been running the tests with no problems?
+
+Which tests are failing and how are you running on CDH?  I've been running the test suite on both my PR branch as well as on an internal branch where I patched the changes back into CDH5 with success.
+
++1, committed final version of PR #794; added a release note.
+
+Ben -thanks for this!
+
+
+
+SUCCESS: Integrated in Jenkins build Hadoop-trunk-Commit #16572 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/16572/])
+HADOOP-16085. S3Guard: use object version or etags to protect against (stevel: rev a36274d69947648dbe82721220cc5240ec5d396d)
+* (add) hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestObjectChangeDetectionAttributes.java
+* (edit) hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/mapreduce/filecache/TestS3AResourceScope.java
+* (edit) hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/s3guard.md
+* (add) hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/impl/CopyOutcome.java
+* (edit) hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3ADelayedFNF.java
+* (edit) hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/impl/ChangeDetectionPolicy.java
+* (edit) hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3GuardOutOfBandOperations.java
+* (edit) hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DirListingMetadata.java
+* (edit) hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/PathMetadata.java
+* (edit) hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3ObjectAttributes.java
+* (edit) hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/select/ITestS3SelectCLI.java
+* (edit) hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DDBPathMetadata.java
+* (edit) hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestPathMetadataDynamoDBTranslation.java
+* (edit) hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/S3Guard.java
+* (edit) hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/RemoteFileChangedException.java
+* (edit) hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/impl/ChangeTracker.java
+* (edit) hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/S3GuardTool.java
+* (edit) hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/testing.md
+* (edit) hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AInputStream.java
+* (edit) hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/MockS3AFileSystem.java
+* (edit) hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/select/ITestS3SelectLandsat.java
+* (edit) hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/LocalMetadataStore.java
+* (edit) hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/S3ATestUtils.java
+* (edit) hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/Invoker.java
+* (edit) hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/ITestDynamoDBMetadataStoreScale.java
+* (edit) hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/WriteOperationHelper.java
+* (edit) hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/Listing.java
+* (edit) hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileStatus.java
+* (edit) hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestS3Guard.java
+* (edit) hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/committers.md
+* (edit) hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3GuardListConsistency.java
+* (edit) hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/TestStreamChangeTracker.java
+* (edit) hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/AbstractS3GuardToolTestBase.java
+* (edit) hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/AbstractS3AMockTest.java
+* (edit) hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStoreTestBase.java
+* (edit) hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DescendantsIterator.java
+* (edit) hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/ITestS3GuardToolLocal.java
+* (edit) hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/troubleshooting_s3a.md
+* (edit) hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestLocalMetadataStore.java
+* (edit) hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/select/ITestS3SelectMRJob.java
+* (edit) hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3ARemoteFileChanged.java
+* (edit) hadoop-tools/hadoop-aws/pom.xml
+* (edit) hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/DynamoDBMetadataStore.java
+* (edit) hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/TestListing.java
+* (edit) hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/TestDirListingMetadata.java
+* (edit) hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/MetadataStoreListFilesIterator.java
+* (edit) hadoop-common-project/hadoop-common/src/main/resources/core-default.xml
+* (edit) hadoop-tools/hadoop-aws/src/site/markdown/tools/hadoop-aws/delegation_tokens.md
+* (edit) hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/ITestS3AInconsistency.java
+* (edit) hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/s3guard/PathMetadataDynamoDBTranslation.java
+* (edit) hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/s3guard/ITestDynamoDBMetadataStore.java
+* (add) hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3ALocatedFileStatus.java
+* (edit) hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3GuardExistsRetryPolicy.java
+* (edit) hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java
+* (edit) hadoop-tools/hadoop-aws/src/test/java/org/apache/hadoop/fs/s3a/scale/AbstractITestS3AMetadataStoreScale.java
+* (edit) hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AUtils.java
+
+
+Thanks Steve for all your help!
+
+just noticed this adds a runtime dependency on httpcore just to get the HTTP status code. Going to add a new JIRA for that as there's no value in amplifying dependency pain. As its also tagged as provided, and not in the hadoop-object-stores pom, anything which pulls the hadoop-object stores in (Spark, druid, Tez) isn't going to be able to work with S3 unless they discover they need to add this feature. 
+
+Right now the fact that all we need is hadoop-common & some transients, and aws shaded SDK, keeps dependency pain down, though even there we want to shade stuff in hadoop-object-store as things like guava still cause needless suffering. If we can avoid making this worse, we should
+
+Yeah, I wasn't sure about that add.  I tried to call it out in one of the reviews but I'm not sure it got attention.
+
+I understand the desire to limit dependencies and am supportive of pulling that back out.  I overlooked impact to things like Spark, druid, Tez.
+
+HADOOP-16332 is the fix; all good on my test runs (i.e no new failures other than a timeout)
+

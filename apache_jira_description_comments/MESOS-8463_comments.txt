@@ -1,0 +1,125 @@
+[~tillt] would you have a cycle to take a look at this?
+
+The first thing that sticks out when reading the logs is the fact that we see two scheduled re-registration attempts. The trigger here is the lack of a lower boundary for agent re-registration delay.
+
+The first {{doReliableRegistration}} re-registration delay log entry tells us that we should just have sent a registration message to the master - our first one. 
+{noformat}
+I0118 21:44:45.659322  1093 slave.cpp:1673] Will retry registration in 925295ns if necessary
+{noformat}
+
+The first registration now succeeds on the master side with all bells and whistles - this is {{S0}}.
+{noformat}
+I0118 21:44:45.659622  1103 master.cpp:6233] Registering agent at slave(144)@172.16.10.65:40262 (ip-172-16-10-65.ec2.internal) with id 1eb6ab2c-293d-4b99-b76b-87bd939a1a19-S0
+{noformat}
+
+Next we see an {{addSlave}} on the allocator which will satisfy the expectation from our test for the first time (which is entirely).
+{noformat}
+I0118 21:44:45.660295  1093 hierarchical.cpp:574] Added agent 1eb6ab2c-293d-4b99-b76b-87bd939a1a19-S0 (ip-172-16-10-65.ec2.internal) with cpus:2; mem:1024; ports:[31000-32000] (allocated: {})
+{noformat}
+
+Just as scheduled we see another log telling us that we hit {{doReliableRegistration}} again, 
+ about 0.001 seconds after the first one. We now sent the second registration request to the master.
+{noformat}
+I0118 21:44:45.660614  1105 slave.cpp:1673] Will retry registration in 2.182634ms if necessary
+{noformat}
+
+The rest of our test now quickly gets processed until it is done. Scheduler and the slave processes are shutting down.
+{noformat}
+I0118 21:44:45.661115  1071 sched.cpp:2009] Asked to stop the driver
+I0118 21:44:45.661146  1097 sched.cpp:1191] Stopping framework 1eb6ab2c-293d-4b99-b76b-87bd939a1a19-0000
+I0118 21:44:45.661387  1071 slave.cpp:931] Agent terminating
+{noformat}
+
+We still have that second re-registration in progress and that succeeds eventually. It came without a {{slaveID}} so we assigned a new one in the master - this now is {{S1}}.
+{noformat}
+I0118 21:44:45.664952  1107 master.cpp:6233] Registering agent at slave(144)@172.16.10.65:40262 (ip-172-16-10-65.ec2.internal) with id 1eb6ab2c-293d-4b99-b76b-87bd939a1a19-S1
+{noformat}
+
+The entire chain of events continues until we finally reach {{addSlave}} on the allocator again which will oversaturate our expectation for the invocation count of that function now.
+{noformat}
+../../src/tests/master_allocator_tests.cpp:175: Failure
+Mock function called more times than expected - taking default action specified at:
+../../src/tests/allocator.hpp:273:
+    Function call: addSlave(@0x7fe8dc03d0e8 1eb6ab2c-293d-4b99-b76b-87bd939a1a19-S1, @0x7fe8dc03d108 hostname: "ip-172-16-10-65.ec2.internal"
+{noformat}
+
+The lack of a re-registration delay minimum triggers the problem in combination with a strict expectation on registration-chained events of this test (and likely others as well).
+
+This was fixed before on some of the allocator tests, but not all - I wonder why not all of them?
+
+Note that the agent registers after a backoff delay.
+
+1. pause the timer
+2. advance the timer after the slave-startup by the authentication backoff-factor + registration backoff-factor
+3. expect at least one {{addSlave}} on the allocator - but not exactly one - {{WillOnce(DoAll(InvokeAddSlave(&allocator);}} could do here
+(4.) satisfy a future during the {{addSlave}}  invocation to allow explicit waiting for that event on the allocator -- this could ease the stress on later  awaits and hence would increase the sturdynes
+
+For the scheduler registration, we need to do similar things - however without advancing the timer as we dont need to cover a backoff
+2. expect at least one {{addFramework}} on the allocator - but again not exactly one
+(3.) satisfy a future during the {{addFramework}}  invocation to allow explicit waiting for that event on the allocator
+
+Reviews:
+
+https://reviews.apache.org/r/65581/
+https://reviews.apache.org/r/65717/
+
+
+{noformat}
+commit 75dd718866675542be77696eecd7570c0a74a966
+Author: Till Toenshoff <toenshoff@me.com>
+Date:   Tue Feb 20 21:45:31 2018 +0100
+
+    Made all allocator tests allow for slave backoff.
+    
+    Most of the allocator tests were expecting a single invocation of
+    'addSlave' on the allocator when registering a slave. Due to the nature
+    of our slave registration backoff, a single slave possibly sends
+    multiple registration requests in short succession. Any event closely
+    connected to a slave registration will therefor be possibly invoked
+    multiple times over the lifetime of such a test.
+    
+    We now allow multiple invocations of 'addSlave'. This patch also
+    enhances the timing control by introducing a paused clock over the
+    slave registration phase of these tests.
+    
+    Review: https://reviews.apache.org/r/65581/
+
+commit 143484edd0bc0ba890498c6a8dc7b0bdcccf0a1a
+Author: Till Toenshoff <toenshoff@me.com>
+Date:   Tue Feb 20 21:45:22 2018 +0100
+
+    Updated Cluster::Slave::shutdown to support a paused clock.
+    
+    Review: https://reviews.apache.org/r/65717/
+{noformat}
+
+The solution above was too invasive and not matching the problem - needs to be updated. See MESOS-8613
+
+In fact, options (1) and (2) shall be ignored for now while reducing this fix towards (3) implemented by
+{noformat}
+EXPECT_CALL(allocator, addSlave(_, _, _, _, _, _))
+  .WillOnce(DoAll(InvokeAddSlave(&allocator))
+  .WillRepeatedly(Return());
+{noformat}
+
+One problematic area are the multi-slave tests - we can not simply use the above pattern for those and thus they remain flaky in their design.
+
+{noformat}
+commit c526016e80396e95dbaee79eb3dedfbf216bce52
+Author:     Till Toenshoff <toenshoff@me.com>
+AuthorDate: Fri Apr 6 20:05:51 2018 +0200
+Commit:     Alexander Rukletsov <alexr@apache.org>
+CommitDate: Fri Apr 6 20:07:31 2018 +0200
+
+    Re-fixed many master allocator tests.
+    
+    When the slave has a very short lifetime, its scheduled registration
+    retry might occur when the test is tearing down. These unintuitively
+    motivated registrations in turn cause additional invocations of
+    `AddSlave` on the allocator.
+    Additionally, this also reverts the newly introduced Clock pauses as
+    they have shown to be problematic.
+    
+    Review: https://reviews.apache.org/r/66165/
+{noformat}
+

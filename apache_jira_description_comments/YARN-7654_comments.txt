@@ -1,0 +1,1926 @@
+I can work on this as a follow on to the recovery and clean up lifecycle work.
+
+In the current implementation, high level operation performed to launch a docker container through container-executor:
+
+1.  launch_docker_container_as_user
+2.  create_local_dirs
+3.  construct_docker_command
+4.  change effective user
+5.  launch docker run command
+6.  docker inspect
+7.  write pid to pidfile
+
+The change will happen to construct_docker_command.  The current implementation will generate a localized launch_container.sh in yarn local dir for the container, and bind mount the launch_container.sh to identical path inside container.  Docker run command is constructed as:
+
+{code}
+docker run ... launch_container.sh
+{code}
+
+The new proposal is to change construct_docker_command as:
+
+exporting all environment and command line arguments to a template that looks like:
+
+{code}
+#!/bin/bash
+{ { docker run ... -e K=V -e K-V [image-name] } > >(tee stdout.txt ); } \
+  2> >(tee stderr.txt >&2 )
+{code}
+
+In step 5, run the generated template script from container local dir.
+
+[~shanekumpf@gmail.com] [~ebadger] Do you see any problem with this approach?
+
+Thanks [~eyang]! - overall I do feel this will improve the process. 
+
+Couple of questions:
+ * Will we eliminate setting the workdir in this model and leave that up to the image? This has been a complaint I've heard with the bring your own image model.
+ * What is the impact on bind mounts? Will this help eliminate any of the read-write mounts?
+ * Would it also be possible to support arguments passed into the container's entrypoint? For instance, the Dockerfile ENTRYPOINT is ["ping"], the CMD is  ["google.com"] and instead of pinging www.google.com, I want to "ping www.yahoo.com" - the {{docker run}} would be {{docker run ... -e K=V \-e K=V [image-name] www.yahoo.com}}.
+
+Excited to see this make progress. :)
+
+[~shanekumpf@gmail.com]
+{quote}
+Will we eliminate setting the workdir in this model and leave that up to the image? This has been a complaint I've heard with the bring your own image model.
+{quote}
+
+We have two choices here.  
+
+Choice 1: We can make bring your own image first class citizen.  User who would like to use file cache, and yarn localized data in workdir, they will have to define this via user bind-mount.  This approach will break compatibility with existing apps.
+
+Choice 2: We can introduce a flag to skip bind-mount of workdir.  I am open to suggestions on how to describe the flag in a clean way to prevent breaking compatibility.
+
+{quote}
+What is the impact on bind mounts? Will this help eliminate any of the read-write mounts?
+{quote}
+
+The current code has good validations to control user defined read-write mounts and comply with security checks.  Therefore, all bind-mounts feature is same.
+
+{quote}
+Would it also be possible to support arguments passed into the container's entrypoint? For instance, the Dockerfile ENTRYPOINT is ["ping"], the CMD is  ["google.com"] and instead of pinging www.google.com, I want to "ping www.yahoo.com" - the docker run would be docker run ... -e K=V -e K=V [image-name] www.yahoo.com.
+{quote}
+
+Yes, this will be supported.
+
+bq. Will we eliminate setting the workdir in this model and leave that up to the image? This has been a complaint I've heard with the bring your own image model.
+Don't we need the workdir to be defined in the image? If not, the container will write as a user that the NM won't be able to clean up after. 
+
+{quote}
+The new proposal is to change construct_docker_command as:
+
+exporting all environment and command line arguments to a template that looks like:
+
+{noformat}
+#!/bin/bash
+{ { docker run ... -e K=V -e K-V [image-name] } > >(tee stdout.txt ); } \
+  2> >(tee stderr.txt >&2 )
+{noformat}
+{quote}
+This approach could overwrite variables that are defined by the image. If variables are in the whitelist, then we want them to be set, but only if they aren't in the docker image. However, this would always overwrite whatever the image had defined
+
+[~ebadger]
+{quote}
+Don't we need the workdir to be defined in the image? If not, the container will write as a user that the NM won't be able to clean up after.
+{quote}
+
+It appears that we need to support two modes of operation.  The current mode where workdir is bind-mounted into the same location as host to allow Hadoop native apps to work.  The second mode will launch container and bind-mount HDFS via NFS gateway for non-Hadoop workload.  Image can write to HDFS and follows hdfs permission rules.  There is no workdir used to write output.  Hence, the clean up will not be a problem.
+
+{quote}
+This approach could overwrite variables that are defined by the image. If variables are in the whitelist, then we want them to be set, but only if they aren't in the docker image. However, this would always overwrite whatever the image had defined
+{quote}
+
+I plan to retain the current behavior. If USE_ENTRY_POINT is enabled, then it follows the second method for environment construction, and user defined environment variable may override image supplied environment.  This depends on how the image is arranged.
+
+{quote}The second mode will launch container and bind-mount HDFS via NFS gateway for non-Hadoop workload.{quote}
+I'd say there is a third mode of operation then. Don't set the workdir at all and let it be part of the container's root filesystem. Docker will have no problem cleaning up those files and this is in line with minimizing surprises of running an existing Docker container on YARN.
+
+{quote}I plan to retain the current behavior. If USE_ENTRY_POINT is enabled, then it follows the second method for environment construction, and user defined environment variable may override image supplied environment. This depends on how the image is arranged.{quote}
+One quick note on this, there is already an environment variable for disabling the launch script, let's consider reusing or removing it vs just adding yet another variable to set. :) See {{YARN_CONTAINER_RUNTIME_DOCKER_RUN_OVERRIDE_DISABLE}}
+
+bq. I plan to retain the current behavior. If USE_ENTRY_POINT is enabled, then it follows the second method for environment construction, and user defined environment variable may override image supplied environment. This depends on how the image is arranged.
+But how do you differentiate between user-defined variables and NM-defined variables? [~Jim_Brennan] and [~jlowe] can correct me if I'm wrong on our current approach with YARN-7677, but I thought we were going with the following hierarchy: user-defined, image-defined, NM-defined. If something is NM-defined, but not user-defined, we want it to use the image-defined version. However, if it is user-defined, then we want the user-defined version. But, this is not possible by simply passing {{-e K=V}} on the {{docker run}} command line
+
+{quote}But how do you differentiate between user-defined variables and NM-defined variables? Jim Brennan and Jason Lowe can correct me if I'm wrong on our current approach with YARN-7677, but I thought we were going with the following hierarchy: user-defined, image-defined, NM-defined. If something is NM-defined, but not user-defined, we want it to use the image-defined version. However, if it is user-defined, then we want the user-defined version. But, this is not possible by simply passing -e K=V on the docker run command line
+{quote}
+YARN-7677 adds the ability for the docker image to override the whitelisted NM variables that are not set by the user, by using the V=${V:-default} syntax in the launch_container.sh script. This works because the script is evaluated in the context of the image, so if the image defines a different value, it will replace the default that was set by NM.  But more importantly, if the docker image does not define it, it will get the NM value.
+
+If I understand this use-case correctly, there would be no launch_container.sh script that is evaluated in the image context, so things would be different.  Do the environment variables passed on the docker run command line override those set in the image?  If they do, then they would eclipse any value set in the image.
+
+[~Jim_Brennan] [~ebadger] The answers are not straight forward, and here are the possible scenarios:
+
+1.  Dockerfile describes ENV variables, they are the default value if user do not override them.
+2.  User can pass in -e K=V to override the the default values.
+3.  For hardcoded values, they can be described in /etc/profile or /root/.bashrc file, if the first process is bash.
+
+This means docker will mostly inherit values from image, then follow by YARN enforced values for images that utilize ENTRY_POINT.  Do you see any hole that might lead to undesired behavior?
+
+[~shanekumpf@gmail.com] Sounds good, the entry point will be activated based on YARN_CONTAINER_RUNTIME_DOCKER_RUN_OVERRIDE_DISABLE=true flag.
+
+{quote}
+1. Dockerfile describes ENV variables, they are the default value if user do not override them.
+2. User can pass in -e K=V to override the the default values.
+3. For hardcoded values, they can be described in /etc/profile or /root/.bashrc file, if the first process is bash.
+
+This means docker will mostly inherit values from image, then follow by YARN enforced values for images that utilize ENTRY_POINT. Do you see any hole that might lead to undesired behavior?
+{quote}
+
+If the docker image defines one of the values listed in the nodemanager whitelist, and the user does not override it, the nodemanager value will be passed in via -e K=V, and that will override the value defined in the docker image.   This would be a difference in behavior compared with the non-entry-point images (after [YARN-7677] goes in.
+
+
+[~Jim_Brennan] Yes, this is partially true.  The actual behavior difference depends on ENTRY_POINT.  If the launching process is reconstructing user environment for child process.  There is nothing that container-executor can do to prevent it.  The parent layer (container-executor) provide the same information to the first process in docker.  The observed behavior is caused by how the docker image was originally constructed, not caused by different code path leading to the difference in behavior.  As long as we show the execution command clearly in container log, I think it is easy for programmers to identify the root causes of difference in behavior.  Thoughts?
+
+bq. The parent layer (container-executor) provide the same information to the first process in docker. The observed behavior is caused by how the docker image was originally constructed, not caused by different code path leading to the difference in behavior.
+That's not true. In the current implementation the environment is being written out into launch_container.sh (and in a special way such as to only overwrite variables with user-defined variables, not NM-defined), which gets executed *after* the docker environment variables are set. By adding the variables via {{-e K=V}}, we are switching around the order and losing the ability to differentiate between NM-defined and user-defined. 
+
+I think the best approach here is to explicitly deny NM variables from being passed on the command line when ENTRY_POINT is being used. I don't see a case where a container using ENTRY_POINT is going to need NM variables, since the container should be self-contained. We're already making assumptions about bind-mounts and such. This would require a follow-up change to YARN-7677, however.
+
+[~ebadger] I agree with your analysis.  [~Jim_Brennan] Sorry, I might have been wrong about inclusion of NM variables in YARN-7677 for connivence .  It is probably safer to not inherit NM variables.
+
+Hi [~ebadger] [~billie.rinaldi] [~shanekumpf@gmail.com] Here is an early draft of the patch.  The current patch allows to run both ENTRY_POINT enabled or disabled with limitation that user environment variables are not forwarded to ENTRY_POINT enabled container.  Given the complexity of the code base, and having to work on two different modes.  I think it is best to get some early feedbacks.
+
+For patch 001 to work, you will need to apply YARN-7221 patch 6 and YARN-7677 patch 7.
+
+I did some review of the environment variables, and I am only comfortable to expose user defined environment variables in ENTRY_POINT enabled container.  The global hadoop environment variable and node manager constructed environment variables will be available in prelaunch, but not forwarded to container.  Let me know your thoughts on this approach.  Thanks
+
+Example job that I used to submit:
+{code}
+{
+  "name": "sleeper-service",
+  "kerberos_principal" : {
+    "principal_name" : "hbase/_HOST@EXAMPLE.COM",
+    "keytab" : "file:///etc/security/keytabs/hbase.service.keytab"
+  },
+  "components" :
+  [
+    {
+      "name": "sleeper",
+      "number_of_containers": 2,
+      "artifact": {
+        "id": "hadoop/centos:latest",
+        "type": "DOCKER"
+      },
+      "privileged": true,
+      "launch_command": "sleep 90",
+      "resource": {
+        "cpus": 1,
+        "memory": "256"
+      },
+      "configuration": {
+        "env": {
+          "YARN_CONTAINER_RUNTIME_DOCKER_DELAYED_REMOVAL":"true",
+          "YARN_CONTAINER_RUNTIME_DOCKER_RUN_OVERRIDE_DISABLE":"true",
+          "USER_DEFINE":"1",
+          "USER_DEFINE":"2"
+        },
+        "properties": {
+          "docker.network": "host"
+        }
+      }
+    }
+  ]
+}
+{code}
+
+[~ebadger] [~jlowe] [~shanekumpf@gmail.com] This is a early patch using execl instead of shell script to launch.  I am currently running into a problem that after docker is started, the existing logic for detecting docker exit is not working.  Let me know what you think about this approach.  I am concerned that we are using popen for docker launch for non-entry point version, it actually spawn a shell underneath.   We might need to convert the output buffer from char array to char pointer array to avoid chopping strings in the middle.  Your early feedback is appreciated.  Thanks
+
+Thanks for the patch!  Switching the code to execv docker instead of popen docker is going to be a fairly extensive change that isn't directly tied to supporting an entry point.  Would it make more sense to track the execv effort as a separate JIRA?
+
+What base should be used for the patch?  I couldn't apply it to trunk, branch-3.1, or branch-3.0.
+
+bq.  I am currently running into a problem that after docker is started, the existing logic for detecting docker exit is not working.
+
+I couldn't tell from the patch what the problem would be.  If I can get the patch applied and some more details on how it behaves when it doesn't work I may be able to help debug.
+
+bq.  I am concerned that we are using popen for docker launch for non-entry point version, it actually spawn a shell underneath.
+
+Yes, popen opens up the possibility of the shell doing us "favors" that we really do not want.  It would be safer to avoid it.
+
+bq. We might need to convert the output buffer from char array to char pointer array to avoid chopping strings in the middle.
+
+This is a necessity.  By serializing multiple values into a String and then needing to rediscover the individual values later, we're opening up the possibility that the arguments will be mishandled based on the contents of the arguments accidentally looking like separator characters.  That's one of the many dangers of running the shell instead of execv directly which we're trying to avoid.  If we're going to be serious about leveraging execv for security and correctness in light of untrusted data in the arguments then building up the command line for execv shouldn't be serialzing and deserializing through String.
+
+As a bonus for going through execv directly, the whole quoting and appending and sanitizing argument logic seems unnecessary at that point.  We can just pass these values straight through to the docker command for interpretation by Docker rather than worrying about how to quote them properly so the shell doesn't butcher them on the way through.
+
+Why does the code not check for an execv error and instead exits with a success code?  It should log the strerror of the execv failure and exit with a failure code instead.
+
+
+[~jlowe] Thank you for the review.  This patch requires YARN-7221 to apply.  As you can see the struggle with flipping code for execv, this is the reason that this patch takes a long time to develop.  If we want to separate execv call from getting a working version, then patch 001 would be reasonable to commit.  However, my current workspace is deeply committed to get execv working and I don't want to get another CVE to add to my list of Hadoop security problems.  Therefore, I am likely to stay on course to finish execv version.  I also found that we only did docker inspect once to get pid.  There is a fairly high chance that docker inspect isn't ready and no pid would be produced.  I have refactor the code to loop through docker inspect n times before giving up.  This property needs to be configurable or detect the first child process has exited.  Docker image download can take sometime, and the inspect command might need a lot of retires before giving up.  Shane provided some good technique to check proc in existing code.  I should be able to reuse it for detection part.
+
+{quote}
+Why does the code not check for an execv error and instead exits with a success code? It should log the strerror of the execv failure and exit with a failure code instead.
+{quote}
+
+Good point.  This will be fixed in the next version.  Thanks again.
+
+- Fixed the concurrency issue, and added exit code check.  The new execv approach will work for existing mode as well as entry_point mode.  Fixing add_to_buffer mechanism next.  I think I will keep test cases using char* buffer, and having a intermediate concatenation function to convert char** to char* to avoid unnecessary test change. 
+
+bq. As you can see the struggle with flipping code for execv, this is the reason that this patch takes a long time to develop. If we want to separate execv call from getting a working version, then patch 001 would be reasonable to commit.
+
+Patch 001 isn't reasonable to commit because it's executing untrusted shell constructs as root.  I agree that the execv work makes implementing the entry point feature easier to secure.  What I'm advocating is separating the execv work into a separate JIRA, since it can stand on its own and has an additional security benefit even without the entry point feature.  This feature can depend upon the execv JIRA.  That makes the overall work easier to review since it doesn't come in as one big patch.
+
+
+[~jlowe] Yes, you are right patch 001 doesn't handle shell expansion, and likely to cause more problems if release schedule happened prior to having a chance to close all holes.  I am going to stay on course for execv version.  It is a bit late for me to restart the coding to fix execv problem first then apply entry_point after.  I think it is possible to get this done within 50k of code changes.
+
+Patch 004 addresses the following:
+- Ensure container environment variables are passed through from user defined values to docker without expansion.
+- Instead of constructing shell command using char*, use string array for execv.
+- Removed exposure of WORK_DIR variables.
+- Added retry logic for running docker inspect command for acquiring pid from docker container.
+
+Let me know if there is any question or concerns.  Thanks
+
+What is the base for this patch?  It doesn't apply directly, and I tried using the last few patches of YARN-7221 and it still doesn't apply.  It will take me a while to digest a patch this large.  Some comments in the interim after a quick reading of the patch:
+
+We should avoid the double-lookup here by using a local variable to cache a single lookup:
+{code}
+      if (component.getConfiguration()
+          .getEnv(ENV_DOCKER_CONTAINER_RUN_OVERRIDE_DISABLE) == null ||
+          component.getConfiguration()
+          .getEnv(ENV_DOCKER_CONTAINER_RUN_OVERRIDE_DISABLE).equals("false")) {
+        operation.addOutAndErrFiles(OUT_FILE, ERR_FILE);
+      }
+{code}
+There are other instances where there are unnecessary double-lookups for this setting.
+
+This should just be a boolean, since everyone consuming it has to check for null and then the boolean value they are looking for:
+{code}
+    String disableOverride = environment.get(
+        ENV_DOCKER_CONTAINER_RUN_OVERRIDE_DISABLE);
+{code}
+
+Why are we avoiding sanitizeEnv in the entry point case?  I could see cases where the container wants to know the container ID, NM address, etc.  I know we were going to avoid cases at least initially where environment variables reference other variables, but none of the variables set in sanitizeEnv reference each other.
+
+so_fd is not closed if se_fd fails to open.
+
+There's no error checking on the dup2 calls.
+
+run_docker uses execvp but launch_docker_container_as_user uses execv.  These should be consistent (i.e.: either the docker path is always fully qualified and we should be doing execv, or we leverage the shell-like path lookup and use execvp).
+
+The error message for the execv refers to the tc command, looks like a copy-n-paste error.
+
+Why is there a {{sleep(3)}} after the fork?
+
+flatten allocates a fixed-size buffer which may be insufficient in light of many bind-mount paths that may themselves be very long.
+
+"if (strlen(string)==0)" should just be "if (string[0] == '\0')" or "if (!string[0])"
+
+The use of {{strdup}} could simplify add_to_buffer quite a bit.  It also fixes the off-by-one error where it doesn't account for the terminating NUL when it makes a copy of the string.
+
+It's a bit odd that we keep re-parsing the command file.  use_entry_point reparses the same command file that construct_docker_command just parsed a few lines earlier.  We should parse the config once then pass the config values around rather than reparsing the file from scratch each time.
+
+buff_len is an argument that keeps getting passed around but it's never checked to see if it is exceeded.  Also looks like zero is passed for it, at least in construct_docker_command, maybe elsewhere.
+
+This comment was changed from 750 to 751, but the permissions look like they're really 0700?
+{code}
+  // Copy script file with permissions 751
+  if (copy_file(container_file_source, script_name, script_file_dest,S_IRWXU) != 0) {
+{code}
+
+
+[~jlowe] Thank you for the review, the patch was based on: 727c033997990b4c76382ea7bb98f41695da591e
+I manually applied YARN-7221, YARN-7677 patch 07 on top.  I will rebase the patch to trunk once YARN-7221 is finalized.
+I will fix the coding style issues according to your suggestions.  
+
+{quote}
+Why is there a sleep(3) after the fork?
+{quote}
+
+For sleep(3), it was added to be less aggressive on query docker daemon for status to prevent docker daemon being overwhelmed.  This was done before I implemented retry logic on docker inspect.  I think it can be removed.
+
+{quote}
+This comment was changed from 750 to 751, but the permissions look like they're really 0700?
+{quote}
+
+The script is owned by the end user who submitted the job, and 700 is correct.  At first, I thought privileged container would depend on others +x bits for root to run the script.  It turns out that Linux depends on user's +x bits for root user to run the script.  Hence, the comment was incorrect, and will be adjusted accordingly.
+
+{quote}
+buff_len is an argument that keeps getting passed around but it's never checked to see if it is exceeded. Also looks like zero is passed for it, at least in construct_docker_command, maybe elsewhere.
+{quote}
+
+Buff_len is only passed from get_docker_command > get_docker_*_command.  Any of the sub command will allocate the buffer of parent specified size, or flush out string array of "out" when invalid condition is encountered.  The inner methods are changed to track the index location of the current buffer.  Buff_len is computed from sysconf(_SC_ARG_MAX), hence, add_to_buffer does check the same max value to prevent overflow.  I think we can omit buff_len passing and use sysconf_(_SC_ARG_MAX) as baseline.  Please excuse the bravery for coding 30 hours straight to fix parameter passing for the past weekend.  I can see the roughness in the code, and will fix accordingly.   
+
+[~jlowe] Can you share how spark does tokenizer for environment variables that we talked about in the meeting?  The current approach is a bit adhoc in this jira, and I like to address it, if possible.  Thanks
+
+[~jlowe] 
+{quote} Why are we avoiding sanitizeEnv in the entry point case? I could see cases where the container wants to know the container ID, NM address, etc. I know we were going to avoid cases at least initially where environment variables reference other variables, but none of the variables set in sanitizeEnv reference each other. {quote}
+
+In previous meeting, we agreed on for ENTRY_POINT, we don't expose any of the node manager environment variables.  This is the reason that I by passed sanitizeEnv.  Do we want to revisit the design?  I see a few problems such as locale, working directory, that they don't apply inside the container.  Environment variables are passed without expansion in current form.  I have some trouble to differentiate between user passed value, node manager values, and other values.  Let me know if there is a subset that would be interesting to have.  I will modify code accordingly.
+
+bq. Can you share how spark does tokenizer for environment variables that we talked about in the meeting? The current approach is a bit adhoc in this jira, and I like to address it, if possible.
+
+That is a separate, mostly unrelated thing having to do with Configuration.getStrings behavior when the values within the commas have commas themselves.  See the discussion in YARN-6830, and http://spark.apache.org/docs/latest/running-on-yarn.html#configuration discusses how Spark handles environment variables being passed by the user (see spark.yarn.appMasterEnv on that page).
+
+The clean way to handle this would be to either avoid using ShellCommandExecutor in PrivilegedOperationExecutor and use ProcessBuilder directly or fix Shell#runCommand to not smash all of its arguments together into one big string.  It's a shame that we actually do go through all the motions to build up an array of separate arguments only to smash them all together with space separators before running the child process.  ProcessBuilder supports an array of arguments which is what we need to avoid marshalling multiple values into strings and the pitfalls that arise from trying to decode it.  That's clearly a separate JIRA which could be a prerequisite if we want to leverage it here.
+
+bq.  Let me know if there is a subset that would be interesting to have. I will modify code accordingly.
+
+Yeah, we can start out with no variables being passed through from the nodemanager and see if that's going to be problematic for the entry point use cases.  In essence we're bundling "my container has an entry point" with "I don't need to inherit any environment variables."  We may need a way to distinguish those two later, but we can try combining them for now.  I would add a comment to the relevant code explaining why we're not putting in those variables to help document the decision to combine these two concepts.
+
+
+[~jlowe] YARN-6830 appears to focus on Java side of serialization.  It may take a while to settle.  I don't think we want to make YARN-6830 a pre-requisite of this jira to introduce extra delays.  For now, environment key/value pair are delimited by pipe character, and replaced to = prior to docker launch.  I think this is the least intrusive approach to solve environment variable delimiter in .cmd file for now with some extra comments to indicate future fix to make this better by changing .cmd file format to JSON.
+
+[~jlowe] Patch 005 requires YARN-7221 patch 10.  This patch has been rebased to current trunk with all your recommendation included.  Let me know if this works for you.  Thanks
+
+[~jlowe] Patch 006 has been rebased to depend on YARN-7221 patch 12 and trunk code.  Base on our discussion today, the new proposal is to create a section in cmd file, i.e.
+
+{code}
+[docker-command-execution]
+  ...
+[docker-command-environment]
+  LANGUAGE=en_US.UTF-8
+  YARN_CONTAINER_RUN_TIME_DOCKER_CONTAINER_HOSTNAME=appcatalog-0.abc.hbase.ycluster
+  ..
+{code}
+
+This can avoid to get stuck by the pipe delimiter in environment variables.  Is this the proposed approach?
+
+[~jlowe] Patch 007 has been updated to use section to list environment variables when entry point is enabled.  Let me know if there is any questions or concerns.  Thanks
+
+Thanks for updating the patch!
+{quote}Is this the proposed approach?
+{quote}
+That isn't quite what I was thinking in the meeting, but that probably works even better. Essentially what is needed is a way to reliably convey environment variable values that may have problematic characters in them. Putting one environment variable per line is a similar approach to how YARN-8071 is proposing to handle variables with commas in them for another use case.
+
+This approach would allow any character in the env variable except a newline since we're still using a newline to know when the variable value ends and the next setting would begin. That's an improvement over the existing approach which would also disallow other characters (like space and |).
+
+What I was referring to in the meeting was potentially using a series of runCommand.setEnv invocations, one per environment variable, so we can avoid the pipe character hack. It looks like DockerCommand coalesces multiple arguments into a comma-separated list which we might be able to work. However commas are going to be problematic characters in environment variable values unless we go with something like an approach you describe above.
+
+Actually now that I think about this more, I think we can side step the pipe character hack, the comma problems, the refactoring of the command file, etc., if we leverage the --env-file feature of docker-run. Rather than try to pass untrusted user data on the docker-run command-line and the real potential of accidentally letting some of these "variables" appear as different command-line directives to docker, we can dump the variables to a new file next to the existing command file that contains the environment variable settings, one variable per line. Then we just pass --env-file with the path to the file. That way Docker will never misinterpret this data as anything but environment variables, we don't have to mess with pipe encoding to try to get these variables marshalled through the command file before they get to the container-executor, and we don't have to worry about how to properly marshal them on the command-line for the docker command. As a bonus, I think that precludes needing to refactor the container-executor to do the argument array stuff since we're not trying to pass user-specified env variables on the command-line. That lets us make this JIRA a lot smaller and more focused, and we can move the execv changes to a separate JIRA that wouldn't block this one.
+
+Comments on the patch:
+
+ENV_DOCKER_CONTAINER_RUN_OVERRIDE_DISABLE appearing in an abstract provider (that's not supposed to know about Docker) is pretty jarring and makes me think the abstractions aren't right here. Ideally AbstractProviderService should not be checking for a docker-specific thing. Shouldn't using the image entry point cause launchCommand to be empty? If we can make that so then it would seem there's nothing to do in AbstractProviderService since it already avoids adding out and err in the empty launch command case. Otherwise besides the abstraction leakage we'll have a constant defined in multiple places which isn't ideal.
+
+The patch adds a bunch of imports to ContainerExecutor but no other code changes.
+
+Nit: ContainerLaunch has a similar abstraction breakage as mentioned above. It shouldn't be checking for docker-specific flags given it's not supposed to know about docker --that's the job of the container executor. Seems like we need a way of having ContainerLaunch query the container executor to know if it should sanitize the env or have the container executor do the santization. I'm OK with leaving this in for now, especially if we're thinking of possibly removing the no-sanitize limitation for entry point launches in the future, but I'm curious if there are suggestions on how to make this cleaner.
+
+"Base on discussion" s/b "Based on the discussion"
+
+Rather than always adding WORK_DIR and then conditionally removing it, would it be better to simply move the setup of WORK_DIR to the sanitizeEnv method? Then we only add it when we should.
+
+ENV_DOCKER_CONTAINER_RUN_USER_ENV and ENV_DOCKER_CONTAINER_RUN_CMD can be private.
+
+Nit: This code still does a double-lookup and instead should cache the get result in a local.
+{code:java}
+    boolean dockerOverride = ((environment
+        .get(ENV_DOCKER_CONTAINER_RUN_OVERRIDE_DISABLE) == null) ? false :
+          Boolean.parseBoolean(environment
+              .get(ENV_DOCKER_CONTAINER_RUN_OVERRIDE_DISABLE)));
+{code}
+A utility method to lookup a boolean env variable would be useful here since it applies not only to this variable but also ENV_DOCKER_CONTAINER_DELAYED_REMOVAL and ENV_DOCKER_CONTAINER_RUN_PRIVILEGED_CONTAINER. Updating the other instances to use the utility method can be a separate JIRA if desired.
+
+I'm confused why the '-e ' flag destined for the docker run command is being encoded in DockerLinuxContainerRuntime as part of the value payload for environment variables. I would expect the '-e' flag would only be appearing in container-executor code as it parses the docker command file. Per the --env-file suggestion above, I think we can ditch that flag entirely.
+
+The variable "disableOverride" was changed to "dockerOverride" which to me sounds like it has the opposite semantics wrt. how the boolean is interpreted.  It acts like it means disableOverride. I'd recommend keeping the old name or changing it to something like useEntryPoint for readability, otherwise code like this looks odd:
+{code:java}
+    if (dockerOverride) {
+      LOG.info("command override disabled");
+{code}
+Why is the detach behavior different for entry point containers vs. command override containers?
+
+This has an off-by-one error and ends up corrupting memory since it doesn't account for the terminating NUL character:
+{code:java}
+        chosen_container_log_dir = (char *) alloc_and_clear_memory(strlen(container_log_dir), sizeof(char));
+        strncpy(chosen_container_log_dir, container_log_dir, strlen(container_log_dir));
+        free(container_log_dir);
+{code}
+I noticed we're making a copy of container_log_dir and then immediately freeing the string we just copied. Instead set chosen_container_log_dir = container_log_dir and then not free container_log_dir in this case.
+
+Suggestion: It's dangerous to manually compute the space needed for a string operation for things like this:
+{code:java}
+  tmp_buffer_size = strlen(container_log_dir) + strlen(logfile) + 2;
+  tmp_buffer = (char *) alloc_and_clear_memory(tmp_buffer_size, sizeof(char));
+  snprintf(tmp_buffer, tmp_buffer_size, "%s/%s", container_log_dir, logfile);
+{code}
+It looks like we're doing this a lot and will continue to do so. I'd recommend creating a simple vararg utility function that lets vsnprintf do the calculation for us. It would be very handy to solve the potential buffer overruns in a lot of the get_docker_*_command functions. See the vsnprintf manpage for sample code.
+
+init_log_path has an error message referring to a sticky bit that isn't trying to be set.
+
+Nit: container-executor is using a docker_override flag that seems to do the opposite of what one might expect. Renaming it to something like using_entry_point would help.
+
+The error messages for dup2 failing refer to appending which looks like a copy-n-paste error.
+
+In the following code the parent frees memory that the child is about to use, resulting a use-after-free error:
+{code:java}
+  if (child_pid == 0) {
+    FILE* so_fd = fopen(so, "a+");
+    [...]
+    FILE* se_fd = fopen(se, "a+");
+    [...]
+  }
+  free(so);
+  free(se);
+{code}
+Part of the problem is that the parent is not waiting for the child to complete as it did before when it was calling pclose(). I suspect that's why retries needed to be added here – it's not tied at all to the entry point feature being used but the fact that the parent is not waiting for the child.  The parent can end up asking for a process that docker hasn't finished launching yet. If we fix the parent to wait then I don't think there's a need to retry the inspect.
+
+The flatten function corrupts memory since by the time it knows it needs to grow the buffer the data has already been written beyond the end of the buffer. It may make sense to do a double-loop, the first to compute the buffer we need and the second to build the string in the buffer we know is big enough to fit it.
+
+Nit: flatten doesn't need to be publicly exposed in container-executor.h, just forward-declared in container-executor.c or defined earlier in the container-executor.c file.
+
+Why does add_param_to_command_if_allowed bother to track the previous index? The code only modifies the index if the command is allowed, and the index is only adjusted if add_to_buffer doesn't fail.
+
+The entry_point variable and use_entry_point function appear to be backwards. They are false when the command file says to use the entry point.
+
+sysconf(_SC_ARG_MAX) is not a maximum count of arguments but a maximum size of all argument strings together. Using it to size the index buffer is a bit of a misuse, but it does have the advantage that we will never exceed that since we're scaling it by 8 (the size of a 64-bit char* pointer). Note that on some systems _SC_ARG_MAX could be quite large which could cause some problems if we always allocate a buffer 8 times that size.
+
+All instances of this code are only initializing 1/8th of the buffer since it forgets to scale by the size of a char*:
+{code:java}
+  int buff_len = sysconf(_SC_ARG_MAX);
+[...]
+  memset(out, 0, buff_len);
+{code}
+get_docker_volume_command assumes the volume_name, driver, and format are all less than 1024 characters. For valid inputs that should be the case, but it may not be given malicious input in the command file.
+
+get_docker_inspect_command assumes the format is less than 256 characters, similar concern to previous issue.
+
+get_docker_stop_command assumes the time is less than 256 characters.
+
+get_docker_kill_command assumes the signal is less than 40 characters.
+
+... and that's as far as I got for today, about 1/3 of the way through the patch. As I mentioned above, I think we should split this into two patches, one for adding entry point support leveraging the --env-file feature to avoid the sanitization issues with environment variables and a separate patch to refactor the popen calls in the container executor. They should be separate concerns at this point.
+
+[~jlowe] . Thank you for the feedback.  The cmd file section based approach is the best option in my opinion to ensure we don't have to look through multiple files to puzzle together the launch command.
+{quote}
+ENV_DOCKER_CONTAINER_RUN_OVERRIDE_DISABLE appearing in an abstract provider (that's not supposed to know about Docker) is pretty jarring and makes me think the abstractions aren't right here. Ideally AbstractProviderService should not be checking for a docker-specific thing. Shouldn't using the image entry point cause launchCommand to be empty? If we can make that so then it would seem there's nothing to do in AbstractProviderService since it already avoids adding out and err in the empty launch command case. Otherwise besides the abstraction leakage we'll have a constant defined in multiple places which isn't ideal.
+{quote}
+
+Agree, I will move the constant to org.apache.hadoop.yarn.api.ApplicationConstants.Environment for correctness.  This will reduce leaking through abstraction layer.
+
+{quote}
+Shouldn't using the image entry point cause launchCommand to be empty?
+{quote}
+
+No, docker can support launch command to entry point based image.  For example, someone can write a entry point = ping utility.  The launch command passed to ping, can be www.google.com.  Launch command essentially becomes arguments to entry point program.
+
+{quote}
+Rather than always adding WORK_DIR and then conditionally removing it, would it be better to simply move the setup of WORK_DIR to the sanitizeEnv method? Then we only add it when we should.
+{quote}
+
+WORK_DIR environment variable exists when JVM starts and we skip sanitizeEnv method because we want what user passed in with minimized set of environment variables without expansion.  This is the reason that I wrote it outside.  I agree on pushing the logic into sanitizeEnv to improve code readability.  I will add subroutines to sanitizeEnv alternate path for entry point mode.
+
+{quote}
+Nit: This code still does a double-lookup and instead should cache the get result in a local.
+{quote}
+
+Sorry, lost focus, will rewrite to:
+{code}
+boolean dockerOverride = false;
+String tmpBuffer = environment
+        .get(ENV_DOCKER_CONTAINER_RUN_OVERRIDE_DISABLE);
+if (tmpBuffer != null) {
+  dockerOverride = Bolean.parseBoolean(tmpBuffer);
+}
+{code}
+
+{quote}
+I'm confused why the '-e ' flag destined for the docker run command is being encoded in DockerLinuxContainerRuntime as part of the value payload for environment variables. I would expect the '-e' flag would only be appearing in container-executor code as it parses the docker command file. Per the --env-file suggestion above, I think we can ditch that flag entirely.
+{quote}
+
+In version 006 and prior, this was true, but version 007 of the patch, -e flag encoding happens only in container-executor docker utility method set_env.
+
+{quote}
+Why is the detach behavior different for entry point containers vs. command override containers?
+{quote}
+
+This is a good question.  In entry-point mode, the stdout/stderr are streamed directly from docker run command to disk because the fork execvp clone the stdout/stderr directly to disk.  Output is identical to what user would get from a terminal that docker errors and program output are flush to the same buffer.  Bash mode launches the docker run to background, and stdout/stderr are setup inside the docker container to write to bind-mounted location.  Hence, Bash mode depends on another set of prelaunch log files to capture pre-launch tasks to capture docker errors.  If Bash mode is not pushed to background both preloaunch.out and stdout.txt will have almost identical output.  I keep bash mode as closer to existing implementation as possible to prevent breakage.  These are the reasons that there are difference using foreground mode for entry point mode, and detach for bash mode.
+
+I will improve on the code style issues for all problems that you caught.  Thank you again for the review.
+
+[~jlowe] {quote}
+In the following code the parent frees memory that the child is about to use, resulting a use-after-free error:
+
+{code}
+  if (child_pid == 0) {
+    FILE* so_fd = fopen(so, "a+");
+    [...]
+    FILE* se_fd = fopen(se, "a+");
+    [...]
+  }
+  free(so);
+  free(se);
+{code}
+
+Part of the problem is that the parent is not waiting for the child to complete as it did before when it was calling pclose(). I suspect that's why retries needed to be added here – it's not tied at all to the entry point feature being used but the fact that the parent is not waiting for the child.  The parent can end up asking for a process that docker hasn't finished launching yet. If we fix the parent to wait then I don't think there's a need to retry the inspect.
+{quote}
+
+I don't think the above is correct.  After fork, parent and child have different address space because they are separate processes.  Child so pointer is no longer the same as so pointer in parent.
+
+
+[~jlowe]
+
+{quote}
+Why does add_param_to_command_if_allowed bother to track the previous index? The code only modifies the index if the command is allowed, and the index is only adjusted if add_to_buffer doesn't fail.
+{quote}
+
+This is only forwarding the integer pointer because the top level functions call this method, which calls add_to_buffer.  We can not lose track of index because it is local pointer, not a global variable.
+
+{quote}
+It looks like we're doing this a lot and will continue to do so. I'd recommend creating a simple vararg utility function that lets vsnprintf do the calculation for us. It would be very handy to solve the potential buffer overruns in a lot of the get_docker_*_command functions. See the vsnprintf manpage for sample code.
+{quote}
+
+The sample code is GPL license right?  Can this be a problem for us to use this?
+
+{quote}The cmd file section based approach is the best option in my opinion to ensure we don't have to look through multiple files to puzzle together the launch command.
+{quote}
+I strongly disagree here. It is much more dangerous try to place the untrusted environment variable settings on the docker command-line directly rather than in a separate file that can only be interpreted as env settings by docker. The envfile approach drastically simplifies this implementation, makes it much more secure, and reduces the need to significantly lengthen an already potentially very long docker run command line.
+{quote}After fork, parent and child have different address space because they are separate processes.
+{quote}
+Ah yes, sorry my bad. I was thinking of thread semantics for a bit there but yes, the child is a completely separate process at that point.
+{quote}The sample code is GPL license right? Can this be a problem for us to use this?
+{quote}
+Maybe. So ignore the code in the vnsprintf manpage, but the point of the comment is still valid – it would be very helpful to have something like an alloc_sprintf that automatically allocates a buffer rather than having coders guesstimate and hand calculate how big it needs to be.  We've gotten this wrong so many times already. The idea is essentially to have a varargs function that calls vsnprintf twice, something like this (I wrote this off the top of my head, may not compile. It's just an example to show the general idea):
+{code:java}
+char* alloc_sprintf(const char* fmt, ...) {
+  va_list vargs;
+  va_start(vargs);
+  size_t buflen = vsnprintf(NULL, 0, fmt, vargs) + 1;
+  va_end(vargs);
+  char* buf = malloc(buflen);
+  if (buf != NULL) {
+    va_start(vargs);
+    vsnprintf(buf, buflen, fmt, vargs);
+    va_end(vargs);
+  }
+  return buf;
+}
+{code}
+
+[~jlowe] {quote}
+I strongly disagree here. It is much more dangerous try to place the untrusted environment variable settings on the docker command-line directly rather than in a separate file that can only be interpreted as env settings by docker. The envfile approach drastically simplifies this implementation, makes it much more secure, and reduces the need to significantly lengthen an already potentially very long docker run command line.{quote}
+
+There are some quirks with env file.  On Mac, it doesn't function the same for key value pair that are quoted.  When specified both --env-file and -e, the evaluation order is env file then -e.  The small inconsistency around this area is unsettling for me.  Another concern is the ENV file is in the localizer directory, and job submitter can call identical filename to override the file.  YARN service API allows payload of configuration files to localizer directory, this may allow user to shoot himself on the foot.
+
+When using execvp, we know that the -e k=v are static arguments, and there is no shell expansion.  ARG_MAX limit helps to safe guard over all size to prevent buffer overflow.  The output is written to stdout.txt for debugging purpose.  It is more resilient and user friendly to implement as -e pairs.  This is the reason that I am more in favor of the cmd section approach.  [~billie.rinaldi][~shanekumpf@gmail.com] [~ebadger], we need a tight breaker.  Please charm in on the env-file vs cmd section to compose -e.
+
+{quote}So ignore the code in the vnsprintf manpage, but the point of the comment is still valid{quote}
+
+Agree, I have written a variant in string-utils.c to improve the string formatting issue.  It will be included in the next patch.
+
+{quote}On Mac, it doesn't function the same for key value pair that are quoted.
+{quote}
+There's no need to quote values if we're using the envfile approach, right?
+{quote}When specified both --env-file and -e, the evaluation order is env file then -e.
+{quote}
+Why would be be specifying both arguments?  All of the environment variables would go into the envfile.
+{quote}Another concern is the ENV file is in the localizer directory, and job submitter can call identical filename to override the file.
+{quote}
+The file would go into the nmPrivate directory which is not accessible by the user, only writable by the NM user and would be read by the container-executor. This is the same location where the NM writes the launch script and tokens today to be picked up by the container-executor. The user would not be able to access or overwrite this file.
+
+[~jlowe]
+{quote}
+Why would be be specifying both arguments?  All of the environment variables would go into the envfile.
+{quote}
+
+It might be preferable to have user defined variables in envfile, and system specific environment variables goes into "-e" to prevent override.  We need to converge on possible solutions with least amount of loopholes.  How about make both solutions available to user?  User can specify either env-file= in cmd file, or use [docker-command-environment] to define -e environment variables.  The env-file will trigger localization of hdfs env file to localized directory and pass along with --env-file.  If user specify the environment key/value pair in yarnfile, then we construct them as -e parameters?  This will allow both preference to work, also eliminate the loophole that key/value pair materialized file conflicting with user specified configuration file.
+
+{quote}
+The file would go into the nmPrivate directory which is not accessible by the user, only writable by the NM user and would be read by the container-executor. This is the same location where the NM writes the launch script and tokens today to be picked up by the container-executor. The user would not be able to access or overwrite this file.
+{quote}
+
+This is only partially true, launcher script is copied to appcache directory because the copy in nmPrivate is partially complete, and doesn't have executable permission and file ownership.  If envfile is in nmPrivate only, it become non-viewable, and need to copy to log directory for debugging purpose. 
+Most users are likely to prefer to see -e on stdout.txt because it is one click less, and provide clear view of the launch command.  However, I agree there are also merits in using ENV file in case passwords are being passed via ENV.  For containing the scope of this JIRA, I think making the easy case work has higher priority.  I file YARN-8097 as enhancement for env-file support.
+
+It does not make sense to me to support both options.  It significantly complicates the design and relies on docker's arbitrary ordering between the two options.
+
+bq.  We need to converge on possible solutions with least amount of loopholes.
+
+I completely agree with that, but to me going with a _single way_ to set the environment variables is the clear choice to accomplish that.  It's harder to close loopholes when there's more than one way to do the same thing, and passing untrusted input on a root command-line is clearly riskier than passing the same input in a file whose contents cannot be misconstrued as something other than environment variable settings.
+
+Using the env-file option would greatly simplify this design, decouple it from the execv changes, and make it easier to secure, both from a malicious input standpoint and from a secrets-in-the-env standpoint.  I do not understand why we would continue to pursue the command-line approach to setting environment variables in light of those benefits.
+
+
+[~jlowe] Env-file design would work better when user to supply the filename instead of node manager hardcode the file name.  This eliminate the possibility of user overrides the env-file generated from node-manager environment using config file payload from Yarn services.  The file needs to be in usercache because node manager private area will prevent users from debugging the generated environment variables.  Node manager private directory will also require some clean up work after container/application is completed.  If we can eliminate those three problems, then the proposal can work.  Otherwise, we are creating extra problems that requires more clean up.  This is the reason I think having another JIRA to tackle env-file problem is better since this one is already over bearing to clean up past problems.
+
+We can place the debugging in the already existing launch-container.sh script path if we're really that worried about file path collisions.  That file isn't going to be used in the entry_point case, and it is where users will probably look first anyway if they're used to looking at that script in the non-entry point case.
+
+The nodemanager private area is already cleaned up when the container exits.  There's no additional work necessary there.
+
+[~jlowe] launch-container.sh doesn't exist in entry_point mode.  Node manager private area is accessible by yarn and root only.  Although docker is launched via root/yarn privileges today, it maybe preferable to harden docker launch using trusted group (docker) to avoid abusing root privileges and yarn user privileges.  If we give docker access to nmPrivate, it will inconvenient future hardening in this area.  Sorry, I have to disagree to put env-file in nmPrivate area.
+
+[~jlowe] Patch 008 fixed API leakages, and code style problems that you mentioned.  Do you have any other issues with this patch besides env-file feature?  Thank you for the reviews.
+
+Rebased patch to changes based on YARN-7221 patch 16.
+
+Rebase patch 10 to current trunk after YARN-7221 and YARN-7973 changes.
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 43s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  1m  7s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 24m 30s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  7m 52s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 15s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 59s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 12m 53s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  3m  0s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 24s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 11s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m 29s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  6m 48s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} cc {color} | {color:green}  6m 48s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  6m 48s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  1m 14s{color} | {color:orange} hadoop-yarn-project/hadoop-yarn: The patch generated 10 new + 115 unchanged - 0 fixed = 125 total (was 115) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 52s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} whitespace {color} | {color:red}  0m  0s{color} | {color:red} The patch has 8 line(s) that end in whitespace. Use git apply --whitespace=fix <<patch_file>>. Refer https://git-scm.com/docs/git-apply {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 10m  7s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  3m 17s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 22s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 45s{color} | {color:green} hadoop-yarn-api in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 20m  7s{color} | {color:red} hadoop-yarn-server-nodemanager in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  7m 15s{color} | {color:green} hadoop-yarn-services-core in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 34s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}108m 34s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.yarn.server.nodemanager.containermanager.scheduler.TestContainerSchedulerQueuing |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:8620d2b |
+| JIRA Issue | YARN-7654 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12918621/YARN-7654.010.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  cc  |
+| uname | Linux b70085329fd6 4.4.0-89-generic #112-Ubuntu SMP Mon Jul 31 19:38:41 UTC 2017 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 18de6f2 |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_162 |
+| findbugs | v3.1.0-RC1 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/20310/artifact/out/diff-checkstyle-hadoop-yarn-project_hadoop-yarn.txt |
+| whitespace | https://builds.apache.org/job/PreCommit-YARN-Build/20310/artifact/out/whitespace-eol.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/20310/artifact/out/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-nodemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/20310/testReport/ |
+| Max. process+thread count | 688 (vs. ulimit of 10000) |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager hadoop-yarn-project/hadoop-yarn/hadoop-yarn-applications/hadoop-yarn-services/hadoop-yarn-services-core U: hadoop-yarn-project/hadoop-yarn |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/20310/console |
+| Powered by | Apache Yetus 0.8.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+The failed unit test is tracked in YARN-7700, and not related to this JIRA.
+
+[~ebadger] [~jlowe] Would you mind to take another pass on the latest patch?  Thank you
+
+Patch 11 fixed checkstyle problems.
+
+Patch 12 rebased to current trunk, and removed some unnecessary changes.
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 32s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 13s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 23m 30s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  7m 37s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 12s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 58s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 12m 45s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 28s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 59s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 10s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:red}-1{color} | {color:red} mvninstall {color} | {color:red}  0m 16s{color} | {color:red} hadoop-yarn-services-core in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} compile {color} | {color:red}  3m 12s{color} | {color:red} hadoop-yarn in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} cc {color} | {color:red}  3m 12s{color} | {color:red} hadoop-yarn in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} javac {color} | {color:red}  3m 12s{color} | {color:red} hadoop-yarn in the patch failed. {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  1m  0s{color} | {color:orange} hadoop-yarn-project/hadoop-yarn: The patch generated 3 new + 110 unchanged - 0 fixed = 113 total (was 110) {color} |
+| {color:red}-1{color} | {color:red} mvnsite {color} | {color:red}  0m 19s{color} | {color:red} hadoop-yarn-services-core in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} whitespace {color} | {color:red}  0m  0s{color} | {color:red} The patch has 8 line(s) that end in whitespace. Use git apply --whitespace=fix <<patch_file>>. Refer https://git-scm.com/docs/git-apply {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green}  9m 20s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:red}-1{color} | {color:red} findbugs {color} | {color:red}  0m 43s{color} | {color:red} hadoop-yarn-services-core in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 46s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 33s{color} | {color:green} hadoop-yarn-api in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}  0m 20s{color} | {color:red} hadoop-yarn-server-nodemanager in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}  0m 20s{color} | {color:red} hadoop-yarn-services-core in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 22s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 71m 11s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:8620d2b |
+| JIRA Issue | YARN-7654 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12919292/YARN-7654.012.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  cc  |
+| uname | Linux 23b94fc82fd8 4.4.0-89-generic #112-Ubuntu SMP Mon Jul 31 19:38:41 UTC 2017 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 49f9aca |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_162 |
+| findbugs | v3.1.0-RC1 |
+| mvninstall | https://builds.apache.org/job/PreCommit-YARN-Build/20363/artifact/out/patch-mvninstall-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-applications_hadoop-yarn-services_hadoop-yarn-services-core.txt |
+| compile | https://builds.apache.org/job/PreCommit-YARN-Build/20363/artifact/out/patch-compile-hadoop-yarn-project_hadoop-yarn.txt |
+| cc | https://builds.apache.org/job/PreCommit-YARN-Build/20363/artifact/out/patch-compile-hadoop-yarn-project_hadoop-yarn.txt |
+| javac | https://builds.apache.org/job/PreCommit-YARN-Build/20363/artifact/out/patch-compile-hadoop-yarn-project_hadoop-yarn.txt |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/20363/artifact/out/diff-checkstyle-hadoop-yarn-project_hadoop-yarn.txt |
+| mvnsite | https://builds.apache.org/job/PreCommit-YARN-Build/20363/artifact/out/patch-mvnsite-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-applications_hadoop-yarn-services_hadoop-yarn-services-core.txt |
+| whitespace | https://builds.apache.org/job/PreCommit-YARN-Build/20363/artifact/out/whitespace-eol.txt |
+| findbugs | https://builds.apache.org/job/PreCommit-YARN-Build/20363/artifact/out/patch-findbugs-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-applications_hadoop-yarn-services_hadoop-yarn-services-core.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/20363/artifact/out/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-nodemanager.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/20363/artifact/out/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-applications_hadoop-yarn-services_hadoop-yarn-services-core.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/20363/testReport/ |
+| Max. process+thread count | 440 (vs. ulimit of 10000) |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager hadoop-yarn-project/hadoop-yarn/hadoop-yarn-applications/hadoop-yarn-services/hadoop-yarn-services-core U: hadoop-yarn-project/hadoop-yarn |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/20363/console |
+| Powered by | Apache Yetus 0.8.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 31s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 11s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 22m 45s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  8m 18s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 38s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m 11s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 13m 13s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 52s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 24s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 16s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:red}-1{color} | {color:red} mvninstall {color} | {color:red}  0m 29s{color} | {color:red} hadoop-yarn-api in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} mvninstall {color} | {color:red}  0m 20s{color} | {color:red} hadoop-yarn-server-nodemanager in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} mvninstall {color} | {color:red}  0m 18s{color} | {color:red} hadoop-yarn-services-core in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  6m 32s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} cc {color} | {color:green}  6m 32s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  6m 32s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  1m  9s{color} | {color:orange} hadoop-yarn-project/hadoop-yarn: The patch generated 3 new + 110 unchanged - 0 fixed = 113 total (was 110) {color} |
+| {color:red}-1{color} | {color:red} mvnsite {color} | {color:red}  0m 30s{color} | {color:red} hadoop-yarn-server-nodemanager in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} mvnsite {color} | {color:red}  0m 29s{color} | {color:red} hadoop-yarn-services-core in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} whitespace {color} | {color:red}  0m  0s{color} | {color:red} The patch has 8 line(s) that end in whitespace. Use git apply --whitespace=fix <<patch_file>>. Refer https://git-scm.com/docs/git-apply {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 10m  6s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:red}-1{color} | {color:red} findbugs {color} | {color:red}  0m 27s{color} | {color:red} hadoop-yarn-services-core in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 19s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 43s{color} | {color:green} hadoop-yarn-api in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}  0m 30s{color} | {color:red} hadoop-yarn-server-nodemanager in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}  0m 30s{color} | {color:red} hadoop-yarn-services-core in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 33s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 78m 23s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:8620d2b |
+| JIRA Issue | YARN-7654 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12919299/YARN-7654.013.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  cc  |
+| uname | Linux 523d093cdae1 4.4.0-89-generic #112-Ubuntu SMP Mon Jul 31 19:38:41 UTC 2017 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 60e5c1b |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_162 |
+| findbugs | v3.1.0-RC1 |
+| mvninstall | https://builds.apache.org/job/PreCommit-YARN-Build/20365/artifact/out/patch-mvninstall-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-api.txt |
+| mvninstall | https://builds.apache.org/job/PreCommit-YARN-Build/20365/artifact/out/patch-mvninstall-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-nodemanager.txt |
+| mvninstall | https://builds.apache.org/job/PreCommit-YARN-Build/20365/artifact/out/patch-mvninstall-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-applications_hadoop-yarn-services_hadoop-yarn-services-core.txt |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/20365/artifact/out/diff-checkstyle-hadoop-yarn-project_hadoop-yarn.txt |
+| mvnsite | https://builds.apache.org/job/PreCommit-YARN-Build/20365/artifact/out/patch-mvnsite-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-nodemanager.txt |
+| mvnsite | https://builds.apache.org/job/PreCommit-YARN-Build/20365/artifact/out/patch-mvnsite-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-applications_hadoop-yarn-services_hadoop-yarn-services-core.txt |
+| whitespace | https://builds.apache.org/job/PreCommit-YARN-Build/20365/artifact/out/whitespace-eol.txt |
+| findbugs | https://builds.apache.org/job/PreCommit-YARN-Build/20365/artifact/out/patch-findbugs-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-applications_hadoop-yarn-services_hadoop-yarn-services-core.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/20365/artifact/out/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-nodemanager.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/20365/artifact/out/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-applications_hadoop-yarn-services_hadoop-yarn-services-core.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/20365/testReport/ |
+| Max. process+thread count | 408 (vs. ulimit of 10000) |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager hadoop-yarn-project/hadoop-yarn/hadoop-yarn-applications/hadoop-yarn-services/hadoop-yarn-services-core U: hadoop-yarn-project/hadoop-yarn |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/20365/console |
+| Powered by | Apache Yetus 0.8.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Patch 14 fixed white space error.  Patch 13 seems to have caught between daily snapshot builds and precommit builds, which made pre-commit report inaccurate.
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 36s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 11s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 25m  9s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  8m 43s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 22s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m  1s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 14m  5s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  3m  3s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 25s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 13s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m 36s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  7m 53s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} cc {color} | {color:green}  7m 53s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  7m 53s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  1m 21s{color} | {color:orange} hadoop-yarn-project/hadoop-yarn: The patch generated 3 new + 111 unchanged - 0 fixed = 114 total (was 111) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 58s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} whitespace {color} | {color:red}  0m  0s{color} | {color:red} The patch has 2 line(s) that end in whitespace. Use git apply --whitespace=fix <<patch_file>>. Refer https://git-scm.com/docs/git-apply {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 11m 22s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  3m 49s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 21s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 51s{color} | {color:green} hadoop-yarn-api in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 19m 24s{color} | {color:green} hadoop-yarn-server-nodemanager in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  8m 53s{color} | {color:green} hadoop-yarn-services-core in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 37s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}114m 37s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:8620d2b |
+| JIRA Issue | YARN-7654 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12919498/YARN-7654.014.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  cc  |
+| uname | Linux 2b44c5ccfe84 3.13.0-139-generic #188-Ubuntu SMP Tue Jan 9 14:43:09 UTC 2018 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / e4313e7 |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_162 |
+| findbugs | v3.1.0-RC1 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/20376/artifact/out/diff-checkstyle-hadoop-yarn-project_hadoop-yarn.txt |
+| whitespace | https://builds.apache.org/job/PreCommit-YARN-Build/20376/artifact/out/whitespace-eol.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/20376/testReport/ |
+| Max. process+thread count | 674 (vs. ulimit of 10000) |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager hadoop-yarn-project/hadoop-yarn/hadoop-yarn-applications/hadoop-yarn-services/hadoop-yarn-services-core U: hadoop-yarn-project/hadoop-yarn |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/20376/console |
+| Powered by | Apache Yetus 0.8.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+| (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 36s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 12s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 23m  1s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  8m 28s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 32s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 58s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 12m 54s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 41s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m  9s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 10s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m 25s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  7m 31s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} cc {color} | {color:green}  7m 31s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  7m 31s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  1m 11s{color} | {color:orange} hadoop-yarn-project/hadoop-yarn: The patch generated 3 new + 110 unchanged - 0 fixed = 113 total (was 110) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 48s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green}  9m 53s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  3m 13s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 21s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 44s{color} | {color:green} hadoop-yarn-api in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 19m 32s{color} | {color:green} hadoop-yarn-server-nodemanager in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  9m  1s{color} | {color:green} hadoop-yarn-services-core in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 34s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}107m 24s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:8620d2b |
+| JIRA Issue | YARN-7654 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12919503/YARN-7654.015.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  cc  |
+| uname | Linux 8e1a4f794b0d 4.4.0-89-generic #112-Ubuntu SMP Mon Jul 31 19:38:41 UTC 2017 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / e4313e7 |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_162 |
+| findbugs | v3.1.0-RC1 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/20378/artifact/out/diff-checkstyle-hadoop-yarn-project_hadoop-yarn.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/20378/testReport/ |
+| Max. process+thread count | 712 (vs. ulimit of 10000) |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager hadoop-yarn-project/hadoop-yarn/hadoop-yarn-applications/hadoop-yarn-services/hadoop-yarn-services-core U: hadoop-yarn-project/hadoop-yarn |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/20378/console |
+| Powered by | Apache Yetus 0.8.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+For following up on today's meet up discussion:
+
+Proposal 1: Environment variables are passed as a section in .cmd file, and docker run construct command line arguments to pass environment variables to docker.  In YARN-8079, user can reference to localized env-file from HDFS to support complex use-case where the software developer supplied default environment variables, and allow system administrator to override them.
+
+Proposal 2: All environment key/value pair are written to a file in nmPrivate directory, and docker run reference to filename in nmPrivate directory.  For debug purpose, the same file in nmPrivate directory is copied to log directory for debugging purpose.
+
+The current implementation is written to support proposal 1.
+
+Proposal 1
+| Pro | Cons |
+| No additional file to clean up, environment variables can be seen from docker run command line | docker run command is a long line of string in stdout.txt, it may appear ugly to some users |
+| Separation of duty, allow system administrator to run services and override developer supplied environment variables | |
+| Can hide environment secrets from stdout.txt log file (YARN-8079) | Environment file is not copied to log directory |
+| No filename clashes in localizer directory because user define the env-file filename | Possible abuse of sourcing other container's environment file by guessing exact file path.  (high degree of difficulty) |
+| Save 1 inode for not duplicating env-file in log directory, if log aggregation is not enabled | |
+| Extensible to support "docker run" to be launched as non-yarn user.  yarn.nodemanager.linux-container-executor.nonsecure-mode.local-user can be supported | |
+
+Proposal 2
+| Pro | Cons |
+| Fewer code path to maintain | |
+| | No separation of duty, only one way to define environment variables. |
+| Hide environment secrets from stdout.txt log file | Environment file is copied to log directory, therefore environment secrets is still visible to yarn logs cli command. |
+| | Possible limitation when docker run user != YARN user, nmPrivate directory is limited to yarn user. |
+| | Referenced env-file is different path from what is displayed to user. It can be confusing to first time users. |
+| | Pay 1 extra inode to duplicate env-file to log directory for debugging purpose. |
+
+[~jlowe] [~ebadger] [~Jim_Brennan] [~shanekumpf@gmail.com] [~billie.rinaldi] I try to summarize the pro and cons of both possible implementations.  I think I could be bias toward proposal 1 because it is already implemented.  We can refine code to proposal 2 if we are willing to risk the limitation that docker run user  == root user, and root user always have access to nmPrivate directory.  I am not ready to make that commitment, this is the reason that I ask everyone to provide their input and we respect the majority rules on this matter.  Thank you for reviewing this patch.
+
+{quote}No additional file to clean up, environment variables can be seen from docker run command line
+{quote}
+This is not a pro, it's a con. Users will pass secrets to the container via environment variables, and anyone on the system could casually observe them via the {{ps}} command.
+{quote}Separation of duty, allow system administrator to run services and override developer supplied environment variables
+{quote}
+This is not specific to proposal 1. System administrator variables can be (and already are) overridden by the nodemanager before the environment variables are passed down to the container executor.
+{quote}Can hide environment secrets from stdout.txt log file
+{quote}
+Again I don't see how this is specific to proposal 1. IIUC proposal 1 is going to expose all the enviroment variables in the docker command file that is copied to the log directory. This could be avoided for security reasons, but it could also be avoided for proposal 2 as well. Proposal 2 does not require the environment file for the docker run command to be in the container working directory.
+{quote}No filename clashes in localizer directory because user define the env-file filename
+{quote}
+There are no filename clashes. The env file is being written to the container private directory, the same place tokens are written by the nodemanager today. This is not the container working directory where user files are located, so there's no possibility of a collision.
+{quote}Save 1 inode for not duplicating env-file in log directory, if log aggregation is not enabled
+{quote}
+The env file can be copied into the existing docker.cmd file or other debugging-file-for-launch that already exists which eliminates the extra inode concern along with any file collision potential in the log directory.
+{quote}No separation of duty, only one way to define environment variables.
+{quote}
+This is not a con, it's a pro. Otherwise it's a maintenance burden to support two independent code paths that essentially are doing the same thing.
+{quote}Environment file is copied to log directory, therefore environment secrets is still visible to yarn logs cli command
+{quote}
+This is the same issue as proposal 1, and as I mentioned above, we don't have to copy the environment file to the log directory. It's only for debugging purposes for the user. Either we're going to copy environment variable settings to the log directory for debugging in both proposals, or we're not going to do this for both proposals.
+
+To me this all boils down to the fact that we need to keep the environment variables off the command-line because:
+ 1) They contain unfiltered data from an untrusted source being passed on the command-line to a root program.
+ 2) They are likely to contain sensitive information.
+
+That means we need to go the env-file route. If we have to go the env-file route for security reasons then I don't understand why we would need yet another way to set environment variables.
+
+[~jlowe] {quote}This is not a pro, it's a con. Users will pass secrets to the container via environment variables, and anyone on the system could casually observe them via the ps command.{quote}
+
+This is not true, you can combine YARN-8097 to hide secrets, and they will not be revealed via ps command.
+
+{quote}This is not specific to proposal 1. System administrator variables can be (and already are) overridden by the nodemanager before the environment variables are passed down to the container executor.{quote}
+
+Again, you misunderstand my definition of system administrator in this case.  I am not referring to node manager system environment variables.  They are omitted by ENTRY_POINT support.  The user who launch privileged container to run a system wide Hive service.  This user is a system administrator, and he should have the capability to setup in site specific environment variables files.  Software vendor can provide a set of yarnfile template.  This allows separation to determine which variable is provided by user who ran the job, or software vendor.
+
+{quote}There are no filename clashes. The env file is being written to the container private directory, the same place tokens are written by the nodemanager today. This is not the container working directory where user files are located, so there's no possibility of a collision.{quote}
+
+The problem associated with having the environment variable file in node manager private directory, will require docker to run as root.  In your reply, you did not reply if you will accept all consequence to hard code container-executor to always launch docker as root user.  If this question remains unanswered, then filename collision will happen in localizer directory.  There is a settle difference between container-executor having access to node manager private directory, vs docker have access to node manager private directory.  This issue must be resolved first for no filename collision assumption to be valid.
+
+{quote}That means we need to go the env-file route. If we have to go the env-file route for security reasons then I don't understand why we would need yet another way to set environment variables.{quote}
+
+The world is usually more complex, and there are people delivering the software to customer, and the administrator that maintains the system.  This is similar to Hadoop have core-default.xml, why do we have core-site.xml.  There are good reasons to have those separations.  I am only looking for permission to hard code docker to always be started as root.  In the current feature set, this is not true because we want to support yarn.nodemanager.linux-container-executor.nonsecure-mode.local-user.  Proposal 2 will prevent future support of yarn.nodemanager.linux-container-executor.nonsecure-mode.local-user for docker.  This requires community's consensus to drop support for launch docker other than root user.  [~jlowe] I will accept your view point as drop support for yarn.nodemanager.linux-container-executor.nonsecure-mode.local-user to work with docker.  However, I know that majority of the enterprises do not like having application to run as root.  This is the reason that I like everyone to form a opinion on this issue, and we decide as a community if we are going to make that hard code.  Please be patient and let involved people to provide their feedback.  Thank you for your patience.
+
+bq. Possible limitation when docker run user != YARN user, nmPrivate directory is limited to yarn user.
+[~eyang], I'm confused by this point. Can you explain further? In what circumstance would the user need to look in the nmPrivate directory? AFAIK the NM will always invoke the container-executor (a root setuid binary) to start the docker container. After that, I don't see why the user would need access to the nmPrivate directory outside of debugging (where there have been other ways discussed on how to deal with this). 
+
+bq. The problem associated with having the environment variable file in node manager private directory, will require docker to run as root
+Again, I don't see how the NM would start a docker container that wasn't invoked via the root setuid binary container-executor. Is there some way that I have missed? 
+
+bq. This is not true, you can combine YARN-8079 to hide secrets, and they will not be revealed via ps command.
+How so? The question here is whether the environment variables will be passed on the command line or via an env file whose path is passed via the command line. I don't see how the docker run command can pass the environment variables on the command line while also masking them to the rest of the world. If you are localizing an env file inside of the docker container after the docker run is invoked, then that is outside of the scope of this specific discussion. 
+
+{quote}
+To me this all boils down to the fact that we need to keep the environment variables off the command-line because:
+1) They contain unfiltered data from an untrusted source being passed on the command-line to a root program.
+2) They are likely to contain sensitive information.
+{quote}
+I think this is the most important piece here. If we (rightfully) aren't willing to put secrets or other untrusted code on the command line, then we by definition cannot go with proposal 1. Regardless of YARN-8079, I do not see a path forward with proposal 1 that will prevent a user from unknowingly passing secrets on the command line
+
+[~ebadger]  
+{quote}
+I'm confused by this point. Can you explain further? In what circumstance would the user need to look in the nmPrivate directory? AFAIK the NM will always invoke the container-executor (a root setuid binary) to start the docker container. After that, I don't see why the user would need access to the nmPrivate directory outside of debugging (where there have been other ways discussed on how to deal with this).
+{quote}
+
+Without docker in the picture for a moment, Container-executor runs as root privilege then drop privileges to end user privilege to run java vm.  Therefore all files are prepared and initialized by container-executor to end user privileges in localizer directory for launch.  NmPrivate directory is a contract between node manager and container-executor to exchange private information.
+
+With docker, container-executor doesn't drop privileges to end user to run docker cli.  Instead, the end user uid:gid are passed to docker cli utilities for docker to prepare the proper privileges to run the container.  At this time, docker run is running as root user, it will be possible for --env-file to reference to a file in nmPrivate directory.  If customer ask to harden docker run to a specific user with docker group privileges only.  We can drop privileges in container-executor to a target user, i.e. end user himself or the user configured via yarn.nodemanager.linux-container-executor.nonsecure-mode.local-user.  The env-file in nmPrivate will not be readable by docker client.  Hence, proposal 2 will create limitation for future hardening.
+
+{quote}
+How so? The question here is whether the environment variables will be passed on the command line or via an env file whose path is passed via the command line. I don't see how the docker run command can pass the environment variables on the command line while also masking them to the rest of the world. If you are localizing an env file inside of the docker container after the docker run is invoked, then that is outside of the scope of this specific discussion.
+{quote}
+
+Docker can do this:
+
+{code}
+docker run -e KEY1=KEY2 --env-file=/path/to/password ...
+{code}
+
+The key value pair specified in yarnfile will be passed as command arguments.  Where the file path is supplied directly, they will be evaluated by docker and not exposed as command arguments.  YARN-8097 has example of how the file path is specified.
+
+{quote}
+I think this is the most important piece here. If we (rightfully) aren't willing to put secrets or other untrusted code on the command line, then we by definition cannot go with proposal 1. Regardless of YARN-8079, I do not see a path forward with proposal 1 that will prevent a user from unknowingly passing secrets on the command line
+{quote}
+
+My side of the arguement is to use YARN-8097.  Sorry the JIRA numbers are very similar, please make sure that you evaluated the correct number.  Thanks.  I agree with the potential of unknowing passing secrets on the command line for first time user, but YARN-8097 offers solution to resolve that concern.
+
+{quote}With docker, container-executor doesn't drop privileges to end user to run docker cli. Instead, the end user uid:gid are passed to docker cli utilities for docker to prepare the proper privileges to run the container. At this time, docker run is running as root user, it will be possible for --env-file to reference to a file in nmPrivate directory. If customer ask to harden docker run to a specific user with docker group privileges only. We can drop privileges in container-executor to a target user, i.e. end user himself or the user configured via yarn.nodemanager.linux-container-executor.nonsecure-mode.local-user. The env-file in nmPrivate will not be readable by docker client. Hence, proposal 2 will create limitation for future hardening.
+{quote}
+Thanks for the explanation, [~eyang], that clears things up a ton. I can now see what you're concerned about. That being said, this would be a pretty big change to how we're doing things currently in the docker-hadoop space. Not that we should go with the status quo just because, but it's harder to rationalize making decisions based on things we're not even sure that we would do in the future. For example, you say that a customer may want to have docker be run as a user in the docker group instead of root. I'm wondering if there's really much of a difference there. I can trivially root the box if I'm in the docker group by using docker containers that would be started as root. I can overwrite sudo, add myself to the sudo group, create setuid binaries, etc. So from that angle, I'm not sure running as the docker group really buys us much other than extra code bloat and I think that the act of giving users access to the docker daemon actually decreases security by quite a bit because it's a large attack surface that can be manipulated fairly easily.
+
+{quote}
+Docker can do this:
+
+docker run -e KEY1=KEY2 --env-file=/path/to/password ...
+The key value pair specified in yarnfile will be passed as command arguments. Where the file path is supplied directly, they will be evaluated by docker and not exposed as command arguments. YARN-8097 has example of how the file path is specified.
+{quote}
+Yes, this is true, but this puts no restrictions on the potentially unknowing user and what they can/cannot do. They might just pass all of their secrets on the command line via the key-value pairs, since they don't know any better. If it's unsafe, then why support it at all? When we're dealing with root, I think it's best to move with caution and take out as many variables and moving parts as possible. 
+
+
+
+I'm not going to repeat all of the arguments, but I agree with [~jlowe] and [~ebadger].
+
+The main point I would like to add is that [~eyang]'s proposal seems to rest on the assumption that we will do YARN-8097, exposing the {{--env-file-}} option to the end-user.  I don't agree that this is necessary nor desired.   IIRC,  YARN-8097 was filed in response to one of [~jlowe]'s earlier reviews of this Jira, where he recommended using {{-env-file}} *instead of* a list of {{-e key=value}} pairs.
+
+[~jlowe]'s original comment on this (which I still find very compelling):
+{quote}Actually now that I think about this more, I think we can side step the pipe character hack, the comma problems, the refactoring of the command file, etc., if we leverage the --env-file feature of docker-run. Rather than try to pass untrusted user data on the docker-run command-line and the real potential of accidentally letting some of these "variables" appear as different command-line directives to docker, we can dump the variables to a new file next to the existing command file that contains the environment variable settings, one variable per line. Then we just pass --env-file with the path to the file. That way Docker will never misinterpret this data as anything but environment variables, we don't have to mess with pipe encoding to try to get these variables marshalled through the command file before they get to the container-executor, and we don't have to worry about how to properly marshal them on the command-line for the docker command. As a bonus, I think that precludes needing to refactor the container-executor to do the argument array stuff since we're not trying to pass user-specified env variables on the command-line. That lets us make this JIRA a lot smaller and more focused, and we can move the execv changes to a separate JIRA that wouldn't block this one.
+{quote}
+I do not see any value in providing two ways to specify environment variables to docker, and the {{--env-file}} approach is much cleaner and easier to maintain in code.
+
+Perhaps we should consider YARN-8097 on its own.
+
+{quote}For example, you say that a customer may want to have docker be run as a user in the docker group instead of root. I'm wondering if there's really much of a difference there. I can trivially root the box if I'm in the docker group by using docker containers that would be started as root.{quote}
+
+The purpose is to improve ability to audit the system of who used root privileges.  Most enterprise have audit log streamed to their internal audit system, and analyze who used root privileges.  Without the drop privileges of docker run, we may prevent system audit to take place.  This is something worth your consideration.  Thanks
+
+Thanks for the updated patches, [~eyang]. I'm still going through my review and hope to have more next week.
+{quote}This requires community's consensus to drop support for launch docker other than root user. Jason Lowe I will accept your view point as drop support for yarn.nodemanager.linux-container-executor.nonsecure-mode.local-user to work with docker.
+{quote}
+This statement is misleading. Docker CLI commands are already hard coded to run as root, so no support is being "dropped". {{yarn.nodemanager.linux-container-executor.nonsecure-mode.local-user}} continues to function as it does today, in that it impacts the {{--user}} flag passed to {{docker run}}.
+{quote}The problem associated with having the environment variable file in node manager private directory, will require docker to run as root.
+{quote}
+I hadn't considered this implication in storing the env-file in nmPrivate, so thanks for bringing it up. I can understand that concern and think non-root is an important item to discuss. Unfortunately, there are other features that make removing the root user restriction problematic, such as the docker client config. I think we should open a new issue to explore what it would take to run as non-root, but that shouldn't be a blocker for what we decide here. As Eric B points out, if the non-root user is in the docker group, why not also the yarn group? Giving them docker access essentially gives them root anyway... but I digress, we should discuss that in a separate issue.
+{quote}I do not see any value in providing two ways to specify environment variables to docker
+{quote}
+With what has been outlined so far, I have to agree that I don't see value in two different approaches. The Docker support is already complex and I don't see an immediate need for the use case that was provided for having both.
+{quote}docker run -e KEY1=KEY2 --env-file=/path/to/password ...
+ The key value pair specified in yarnfile will be passed as command arguments. Where the file path is supplied directly, they will be evaluated by docker and not exposed as command arguments. YARN-8097 has example of how the file path is specified.
+{quote}
+IIRC, when a variable is defined in both places, -e options will clobber those in the --env-file . Users now need to understand precedence rules around the Docker CLI options, which is further complicated by YARN's own internal handling of environment variables expansion. Let's keep it simple and use one way.
+{quote}To me this all boils down to the fact that we need to keep the environment variables off the command-line because:
+ 1) They contain unfiltered data from an untrusted source being passed on the command-line to a root program.
+ 2) They are likely to contain sensitive information.
+{quote}
+Frankly, both environment variable options achieve the same end goal; environment variables are set in the container. The {{--env-file}} option gets my vote because it does keep the k=v pairs off the command line and avoids any potential for expansion.
+
+[~jlowe][~ebadger][~Jim_Brennan][~shanekumpf@gmail.com] Thank you all for your feedbacks.  It looks like almost majority of people involved are agreeing to do --env-file approach, and I will revise the patch for proposal #2.  There is zero chance of shell expansion with execvp.  The stdout.txt command line output is only a render of what the command looks like.  Ps and top will display argv[0] as command.  It will not display any -e parameters.  Unless people change their mind, I consider env matter closed and move forward with the implementation.
+
+Patch 16 is changed to support env-file only without -e parameters.  The env file locates in nmPrivate directory next to .cmd file.
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 39s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  1m 42s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 26m 29s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  8m 47s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 27s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m  8s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 14m  7s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  3m 10s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 25s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 13s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m 33s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  7m 34s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} cc {color} | {color:red}  7m 34s{color} | {color:red} hadoop-yarn-project_hadoop-yarn generated 3 new + 0 unchanged - 0 fixed = 3 total (was 0) {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  7m 34s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  1m 19s{color} | {color:orange} hadoop-yarn-project/hadoop-yarn: The patch generated 4 new + 111 unchanged - 0 fixed = 115 total (was 111) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 52s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 11m 17s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  3m 46s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 18s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 45s{color} | {color:green} hadoop-yarn-api in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 19m 29s{color} | {color:green} hadoop-yarn-server-nodemanager in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  8m 48s{color} | {color:green} hadoop-yarn-services-core in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 39s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}117m  3s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:8620d2b |
+| JIRA Issue | YARN-7654 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12920359/YARN-7654.016.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  cc  |
+| uname | Linux 7b663556bba5 3.13.0-139-generic #188-Ubuntu SMP Tue Jan 9 14:43:09 UTC 2018 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 989a392 |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_162 |
+| findbugs | v3.1.0-RC1 |
+| cc | https://builds.apache.org/job/PreCommit-YARN-Build/20447/artifact/out/diff-compile-cc-hadoop-yarn-project_hadoop-yarn.txt |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/20447/artifact/out/diff-checkstyle-hadoop-yarn-project_hadoop-yarn.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/20447/testReport/ |
+| Max. process+thread count | 696 (vs. ulimit of 10000) |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager hadoop-yarn-project/hadoop-yarn/hadoop-yarn-applications/hadoop-yarn-services/hadoop-yarn-services-core U: hadoop-yarn-project/hadoop-yarn |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/20447/console |
+| Powered by | Apache Yetus 0.8.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Patch 17 fixed checkstyle and unused variable issue.
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 35s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  1m  3s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 25m 21s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  8m 33s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 22s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m  0s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 14m  2s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  3m  0s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 25s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 12s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m 33s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  7m 22s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} cc {color} | {color:green}  7m 22s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  7m 22s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 20s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 53s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 11m 13s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  3m 19s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 24s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 47s{color} | {color:green} hadoop-yarn-api in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 19m  1s{color} | {color:red} hadoop-yarn-server-nodemanager in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  8m 55s{color} | {color:green} hadoop-yarn-services-core in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 37s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}113m 49s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.yarn.server.nodemanager.containermanager.TestContainerManager |
+|   | hadoop.yarn.server.nodemanager.containermanager.scheduler.TestContainerSchedulerQueuing |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:b78c94f |
+| JIRA Issue | YARN-7654 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12920474/YARN-7654.017.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  cc  |
+| uname | Linux c9fec707bae1 3.13.0-139-generic #188-Ubuntu SMP Tue Jan 9 14:43:09 UTC 2018 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / f64501f |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_162 |
+| findbugs | v3.1.0-RC1 |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/20461/artifact/out/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-nodemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/20461/testReport/ |
+| Max. process+thread count | 692 (vs. ulimit of 10000) |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager hadoop-yarn-project/hadoop-yarn/hadoop-yarn-applications/hadoop-yarn-services/hadoop-yarn-services-core U: hadoop-yarn-project/hadoop-yarn |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/20461/console |
+| Powered by | Apache Yetus 0.8.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+| (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 58s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  1m  3s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 24m 25s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  8m 53s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 11s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 45s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 12m  7s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 55s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 26s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 12s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m 28s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  6m 40s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} cc {color} | {color:green}  6m 40s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  6m 40s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m  6s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 41s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green}  9m 50s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  3m 13s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 22s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 44s{color} | {color:green} hadoop-yarn-api in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 19m 30s{color} | {color:green} hadoop-yarn-server-nodemanager in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  9m  1s{color} | {color:green} hadoop-yarn-services-core in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 35s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}109m 18s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:b78c94f |
+| JIRA Issue | YARN-7654 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12920474/YARN-7654.017.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  cc  |
+| uname | Linux d05f0ac763bf 4.4.0-89-generic #112-Ubuntu SMP Mon Jul 31 19:38:41 UTC 2017 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / bb3c504 |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_162 |
+| findbugs | v3.1.0-RC1 |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/20463/testReport/ |
+| Max. process+thread count | 712 (vs. ulimit of 10000) |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager hadoop-yarn-project/hadoop-yarn/hadoop-yarn-applications/hadoop-yarn-services/hadoop-yarn-services-core U: hadoop-yarn-project/hadoop-yarn |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/20463/console |
+| Powered by | Apache Yetus 0.8.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+[~jlowe] Can you review the latest patch to see if it addressed all your concerns?  Thank you
+
+My apologies for the delay.  I hope to get some time to look at this tomorrow.  At a quick glance it looks like this is still coupled with the execv changes, but now that the env settings are no longer being passed on the command line there's no need to couple those changes together.  Separating them would make the patches much more focused, smaller, and easier to review.
+
+bq. Ps and top will display argv[0] as command. It will not display any -e parameters.
+
+By default this is true, but it is trivial to use them to dump the full command line.  For example, {{ps -wwef}} or {{top -c}}.
+
+[~jlowe] {quote}
+My apologies for the delay. I hope to get some time to look at this tomorrow. At a quick glance it looks like this is still coupled with the execv changes, but now that the env settings are no longer being passed on the command line there's no need to couple those changes together.
+{quote}
+
+Execv change is required to prevent shell expansion and not limit to environment variable passing.  Popen is vulnerable to user pass in semicolon for launch_command and any of the parameters that have a surface to user input.  Prior to this JIRA, the shell expansion happens inside the docker container because launch_script.sh is running inside the docker container.  In order to reduce risk of possibility to run as root user via popen shell expansion or parameter passing.  You recommended to use exec family call to eliminate the shell expansion.  In the follow up meeting, [~ebadger] also reminded you that execv change is not limited to environment variables but every parameters were passed to docker run.  In order to ensure that launch_command is not ran on host, exec is required.  In order for exec to work with ENTRY_POINT, large amount of boilerplate code would reside in this JIRA and can not be separated out easily.  I am not ignoring your comment on separation to make the core change smaller to improve ability to review, but it is simply not possible to do due to the way code was structured and written.  
+
+Here is a digested summary of the basic change in this JIRA are:
+
+- Passing use-entry-point flag to .cmd file via (DockerRunCommand.java)
+- Write out user defined environment variables to .env file (DockerClient.java)
+- Pass .env file path in .cmd file for container-executor.  (DockerClient.java)
+- Run the docker run command with launch_command as arguments instead of launching docker run with launch_script.sh (container-executor.c)
+- tap to stdout and stderr of the fork child process (docker run) and dup them to disk (stdout.txt, stderr.txt).  (container-executor.c Line 1553)
+- Added retries for docker inspect execution (container-executor.c).
+
+The rest of 95% of the patch are converting from a char* buffer to string array for managing argument passing.
+
+I am not proposing to postpone the execv changes, rather to break up the changes.  We do not have to put in the entry point feature before the execv change.  It sounds like it would be easier to do the execv changes first, then build the entry point feature on top of that.  That's fine with me, but they should not be coupled in the same JIRA since one does not require the other (in a semantic sense).
+
+
+[~jlowe] I filed YARN-8207 for moving execv changes to that JIRA.
+
+[~jlowe] Patch 18 contains only ENTRY_POINT support code.  I cancel the patch review until YARN-8207 is review and committed.
+
+[~jlowe] {quote}By default this is true, but it is trivial to use them to dump the full command line. For example, ps -wwef or top -c.{quote}
+
+It is equally trivial for system administrator to hide program args from user: https://unix.stackexchange.com/questions/264681/how-to-stop-a-user-from-seeing-command-line-arguments/264700#264700
+
+Rebased patch to based on YARN-8207 patch 5.
+
+Rebased patch 20 to based on YARN-8207 patch 007.
+
+I'll try to find time to take a closer look at this patch tomorrow, but I'm wondering if we really need to separate the detached vs. foreground launching for override vs. entry-point containers.  The main problem with running containers in the foreground is that we have no idea how long it takes to actually start a container.  As I mentioned above, any required localization for the image is likely to cause the container launch to fail due to docker inspect retries hitting the retry limit and failing, leaving the container uncontrolled or at best finally killed sometime later if Shane's lifecycle changes cause the container to get recognized long afterwards and killed.
+
+I think a cleaner approach would be to always run containers as detached, so when the {{docker run}} command returns we will know the {{docker inspect}} command will work.  If I understand correctly, the main obstacle to this approach is finding out what to do with the container's standard out and standard error streams which aren't directly visible when the container runs detached.  However I think we can use the {{docker logs}} command after the container is launched to reacquire the container's stdout and stderr streams and tie them to the intended files.  At least my local experiments show {{docker logs}} is able to obtain the separate stdout and stderr streams for containers whether they were started detached or not.  Thoughts?
+
+
+[~jlowe] {quote}I'll try to find time to take a closer look at this patch tomorrow, but I'm wondering if we really need to separate the detached vs. foreground launching for override vs. entry-point containers. The main problem with running containers in the foreground is that we have no idea how long it takes to actually start a container. As I mentioned above, any required localization for the image is likely to cause the container launch to fail due to docker inspect retries hitting the retry limit and failing, leaving the container uncontrolled or at best finally killed sometime later if Shane's lifecycle changes cause the container to get recognized long afterwards and killed.{quote}
+
+Detach option is only obtaining a container id, and container process continues to update information in the background.  We call docker inspect by name reference instead of container id.  Detach does not produce more accurate result than running in the foreground from docker inspect point of view because operations to docker daemon via docker CLI are asynchronous via docker daemon's rest api.  Json output from docker inspect may have partial information.  Since we know exactly the information to parse, therefore retry provides better success rate.  For ENTRY_POINT, docker run in foreground to capture stdout and stderr of ENTRY_POINT process without reliant on mounting host log directory to docker container.  This helps to prevent host log path sticking out inside the container that may look odd to users.
+
+{quote}I think a cleaner approach would be to always run containers as detached, so when the docker run command returns we will know the docker inspect command will work. If I understand correctly, the main obstacle to this approach is finding out what to do with the container's standard out and standard error streams which aren't directly visible when the container runs detached. However I think we can use the docker logs command after the container is launched to reacquire the container's stdout and stderr streams and tie them to the intended files. At least my local experiments show docker logs is able to obtain the separate stdout and stderr streams for containers whether they were started detached or not. Thoughts?{quote}
+
+If we want to run in background, then we have problems to capture logs again base on issues found in prior meetings.  
+
+# The docker logs command will show logs from beginning of the launch to the point where it was captured.  Without frequent calls to docker logs command, we don't get the complete log.  It is expensive to call docker logs with fork and exec than reading a local log file.  If we use --tail option, it is still one extra fork and managing the child process liveness and resource usage.  This complicates how the resource usage should be computed.
+# docker logs does not seem to separate out stdout from stderr.  [This issue|https://github.com/moby/moby/issues/7440] is unresolved in docker. This is different from YARN log file management.  It would be nice to follow yarn approach to make the output less confusing in many situations.
+
+After many experiments, I settled on foreground and dup for simplicity.  Foreground and retry docker inspect is a good concern.  However, there is a way to find the reasonable timeout value to decide if a docker container should be marked as failed.
+
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 25s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 10s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 22m 47s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  9m 34s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 12s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 47s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 12m  5s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 46s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 11s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 12s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m 37s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  9m 23s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} cc {color} | {color:green}  9m 23s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  9m 23s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 16s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 45s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} whitespace {color} | {color:red}  0m  0s{color} | {color:red} The patch has 1 line(s) that end in whitespace. Use git apply --whitespace=fix <<patch_file>>. Refer https://git-scm.com/docs/git-apply {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green}  9m 35s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  3m  6s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m  4s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 40s{color} | {color:green} hadoop-yarn-api in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 20m 33s{color} | {color:red} hadoop-yarn-server-nodemanager in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 11m 12s{color} | {color:green} hadoop-yarn-services-core in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 29s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}111m 36s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.yarn.server.nodemanager.containermanager.TestContainerManager |
+|   | hadoop.yarn.server.nodemanager.containermanager.scheduler.TestContainerSchedulerQueuing |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:abb62dd |
+| JIRA Issue | YARN-7654 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12922559/YARN-7654.021.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  cc  |
+| uname | Linux ab923cc4d5af 4.4.0-64-generic #85-Ubuntu SMP Mon Feb 20 11:50:30 UTC 2017 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 69aac69 |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_162 |
+| findbugs | v3.1.0-RC1 |
+| whitespace | https://builds.apache.org/job/PreCommit-YARN-Build/20653/artifact/out/whitespace-eol.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/20653/artifact/out/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-nodemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/20653/testReport/ |
+| Max. process+thread count | 777 (vs. ulimit of 10000) |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager hadoop-yarn-project/hadoop-yarn/hadoop-yarn-applications/hadoop-yarn-services/hadoop-yarn-services-core U: hadoop-yarn-project/hadoop-yarn |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/20653/console |
+| Powered by | Apache Yetus 0.8.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+{{docker logs -f}} does what we want (at least as of Docker 1.13.1 where I've been testing it).  It grabs the logs from the beginning and then proceeds to follow it.  The concern that it is a process that persists is no different than running with the foreground process, as both are processes that will keep running and complete when the container completes.
+
+bq.  Detach does not produce more accurate result than running in the foreground from docker inspect point of view because operations to docker daemon via docker CLI are asynchronous via docker daemon's rest api.
+
+What I mean by more reliable is that the docker run with detach does not have races with the docker daemon.  The docker run with detach will not complete until the container is running (i.e.: completed localizing the image and finished launching), therefore the docker daemon will definitely know about the container and its name.  That's why we haven't needed retries on the inspect command in the past.  The converse with running in the foreground is very racy.  We can't wait until it returns since the foreground process won't complete until the container is done executing, but we don't know when the docker daemon will have started the container.  It could be in a fraction of a second or it could be many minutes.
+
+bq. docker logs does not seem to separate out stdout from stderr.
+
+Hmm, it is working fine for me:
+{noformat}
+$ cat Dockerfile
+FROM baseimage
+ENTRYPOINT /bin/sh -c 'sleep 30;echo "Hello stdout!";echo "Hello stderr!" >&2'
+$ sudo docker run -d 3e7a52965e43
+31566fcf778647192bff7083580efe1c74524c6c451c0170914d286ba7652778
+$ sudo docker logs -f 31566fcf778647192bff7083580efe1c74524c6c451c0170914d286ba7652778 >/tmp/stdout 2>/tmp/stderr
+[the docker logs command does not complete until the container exits]
+$ cat /tmp/stdout
+Hello stdout!
+$ cat /tmp/stderr
+Hello stderr!
+{noformat}
+
+
+{quote}docker logs does not seem to separate out stdout from stderr. [This issue|https://github.com/moby/moby/issues/7440] is unresolved in docker. This is different from YARN log file management. It would be nice to follow yarn approach to make the output less confusing in many situations.
+{quote}
+[~eyang] did you reference the correct link here? The [issue|https://github.com/moby/moby/issues/7440] referenced appears to have been closed as a user misunderstanding.
+
+[~jlowe]  [~Jim_Brennan] I misread the last message in the discussion forum.  Logs feature can redirect stdout and stderr streams correctly.  However, I am not thrilled to call extra docker logs command to fetch logs, and maintaining the liveness of docker logs command.  In my view, this is more fragile because docker logs command can receive external signal to prevent the whole log to be sent to yarn, and subsequence tailing will report duplicated information.  If it is attached to the real stdout and stderr of the running program, we reduces the headache of additional process management and no duplicate information.
+
+I don't believe blocking call is the correct answer to help determine liveness of docker container.  The blocking call to wait for docker detach has several problems: 1.  Docker run could get stuck in pull docker images when mass number of containers are all starting at the same time and image is not cached locally.  This happen a lot on repositories that are hosted on docker hub.  2.  Docker run cli can also get stuck when docker daemon hangs, and no exit code is returned.  3.  Some docker image that are not built to run in detached mode.  Some developer might have built their system to require foreground mode.  These images will terminate in detach mode.
+
+When "docker run -d", and "docker logs" combination are employed, there is some progress are not logged.  i.e. the downloading progress, docker daemon error message.  The current patch would log any errors coming from docker run cli to provide more information for user who is troubleshooting the problems.
+
+Regarding the racy problem, this is a problem that can be optimized by system administrator.  On a cluster that download all images from internet via a slow internet link.  It is perfectly reasonable to set the retry and timeout value to 30 minutes to wait for download to complete.  In highly automated system, such as a cloud vendor trying to spin up images in fraction of a second for mass number of user, the timeout value might be set to as short as 5 seconds.  If the image came up in 6 seconds, and it missed the SLA, another container takes its place in the next 5 second to provide smooth user experience.  The 6 seconds container is recycled and rebuilt.  At mass scale, race condition problem is easier to deal with than blocking call that prevent the entire automated system from working.
+I can update the code to make retry configurable setting in the short term.
+
+I am not discounting the possibilities to support docker run -d and docker logs, but this requires more development experiments to ensure all mechanic are covered well.  The current approach has been in use in my environment for the past 6 months, and it works well.  For 3.1.1 release, it would be safer to use the current approach to get us better coverage of the type of containers that can be supported.  Thoughts?
+
+In the interest in trying to get this into 3.1, I'm OK with going with the foreground approach for entry point for now as long as the pre-existing containers launch as before (which appears to be the case with the patch).  Changing the entry-point launch logic is something we should be able to update in the future since it's details are hidden from the user.
+
+Comments on the latest patch:
+
+In DockerProviderService#buildContainerLaunchContext it's calling processArtifact then super.buildContainerLaunchContext, but the parent's buildContainerLaunchContext calls processArtifact as well.  Is the double-call intentional?
+
+It looks like the parent is called but in the end the result is smashed by the new setCommand method, and much of the parent method's code was replicated in this method.  Rather than requiring a setCommand interface be added to AbstractLauncher to clobber work previously done, would it make more sense to refactor AbstractProviderService#buildContainerLaunchContext so the pieces needed by DockerProviderService can be reused without requiring the launcher command to be clobbered afterwards?
+
+globalTokens and tokensForSubstitution are unconditionally computed but only needed if the launchCommand is empty.  The computation should be moved inside the conditional.
+
+typo: "Base on discussion" s/b "Based on the discussion"
+
+ENV_DOCKER_COTAINER_ENV_FILE is not used and should be removed.
+
+DockerLinuxContainerRuntime imports ENV_DOCKER_CONTAINER_RUN_OVERRIDE_DISABLE from itself.
+dockerOverride is true when the override disable flag is true which is confusing.  That makes me think dockerOverride actually means "use entry point" but the name implies it is true when we are overriding docker and _not_ using the entry point.  A name like useEntryPoint would make the code much easier to follow if that's indeed what the boolean means.  One example of confusing code that looks like the logic is backwards:
+{code}
+    if (dockerOverride) {
+       LOG.info("command override disabled");
+       runCommand.setOverrideDisabled(true);
+{code}
+
+Nit: The patch is doing the double-env lookup pattern again.  Would be helpful to have a utility method like getEnvBoolean that can be used to lookup environment variables whose values are treated like booleans.
+
+Is it necessary to do the following in isolation or can it be folded into the primary conditional that does entry point logic vs. override logic a bit below?
+{code}
+    if (!dockerOverride) {
+      runCommand.setContainerWorkDir(containerWorkDir.toString());
+    }
+{code}
+
+Should we order the environment by dependencies as we do for normal container launches?  I see DockerRunCommand is using a TreeMap, but would a LinkedHashMap make more sense?  Then we're ordering things based on the order they were added.
+
+DockerClient is creating the environment file in /tmp which has the same leaking problem we had with the docker .cmd files.
+
+writeEnvFile should use try-with-resources to make sure the writer is always closed even when something throws.
+
+writeCommandToTempFile should use try-with-resources so the printWriter is always closed rather than placing explicit close calls on certain errors.
+
+The instance checking and downcasting in writeCommandToTempFile looks pretty ugly.  It would be cleaner to encapsulate this in the DockerCommand abstraction.  One example way to do this is to move the logic of writing a docker command file into the DockerCommand abstract class.  DockerRunCommand can then override that method to call the parent method and then separately write the env file.  Worst case we can add a getEnv method to DockerCommand that returns the collection of environment variables to write out for a command.  DockerCommand would return null or an empty collection while DockerRunCommand can return its environment.
+
+There's no need to have a containsEnv method and a getEnv method, especially when getEnv is cheap.
+
+Nit: It would be nice if DockerRunCommand had a method to add a Collection of environment variables rather than forcing the caller to iterate themselves.
+
+Nit: The following should just be {{String value = Boolean.toString(toggle)}}
+{code}
+    String value = "false";
+    if (toggle) {
+      value = "true";
+    }
+{code}
+
+init_log_path should free tmp_buffer before setting it to NULL.
+
+use_entry_point returns false when the entry point should be used.
+
+The code is now writing "Launching docker container..." etc. even when not using the entry point.  Are these smashed by the container_launch.sh script when not using the entry point?  If not it could be an issue since it's changing what the user's code is writing to those files today.
+
+It would be be nice to factor out the entry-point-specific code path to do the docker inspect with retries logic into a separate function for readability.  It looks like it would come out pretty cleanly.
+
+
+
+[~jlowe] Thank you for the review, the styling improvement will be addressed.  
+
+{quote}
+DockerClient is creating the environment file in /tmp which has the same leaking problem we had with the docker .cmd files.
+{quote}
+
+The patch writes .env file in the same nmPrivate directory as .cmd file.  It doesn't write to /tmp.
+
+{quote}
+The code is now writing "Launching docker container..." etc. even when not using the entry point. Are these smashed by the container_launch.sh script when not using the entry point? If not it could be an issue since it's changing what the user's code is writing to those files today.{quote}
+
+Yes, these lines are overwritten by container_launch.sh for non entry_point mode.  It doesn't break existing compatibility.
+
+
+bq. The patch writes .env file in the same nmPrivate directory as .cmd file. It doesn't write to /tmp.
+
+Yes sorry, I misread that code.  It's using the same directory, so we're good there.
+
+
+[~jlowe] I am struggling withe the following problems:
+{quote}AbstractProviderService#buildContainerLaunchContext so the pieces needed by DockerProviderService can be reused without requiring the launcher command to be clobbered afterwards?{quote}
+
+Launch command is override to bash -c 'launch-command' in DockerLinuxContainerRuntime, and subsequently appended the log redirection. '2> <LOG_DIR>/stderr.txt 1> <LOG_DIR>/stdout.txt', then replaced <LOG_DIR> with actual container logging directory.  The number of steps to go through the preprocessing before writing to .cmd file complicates how to refactor the code base without breaking things.  This is the reason that setCommand was created to flush out the override commands to ensure the command is not tempered incorrectly during the hand off from DockerLinuxContainerRuntime to DockerClient to container-executor.  For safety reason, I keep setCommand to ensure the command is not tempered by string substitutions, and not break YARN v2 API. 
+
+{quote}The instance checking and downcasting in writeCommandToTempFile looks pretty ugly. It would be cleaner to encapsulate this in the DockerCommand abstraction. One example way to do this is to move the logic of writing a docker command file into the DockerCommand abstract class. DockerRunCommand can then override that method to call the parent method and then separately write the env file. Worst case we can add a getEnv method to DockerCommand that returns the collection of environment variables to write out for a command. DockerCommand would return null or an empty collection while DockerRunCommand can return its environment.{quote}
+
+DockerCommand is a data structure class.  It does not handle IO operation.  If we move IO operation to this class, it would not be clean data structure to represent the docker command.  I think it is more self explanatory that for DockerRunCommand, we also write out the environment file.  With changes in YARN-8261, we are interested to ensure that directory is created, create the cmd file, create the env file.  For safety reason, I think we should not make the styling changes for this area at this time because we are out of time to throughly retest what have been tested in the previous patch set.
+
+
+
+[~jlowe] Patch 22 contains all requested changes except refactoring code in AbstractProviderService and DockerProviderService.  I tried to refactor the code, but I haven't got a working implementation.  Due to time constraint, I upload the latest revision for your review first.
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 26s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  1m  1s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 23m 25s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  7m 56s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m  9s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m  4s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 11m 59s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:blue}0{color} | {color:blue} findbugs {color} | {color:blue}  0m  0s{color} | {color:blue} Skipped patched modules with no Java source: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-site {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 43s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 21s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 10s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:red}-1{color} | {color:red} mvninstall {color} | {color:red}  0m 20s{color} | {color:red} hadoop-yarn-server-nodemanager in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} compile {color} | {color:red}  1m  9s{color} | {color:red} hadoop-yarn in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} cc {color} | {color:red}  1m  9s{color} | {color:red} hadoop-yarn in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} javac {color} | {color:red}  1m  9s{color} | {color:red} hadoop-yarn in the patch failed. {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  1m  1s{color} | {color:orange} hadoop-yarn-project/hadoop-yarn: The patch generated 5 new + 110 unchanged - 0 fixed = 115 total (was 110) {color} |
+| {color:red}-1{color} | {color:red} mvnsite {color} | {color:red}  0m 22s{color} | {color:red} hadoop-yarn-server-nodemanager in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} whitespace {color} | {color:red}  0m  0s{color} | {color:red} The patch has 1 line(s) that end in whitespace. Use git apply --whitespace=fix <<patch_file>>. Refer https://git-scm.com/docs/git-apply {color} |
+| {color:red}-1{color} | {color:red} shadedclient {color} | {color:red}  2m 59s{color} | {color:red} patch has errors when building and testing our client artifacts. {color} |
+| {color:blue}0{color} | {color:blue} findbugs {color} | {color:blue}  0m  0s{color} | {color:blue} Skipped patched modules with no Java source: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-site {color} |
+| {color:red}-1{color} | {color:red} findbugs {color} | {color:red}  0m 15s{color} | {color:red} hadoop-yarn-server-nodemanager in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m  0s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 33s{color} | {color:green} hadoop-yarn-api in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}  0m 22s{color} | {color:red} hadoop-yarn-server-nodemanager in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 10m 25s{color} | {color:green} hadoop-yarn-services-core in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m  9s{color} | {color:green} hadoop-yarn-site in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 17s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 73m 23s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:abb62dd |
+| JIRA Issue | YARN-7654 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12922945/YARN-7654.022.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  cc  |
+| uname | Linux 8877a9f65ba8 4.4.0-64-generic #85-Ubuntu SMP Mon Feb 20 11:50:30 UTC 2017 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / d76fbbc |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_162 |
+| findbugs | v3.1.0-RC1 |
+| mvninstall | https://builds.apache.org/job/PreCommit-YARN-Build/20696/artifact/out/patch-mvninstall-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-nodemanager.txt |
+| compile | https://builds.apache.org/job/PreCommit-YARN-Build/20696/artifact/out/patch-compile-hadoop-yarn-project_hadoop-yarn.txt |
+| cc | https://builds.apache.org/job/PreCommit-YARN-Build/20696/artifact/out/patch-compile-hadoop-yarn-project_hadoop-yarn.txt |
+| javac | https://builds.apache.org/job/PreCommit-YARN-Build/20696/artifact/out/patch-compile-hadoop-yarn-project_hadoop-yarn.txt |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/20696/artifact/out/diff-checkstyle-hadoop-yarn-project_hadoop-yarn.txt |
+| mvnsite | https://builds.apache.org/job/PreCommit-YARN-Build/20696/artifact/out/patch-mvnsite-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-nodemanager.txt |
+| whitespace | https://builds.apache.org/job/PreCommit-YARN-Build/20696/artifact/out/whitespace-eol.txt |
+| findbugs | https://builds.apache.org/job/PreCommit-YARN-Build/20696/artifact/out/patch-findbugs-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-nodemanager.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/20696/artifact/out/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-nodemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/20696/testReport/ |
+| Max. process+thread count | 778 (vs. ulimit of 10000) |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager hadoop-yarn-project/hadoop-yarn/hadoop-yarn-applications/hadoop-yarn-services/hadoop-yarn-services-core hadoop-yarn-project/hadoop-yarn/hadoop-yarn-site U: hadoop-yarn-project/hadoop-yarn |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/20696/console |
+| Powered by | Apache Yetus 0.8.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Thanks for updating the patch!
+
+This previous comment appears to have been missed:
+{quote}In DockerProviderService#buildContainerLaunchContext it's calling processArtifact then super.buildContainerLaunchContext, but the parent's buildContainerLaunchContext calls processArtifact as well. Is the double-call intentional?
+{quote}
+Related to the above, it looks like the
+ Boolean.valueOf is more inefficient than Boolean.parseBoolean if what we want is a {{boolean}} instead of a {{Boolean}}. valueOf is implemented in terms of parseBoolean. parseBoolean handles null arguments, so the code can just be a call to parseBoolean directly.
+
+dockerOverride is still named the opposite of what it means based on how it is initialized. It will be true when YARN_CONTAINER_RUNTIME_DOCKER_RUN_OVERRIDE_DISABLE=true which seems backwards. Example of confusing code:
+{code:java}
+    if (dockerOverride) {
+      runCommand.setOverrideDisabled(true);
+{code}
+If we're not going to clean up the DockerRunCommand instance checks then they need to be not so prevalent. writeEnvFile should take a DockerRunCommand and we should only be downcasting once, right after we verified the downcast should succeed.
+
+Nit: printWriter and envWriter are being closed unnecessarily since try-with-resources will also close it.
+
+DockerRunCommand#addEnv should just be: {{userEnv.putAll(environment)}}
+
+docker_override local in create_container_log_dirs is named backwards. It's true when we're using the entry point and false when we're overriding the entry point.
+
+get_max_retries should free max_retries
+
+typo: "spwaning" s/b "spawning"
+
+The documentation states that a replacement container will be launched, but I think it would be more accurate to state the container launch will be marked as failed if the retries max out. IIUC a relaunch will not occur unless the application logic decides to retry that failure.
+{quote}The number of steps to go through the preprocessing before writing to .cmd file complicates how to refactor the code base without breaking things.
+{quote}
+I'm not seeing that at all. There's only two places in the code that setup commands in the AbstractLauncher: AbstractProviderService which is calling addCommands and DockerProviderService which is calling the new setCommands method. The only reason we need a setCommands method on AbstractLauncher is because we want to leverage some code in AbstractProviderService#buildContainerLaunchContext but it does more than we want. All I'm proposing is to break up that method into the parts we do want to reuse and the parts we want to override. For example, we can refactor the part of AbstractProviderService#buildContainerLaunchContext that sets up the launch command to a separate, overridable method like this:
+{code:java}
+  protected void substituteLaunchCommand(AbstractLauncher launcher,
+      ComponentInstance instance, Container container,
+      ContainerLaunchService.ComponentLaunchContext compLaunchContext,
+      Map<String, String> tokensForSubstitution) {
+    // substitute launch command
+    String launchCommand = compLaunchContext.getLaunchCommand();
+    // docker container may have empty commands
+    if (!StringUtils.isEmpty(launchCommand)) {
+      launchCommand = ProviderUtils
+          .substituteStrWithTokens(launchCommand, tokensForSubstitution);
+      CommandLineBuilder operation = new CommandLineBuilder();
+      operation.add(launchCommand);
+      operation.addOutAndErrFiles(OUT_FILE, ERR_FILE);
+      launcher.addCommand(operation.build());
+    }
+  }
+{code}
+then DockerProviderService can override substituteLaunchCommand instead of buildContainerLaunchContext like this:
+{code:java}
+  @Override
+  protected void substituteLaunchCommand(AbstractLauncher launcher,
+      ComponentInstance instance, Container container,
+      ContainerLaunchService.ComponentLaunchContext compLaunchContext,
+      Map<String, String> tokensForSubstitution) {
+    Component component = instance.getComponent().getComponentSpec();
+    Map<String, String> globalTokens =
+        instance.getComponent().getScheduler().globalTokens;
+    tokensForSubstitution = ProviderUtils
+        .initCompTokensForSubstitute(instance, container, compLaunchContext);
+    tokensForSubstitution.putAll(globalTokens);
+
+    // substitute launch command
+    String launchCommand = component.getLaunchCommand();
+    // docker container may have empty commands
+    if (!StringUtils.isEmpty(launchCommand)) {
+      launchCommand = ProviderUtils
+          .substituteStrWithTokens(launchCommand, tokensForSubstitution);
+      CommandLineBuilder operation = new CommandLineBuilder();
+      operation.add(launchCommand);
+      boolean overrideDisable = Boolean.parseBoolean(component
+          .getConfiguration().getEnv(Environment
+              .YARN_CONTAINER_RUNTIME_DOCKER_RUN_OVERRIDE_DISABLE.name()));
+      if (!overrideDisable) {
+        operation.addOutAndErrFiles(OUT_FILE, ERR_FILE);
+      }
+      launcher.addCommand(operation.build());
+    }
+  }
+{code}
+Then the code does less wasted work and doesn't need a setCommands method on the AbstractLauncher.
+
+Note I'm not sure if we really need to rebuild tokensForSubtitution in DockerProviderService, I'm just preserving what the patch was doing. AFAICT the only difference between what the patch had DockerProviderService build for tokens and what AbstractProviderService builds is the latter is doing a pass adding ${env} forms of every env var to the map. If DockerProviderService is supposed to be doing that as well then it can just use the tokenProviderService arg directly rather than building it from scratch.
+
+[~jlowe] Thanks for the reply.  Some answers:
+
+{quote}
+In DockerProviderService#buildContainerLaunchContext it's calling processArtifact then super.buildContainerLaunchContext, but the parent's buildContainerLaunchContext calls processArtifact as well. Is the double-call intentional?
+{quote}
+
+Not intentional, this is fixed in patch 23.
+
+{quote}Note I'm not sure if we really need to rebuild tokensForSubtitution in DockerProviderService, I'm just preserving what the patch was doing. AFAICT the only difference between what the patch had DockerProviderService build for tokens and what AbstractProviderService builds is the latter is doing a pass adding ${env} forms of every env var to the map. If DockerProviderService is supposed to be doing that as well then it can just use the tokenProviderService arg directly rather than building it from scratch.{quote}
+
+I was able to make the refactoring happen this morning with a clear head.  This is more readable without repeat in patch 23.
+
+
+
+[~jlowe] Patch 23 includes all your suggestions.
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 31s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 12s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 26m 12s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  8m 56s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 22s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m 31s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 14m 32s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:blue}0{color} | {color:blue} findbugs {color} | {color:blue}  0m  0s{color} | {color:blue} Skipped patched modules with no Java source: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-site {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  3m  2s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 48s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 12s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m 44s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  7m 17s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} cc {color} | {color:green}  7m 17s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  7m 17s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  1m 22s{color} | {color:orange} hadoop-yarn-project/hadoop-yarn: The patch generated 11 new + 113 unchanged - 0 fixed = 124 total (was 113) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m 18s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 11m 18s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:blue}0{color} | {color:blue} findbugs {color} | {color:blue}  0m  0s{color} | {color:blue} Skipped patched modules with no Java source: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-site {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  3m 20s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 42s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 46s{color} | {color:green} hadoop-yarn-api in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 19m  4s{color} | {color:red} hadoop-yarn-server-nodemanager in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 10m 36s{color} | {color:green} hadoop-yarn-services-core in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 21s{color} | {color:green} hadoop-yarn-site in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 36s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}117m 58s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.yarn.server.nodemanager.containermanager.TestContainerManager |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:abb62dd |
+| JIRA Issue | YARN-7654 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12923074/YARN-7654.023.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  cc  |
+| uname | Linux b899f3a28579 3.13.0-139-generic #188-Ubuntu SMP Tue Jan 9 14:43:09 UTC 2018 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 8f7912e |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_162 |
+| findbugs | v3.1.0-RC1 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/20705/artifact/out/diff-checkstyle-hadoop-yarn-project_hadoop-yarn.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/20705/artifact/out/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-nodemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/20705/testReport/ |
+| Max. process+thread count | 815 (vs. ulimit of 10000) |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager hadoop-yarn-project/hadoop-yarn/hadoop-yarn-applications/hadoop-yarn-services/hadoop-yarn-services-core hadoop-yarn-project/hadoop-yarn/hadoop-yarn-site U: hadoop-yarn-project/hadoop-yarn |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/20705/console |
+| Powered by | Apache Yetus 0.8.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Thanks for updating the patch!
+
+AbstractLauncher still has a setCommand method which is no longer necessary. DockerProviderService should call addCommand instead of setCommand. The only other place commands can be added to AbstractLauncher is in AbstractProviderService#buildLaunchCommand which DockerProviderService overrides.
+
+The try-with-resources was added to only one of the writeCommandToTempFile methods (yes, oddly there are two), and the one that matters was not the one that was updated. As a result the OutputStreamWriter is not closed if anything throws, and the printWriter is not closed if some exceptions are thrown. My apologies for missing this earlier. The clue was only one of them is checking for DockerRunCommand instances.
+
+My previous comment on putAll was misconstrued. I wasn't asking for DockerRunCommand to have a putAll method, rather that the addEnv method should be implemented in terms of userEnv.putAll. putAll is not a very useful method name for DockerRunCommand since it's not clear what "all" is. It's not clear that it's environment variables that are being added to the command. What I originally meant was for DockerRunCommand#addEnv to simply be this:
+{code:java}
+  public final void addEnv(Map<String, String> environment) {
+    userEnv.putAll(environment);
+  }
+{code}
+typo: "use_entry_pont" s/b "use_entry_point"
+
+[~jlowe] Patch 24 fixed the issues above.  I still need time to test all 5 scenarios to make sure that command doesn't get pre-processed by mistake.  The 5 scenarios are:
+
+# Mapreduce
+# LLAP app
+# Docker app with command override
+# Docker app with entry point
+# Docker app with entry point and no launch command
+
+[~jlowe] All 5 scenarios passed with my local kerberos enabled cluster tests.
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 27s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  1m 12s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 27m 26s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  9m  9s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 26s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m 26s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 15m 11s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:blue}0{color} | {color:blue} findbugs {color} | {color:blue}  0m  0s{color} | {color:blue} Skipped patched modules with no Java source: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-site {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  3m 58s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 39s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 11s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m 58s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 11m 18s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} cc {color} | {color:green} 11m 18s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 11m 18s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  1m 36s{color} | {color:orange} hadoop-yarn-project/hadoop-yarn: The patch generated 14 new + 89 unchanged - 0 fixed = 103 total (was 89) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m 48s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 12m 34s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:blue}0{color} | {color:blue} findbugs {color} | {color:blue}  0m  0s{color} | {color:blue} Skipped patched modules with no Java source: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-site {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  3m 49s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 59s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 53s{color} | {color:green} hadoop-yarn-api in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 20m 30s{color} | {color:red} hadoop-yarn-server-nodemanager in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 11m 55s{color} | {color:green} hadoop-yarn-services-core in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 25s{color} | {color:green} hadoop-yarn-site in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 44s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}132m  7s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.yarn.server.nodemanager.containermanager.TestContainerManager |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:abb62dd |
+| JIRA Issue | YARN-7654 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12923095/YARN-7654.024.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  cc  |
+| uname | Linux 1e3436b312de 3.13.0-137-generic #186-Ubuntu SMP Mon Dec 4 19:09:19 UTC 2017 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 4b4f24a |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_162 |
+| findbugs | v3.1.0-RC1 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/20709/artifact/out/diff-checkstyle-hadoop-yarn-project_hadoop-yarn.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/20709/artifact/out/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-nodemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/20709/testReport/ |
+| Max. process+thread count | 815 (vs. ulimit of 10000) |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager hadoop-yarn-project/hadoop-yarn/hadoop-yarn-applications/hadoop-yarn-services/hadoop-yarn-services-core hadoop-yarn-project/hadoop-yarn/hadoop-yarn-site U: hadoop-yarn-project/hadoop-yarn |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/20709/console |
+| Powered by | Apache Yetus 0.8.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Thanks for updating the patch!  The unit test failure does not appear to be related, and the test passes for me with the patch applied.  Looks like it is a known flaky test according to YARN-7145.
+
++1 for patch 024.  Committing this.
+
+Thanks to [~eyang] for the contribution and to [~ebadger], [~shanekumpf@gmail.com], and [~Jim_Brennan] for additional review!  I committed this to trunk and branch-3.1.
+
+
+SUCCESS: Integrated in Jenkins build Hadoop-trunk-Commit #14180 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/14180/])
+YARN-7654. Support ENTRY_POINT for docker container. Contributed by Eric (jlowe: rev 6c8e51ca7eaaeef0626658b3c45d446a537e4dc0)
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-api/src/main/java/org/apache/hadoop/yarn/api/ApplicationConstants.java
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-site/src/site/markdown/DockerContainers.md
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/runtime/DockerLinuxContainerRuntime.java
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/native/container-executor/impl/container-executor.c
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/native/container-executor/test/utils/test_docker_util.cc
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/runtime/docker/DockerClient.java
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/native/container-executor/impl/utils/docker-util.c
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/linux/runtime/docker/DockerRunCommand.java
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/native/container-executor/impl/utils/docker-util.h
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-applications/hadoop-yarn-services/hadoop-yarn-services-core/src/main/java/org/apache/hadoop/yarn/service/provider/AbstractProviderService.java
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-applications/hadoop-yarn-services/hadoop-yarn-services-core/src/main/java/org/apache/hadoop/yarn/service/provider/docker/DockerProviderService.java
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/containermanager/launcher/ContainerLaunch.java
+
+
+[~jlowe] Thank you for the great reviews and commit.
+[~shanekumpf@gmail.com] [~Jim_Brennan] [~ebadger] Thank you for the reviews.
+

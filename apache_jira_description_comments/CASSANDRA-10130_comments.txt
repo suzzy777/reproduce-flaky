@@ -1,0 +1,598 @@
+[~yukim] I don't think this is an issue.  We have a transaction for the StreamingFileTask that only succeeds if all the mutations were applied.  If the node dies during then the sstable isn't marked finished AFAIK.  
+
+[~benedict] If the transaction doesn't succeed would the sstables be used or cleaned up on restart? I would expect the latter.
+
+The latter. Unless there were disk corruption of the transaction log detected, in which case it is pessimistic and assumes they should be kept. We could change this behaviour for MVs, and default to deletion instead.
+
+Thx, closing
+
+I'm afraid this is still an issue for 2is though, since if a node fails [during 2i rebuild after stream|https://github.com/apache/cassandra/blob/af3fe39dcabd9ef77a00309ce6741268423206df/src/java/org/apache/cassandra/streaming/StreamReceiveTask.java#L212] the sstables are already live in the indexed table so 2is will not be fixed by a subsequent repair. Reopening and updating title.
+
+The most straightforward solution would be to use the write path, as it is done with materialized views and CDC. 
+
+As we want to avoid this, we could use [a new table|https://github.com/adelapena/cassandra/blob/10130-trunk/src/java/org/apache/cassandra/db/SystemKeyspace.java#L147] in the system keyspace to keep track of indexes that should be rebuilt before start. So, we could mark the indexes to be rebuilt [right before|https://github.com/adelapena/cassandra/blob/10130-trunk/src/java/org/apache/cassandra/streaming/StreamReceiveTask.java#L231] adding the sstables to the column family and rebuilding the index. If everything is ok, we [unmark|https://github.com/adelapena/cassandra/blob/10130-trunk/src/java/org/apache/cassandra/streaming/StreamReceiveTask.java#L238] the indexes for rebuilding. Otherwise, if the node dies, the next node start would [detect|https://github.com/adelapena/cassandra/blob/10130-trunk/src/java/org/apache/cassandra/index/internal/CassandraIndex.java#L173] the indexes as marked for rebuilding and would throw a full index rebuild.
+
+[Here|https://github.com/adelapena/cassandra/commit/cd5c3faab5d59cc75b98a8151f6245034c634e53] is the draft of the approach.
+
+And [here is a dtest|https://github.com/riptano/cassandra-dtest/compare/master...adelapena:CASSANDRA-10130] reproducing the problem and testing the patch. 
+
+It uses byteman to simulate an index building failure during the load of SSTables with sstableloader. It checks that after the sstableloader failure the table rows are loaded but not indexed, and the index is marked for future rebuilding. Then, it restarts the node and checks that the index is rebuilt and not marked for rebuilding anymore.
+
+The approach looks mostly good, great job! I was thinking we could perhaps merge the {{IndexInfo}} and {{indexes_to_rebuild}} table into a single {{index_build_status}} table, which has the same schema as {{IndexInfo}} plus an additional {{status}} field with the possible values and implications:
+* {{not_built}} or not present: throws unavailable exception when queried
+* {{built}}: serves requests normally
+* {{rebuilding}}: serves requests normally on already started node, rebuild on restart.
+* {{needs_rebuild}}: serves requests normally on already started node while printing a periodic message asking the user to run a manual rebuild, rebuilds on restart.
+
+WDYT?
+
+We would need to deprecate the {{IndexInfo}} table for a couple of major versions and also require a migration of values from the {{IndexInfo}} to the {{index_build_status}} table though, see {{LegacyHintsMigrator}} and {{LegacyBatchlogMigrator}} - we should at some point generalize these migrations.
+
+I had a quick look at this one and I think we could avoid adding yet another system table by just reusing the {{BUILT_INDEXES}} table and following the same pattern used by {{SIM#rebuildIndexesBlocking()}}, that is:
+* Call {{SystemKeyspace#setIndexRemoved()}}.
+* Build index.
+* Call {{SystemKeyspace#setIndexBuilt()}}.
+
+Thoughts? Am I missing anything actually requiring a new table?
+
+[~sbtourist], I think you are right, this could make things much easier :)
+
+Here is the updated patch:
+
+||[trunk|https://github.com/apache/cassandra/compare/trunk...adelapena:10130-trunk]|[utests|http://cassci.datastax.com/view/Dev/view/adelapena/job/adelapena-10130-trunk-testall/]|[dtests|http://cassci.datastax.com/view/Dev/view/adelapena/job/adelapena-10130-trunk-dtest/]|
+
+I have also updated [the dtest|https://github.com/riptano/cassandra-dtest/compare/master...adelapena:CASSANDRA-10130] to be sure that it is still possible to query the index when it is not marked as built.
+
+[~pauloricardomg], what do you think? Are we missing something? The idea about adding a status to the index info table looked nice for future changes. At least we could have renamed the column containing the keyspace name as {{keyspace_name}} instead of {{table_name}}.
+
+Good call [~sbtourist]! I thought setting the index removed would make the queries unavailable so I haven't considered this route, my bad!
+
+There is still a slight possibility of race though if an index is being built by some other thread and we mark the index as built after the streaming operation but before the  other thread build is completed.
+ 
+Perhaps we could have a counter incremented each time an index starts rebuilding and only call {{markIndexBuilt}} if this counter is zero when the index finishes rebuilding?
+
+Dtest looks good!
+
+Good catch [~pauloricardomg]. We could make the {{SecondaryIndexManager#markIndexRemoved}}/{{SecondaryIndexManager#markIndexBuilt}} pair rely on these per index counters, and make sure that all index rebuildings use them.
+
+bq. There is still a slight possibility of race though if an index is being built by some other thread and we mark the index as built after the streaming operation but before the other thread build is completed.
+
+There's actually a very probable race in case of parallel repairs when multiple streaming tasks for the same table are created. We should either find a better (race-free) place where to put those calls, or employ a guarded counter as suggested.
+
+I have updated the patch to use counters, as suggested by [~pauloricardomg]:
+
+||[trunk|https://github.com/apache/cassandra/compare/trunk...adelapena:10130-trunk]|[utests|http://cassci.datastax.com/view/Dev/view/adelapena/job/adelapena-10130-trunk-testall/]|[dtests|http://cassci.datastax.com/view/Dev/view/adelapena/job/adelapena-10130-trunk-dtest/]|
+
+To complement [{{SecondaryIndexManager#markIndexBuilt}}|https://github.com/adelapena/cassandra/blob/55c1fbad6116b8a8b9ccc86ce9fa50396d6bc522/src/java/org/apache/cassandra/index/SecondaryIndexManager.java#L421] and [{{SecondaryIndexManager#markIndexRemoved}}|https://github.com/adelapena/cassandra/blob/55c1fbad6116b8a8b9ccc86ce9fa50396d6bc522/src/java/org/apache/cassandra/index/SecondaryIndexManager.java#L432] I have added a new method [{{SecondaryIndexManager#markIndexBuilding}}|https://github.com/adelapena/cassandra/blob/55c1fbad6116b8a8b9ccc86ce9fa50396d6bc522/src/java/org/apache/cassandra/index/SecondaryIndexManager.java#L410] to be called before any index (re)building. When this method is called it increases a [{{SecondaryIndexManager.PendingIndexBuildsCounter}}|https://github.com/adelapena/cassandra/blob/55c1fbad6116b8a8b9ccc86ce9fa50396d6bc522/src/java/org/apache/cassandra/index/SecondaryIndexManager.java#L1216] associated to the index, and if the counter value is zero it removes the index from the {{IndexInfo}} table. Later, after the index (re)building has successfully ended, a call to the modified [{{SecondaryIndexManager#markIndexBuilt}}|https://github.com/adelapena/cassandra/blob/55c1fbad6116b8a8b9ccc86ce9fa50396d6bc522/src/java/org/apache/cassandra/index/SecondaryIndexManager.java#L421] will decrease the counter and, if it is zero, it will add the index to the {{IndexInfo}} table.
+
+I'm not sure about if the assert in [{{SecondaryIndexManager.PendingIndexBuildsCounter#decrease()}}|https://github.com/adelapena/cassandra/blob/55c1fbad6116b8a8b9ccc86ce9fa50396d6bc522/src/java/org/apache/cassandra/index/SecondaryIndexManager.java#L1236] is too aggressive. The idea is to easily detect calls to [{{SecondaryIndexManager#markIndexBuilt}}|https://github.com/adelapena/cassandra/blob/55c1fbad6116b8a8b9ccc86ce9fa50396d6bc522/src/java/org/apache/cassandra/index/SecondaryIndexManager.java#L421] that are not preceded by a call to [{{SecondaryIndexManager#markIndexBuilding}}|https://github.com/adelapena/cassandra/blob/55c1fbad6116b8a8b9ccc86ce9fa50396d6bc522/src/java/org/apache/cassandra/index/SecondaryIndexManager.java#L410], but maybe it could be replaced by a warning, or even write the {{IndexInfo}} table anyway. What do you think?
+
+Also, it's worth noting that, with this approach, if any (re)building fails for a index, it will get inevitably marked for rebuilding at restart, even if an index rebuilding is manually run. Should we avoid this? If so, how could we avoid race conditions between these manual (re)buildings and those produced by streaming?
+
+bq. To complement SecondaryIndexManager#markIndexBuilt and SecondaryIndexManager#markIndexRemoved I have added a new method SecondaryIndexManager#markIndexBuilding to be called before any index (re)building. 
+
+The approach looks good, but do we really need a {{PendingIndexBuildsCounter}} class? I thought it would be simpler to make {{pendingBuilds}} a {{Map<String, AtomicInteger>}} and keep the inc/dec logic on {{markIndexBuilding}} and {{markIndexBuilt}} instead, which are the only consumers of this class.
+
+bq. Also, it's worth noting that, with this approach, if any (re)building fails for a index, it will get inevitably marked for rebuilding at restart, even if an index rebuilding is manually run. Should we avoid this? If so, how could we avoid race conditions between these manual (re)buildings and those produced by streaming?
+
+Hmm that is a bit less than ideal, since the user will expect the index *NOT* to be rebuilt on restart if there was a subsequent successful rebuild. How about making {{markIndexBuilding}} return the current counter value, and on full index rebuilds we could pass the value to {{markIndexBuilt}}, and if it's the same as before we could assume no new partial or full rebuild was submitted in-between and so we can mark the index as built and reset/remove the counters?
+
+bq. I'm not sure about if the assert in SecondaryIndexManager.PendingIndexBuildsCounter#decrease() is too aggressive.
+
+The previous API did not require users to call {{markIndexBuilding}} before {{markIndexBuilt}}, so we should probably leave the {{markIndexBuilt}} API with the current unsafe behavior (while marking it as deprecated), and add the assertion only on the new API. WDYT?
+
+Some more feedback by my side too.
+
+I think there still is a subtle concurrency issue, due to the fact we have some methods managing the "index status" in the system keyspace via the counter, and other methods directly messing with the system keyspace and/or the pending builds map; i.e., what happens if the index is unregistered while it is being rebuilt? Probably an [NPE|https://github.com/apache/cassandra/compare/trunk...adelapena:10130-trunk#diff-3f2c8994c4ff8748c3faf7e70958520dR424]. I would suggest to clean it up a bit by avoiding to keep "pending builds" in the map after they're all done, that is after the index has been marked as built: by doing so, you can just remove the pending build inside {{markIndexBuilt}} if the counter reaches 0 (you'd have to guard the {{mark*}} methods rather than the counter ones), and hence keep the "build management" code inside the two "mark building/built" methods only.
+
+I'm kinda unsure if we should actually call {{markIndexBuilding}} inside {{createIndex}}: what if the user forgets to call {{markIndexBuilt}} inside the initialization task? There's no such contract forcing the user to do that. So, as a corollary, we should probably accept calls to {{markIndexBuilt}} even without a previous {{markIndexBuilding}} call (that is, making it idempotent).
+
+Also, {{buildAllIndexesBlocking}} doesn't follow the "mark building/built" pattern: isn't that a weird anomaly? I know the {{StreamReceiveTask}} does that, but what about other callers?
+
+Regarding {{PendingIndexBuildsCounter}}, it isn't really just a counter, I would rename it (i.e. just {{PendingBuild}}), and rename its methods as well for further clarity; or we could ditch it altogether as suggested by [~pauloricardomg].
+
+Finally regarding:
+
+bq. the user will expect the index NOT to be rebuilt on restart if there was a subsequent successful rebuild.
+
+Is it what [~adelapena] actually meant? I do not think the index is actually rebuilt on restart if successfully rebuilt manually, or am I missing the point?
+
+bq. do we really need a {{PendingIndexBuildsCounter}} class? I thought it would be simpler to make {{pendingBuilds}} a {{Map<String, AtomicInteger>}} and keep the inc/dec logic on {{markIndexBuilding}} and {{markIndexBuilt}} instead, which are the only consumers of this class.
+Probably not. The {{AtomicInteger}} s are going to be manipulated inside a {{synchronized}} block, so a not thread-safe mutable integer should be enough. This is what led me to build the {{PendingIndexBuildsCounter}} class. But is true that it is easier to just use a {{Map<String, AtomicInteger>}} and keep the logic inside the markIndex* methods.
+
+bq. I'm kinda unsure if we should actually call {{markIndexBuilding}} inside {{createIndex}}: what if the user forgets to call {{markIndexBuilt}} inside the initialization task? There's no such contract forcing the user to do that. So, as a corollary, we should probably accept calls to {{markIndexBuilt}} even without a previous {{markIndexBuilding}} call (that is, making it idempotent).
+It is true that an implementation could forget to call {{markIndexBuilding}} or {{markIndexBuilt}}. But I think that if we relax the counters system then we could have the race conditions that we try to solve. I mean, an effective call to {{markIndexBuilt}} (marking) without a preceding {{markIndexBuilding}} could spoil the efforts of a proper {{markIndexBuilding}}/{{markIndexBuilt}} pair usage. The approach suggested by [~pauloricardomg] could help. Also, as it is pointed, there is no contract forcing the users to use any of the {{markIndex*}} methods, so it's hard to anticipate all possible scenarios to avoid race conditions.
+
+As, an alternative approach, we could hide all the {{markIndex*}} and let the {{SecondaryIndexManager}} to internally manage it. This should avoid the risk of index implementations or other components making calls out of order. Here is a patch showing the approach:
+
+||[trunk|https://github.com/apache/cassandra/compare/trunk...adelapena:10130-trunk]|[utests|http://cassci.datastax.com/view/Dev/view/adelapena/job/adelapena-10130-trunk-testall/]|[dtests|http://cassci.datastax.com/view/Dev/view/adelapena/job/adelapena-10130-trunk-dtest/]|
+
+It adds a {{Runnable}} argument to {{buildAllIndexesBlocking}} to provide the ability of retrying failed new sstables indexing guaranteeing that the hidden {{markIndex*}} methods are properly called. 
+
+The index implementations are not responsible anymore of marking the index as built. This eliminates the bidirectional dependency between {{SecondaryIndexManager}} and the index implementations. We might consider updating the log messages produced by {{CassandraIndex.buildBlocking}} and {{CustomCassandraIndex.buildBlocking}}, or even moving them to the {{SecondaryIndexManager}}.
+
+What do you think? Does it make sense?
+
+[~adelapena], the approach looks good to me, here is some specific feedback:
+
+* Why executing the [preBuildTask|https://github.com/apache/cassandra/compare/trunk...adelapena:10130-trunk#diff-3f2c8994c4ff8748c3faf7e70958520dR389] in another thread via {{executeBlocking}}, rather than just calling {{Runnable#run}}?
+
+* Currently, {{buildIndexesBlocking}} will end up rebuilding *all* indexes even if just a single one failed, because {{markIndexBuilt}} is called in bulk at the very end; I know this is in line with the previous behaviour, but wouldn't it make sense to improve it in this issue?
+
+* Do we have tests checking:
+** Index status pre and post (re)building actions (create index, rebuild index).
+** Index status upon index removal.
+** Index status and automatic rebuild in case of failures.
+
+Overall I like the new approach and the idea of keeping {{markIndex*}} usage restricted to {{SecondaryIndexManager}}, since it will keep things more self-contained and prevent bad usages.
+
+While inspecting usages of {{buildAllIndexesBlocking}} with the {{preBuildTask}} parameter, I noticed that rebuilding indexes is a natural consequence of adding new SSTables to the tracker - I don't see a situation where we want to add SSTables to the tracker and NOT rebuild the indexes, so instead of requiring users of {{Tracker.addSSTables}} to figure out they need to rebuild indexes and create a dependency with the {{SecondaryIndexManager}} (such as {{OnCompletionRunnable}} or {{ColumnFamilyStore.loadNewSSTables}}), or even creating a dependency between {{Tracker.addSSTables}} and the secondary index manager, we could leverage the tracker notification support and make the secondary index automatically rebuild indexes when receiving an {{SSTableAddedNotification}} from the tracker.
+
+However this notification is only triggered *after* the SSTables are added to the tracker, but there is a possibility that there is a failure after some SSTables were already added and we would need to rebuild indexes in that case, so we could maybe add a new {{SSTableBeforeAddedNotification}} (or better name) that is triggered at the start of {{Tracker.addSSTables}}, mark the index as building when receiving that notification and actually trigger {{buildAllIndexesBlocking}} when receiving the {{SSTableAddedNotification}}.
+
+WDYT of this suggestion?
+
+Here is the updated patch:
+
+||[trunk|https://github.com/apache/cassandra/compare/trunk...adelapena:10130-trunk]|[utests|http://cassci.datastax.com/view/Dev/view/adelapena/job/adelapena-10130-trunk-testall/]|[dtests|http://cassci.datastax.com/view/Dev/view/adelapena/job/adelapena-10130-trunk-dtest/]|
+
+bq. Why executing the [preBuildTask|https://github.com/apache/cassandra/compare/trunk...adelapena:10130-trunk#diff-3f2c8994c4ff8748c3faf7e70958520dR389] in another thread via {{executeBlocking}}, rather than just calling {{Runnable#run}}?
+
+Totally agree, [changed|https://github.com/adelapena/cassandra/blob/627266a894d7a34c2c0c7d3226cd91c07fad5a6d/src/java/org/apache/cassandra/index/SecondaryIndexManager.java#L390].
+
+bq. Currently, {{buildIndexesBlocking}} will end up rebuilding all indexes even if just a single one failed, because {{markIndexBuilt}} is called in bulk at the very end; I know this is in line with the previous behaviour, but wouldn't it make sense to improve it in this issue?
+
+I've just changed it to use a [per-builder callback|https://github.com/adelapena/cassandra/blob/627266a894d7a34c2c0c7d3226cd91c07fad5a6d/src/java/org/apache/cassandra/index/SecondaryIndexManager.java#L416] that flushes the indexes, marks them as built and logs the index building completion message.
+
+{quote}
+Do we have tests checking:
+* Index status pre and post (re)building actions (create index, rebuild index).
+* Index status upon index removal.
+* Index status and automatic rebuild in case of failures.
+{quote}
+
+Indeed, some more tests were needed:
+* For unit tests, I have extended the already existent [{{CassandraIndexTest#indexCorrectlyMarkedAsBuildAndRemoved}}|https://github.com/adelapena/cassandra/blob/627266a894d7a34c2c0c7d3226cd91c07fad5a6d/test/unit/org/apache/cassandra/index/internal/CassandraIndexTest.java#L510] to cover the new cases. 
+* For dtests, [{{sstable_generation_loading_test.py#sstableloader_with_failing_2i_test}}|https://github.com/adelapena/cassandra-dtest/blob/8da749e26a4712f4581cabf56c60df92aa65f066/sstable_generation_loading_test.py#L297] covers index status with {{StreamReceiveTask}}. I have also added [{{test_failing_manual_rebuild_index}}|https://github.com/adelapena/cassandra-dtest/blob/8da749e26a4712f4581cabf56c60df92aa65f066/secondary_indexes_test.py#L338-L396], [{{test_drop_index_while_building}}|https://github.com/adelapena/cassandra-dtest/blob/8da749e26a4712f4581cabf56c60df92aa65f066/secondary_indexes_test.py#L398-L434] and [{{test_index_is_not_always_rebuilt_at_start}}|https://github.com/adelapena/cassandra-dtest/blob/8da749e26a4712f4581cabf56c60df92aa65f066/secondary_indexes_test.py#L436-L471] to [{{secondary_indexes_test.py#TestSecondaryIndexes}}|https://github.com/adelapena/cassandra-dtest/blob/8da749e26a4712f4581cabf56c60df92aa65f066/secondary_indexes_test.py].
+
+{quote}
+While inspecting usages of {{buildAllIndexesBlocking}} with the {{preBuildTask}} parameter, I noticed that rebuilding indexes is a natural consequence of adding new SSTables to the tracker - I don't see a situation where we want to add SSTables to the tracker and NOT rebuild the indexes, so instead of requiring users of {{Tracker.addSSTables}} to figure out they need to rebuild indexes and create a dependency with the {{SecondaryIndexManager}} (such as {{OnCompletionRunnable}} or {{ColumnFamilyStore.loadNewSSTables}}), or even creating a dependency between {{Tracker.addSSTables}} and the secondary index manager, we could leverage the tracker notification support and make the secondary index automatically rebuild indexes when receiving an {{SSTableAddedNotification}} from the tracker.
+
+However this notification is only triggered *after* the SSTables are added to the tracker, but there is a possibility that there is a failure after some SSTables were already added and we would need to rebuild indexes in that case, so we could maybe add a new {{SSTableBeforeAddedNotification}} (or better name) that is triggered at the start of {{Tracker.addSSTables}}, mark the index as building when receiving that notification and actually trigger {{buildAllIndexesBlocking}} when receiving the {{SSTableAddedNotification}}.
+{quote}
+This would be similar to how SASI indexes work. However, I'm not sure about if there are cases where a {{SSTableAddedNotification}} shouldn't trigger the indexing of the notified SSTables. For example, {{Tracker#replaceFlushed(Memtable, Iterable<SSTableReader>)}} sends a {{SSTableAddedNotification}}. If I understand it right, this happens when a memtable is flushed to disk. I guess that something similar happens when SSTables are merged by compaction. Currently, these {{SSTableAddedNotification}} s are not associated to an reindexing because the added SSTables contain data that has been already indexed. What do you think?
+
+Thanks for the update! I haven't reviewed new patch yet, but just commenting on the latest statement to get you unblocked:
+
+bq. Currently, these SSTableAddedNotification s are not associated to an reindexing because the added SSTables contain data that has been already indexed. What do you think?
+
+good point! since loading external sstables (either via streaming or {{CFS.loadNewSSTables}}) requires rebuilding indexes while flushing does not this probably indicate we want to further specialize {{SSTableAddedNotification}} to indicate whether the new sstables added were flushed or loaded from an external source. By the way, sstables replaced by compaction use the {{SSTableListChangedNotification}} so this would not be a problem there.
+
+We could either add a new field to {{SSTableAddedNotification}} to indicate wether the added sstables come from flush or external sstables or create two new notifications which would inherit from  {{SSTableAddedNotification}} to maintain backward compatibility, perhaps: {{SSTableFlushedNotification}} and {{ExternalSSTableLoadedNotification}}. 
+
+I think it would be cleaner to have a notification-based 2i rebuild, since this would remove a dependency from components that need to load external sstables from the secondary index manager and this is probably a good opportunity to do it.
+
+bq. We could either add a new field to SSTableAddedNotification to indicate wether the added sstables come from flush or external sstables or create two new notifications which would inherit from SSTableAddedNotification to maintain backward compatibility, perhaps: SSTableFlushedNotification and ExternalSSTableLoadedNotification.
+
+The {{SSTableFlushedNotification}} approach sounds cleaner, mostly because it could carry an unambiguously non-null reference to the flushed {{Memtable}}.
+
+[~pauloricardomg], definitively the event driven approach is a better idea than the lambda. Here is the updated patch:
+
+||[trunk|https://github.com/apache/cassandra/compare/trunk...adelapena:33a603bf89f95a2cfea737572840897fb26c6585]|[utests|http://cassci.datastax.com/view/Dev/view/adelapena/job/adelapena-10130-trunk-testall/]|[dtests|http://cassci.datastax.com/view/Dev/view/adelapena/job/adelapena-10130-trunk-dtest/]|
+
+There is a new [{{SSTableLoadedNotification}}|https://github.com/adelapena/cassandra/blob/33a603bf89f95a2cfea737572840897fb26c6585/src/java/org/apache/cassandra/notifications/SSTableLoadedNotification.java]. This notification contains the unused list of added SSTables; maybe be could remove them.
+
+There is a new attribute named {{areLoaded}} to [{{SSTableAddedNotification}}|https://github.com/adelapena/cassandra/blob/33a603bf89f95a2cfea737572840897fb26c6585/src/java/org/apache/cassandra/notifications/SSTableAddedNotification.java#L27]. This attribute indicates if the added SSTables come from an external source such as streaming or sstableoader.
+
+The new {{SSTableLoadedNotification}} is sent by [{{Tracker#addSSTables}}|https://github.com/adelapena/cassandra/blob/33a603bf89f95a2cfea737572840897fb26c6585/src/java/org/apache/cassandra/db/lifecycle/Tracker.java#L204] depending on its new {{areLoaded}} parameter, with the same meaning as in {{SSTableAddedNotification}}.
+
+[{{SecondaryIndexManager#buildAllIndexesBlocking}}|https://github.com/adelapena/cassandra/blob/33a603bf89f95a2cfea737572840897fb26c6585/src/java/org/apache/cassandra/index/SecondaryIndexManager.java#L289] is now private and called by [{{SecondaryIndexManager#handleNotification}}|https://github.com/adelapena/cassandra/blob/33a603bf89f95a2cfea737572840897fb26c6585/src/java/org/apache/cassandra/index/SecondaryIndexManager.java#L1231].
+
+And here is an alternative version of the patch in which [{{SSTableAddedNotification}}|https://github.com/adelapena/cassandra/blob/10130-trunk-memtable/src/java/org/apache/cassandra/notifications/SSTableAddedNotification.java#L31] uses the origin {{Memtable}} instead of the boolean parameter:
+
+||[trunk|https://github.com/apache/cassandra/compare/trunk...adelapena:10130-trunk-memtable]|[utests|http://cassci.datastax.com/view/Dev/view/adelapena/job/adelapena-10130-trunk-memtable-testall/]|[dtests|http://cassci.datastax.com/view/Dev/view/adelapena/job/adelapena-10130-trunk-memtable-dtest/]|
+
+Probably the boolean argument if strictly enough but consumers could be interested in the {{Memtable}}.
+
+[~pauloricardomg], excellent suggestion.
+
+[~adelapena], I personally like the "memtable" version more, as logically speaking, if an sstable is added with a memtable, it means it has been also indexed, while in all other cases it means the sstable(s) have been externally loaded and needs indexing, but I have a few concerns:
+1) There are too many overloads of {{addSSTable(s)}}, and some of them do not make much sense and are there just to support self calls (i.e. the version with many sstables and a single memtable I believe), so can we clean that up?
+2) Who is actually calling the {{addSSTable}} method with the memtable? I think I'm missing where it's actually used...
+3) Why did you reduce the test coverage in {{indexCorrectlyMarkedAsBuildAndRemoved}}?
+
+I also like the {{SSTableAddedNotification}} version with the memtable better. It would be nice if you could add a short comment explaining when the memtable is present or not.
+
+I'm not sure we should restrict the {{SSTableLoadedNotification}} to only loaded sstables, since a subscriber may want to do an action before and after sstables are added to the tracker, regardless if they are flushed or externally loaded, so we should probably trigger regardless if memtable is null or not and rename the notification to {{SSTableBeforeAddedNotification}} (or similar) - this will also prevent confusion from users thinking the sstables are already in the tracker when receiving an {{SSTableLoadedNotification}}.
+
+Also you should probably ubsubscribe from the tracker when the index is dropped.
+
+This is looking much cleaner now, good job!
+
+Here is the updated version of the patch:
+
+||[trunk|https://github.com/apache/cassandra/compare/trunk...adelapena:10130-trunk-memtable]|[utests|http://cassci.datastax.com/view/Dev/view/adelapena/job/adelapena-10130-trunk-memtable-testall/]|[dtests|http://cassci.datastax.com/view/Dev/view/adelapena/job/adelapena-10130-trunk-memtable-dtest/]|
+
+bq. I personally like the "memtable" version more, as logically speaking, if an sstable is added with a memtable, it means it has been also indexed, while in all other cases it means the sstable(s) have been externally loaded and needs indexing
+
+The only exception to this seems to be [{{CompactionStress}}|https://github.com/apache/cassandra/blob/trunk/tools/stress/src/org/apache/cassandra/stress/CompactionStress.java#L147]. It calls to {{ColumnFamilyStore#addSSTables}} without memtable and without indexing. Fortunately there shouldn't be any associated 2i when the call is done, I have added [a check|https://github.com/adelapena/cassandra/blob/bb1f80b0b7be5122887621878fd6137627f72558/tools/stress/src/org/apache/cassandra/stress/CompactionStress.java#L148] to make sure that it is so.
+
+bq. 1) There are too many overloads of addSSTable(s), and some of them do not make much sense and are there just to support self calls (i.e. the version with many sstables and a single memtable I believe), so can we clean that up?
+
+Cleaned.
+
+bq. 2) Who is actually calling the addSSTable method with the memtable? I think I'm missing where it's actually used...
+
+This is called from [{{Tracker#replaceFlushed}}|https://github.com/adelapena/cassandra/blob/bb1f80b0b7be5122887621878fd6137627f72558/src/java/org/apache/cassandra/db/lifecycle/Tracker.java#L340-L371], and it is checked in [{{TrackerTest#testMemtableReplacement}}|https://github.com/adelapena/cassandra/blob/bb1f80b0b7be5122887621878fd6137627f72558/test/unit/org/apache/cassandra/db/lifecycle/TrackerTest.java#L312].
+
+bq. 3) Why did you reduce the test coverage in {{indexCorrectlyMarkedAsBuildAndRemoved}}?
+
+Because it seemed covered by dtests and simulating an index building failure seemed harder without the function passed as parameter. But really there is a case that is not covered by dtests and the failure can be simulated passing a null sstable collections, so I have added [an equivalent check|https://github.com/adelapena/cassandra/blob/bb1f80b0b7be5122887621878fd6137627f72558/test/unit/org/apache/cassandra/index/internal/CassandraIndexTest.java#L512] using rebuilding.
+
+bq. It would be nice if you could add a short comment explaining when the memtable is present or not.
+
+I have just added [several comments|https://github.com/adelapena/cassandra/blob/bb1f80b0b7be5122887621878fd6137627f72558/src/java/org/apache/cassandra/notifications/SSTableAddedNotification.java], not sure about if they are clear enough or too repetitive.
+
+bq. I'm not sure we should restrict the {{SSTableLoadedNotification}} to only loaded sstables, since a subscriber may want to do an action before and after sstables are added to the tracker, regardless if they are flushed or externally loaded, so we should probably trigger regardless if memtable is null or not and rename the notification to {{SSTableBeforeAddedNotification}} (or similar) - this will also prevent confusion from users thinking the sstables are already in the tracker when receiving an {{SSTableLoadedNotification}}.
+
+Good idea. I have replaced {{SSTableLoadedNotification}} by a [{{SSTableBeforeAddedNotification}}|https://github.com/adelapena/cassandra/blob/bb1f80b0b7be5122887621878fd6137627f72558/src/java/org/apache/cassandra/notifications/SSTableBeforeAddedNotification.java] that is always send before {{SSTableAddedNotification}}. It includes the memtable to allow consumers to know if it comes from a flush.
+
+bq. Also you should probably ubsubscribe from the tracker when the index is dropped.
+
+It is the {{SecondaryIndexManager}} who is subscribed to the tracker. It manages all the indexes on its column family store, so it shouldn't unsubscribe when one of its indexes is dropped, unless I'm missing something.
+
+Thanks for the update! The notification comments look great! See follow-up below:
+
+* It's not clear that users of {{buildIndexesBlocking}} should mark the indexes as building beforehand, so we should make that explicit via an assertion and probably also add a comment - or perhaps provide a default version where it marks indexes as building beforehand, since the only case we will not want to do that is when receiving an {{SSTableAddedNotification}}, since we have already marked them as building when receiving an {{SSTableBeforeAddedNotification}}.
+
+* Even though we have unit tests testing the tracker notifications and marking indexes as build, we don't have a SecondaryIndexManager unit test that checks that it's correctly marking the index as building when receiving an {{SSTableBeforeAddedNotification}} and marked as built after a successful {{SSTableAddedNotification}}. Could you add that please?
+
+* There's still a slight chance that an index is created between an {{SSTableBeforeAddedNotification}} and {{SSTableAddedNotification}} and we won't have marked it as building, so we should probably save the indexes we have marked as building when receiving the {{SSTableBeforeAddedNotification}} and mark any new index as building after receiving an {{SSTableBeforeAddedNotification}} but before building all indexes, and maybe extend the previous unit test to test this unlikely scenario.
+
+* Is there any particular reason why you moved the [order|https://github.com/apache/cassandra/compare/trunk...adelapena:10130-trunk-memtable#diff-a1dda2df07c96dc42ddb58766362703fL357] of {{updateSizeTracking}} on {{Tracker.addSSTables}}?
+
+After those are addressed I think this should be mostly done unless [~sbtourist] has further comments. Thanks!
+
+bq. There's still a slight chance that an index is created between an SSTableBeforeAddedNotification and SSTableAddedNotification and we won't have marked it as building, so we should probably save the indexes we have marked as building when receiving the SSTableBeforeAddedNotification and mark any new index as building after receiving an SSTableBeforeAddedNotification but before building all indexes, and maybe extend the previous unit test to test this unlikely scenario.
+
+The suggestion above feels a bit ugly, so this made me think that when loading external sstables we actually don't care about individual indices: on failure we wan't to rebuild them all on restart, so instead of marking individual indices in need of rebuild, we could instead have a special entry (such as all_indexes_need_rebuild ) in the BUILT_INDEXES table, indicating that on restart if a table contains that entry it needs to rebuild all indexes. If we did this we could probably get rid of the {{pendingBuilds}} counter complexity since we wouldn't race with manual individual index rebuilds on the BUILT_INDEXES table. WDYT?
+
+bq.  I have replaced SSTableLoadedNotification by a SSTableBeforeAddedNotification
+
+Nit: {{SSTableBeforeAddedNotification}} would probably read better as {{SSTableBeforeAddNotification}}.
+
+bq. It's not clear that users of buildIndexesBlocking should mark the indexes as building beforehand, so we should make that explicit via an assertion and probably also add a comment
+
+A comment is a good idea, but I think we shouldn't go further than that: {{buildIndexesBlocking}} is private so we can assume callers know what they're doing.
+
+bq. There's still a slight chance that an index is created between an SSTableBeforeAddedNotification and SSTableAddedNotification and we won't have marked it as building
+
+I think in such case the new {{Index}} initialization task would take care of indexing, so it doesn't really matter if the new index misses the sstable notification. So, to cover against the specific race you mentioned, we can just filter out in {{SIM#handleNotification()}}, when receiving the {{SSTableAddedNotification}}, all indexes not marked as building, as we can assume those missed the first notification because not yet registered (and being just registered, the initialization task will eventually take care of any initial indexing).
+
+bq. we could probably get rid of the pendingBuilds counter complexity since we wouldn't race with manual individual index rebuilds on the BUILT_INDEXES table
+
+I think the race above can be solved easily without adding columns to the system table. Other than that, let's not forget the {{pendingBuilds}} counter was needed to protect us not just against concurrent building of multiple indexes, but also against concurrent building of multiple sstables "batches" for the same index.
+
+Thoughts? I'll now proceed with reviewing the latest code changes.
+
+bq. I think in such case the new Index initialization task would take care of indexing, so it doesn't really matter if the new index misses the sstable notification. So, to cover against the specific race you mentioned, we can just filter out in SIM#handleNotification(), when receiving the SSTableAddedNotification, all indexes not marked as building, as we can assume those missed the first notification because not yet registered (and being just registered, the initialization task will eventually take care of any initial indexing).
+
+It's still possible that an index is created after the {{SSTableAddedNotification}} but before all sstables are added to the tracker, in this case the initial index rebuild will not index the sstables that were added and filtering all indexes marked as building will not re-mark the new index as building since it may be still doing the initial rebuild:
+1. {{SSTableBeforeAddNotification}} is received by SIM
+3. new index is created (it will not index the new sstables since they are not in the tracker yet) and mark as building
+4. New sstables are added to the tracker
+5. {{SSTableAddeNotification}} is received and index rebuild of new sstables is triggered - the index is not re-marked as building because it's already marked as building by the index creation
+6. original index rebuild is finished and index is marked as built
+7. index rebuild of new sstables fail but index is marked as built
+
+This case is extremely unlikely to happen but shows the fragility of this approach, which may be prone to other races we're not aware of.
+
+bq.I think the race above can be solved easily without adding columns to the system table. Other than that, let's not forget the pendingBuilds counter was needed to protect us not just against concurrent building of multiple indexes, but also against concurrent building of multiple sstables "batches" for the same index.
+
+My suggestion was not to add new columns to the system table, but rather overload the existing columns with the following semantics:
+- When an index is created for the first time for a table add new entry {{INSERT INTO system.IndexInfo (table_name, index_name) VALUES ("table", "table")}}
+- When new sstables are received remove this entry from the index while these sstables are being indexed
+- On restart, if this entry is not present it means index rebuild failure for all indexes which need rebuild
+
+To protect against concurrent building of multiple sstables "batches" for the same index, we could still have a pendingBuilds counter but a single counter for all indexes rather than one counter per index. For manual rebuilds we could simply prevent a new index rebuild if there's one already running, since it doesn't make much sense to do simultaneous full rebuilds of the same indexes.
+
+In any case this is just a suggestion, I'm fine if we go with other approach (such as saving which indices were marked on the first notification) or decide this race is too unlikely to bother doing anything.
+
+bq. It's still possible that an index is created after the SSTableAddedNotification but before all sstables are added to the tracker
+
+That made me also think of an ABA-like race, where a new index is registered _and built_ in-between the two notifications, causing it to miss the new-to-be-added sstables. Weird stuff, and overall excellent points [~pauloricardomg].
+
+Given most of the races come from the 2-phase event-based solution, I'd say to simplify it in a way that still at least solves the original issue: that is, keep just the {{SSTableAddedNotification}}, and mark the index building/built around that; this will not protect against failures happening _while_ adding SSTables, but again, it would at least solve the original problem of the index itself failing after adding the SSTables and missing to rebuild. Then, we can think about a more complete solution (i.e. one that doesn't rebuild the whole index because of a single failed stream) in another ticket.
+
+Thoughts?
+
+bq. Given most of the races come from the 2-phase event-based solution, I'd say to simplify it in a way that still at least solves the original issue: that is, keep just the SSTableAddedNotification, and mark the index building/built around that; this will not protect against failures happening while adding SSTables, but again, it would at least solve the original problem of the index itself failing after adding the SSTables and missing to rebuild. Then, we can think about a more complete solution (i.e. one that doesn't rebuild the whole index because of a single failed stream) in another ticket.
+
+Agree, we can think in a wider solution in another ticket. Here is a version of the patch that uses only {{SSTableAddedNotification}}, keeping the 2-phase {{markIndexBuilding}}/{{markIndexBuilt}} internal to {{SecondaryIndexManager}}:
+
+||[trunk|https://github.com/apache/cassandra/compare/trunk...adelapena:10130-trunk]|[utests|http://cassci.datastax.com/view/Dev/view/adelapena/job/adelapena-10130-trunk-testall/]|[dtests|http://cassci.datastax.com/view/Dev/view/adelapena/job/adelapena-10130-trunk-dtest/]|
+
+The [tests|https://github.com/adelapena/cassandra-dtest/tree/CASSANDRA-10130] should show how the approach solves the original problem.
+
+Sorry for being picky here but while we are fixing the original limitation, we are introducing a new limitation that if there's ever a non-fatal index build failure, a successful full index rebuild will not mark the index as built until the node is restarted and the index is unnecessarily rebuilt.
+
+We can probably lift this limitation fairly simply by marking the index as built (and clear the pending counters) if there was no other index build submission since the start of the full rebuild - even if there are (likely failed) pending builds. We also should probably log a warning when there is an index build failure instructing the user to run a full index rebuild to fix it.
+
+bq. Sorry for being picky here but while we are fixing the original limitation, we are introducing a new limitation that if there's ever a non-fatal index build failure, a successful full index rebuild will not mark the index as built until the node is restarted and the index is unnecessarily rebuilt.
+
+Excellent point, you're not being picky at all. There's actually a related problem: if a single sstable indexing fails, we restart the node, and try to load a *new* sstable, the index will be marked as built, even if there's an sstable whose indexing failed.
+
+In other words, it seems to me we should mark the index as built _only_ if:
+1) It is a full rebuild.
+2) It is an initialization task (which should be considered as the initial full build).
+3) It is a single/group sstable(s) indexing, and the index was *already built*: that is, if we initiate an sstable indexing, but the index was *not* marked as built, we should preserve such state (that implementation-wise probably means to just keep the counters at 0 and avoid any marking).
+
+Other than that, I have a concern about [flushing indexes in the future transformation|https://github.com/apache/cassandra/compare/trunk...adelapena:10130-trunk#diff-3f2c8994c4ff8748c3faf7e70958520dR399], which would cause such blocking activity to happen in the compaction thread, a departure from previous behaviour and probably an unwanted one.
+
+Here is another version of the patch:
+
+||[trunk|https://github.com/apache/cassandra/compare/trunk...adelapena:10130-trunk]|[utests|http://cassci.datastax.com/view/Dev/view/adelapena/job/adelapena-10130-trunk-testall/]|[dtests|http://cassci.datastax.com/view/Dev/view/adelapena/job/adelapena-10130-trunk-dtest/]|
+
+The key changes are forbidding concurrent full (re)builds of the same index (there is no reason to want them) and making the initial mark operation of a full index rebuild wait until there are no running partial builds:
+
+
+* Partial builds are always fired during the addition of a new SSTables, notified by {{SSTableAddedNotification}}. These use the regular counters system and only wait if there are ongoing calls to {{markReindexingAllSSTables}}. These calls are done by full index rebuilds and should be a very fast operation to don't block repairs for long.
+* Full builds during index creation acquire a lock to avoid full index rebuilds of the index and call to {{markIndexingAllSSTables}}, without checking if there are running partial builds. Since this is done before registering the index, this is the very first and unique build for the index being created. Once the call to {{markIndexingAllSSTables}} has finished we can register the index and throw the build task. Once the task has finished we release the lock to avoid full index rebuilds of the index.
+* Manual full index rebuilds fail if there is any another running (re)build of the index or if it's being created. In the case of finding a full build the fail is instantaneously, whereas there is a small wait period if there are running partial rebuilds. This shouldn't be a big problem given that they are manually thrown and they can be retried if they are rejected. If they are not rejected, the initial call to {{markReindexingAllSSTables}} will set the involved partial builds counters to zero.
+
+This way, manual rebuilds will be able to reset the pending-for-rebuild-during-restart of the indexes. at the price of requiring mutual exclusion with other rebuilds of the same index. Partial rebuilds can always run but they can be held during the presumably fast call to {{markReindexingAllSSTables}} of the manual full index rebuilds.
+
+bq. Other than that, I have a concern about [flushing indexes in the future transformation|https://github.com/apache/cassandra/compare/trunk...adelapena:10130-trunk#diff-3f2c8994c4ff8748c3faf7e70958520dR399], which would cause such blocking activity to happen in the compaction thread, a departure from previous behaviour and probably an unwanted one.
+Right, I have modified the transformation to be run [in the asyncExecutor|https://github.com/adelapena/cassandra/blob/ebfcb302bcc8301928c329a377f0d694976eb477/src/java/org/apache/cassandra/index/SecondaryIndexManager.java#L500]. The reason for flushing indexes in each future is that we should flush before marking the indexes as built, specially for non {{ColumnFamilyStore}}-based indexes, which is not in line with the previous behaviour.
+
+What do you think? Am I missing some case? Is the [timeout of index rebuilds waiting for partial rebuilds|https://github.com/adelapena/cassandra/blob/ebfcb302bcc8301928c329a377f0d694976eb477/src/java/org/apache/cassandra/index/SecondaryIndexManager.java#L118] adequate or should we use another value or fail instantly?
+
+
+[~adelapena], I reviewed your latest patch and found the concurrent lifecycle implementation a bit hard to understand and maintain. I tried to explain it and give suggestions in writing, but in the end I found it easier and more productive to try an alternative implementation by myself, which you can find [here|https://github.com/sbtourist/cassandra/commit/efe452846d29173e8b0d522651e7dc9f49f2597e]; in a nutshell, this implementation doesn't require any additional locks and manages a fully thread safe lifecycle whose cases I tried to extensively test.
+
+Let me know if you (and [~pauloricardomg]) have any feedback, and feel free to pull it in your branch (just note the patch is implemented against [this|https://github.com/adelapena/cassandra/commit/c002d26255eaf53070a840d7232788e33f852e19] commit in your branch, that is the one previous to your latest changes).
+
+bq. Let me know if you (and Paulo Motta) have any feedback
+
+I found the lockless version easier to follow and overall I like the simplified approach of preventing starting a full index rebuild altogether if any other index build is ongoing. Overall I think this is looking very good and nearly good to go, I did some minor updates, please let me know what do you think:
+* [Unify|https://github.com/pauloricardomg/cassandra/commit/24f6616c7980ceac5c5ef356205223b78d357846] nested try-clause on {{SecondaryIndexManager.buildIndexesBlocking}}
+* [Fix|https://github.com/pauloricardomg/cassandra/commit/9a4008f83bbaf83703d56cabada98db2cf00e3de] doc nits and [remove|https://github.com/pauloricardomg/cassandra/commit/7d8586a7aee8d4c8a252ffddf0d1a21d6a96a21f] trailing whitespaces
+* The fact that the {{SecondaryIndexManager.rebuildIndexesBlocking}} took a collection of SSTables as argument and passed {{fullIndexRebuild=true}} downstream was a bit misleading, since it could be wrongly used for a partial index rebuild with only a subset of the SSTables, so I [simplified|https://github.com/pauloricardomg/cassandra/commit/a945358a36f97632e94e9103650d72c04735354d] that to expose a single method for full index rebuilds externally which is used by both {{ColumnFamilyStore}} and tests. I'm not sure if we should keep the {{rebuildFromSSTablesBlocking}} protected or make it public, I can see if being useful to rebuild a subset of the SSTables but It's not currently used anywhere, but it could maybe used by extensions.
+
+On a side note, I noticed that [this statement|https://github.com/adelapena/cassandra/blob/c5604ffd5ae36cc34d13af6c4c4eadba98458fa3/test/unit/org/apache/cassandra/index/SecondaryIndexManagerTest.java#L369] is wrong (missing table name) but it's not throwing exception? Should we create a ticket for this?
+
+I also think that the lockless version is cleaner. I have pulled it and made some changes [here|https://github.com/adelapena/cassandra/tree/10130-trunk]:
+\\
+\\
+* [Set|https://github.com/adelapena/cassandra/commit/ffc328e7af8f32c0f6027338ec3fb503ce75f983] the {{SettableFuture}} in {{createIndex}} callback after marking the index to be sure that the marking is done when the returned future finishes.
+* [Fix|https://github.com/adelapena/cassandra/commit/c5604ffd5ae36cc34d13af6c4c4eadba98458fa3] {{SIM#isIndexQueryable}} to ensure that the indexes are not queryable while they are been initialized, which was making [this test|https://github.com/apache/cassandra/blob/69aa1737d17089278c725cffeca3f69fb25f0aa0/test/unit/org/apache/cassandra/cql3/validation/entities/SecondaryIndexTest.java#L1065] [fail|http://cassci.datastax.com/view/Dev/view/adelapena/job/adelapena-10130-trunk-sergio-testall/lastCompletedBuild/testReport/].
+* [Update|https://github.com/adelapena/cassandra/commit/e075b42e4a7c3a8fcc11ca51388e38ebcbd075b4] {{CassandraIndexTest#indexCorrectlyMarkedAsBuildAndRemoved}} again to the check new expected behaviour. 
+
+It seems that new lockless version is making [{{scrub_test.TestScrubIndexes.test_standalone_scrub}}|https://github.com/riptano/cassandra-dtest/blob/4031157a28bbefa068820c757457f340f4b77fa0/scrub_test.py#L391] to [fail|http://cassci.datastax.com/view/Dev/view/adelapena/job/adelapena-10130-trunk-dtest/lastCompletedBuild/testReport/scrub_test/TestScrubIndexes/test_standalone_scrub/], I'm still diving into it.
+
+bq. I'm not sure if we should keep the rebuildFromSSTablesBlocking protected or make it public, I can see if being useful to rebuild a subset of the SSTables but It's not currently used anywhere, but it could maybe used by extensions.
+
+I think it's a good idea to make it public to allow extensions to use it, and it is used in [{{CassandraIndexTest#indexCorrectlyMarkedAsBuildAndRemoved}}|https://github.com/adelapena/cassandra/blob/eb0316d651bbdec70896be041ab1981cc9349a18/test/unit/org/apache/cassandra/index/internal/CassandraIndexTest.java#L542].
+
+bq. On a side note, I noticed that [this statement|https://github.com/adelapena/cassandra/blob/c5604ffd5ae36cc34d13af6c4c4eadba98458fa3/test/unit/org/apache/cassandra/index/SecondaryIndexManagerTest.java#L369] is wrong (missing table name) but it's not throwing exception? Should we create a ticket for this?
+
+I think it isn't wrong. The {{%%s}} is transformed into {{%s}} by the first {{String#format}}. Then, {{CQLTest#createIndex}} [applies|https://github.com/apache/cassandra/blob/trunk/test/unit/org/apache/cassandra/cql3/CQLTester.java#L650] another {{String#format}} call to set the name of the current table.
+
+
+
+
+
+
+
+[~adelapena], [~pauloricardomg], excellent additions overall, just a few comments:
+
+* I mistakenly removed {{queryableIndexes}} in my refactor (as noted); [this|https://github.com/adelapena/cassandra/commit/c5604ffd5ae36cc34d13af6c4c4eadba98458fa3] commit added it back, but it's unfortunately not enough, as if the initialization task fails, the index will never be made queryable: we need to fix this, and we need a test for such failure case.
+* Nit/OCD: I would change the [rebuildFromSSTablesBlocking|https://github.com/adelapena/cassandra/commit/a945358a36f97632e94e9103650d72c04735354d#diff-3f2c8994c4ff8748c3faf7e70958520dR306] signature to have the {{sstables}} first, consistently with {{buildIndexesBlocking}}.
+* In {{buildIndexesBlocking}}, any exceptions thrown by {{flushIndexesBlocking}} in the {{finally}} block will hide previous exceptions: we should accumulate them.
+* Nit/OCD: In {{buildIndexesBlocking}}, we should put an additional comment before invoking {{flushIndexesBlocking}}.
+* If {{rebuildFromSSTablesBlocking}} is not used elsewhere, I would strongly recommend to make it private/protected and move its comment to {{rebuildIndexesBlocking}}: the [general rule|https://image.slidesharecdn.com/effectivejava-2ndedition-chapter4-151203200429-lva1-app6891/95/effective-java-chapter-4-classes-and-interfaces-4-638.jpg?cb=1449173201] is methods (as well as attributes) should have the most restricted visibility allowed by working code.
+* Regarding the {{test_standalone_scrub}} failure, I _believe_ it's due to the fact we only manage counters in our marking methods when {{DatabaseDescriptor.isDaemonInitialized()}}, which is obviously not the case with the scrubber; if so, it's probably an easy fix.
+
+As a side note, I opened CASSANDRA-13606 to further improve initialization failures handling.
+
+Also, a style note about indentation for lambdas and anonymous classes; I see [some|https://github.com/adelapena/cassandra/blob/eb0316d651bbdec70896be041ab1981cc9349a18/src/java/org/apache/cassandra/index/SecondaryIndexManager.java#L453] are deeply indented, but I think that makes the code harder to read, and I prefer [standard 4 spaces indent|https://github.com/adelapena/cassandra/blob/eb0316d651bbdec70896be041ab1981cc9349a18/src/java/org/apache/cassandra/index/SecondaryIndexManager.java#L492]: thoughts? Whatever the choice, we should make the patch consistent (but possibly avoid to change other untouched code)
+
+Here is another version of the patch:
+
+||[trunk|https://github.com/apache/cassandra/compare/trunk...adelapena:10130-trunk]|[utests|http://cassci.datastax.com/view/Dev/view/adelapena/job/adelapena-10130-trunk-testall/]|[dtests|http://cassci.datastax.com/view/Dev/view/adelapena/job/adelapena-10130-trunk-dtest/]|
+
+bq. I mistakenly removed {{queryableIndexes]] in my refactor (as noted); [this|https://github.com/adelapena/cassandra/commit/c5604ffd5ae36cc34d13af6c4c4eadba98458fa3] commit added it back, but it's unfortunately not enough, as if the initialization task fails, the index will never be made queryable: we need to fix this, and we need a test for such failure case.
+
+[Here|https://github.com/adelapena/cassandra/commit/2994aece1e936b81ad507f2e9baf0092e79edce0] a successful full rebuild adds the index to the set of queryable indexes. I have also added [some tests|https://github.com/adelapena/cassandra/blob/2994aece1e936b81ad507f2e9baf0092e79edce0/test/unit/org/apache/cassandra/index/SecondaryIndexManagerTest.java#L386-L456] to check the behaviour. Note that a partial build doesn't set the index as queryable.
+
+bq. Nit/OCD: I would change the [rebuildFromSSTablesBlocking|https://github.com/adelapena/cassandra/commit/a945358a36f97632e94e9103650d72c04735354d#diff-3f2c8994c4ff8748c3faf7e70958520dR306] signature to have the {{sstables}} first, consistently with {{buildIndexesBlocking}}.
+
+Initially done [here|https://github.com/adelapena/cassandra/commit/7dfc959703231c9f90f53a3b474cf7f66b240213], but see three quotes below.
+
+bq. In {{buildIndexesBlocking}}, any exceptions thrown by {{flushIndexesBlocking}} in the {{finally}} block will hide previous exceptions: we should accumulate them.
+
+Done [here|https://github.com/adelapena/cassandra/commit/fbce3657132a8b87d2ff2446504634f5efdf2b59].
+
+bq. Nit/OCD: In buildIndexesBlocking, we should put an additional comment before invoking flushIndexesBlocking.
+
+Done [here|https://github.com/adelapena/cassandra/commit/b7bf81acd66c3bdac66ba86117e07cac251ca312].
+
+bq. If {{rebuildFromSSTablesBlocking}} is not used elsewhere, I would strongly recommend to make it private/protected and move its comment to {{rebuildIndexesBlocking}}: the [general rule|https://image.slidesharecdn.com/effectivejava-2ndedition-chapter4-151203200429-lva1-app6891/95/effective-java-chapter-4-classes-and-interfaces-4-638.jpg?cb=1449173201] is methods (as well as attributes) should have the most restricted visibility allowed by working code.
+
+Actually {{rebuildFromSSTablesBlocking}} is only called by full rebuilds, so we can eve get rid of this method and move its content and doc to {{rebuildIndexesBlocking}}, as it is done [here|https://github.com/adelapena/cassandra/commit/cdd32e54f86bd831faa4463489bad153520e2754]. Tests still have access to partial builds through [{{handleNotification}}|https://github.com/adelapena/cassandra/blob/fbce3657132a8b87d2ff2446504634f5efdf2b59/test/unit/org/apache/cassandra/index/SecondaryIndexManagerTest.java#L115].
+
+bq. Regarding the {{test_standalone_scrub failure}}, I believe it's due to the fact we only manage counters in our marking methods when {{DatabaseDescriptor.isDaemonInitialized()}}, which is obviously not the case with the scrubber; if so, it's probably an easy fix.
+
+Right, it's fixed [here|https://github.com/adelapena/cassandra/commit/a2744560b2d3262b1872c5f989d1baee645b7c5c].
+
+Apart form this, [here|https://github.com/adelapena/cassandra/commit/70b477bc4c83613474756d39ac36c1301c4a54b2] I have restored {{CassandraIndexTest#indexCorrectlyMarkedAsBuildAndRemoved}} to its initial shape because all the added cases are (better) covered by {{SecondaryIndexManagerTest}}. The reason to preserve the test is that it uses a real index implementation instead of a mocked one, which can be useful although the difficulties to simulate failures, blocking, etc.
+
+I have also removed some unused imports.
+
+The current version looks good to me, except for the following minor stylistic nits that I found that could be improved during review (feel free to take it or disregard):
+* [Update queryableIndexes only on markIndexBuilt and markIndexRemoved|https://github.com/pauloricardomg/cassandra/commit/74f3eea2d7aa89b644f1ddbc96f9f6d987a27f73]
+* [Rename failedIndexes list to needsFullRebuild|https://github.com/pauloricardomg/cassandra/commit/07be39d7db7030bb5616344074c1c96d27c90d15] (this is mostly because failed index gives the impression the index is not queryable, while in reality the index can be queryable but only needs full rebuild)
+* [Remove unnecessary marking of index in need of full rebuild on index creation|https://github.com/pauloricardomg/cassandra/commit/856ec08d24f615399b0d4a4b063fc96259f60be4]
+* [Warn user to run full rebuild after index failure and log failure stack trace if present|https://github.com/pauloricardomg/cassandra/commit/19b6f3c68d1b00895de2d3da5aec54102b44ce9f]
+
+Great job guys! :)
+
+[~pauloricardomg], I think that the suggestions have a lot of sense, we are so close to finish it :). 
+
+It seems that [moving the update of {{queryableIndexes}}|https://github.com/pauloricardomg/cassandra/commit/74f3eea2d7aa89b644f1ddbc96f9f6d987a27f73] is [breaking some tests at {{SASIIndexTest}}|http://cassci.datastax.com/view/Dev/view/adelapena/job/adelapena-10130-trunk-paulo-testall/lastCompletedBuild/testReport/]. These tests assume that an invalidated index is still able of responding queries, [here|https://github.com/apache/cassandra/blob/trunk/test/unit/org/apache/cassandra/index/sasi/SASIIndexTest.java#L858-L870] and also [here|https://github.com/apache/cassandra/blob/trunk/test/unit/org/apache/cassandra/index/sasi/SASIIndexTest.java#L799-L815]. Not sure about if we should preserve this behaviour or change the SASI test.
+
+bq. Update queryableIndexes only on markIndexBuilt and markIndexRemoved
+
+I think we should preserve the original behaviour; it is not perfect, but CASSANDRA-13606 should provide a proper fix.
+
+bq. Remove unnecessary marking of index in need of full rebuild on index creation
+
+I do not think that was unnecessary, because `createIndex` could fail due to an exception in {{Index#getInitializationTask()}}, hence should be considered as failed.
+
+bq. Warn user to run full rebuild after index failure and log failure stack trace if present
+
++1 (but {{logAndMarkIndexesFailed}} seems to have a bug [here|https://github.com/pauloricardomg/cassandra/commit/19b6f3c68d1b00895de2d3da5aec54102b44ce9f#diff-3f2c8994c4ff8748c3faf7e70958520dR627])
+
+Other than that, I'm +1 on the latest changes, I think we're almost done :)
+
+Here we go with [the renaming of {{failedIndexes}}|https://github.com/adelapena/cassandra/commit/3ab7275114f09a4c2581ba1013f1a2a45c0e97e8] and [the new {{logAndMarkIndexesFailed}} method|https://github.com/adelapena/cassandra/commit/eed1a0f07571b6a3b9e3568c3278cb9bcf37c90a]:
+
+||[trunk|https://github.com/apache/cassandra/compare/trunk...adelapena:10130-trunk]|[utests|http://cassci.datastax.com/view/Dev/view/adelapena/job/adelapena-10130-trunk-testall/]|[dtests|http://cassci.datastax.com/view/Dev/view/adelapena/job/adelapena-10130-trunk-dtest/]|
+
+
+bq. I think we should preserve the original behaviour; it is not perfect, but CASSANDRA-13606 should provide a proper fix.
+
+I really think it makes the code cleaner and less prone to errors to update {{SecondaryIndexManager}} state ({{needsFullRebuild}}, {{queryableIndexes}} and {{inProgressBuilds}}) exclusively in the {{mark*}} methods rather than in many places throughout the code.
+
+The SASI test failures was due to the fact that the {{invalidateAllIndexesBlocking}} name was misleading, since this was actually dropping all indexes, so I renamed it to {{dropAllIndexes}} and extracted the invalidate part into another method which can be used by the SASI tests.
+
+Here is the [commit with these changes|https://github.com/pauloricardomg/cassandra/commit/ad8beb0bb4bf40d0e5cc4aee3c1bf02ace3f6929].
+
+In the same spirit, I also removed the marking of index as failed before fetching the initialization task [on this commit|https://github.com/pauloricardomg/cassandra/commit/33f56de12f3573f42e0426cd915fb049405c883d].
+
+Regarding the exception being passed as the last parameter to the logger, that's not a bug since sl4j [will properly handle that case|https://www.slf4j.org/faq.html#paramException], so I added [this commit|https://github.com/pauloricardomg/cassandra/commit/b5771f010191b06198880b5c2bb1dfc0c46b3b1c] reinstating this behavior.
+
+[~sbtourist] let me know what do you think before [~adelapena] updates the branch with these suggestions.
+
+Thanks!
+
+bq. I really think it makes the code cleaner and less prone to errors to update SecondaryIndexManager state (needsFullRebuild, queryableIndexes and inProgressBuilds) exclusively in the mark* methods rather than in many places throughout the code.
+
+I know that would be cleaner, but bear in mind that's also a change from previous behaviour *and* would cause the index to be considered queryable even if the initialization task failed and later a non-full rebuild succeeded. I'm not a fan of that, but I'll leave it to you guys.
+
+bq. I also removed the marking of index as failed before fetching the initialization task on this commit.
+
+Looks good, and also properly marks the index failed (which we forgot to do before).
+
+bq. Regarding the exception being passed as the last parameter to the logger, that's not a bug since sl4j will properly handle that case
+
+Apologies, I misread the diff.
+
+I'd like to finally highlight two further changes from previous behaviour that just crossed my mind (unrelated to Paulo's patches):
+1) If the index initialization fails because of a non build error, and the index was previously built, it will be rebuilt again from scratch anyway.
+2) If a single sstable build fails, the index will be (potentially) fully rebuilt at restart; while theoretically correct, this could have a non-trivial performance impact at startup.
+
+That said, #1 is probably better addressed by CASSANDRA-13606, while #2 is what worries me most; I personally do not think that automatically rebuilding the indexes at startup gives much advantages, as it's an async operation anyway, so I'd propose to either/both add a {{cassandra.yaml}} option to enable automatic rebuilds explicitly or/and add a flag to NodeTool to rebuild indexes _only if_ not already built.
+
+Thoughts?
+
+I have merged the changes by [~pauloricardomg].
+
+bq. I really think it makes the code cleaner and less prone to errors to update SecondaryIndexManager state (needsFullRebuild, queryableIndexes and inProgressBuilds) exclusively in the mark* methods rather than in many places throughout the code.
+
+bq. I know that would be cleaner, but bear in mind that's also a change from previous behaviour and would cause the index to be considered queryable even if the initialization task failed and later a non-full rebuild succeeded. I'm not a fan of that, but I'll leave it to you guys.
+
+What we can do here is adding {{isFullRebuild}} to {{markIndexBuilt}} to only set the index as queryable if the method is invoked by a full index rebuild, as it is done [here|https://github.com/adelapena/cassandra/commit/ca7da30f621e742f85b6a7b1f66d320ba224a6a4]. I have also added a new test to check how a successful partial build doesn't set the index as queryable when the initialization has failed.
+
+bq. I'd propose to either/both add a cassandra.yaml option to enable automatic rebuilds explicitly or/and add a flag to NodeTool to rebuild indexes only if not already built.
+
+Adding a cassandra.yaml option seems like a good idea, I think we could address it as an improvement in a separate ticket. About adding a flag to {{nodetool rebuild_index}}, I think I'd prefer to add a command to let the user query if/which indexes are built in a more friendly way than looking in the {{IndexInfo}} table. Does it make sense?
+
+ 
+
+bq. What we can do here is adding isFullRebuild to markIndexBuilt to only set the index as queryable if the method is invoked by a full index rebuild
+
+Good call! This approach looks better to me than handling state in non mark-methods and will still keep the current behavior.
+
+bq. Adding a cassandra.yaml option seems like a good idea, I think we could address it as an improvement in a separate ticket. 
+
+Agreed. The most typical failures during index rebuild are:
+a) node crash
+b) file system failure
+
+This patch already provides a good solution to A), and B) should in most cases stop the node via the default {{disk_failure_policy: stop}}, so while it would be nice to provide more tools to allow handling 2i rebuild failure more gracefully (via auto-rebuild or nodetool) I think non-crash/stop cases will be pretty uncommon so we can address those in a separate improvement ticket. BTW, relating to point 2, I think we should probably run exceptions during 2i rebuild failure ({{logAndMarkIndexesFailed}}) via the {{JVMStabilityInspector}}. WDYT?
+
+bq. I think we should probably run exceptions during 2i rebuild failure (logAndMarkIndexesFailed) via the JVMStabilityInspector
+
+Agreed.
+
++1 otherwise, excellent job everyone :)
+
+bq. I think we should probably run exceptions during 2i rebuild failure (logAndMarkIndexesFailed) via the JVMStabilityInspector
+
+Done [here|https://github.com/adelapena/cassandra/compare/ca7da30f621e742f85b6a7b1f66d320ba224a6a4...adelapena:0f6972eacdab6b0c81e00d8c0c59968106d3f462], with tests for both create and rebuild.
+
+Here is the full patch with CI results:
+
+||[trunk|https://github.com/apache/cassandra/compare/trunk...adelapena:10130-trunk]|[utests|http://cassci.datastax.com/view/Dev/view/adelapena/job/adelapena-10130-trunk-testall/]|[dtests|http://cassci.datastax.com/view/Dev/view/adelapena/job/adelapena-10130-trunk-dtest/]|
+
+[~adelapena], the latest commit looks good, just two minor notes about tests:
+1) Shouldn't we set the [throwable|https://github.com/adelapena/cassandra/compare/ca7da30f621e742f85b6a7b1f66d320ba224a6a4...adelapena:0f6972eacdab6b0c81e00d8c0c59968106d3f462#diff-0ccfd193eadf8f1c2a48cf846b4eb791R549] null on {{TestingIndex#clear()}}?
+2) Shouldn't we test the stability inspector on index creation too?
+
+bq. 1) Shouldn't we set the [throwable|https://github.com/adelapena/cassandra/compare/ca7da30f621e742f85b6a7b1f66d320ba224a6a4...adelapena:0f6972eacdab6b0c81e00d8c0c59968106d3f462#diff-0ccfd193eadf8f1c2a48cf846b4eb791R549] null on TestingIndex#clear()?
+
+Yes, I totally forgot to reset the two throwables, fixed [here|https://github.com/adelapena/cassandra/commit/387b21f2e8d2c1f6cc6b5f46be8ed0039d32c0bf].
+
+bq. 2) Shouldn't we test the stability inspector on index creation too?
+
+There were tests for the the stability inspector on index creation [here|https://github.com/adelapena/cassandra/blob/387b21f2e8d2c1f6cc6b5f46be8ed0039d32c0bf/test/unit/org/apache/cassandra/index/SecondaryIndexManagerTest.java#L477-L512]. 
+
+I have also fixed [{{SecondaryIndexManagerTest#rebuildWithFailure}}|https://github.com/adelapena/cassandra/commit/3e82cd890f64bd75463568ee67d69a5003f6d935] to wait until the index creation has finished before attempting the failing rebuild. This test was slightly flaky, failing very rarely.
+
+Excellent, can we have another utests/dtests run before the final +1?
+
+Sure:
+
+||[trunk|https://github.com/apache/cassandra/compare/trunk...adelapena:10130-trunk]|[utests|http://cassci.datastax.com/view/Dev/view/adelapena/job/adelapena-10130-trunk-testall/]|[dtests|http://cassci.datastax.com/view/Dev/view/adelapena/job/adelapena-10130-trunk-dtest/]|
+
+The last execution doesn't contain the last commit fixing {{SecondaryIndexManagerTest#rebuildWithFailure}}. The new job execution should take a little bit more than two hours.
+
+LGTM after CI is happy. Great job!
+
+bq. The last execution doesn't contain the last commit fixing SecondaryIndexManagerTest#rebuildWithFailure. The new job execution should take a little bit more than two hours.
+
+I'm not sure if you already prepared for commit (CHANGES, squash+rebase) but it would probably be wise to do that before submitting another CI round to make sure we catch any potential problems on CI after rebase.
+
+Thanks!
+
+bq. I'm not sure if you already prepared for commit (CHANGES, squash+rebase) but it would probably be wise to do that before submitting another CI round to make sure we catch any potential problems on CI after rebase.
+
+Wise idea, [~pauloricardomg]. I hadn't prepared it for commit, but now I have. The squashed and rebased patch is in [this branch|https://github.com/adelapena/cassandra/commits/10130-trunk-squash].
+
+The notice for CHANGES.txt is "Fix management of secondary indexes (re)builds (CASSANDRA-10130)", which is quite generic and distant from the title of this ticket. Suggestions are welcome.
+
+I ran the final patch on our internal CI. There are not failures for the unit tests and the failing dtests are not related to the change.
+
+bq.  The squashed and rebased patch is in this branch.
+
+The squashed patch LGTM, you should just need to format the commit message to include the reviewers ([format here|https://wiki.apache.org/cassandra/HowToContribute#Committing]).
+
+bq. The notice for CHANGES.txt is "Fix management of secondary indexes (re)builds (CASSANDRA-10130)", which is quite generic and distant from the title of this ticket. Suggestions are welcome.
+
+Perhaps "Improve secondary index (re)build failure and concurrency handling"? 
+
+bq. I ran the final patch on our internal CI. There are not failures for the unit tests and the failing dtests are not related to the change.
+
+Great job, ship it! (pending [~sbtourist] final +1) :-)
+
+I have just updated both the CHANGES.txt and the commit message, [here|https://github.com/adelapena/cassandra/commits/10130-trunk-squash]. Thanks!
+
+Excellent job everyone! +1
+
+Committed as [679c31718b709f5619bba80eeb6f388484b94c3c|https://github.com/apache/cassandra/commit/679c31718b709f5619bba80eeb6f388484b94c3c] :)
+
+Thanks a lot for your help!
+
+PR for dtests [here|https://github.com/riptano/cassandra-dtest/pull/1486].
+

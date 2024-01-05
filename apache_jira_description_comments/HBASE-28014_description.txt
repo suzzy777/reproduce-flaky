@@ -1,0 +1,59 @@
+We are doing systematic testing in HBase stable release 2.0.0 and found transient underlying HDFS failure may cause some flaky behaviors in replication between HBase clusters. 
+
+We just utilize the fundamental setup in TestReplicationBase.java, in which we start the first cluster with 2 slaves and the second cluster with 4 slaves. Then it sets the second cluster to be the slave cluster for the first cluster to test replication.
+
+ 
+{code:java}
+...
+utility1.startMiniCluster(2);    
+utility2.startMiniCluster(4);
+...    
+hbaseAdmin.addReplicationPeer("2", rpc); 
+...{code}
+After all setup are done, we just run runSimplePutdeleteTest() in TestReplicationBase.java in which we just add one row to the common topic in the first cluster and then check that row is successfully replicated to the common topic in the second cluster. However, when there is one transient HDFS failure happening, this test becomes flaky. 
+
+In hbaseAdmin.addReplicationPeer(“2”,rpc) during setup, the zknodes for the two regionservers in the first cluster are changed first to reflect the adding cluster 2 as replication peer:
+
+ 
+{code:java}
+2023-08-03 10:19:55,137 DEBUG [Time-limited test-EventThread] zookeeper.ZKUtil(355): regionserver:40051-0x189bbc4c84c0005, quorum=localhost:62113, baseZNode=/1 Set watcher on existing znode=/1/replication/peers/2
+2023-08-03 10:19:55,137 DEBUG [Time-limited test-EventThread] zookeeper.ZKUtil(355): regionserver:40693-0x189bbc4c84c0004, quorum=localhost:62113, baseZNode=/1 Set watcher on existing znode=/1/replication/peers/2 {code}
+After that, the ZKWatcher at each regionserver will sense that and make corresponding state changes in HBase implementation in this stack trace: 
+
+ 
+{code:java}
+at org.apache.hadoop.hbase.util.CommonFSUtils.getRootDir(CommonFSUtils.java:367)
+at org.apache.hadoop.hbase.replication.regionserver.HBaseInterClusterReplicationEndpoint.init(HBaseInterClusterReplicationEndpoint.java:160)        
+at org.apache.hadoop.hbase.replication.regionserver.ReplicationSourceManager.getReplicationSource(ReplicationSourceManager.java:509)        
+at org.apache.hadoop.hbase.replication.regionserver.ReplicationSourceManager.addSource(ReplicationSourceManager.java:263)
+at org.apache.hadoop.hbase.replication.regionserver.ReplicationSourceManager.peerListChanged(ReplicationSourceManager.java:626)
+at org.apache.hadoop.hbase.replication.ReplicationTrackerZKImpl$PeersWatcher.nodeChildrenChanged(ReplicationTrackerZKImpl.java:191)
+at org.apache.hadoop.hbase.zookeeper.ZKWatcher.process(ZKWatcher.java:481)
+at org.apache.zookeeper.ClientCnxn$EventThread.processEvent(ClientCnxn.java:530)
+at org.apache.zookeeper.ClientCnxn$EventThread.run(ClientCnxn.java:505){code}
+However, in CommonFSUtils#getRootDir(), it would call getFileSystem() to step into the HDFS interface in which an IOException could possibly be thrown because of underlying HDFS failures.
+
+ 
+{code:java}
+public static Path getRootDir(final Configuration c) throws IOException {
+  Path p = new Path(c.get(HConstants.HBASE_DIR));
+  FileSystem fs = p.getFileSystem(c);
+ return p.makeQualified(fs.getUri(), fs.getWorkingDirectory());
+}{code}
+When the IOException is thrown, it would be catched in ReplicationSourceManager#peerListChanged() and just print one error log. Note that this failure is permanent and there is no recovery mechanism present to retry. So there will be permanent divergence between zknodes states and HBase states.
+
+It is worth noting that the state changes in HBase implementation for the two regionservers are performed concurrently and highly-separately in two eventThread so there could be the situation that the addingPeer for one regionServer is successful while the other is failed. 
+
+Afterwards when we run runSimplePutdeleteTest() to add one row to the first cluster, the flaky behavior emerges. If the regionserver that successfully added the peer took charge of the row, the second cluster could view the changes and the test would pass. However, if the regionserver that failed to add cluster 2 as the replication peer took charge of it, then the second cluster would not sense the new row and fail the test. 
+
+We saw these as problematic because it would cause the permanent divergence between the metadata in zknodes and the real states in HBase implementation and the flaky behavior is really bad.
+
+We are not sure what is the best place to mitigate the issue. One potential fix we just tried is to just retry nodeChildrenChanged() afterwards with a backoff period and it could successfully fix the problem. 
+
+Any comments and suggestions would be appreciated.
+
+Updated: the patch is proposed here: https://github.com/apache/hbase/pull/5356
+
+ 
+
+ 

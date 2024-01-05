@@ -1,0 +1,273 @@
+Verified that the tests passed with local codecoverage debug builds on old toolchain (with gcc version 4.8.4 (Ubuntu 4.8.4-2ubuntu1~14.04)) .
+Building with new toolchain now to see if the problem is reproducible locally.
+
+Could not reproduce locally even with the new toolchain. Triggered a new build to recreate the environment for reproducing the problem.
+
+I saw a similar issue again here: http://sandbox.jenkins.cloudera.com/job/impala-master-cdh5-trunk/1603/
+
+{code}
+statestore.test_statestore.TestStatestore.test_failure_detected (from pytest)
+Failing for the past 1 build (Since Failed#1603 )
+Took 3 ms.
+add description
+Error Message
+
+statestore/test_statestore.py:423: in test_failure_detected     .wait_for_update(1) statestore/test_statestore.py:233: in kill     self.server.shutdown() statestore/test_statestore.py:96: in shutdown     for t in self.transports: E   RuntimeError: Set changed size during iteration
+
+Stacktrace
+
+statestore/test_statestore.py:423: in test_failure_detected
+    .wait_for_update(1)
+statestore/test_statestore.py:233: in kill
+    self.server.shutdown()
+statestore/test_statestore.py:96: in shutdown
+    for t in self.transports:
+E   RuntimeError: Set changed size during iteration
+{code}
+
+Upgrading since this has broken multiple builds
+
+http://sandbox.jenkins.cloudera.com/job/impala-master-code-coverage-cdh5/83
+
+
+This needs an owner and investigation.
+
+There are several distinct issues in this Jira. I'm looking at this one:
+
+{noformat}
+RuntimeError: Set changed size during iteration
+{noformat}
+
+I may have found the problem, but I'm still trying to test the theory.
+
+tl;dr:
+In EE/python test code, the server handler thread is modifying a resource shared with the main thread while the main thread is iterating on it. Python doesn't allow sets to be modified while iterating on them, hence the {{RuntimeError}}.
+
+Details:
+In {{tests/statestore/test_statestore.py}} we have a {{KillableThreadedServer}} that does the following:
+
+{code}
+ 93   def shutdown(self):
+ 94     self.is_shutdown = True
+ 95     self.serverTransport.close()
+ 96     for t in self.transports:
+ 97       t.close()
+ 98     self.wait_until_down()
+{code}
+
+This path is executed almost directly by test functions via {{KillableThreadedServer.kill()}}.
+
+Meanwhile in {{KillableThreadedServer.handle()}} we have this:
+
+{code}
+131   def handle(self, client):
+132     itrans = self.inputTransportFactory.getTransport(client)
+133     self.transports.add(itrans)
+134     otrans = self.outputTransportFactory.getTransport(client)
+135     iprot = self.inputProtocolFactory.getProtocol(itrans)
+136     oprot = self.outputProtocolFactory.getProtocol(otrans)
+137     try:
+138       while not self.is_shutdown:
+139         self.processor.process(iprot, oprot)
+140     except TTransport.TTransportException, tx:
+141       pass
+142     except Exception, x:
+143       print x
+144 
+145     itrans.close()
+146     otrans.close()
+147     self.transports.remove(itrans)
+{code}
+
+Nothing else touches the {{transports}} attribute.
+
+So test functions call {{kill()}}, which calls {{shutdown()}}. The {{shutdown()}} method sets the {{is_shutdown}} attribute to {{True}} and then ultimately ends up iterating {{self.transports}}. Meanwhile the handler thread falls out of its {{while}} loop and line 147 executes before the main thread finished iterating on {{self.transports}}.
+
+I managed to reproduce the {{RuntimeError}} discussed above within 1200 runs of the {{test_failure_detected}} test. When I make changes to cause the server request handler thread to have sole responsibility of cleanup, I can't reproduce up to 8000 runs. Considering it's pretty easy to see that nothing else is touching {{transports}}, I think that should take care of that problem. I guess it should be OK to go ahead and submit this fix.
+
+I'm now moving on to these failures:
+{noformat}
+Exception: Subscriber python-test-client-85c90b68-92a0-11e5-88b7-06f06db9c0b3 did not fail in 20s
+{noformat}
+I've rebuilt impala with code coverage enabled. The code coverage builds also do this, which is curious if not suspicious:
+{code}
+export TEST_START_CLUSTER_ARGS="--state_store_args='-statestore_update_frequency_ms=100'"
+{code}
+
+I was able to reproduce {{test_failure_detected}} in the manner described 36 out of 2000 times.
+
+commit 770c80bb4fc15e87309193849d5aaedd1d8f4839
+Author: Michael Brown <mikeb@cloudera.com>
+Date:   Tue Jan 19 17:12:20 2016 -0800
+
+    IMPALA-2721: EE statestore tests: subscriber threads now solely handle transport close
+    
+    In the statestore end-to-end tests, we create clients and servers to
+    simulate subscription to the statestore. The servers use threads to
+    handle the I/O. The input transport objects were shared resources whose
+    cleanup was being manipulated in both threads, leading to occasional
+    runtime errors.
+    
+    In this case, let's just let the server threads handle cleanup. Doing it
+    in both is redundant.
+    
+    Testing:
+    
+    With repeated runs of the test_failure_detected test, I was able to
+    reproduce the bug within 1200 runs. After the fix, the test passed up to
+    8000 runs. Also, it's clear by inspection that the shared resources were
+    only touched in two places.
+    
+    Change-Id: Ie878225f9715d0295ae43afaead958d95ad0e62a
+    Reviewed-on: http://gerrit.cloudera.org:8080/1841
+    Reviewed-by: Henry Robinson <henry@cloudera.com>
+    Tested-by: Internal Jenkins
+
+Update on this problem:
+
+{noformat}
+statestore/test_statestore.py:423: in test_failure_detected
+    .wait_for_update(1)
+statestore/test_statestore.py:308: in wait_for_failure
+    raise Exception("Subscriber %s did not fail in %ss" % (self.subscriber_id, timeout))
+E   Exception: Subscriber python-test-client-85c90b68-92a0-11e5-88b7-06f06db9c0b3 did not fail in 20s
+{noformat}
+
+tl;dr: We should increase this timeout to 40s and file a separate bug to investigate why code coverage builds in Jenkins need more than 20s.
+
+Details:
+
+When testing locally on Ubuntu, with Impala built with {{./buildall.sh -codecoverage_debug}}, I'm able to reproduce the failure when doing either of the following:
+1. Running {{test_failure_detected}} in parallel with 8 different runners.
+2. Running {{test_failure_detected}} serially in a loop when the other parallel tests are running (this is 5 different runners).
+
+I'm able to observe messages in the statestored log that look like this:
+{noformat}
+I0123 20:09:54.076426 31346 statestore.cc:366] Creating new topic: ''test_topic_persistence_persistent_526d8232-c250-11e5-983d-02f2ef2c8abf' on behalf of subscriber: 'python-test-client-526db040-c250-11e5-983d-02f2ef2c8abf
+...
+I0123 20:10:20.032500 26541 statestore.cc:705] Subscriber 'python-test-client-526db040-c250-11e5-983d-02f2ef2c8abf' has failed, disconnected or re-registered (last known registration ID: python-test-client-526db040-c250-11e5-983d-02f2ef2c8abf)
+{noformat}
+
+I'm calling the time difference between these messages the "subscriber lifetime".
+
+In my local testing, when the 20s timeout failure occurs, the corresponding subscriber IDs' lifetimes are still under 22s. However, in the formal Jenkins builds, the lifetimes are more. I've seen 29 seconds a couple times; 26 is common. I have not been able to figure out why this discrepancy exists.
+
+Does a regression exist? Not one that I can detect locally. This bug was filed on Nov 26 with the failures reported Nov 16. I went back to commit hash {{d920acd}} which is dated Oct 29. I rebuilt Impala with code coverage enabled and ran 1000 instances of {{test_failure_detected}} using the {{impala-py.test --duration}} option to time the test.  The average test run time was about 13 seconds. I get the same average run time when performed this testing on a recent cdh5-trunk ({{5fbb993}}). If there is a regression, it is not reproducable in my environment.
+
+Both "subscriber lifetime" and duration as reported by {{impala-py.test}} are reasonable measurements for comparison to the 20s failure timeout threshold. Testing showed that almost the entire test's time is spent in the method that employs that timeout ({{wait_for_failure}}). Testing also showed that this method is regularly polling and not blocked or otherwise unable to poll.
+
+Since test code is working, no regression is evident, and the higher timeouts are difficult to reproduce, I recommend we just increase the timeout to get tests to work and investigate the local/Jenkins discrepancy at a later time.
+
+[~mikesbrown], I have a feeling that Martin hacked this job to use a more frequent statestore heartbeat than the res of our jobs. That may be one reason for the failures, might be worth trying to use the same statestore heartbeat frequency as in the other jobs.
+
+The private code coverage build containing the timeout increase passed (well, those tests did). I filed IMPALA-2886 for further investigation.
+
+[~alex.behm] If you're referring to this:
+
+{code}
+export TEST_START_CLUSTER_ARGS="--state_store_args='-statestore_update_frequency_ms=100'"
+{code}
+
+The private code coverage build configuration doesn't have that, and tests failed there. Also, I played with turning that locally and couldn't observe any change in the average test run time. Sorry, I forgot to mention that I had looked at this in my previous, longer comment.
+
+[~mikesbrown], yes, I was referring to those options. Glad to hear they are not being used. Thanks for clarifying!
+
+Reminder I have a review pending for one set of problems:
+
+http://gerrit.cloudera.org:8080/#/c/1902/
+
+For the very last set of problems, I gave up trying to reproduce the flaky test failure locally and will use Jenkins. In my first round of changes to get a better handle on the situation, I parametrized and simplified the test. While Jenkins was 100% failing this test before, it has begun to pass. I've put up the review.
+
+http://gerrit.cloudera.org:8080/#/c/1978/
+
+In short by simplifying the test and not maintaining multiple sessions with different timeouts, I think we have reduced flakiness while also maintaining the spirit of the test, which is to test session idling.
+
+I filed IMPALA-2886 to track root cause investigation of the last issue. Meanwhile, I realize that the last issue is breaking beacause wall clock time allows the timeout to occur before the sleep does. We should compare against wall clock time of "last time session wasn't idle" for each session to know what the *next* execute statement's response will be.
+
+commit d88d52fc11ede46d09816671b8dfa2f4eb44c88a
+Author: Michael Brown <mikeb@cloudera.com>
+Date:   Mon Jan 25 10:53:07 2016 -0800
+
+    IMPALA-2721: EE statestore tests: increase subscriber failure timeout threshold
+    
+    Some end-to-end statestore tests are failing when Impala is built for
+    code coverage. The failures are due to the statestore's not detecting
+    disconnected subscribers within 20 seconds. In some of the failed tests'
+    logs we see subscribers lingering for up to 30 seconds. Local
+    reproduction attempts failed to reproduce such long subscriber
+    lifetimes.
+    
+    To unblock failing builds, the simple fix here is to increase the
+    timeout. The full details for choosing simply to increase the timeout
+    are in IMPALA-2721. IMPALA-2886 tracks further investigation into why
+    the 20 second timeout isn't sufficient and why local reproduction wasn't
+    possible.
+    
+    Testing:
+    
+    In addition to testing described in IMPALA-2721 to justify increasing
+    the timeout, I ran a full private code coverge build in Jenkins. Tests
+    that were failing before now pass:
+    
+    - test_failure_detected
+    - test_topic_persistence
+    
+    Change-Id: Id1e215c6d3874e8c3634f638790a9bac79f75432
+    Reviewed-on: http://gerrit.cloudera.org:8080/1902
+    Reviewed-by: Michael Brown <mikeb@cloudera.com>
+    Tested-by: Internal Jenkins
+
+
+commit 1e0a951c3fbbc23188c270fb494cc30d1940b842
+Author: Michael Brown <mikeb@cloudera.com>
+Date:   Thu Feb 4 14:51:27 2016 -0800
+
+    IMPALA-2721: HiveServer2 EE tests: session idle timeouts: account for wall clock time
+    
+    The HiveServer2 end-to-end test for testing concurrent sessions with
+    mixed idle timeout values iterates a sequence of sessions with varying
+    timeout values, uses sleep() calls to force some sessions to become
+    idle, and then checks that queries against all sessions succeed or fail
+    based on whether the test expects that particular session to have timed
+    out.
+    
+    Part of this iterating process involves a few operations to execute a
+    query statement via ImpalaHiveServer2Service.Client.ExecuteStatement()
+    or close a session via ImpalaHiveServer2Service.Client.CloseSession().
+    Unfortunately, the method by which the test decides whether a session is
+    expected to be active or idle does not take into account how long these
+    operations take. This means that in some corner cases--specifically code
+    coverage builds of Impala on CentOS--a session has idled out, correctly,
+    but the test doesn't expect that, so the test fails.
+    
+    To get the test passing, the fix is to take wall clock time into account
+    by tracking the last time we got a response from each session. For a
+    given session, if the difference between the current time and the last
+    time we got a response is less than that session's idle timeout value,
+    we expect that session to still be active. If it's more, then we expect
+    that session to have gone idle.
+    
+    Further investigation into why ExecuteStatement() takes notably long in
+    the code coverage/CentOS case is tracked in IMPALA-2951.
+    
+    Also:
+    - Improve the name of the test to make its intention more clear.
+    - Remove all flake8 whitespace and useless import notices.
+    
+    Testing:
+    Ran this using a private code coverage build in Jenkins, which uses
+    CentOS, and it passes. This includes a 300-iteration run just to make
+    sure. It still passes locally on Ubuntu.
+    
+    Change-Id: If75127ede0f946e9f277f043a25b6d54bbeda554
+    Reviewed-on: http://gerrit.cloudera.org:8080/2058
+    Reviewed-by: Alex Behm <alex.behm@cloudera.com>
+    Tested-by: Internal Jenkins
+
+
+This looks like the same failure:
+http://sandbox.jenkins.cloudera.com/job/impala-cdh5-trunk-exhaustive-code-coverage/110/testReport/junit/statestore.test_statestore/TestStatestore/test_failure_detected/
+http://sandbox.jenkins.cloudera.com/job/impala-cdh5-trunk-exhaustive-code-coverage/110/testReport/junit/statestore.test_statestore/TestStatestore/test_topic_persistence/
+
+Let's not reopen this bug, because it became a dumping ground for code coverage timeout problems. I'd rather we track classes of them separately. I opened IMPALA-3501
+

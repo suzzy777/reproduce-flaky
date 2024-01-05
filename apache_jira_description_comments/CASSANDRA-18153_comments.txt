@@ -1,0 +1,365 @@
+CC [~jlewandowski] 
+
+Storage service is not yet initiated during CommitLogReplay and MetadataCollection calls StorageService.instance.getLocalHostUUID.
+
+[https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/io/sstable/metadata/MetadataCollector.java#L127]
+
+{{public MetadataCollector(ClusteringComparator comparator)}}
+{{    {}}
+{{        this(comparator, StorageService.instance.getLocalHostUUID());}}
+{{    }}}
+
+ 
+
+StorageService.instance.getLocalHostUUID() will return null and all Memtables will be flushed without this information.
+
+Next time cassandra starts and these SStables are present, this test will fail because originatingHostId is null:
+
+[https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLogReplayer.java#L337]
+
+{{            UUID originatingHostId = reader.getSSTableMetadata().originatingHostId;}}
+{{            if (originatingHostId != null && originatingHostId.equals(localhostId))}}
+{{                builder.addAll(reader.getSSTableMetadata().commitLogIntervals);}}
+{{            else}}
+{{                skippedSSTables.add(reader.getFilename());}}
+
+ 
+
+I thought of implementing it using same strategy as CommitLog.java
+
+[https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLog.java#L211]
+
+{{        Optional.ofNullable(StorageService.instance.getLocalHostUUID()).orElseGet(SystemKeyspace::getLocalHostId);}}
+
+In fact there are some SYSTEM.LOCAL's memtables flushed before Storage service got initialized. 
+
+These SSTables also have missing Host UUID information.
+
+https://github.com/apache/cassandra/pull/2096/files
+
+Hi [~abonacin], to comment on your last comment: _In fact there are some SYSTEM.LOCAL's memtables flushed before Storage service got initialized.  These SSTables also have missing Host UUID information._
+
+Do you think this is something which could be included in this patch? Or does your patch solves this already?
+
+Hi. It's just another scenario where we have this issue but this patch will address both.
+
+ 
+
+Always we have a memtable being flushed before StorageService initialization, SSTable are created without HostUUID.
+
+SSTables are flushed during CommigLogReplay (Keyspaces with mutations on CommitLog). But specifically for system.local, we also have flushes before  StorageService initialization.
+
+This Patch will correct HostUUID returned by MetadataCollector before StorageService initialization.
+
+ 
+
+Hi [~abonacin], thank you for working on this bug.
+
+I'm wondering if is there any case where just calling {{SystemKeyspace.getLocalHostId}} would be incorrect? All in all, could you add an assertion on that the ultimately obtained host id is not null?
+
+Another thing is that complaining about missing host id for local strategy sstables is somehow dumb :/
+
+
+[~abonacin] I have added a reproducer here.
+
+When I run the test, it will print this:
+
+{code}
+/tmp/dtests4687378434417513292/node1/data0/system/local-7ad54392bcdd35a684174e047860b377/nb-2-big -> 00000000-0000-4000-8000-000000000001
+/tmp/dtests4687378434417513292/node1/data0/system/local-7ad54392bcdd35a684174e047860b377/nb-1-big -> null
+local host id -> 00000000-0000-4000-8000-000000000001
+{code}
+
+So you see that for the first SSTable of system.local, it will still print null, only the second table is correctly set on originating id so your fix is actually not fixing it?
+
+If we do this:
+
+{code}
+    public MetadataCollector(ClusteringComparator comparator)
+    {
+        this(comparator, Optional.ofNullable(StorageService.instance.getLocalHostUUID()).orElseGet(SystemKeyspace::getLocalHostId));
+    }
+{code}
+
+if StorageService.instance.getLocalHostUUID() is null, it will call SystemKeyspace::getLocalHostId, but the problem is that the implementation of that method reads data on disk:
+
+{code}
+    /**
+     * Read the host ID from the system keyspace.
+     */
+    public static UUID getLocalHostId()
+    {
+        String req = "SELECT host_id FROM system.%s WHERE key='%s'";
+        UntypedResultSet result = executeInternal(format(req, LOCAL, LOCAL));
+
+        // Look up the Host UUID (return it if found)
+        if (result != null && !result.isEmpty() && result.one().has("host_id"))
+            return result.one().getUUID("host_id");
+
+        return null;
+    }
+{code}
+
+But here it returns null and the reason for that is that when the very first SSTable for system.local is going to be written, there is no SSTable in system.local yet, so it has nowhere to read that id from.
+
+The solution to this would be to cache host id so if "getLocalHostId" returns null, we would set it via "setLocalHostId" or similar (I am just shooting the ideas here ... might be done differently).
+
+I was trying to use "SystemKeyspace.getOrInitializeLocalHostId" but the test was stuck as I think it was in the loop because it was reading non-existing / empty table yet and then it tried to persist generated uuid ....
+
+(1) https://github.com/instaclustr/cassandra/commit/1b17b5191e303b76d9d2888c08934e2520c46291
+
+Hi [~abonacin] 
+
+I think I fixed what I wrote yesterday here:
+
+[https://github.com/apache/cassandra/pull/2113/files]
+
+Now test always returns this:
+{code:java}
+/tmp/dtests8231883753452384466/node1/data0/system/local-7ad54392bcdd35a684174e047860b377/nb-2-big -> 00000000-0000-4000-8000-000000000001
+/tmp/dtests8231883753452384466/node1/data0/system/local-7ad54392bcdd35a684174e047860b377/nb-1-big -> 00000000-0000-4000-8000-000000000001
+local host id -> 00000000-0000-4000-8000-000000000001
+{code}
+
+What do you think?
+
+[~jlewandowski] I think that there is slight advantage of using it like [~abonacin] suggested because if we did SystemKeyspace.getLocalHostId only, we would need to go to disk / execute query every single time instead of just reading it from memory, basically.
+
+[~brandon.williams] what do you think about my patch which builds on what [~abonacin] did? [~jlewandowski] I would appreciate your second look too.
+
+edit: this ticket is about table format "me". I read this in BigFormat class:
+
+{code}
+// me (3.0.25, 3.11.11): added hostId of the node from which the sstable originated
+{code}
+
+So this should be probably done in 3.0.x included up?
+
+Hi [~smiklosovic],
+
+Sorry for delayed reply.
+
+ 
+
+I got your point. It's true, since we don't have defined HostUUID we will produce first SSTable without this info.
+
+I just found this issue, tested a very limited scope and I'm trying to help with a quick fix.
+
+Thanks for your detailed explanation. 
+
+bq. So this should be probably done in 3.0.x included up?
+
+Yes, since CASSANDRA-16619 affects them.
+
+[~smiklosovic] I'm worried that in the newest patch there is a chance we will end up with different host ids in sstables and system keyspace. Maybe there is a way to enforce certain order of operations?
+
+[~jlewandowski] thanks for the feedback. I modified the PR to reflect your worries. I am not saying it is bulletproof but the main idea behind the latest changes is that I tried to do it in such a way that if somebody reads these values they can not be written and vice versa - achieved by ReentrantReadWriteLock (there will be probably still some bugs in there we can work out but as POC to review it is good enough, probably).
+
+It is failing a lot of tests in Circle. No reason to review it until I fix that.
+
+Hi [~smiklosovic],
+
+Is it failing because of your new changes?
+
+If yes, can you consider proceed just with my update since it's a just a single line change which can benefit some live cluster?
+
+Can you share how to check Circle, please? I want to help but I'm new in this world.
+
+Thank you,
+
+[~abonacin] can you provide a full reproduce example?
+
+I don't know exactly how to reproduce this, but assuming this is a possible scenario, I want to propose a mix of something brought by all of us. In particular:
+- in all the places where we try to get host id, we try first from token metadata and then from system.local
+- if we start a fresh instance (that is, there is no commit log files to replay), we conditionally create a host id in the system.local table and flush that table; we do that along with storing other local node metadata, before touching schema or the commit log
+
+With that, we are guaranteed that host id is stored in sstable and not as a mutation in the commit log before we actually start to replay anything.
+
+https://github.com/apache/cassandra/pull/2215 (3.11)
+
+[~jlewandowski] 
+ 
+I have two nodes:
+{{[root@ip-20-0-1-182 ~]# nodetool status}}
+{{Datacenter: datacenter1}}
+{{=======================}}
+{{Status=Up/Down}}
+{{|/ State=Normal/Leaving/Joining/Moving}}
+{{--  Address     Load       Tokens       Owns (effective)  Host ID                               Rack}}
+{{UN  20.0.1.182  66.2 KiB   2            100.0%            1b0c03de-e885-4028-99c9-24122146f07d  rack1}}
+{{UN  20.0.1.239  66.2 KiB   2            100.0%            c54cf0ab-cf6e-46ce-9ebe-86b254fe5606  rack1}}
+ 
+ 
+Creating a keyspace + table and writing something (wait to commitlog be flushed to disk if commitlog_sync is periodic):
+ 
+{{[root@ip-20-0-1-182 ~]# cqlsh $HOSTNAME}}
+{{Connected to AnsibleLab at ip-20-0-1-182.ec2.internal:9042.}}
+{{[cqlsh 5.0.1 | Cassandra 3.11.13 | CQL spec 3.4.4 | Native protocol v4]}}
+{{Use HELP for help.}}
+{{cqlsh> CREATE KEYSPACE abonacin WITH replication = \{'class': 'NetworkTopologyStrategy', 'datacenter1': 2};}}
+{{cqlsh> CREATE TABLE abonacin.emp (}}
+{{... emp_id int PRIMARY KEY,}}
+{{... emp_city text,}}
+{{... emp_name text,}}
+{{... emp_phone varint,}}
+{{... emp_sal varint,}}
+{{... emp_hiredate date}}
+{{... );}}
+
+
+{{cqlsh> insert into abonacin.emp (emp_id, emp_city, emp_name, emp_phone, emp_sal, emp_hiredate) values (1584, 'KVXKAAOHYH', 'KLEMTXEDBDIF', 60457532, 1000, '2022-08-25');}}
+{{cqlsh> select * from abonacin.emp;}}
+
+{{ emp_id | emp_city   | emp_hiredate | emp_name     | emp_phone | emp_sal}}
+{{--------+------------+--------------+--------------+-----------+---------}}
+{{   1584 | KVXKAAOHYH |   2022-08-25 | KLEMTXEDBDIF |  60457532 |    1000}}
+
+ 
+
+ 
+
+Now I'll kill -9 java process on the other node and restart cassandra service:
+
+{{[root@ip-20-0-1-239 ~]# tail -f /var/log/cassandra/debug.log | grep "Ignored commitLogIntervals from the following sstables" | grep abonacin &}}
+{{[root@ip-20-0-1-239 ~]# ps -ef | grep -v grep | grep java | awk '\{print $2}' | xargs kill -9}}{{[root@ip-20-0-1-239 ~]# systemctl restart cassandra}}
+
+
+ 
+ 
+And I see this:
+{{[root@ip-20-0-1-239 ~]# DEBUG [main] 2023-03-14 21:25:46,486 CommitLogReplayer.java:254 - Ignored commitLogIntervals from the following sstables: [/var/lib/cassandra/data/abonacin/emp-ee4bec70c2ac11ed85b715ea429a0971/me-1-big-Data.db]}}
+ 
+ 
+What I found is that Storage Service is not yet available during CommigLogReplay (not sure if it is always starts after commitlog replay or it's just a coincidence). The following +StorageService.instance.getLocalHostUUID()+ returns {_}null{_}.
+ 
+{{private static UUID getLocalHostId()}}
+{{    {}}
+{{        return StorageService.instance.getLocalHostUUID();}}
+{{    }}}
+ 
+I also find that{{ +Optional.ofNullable(StorageService.instance.getLocalHostUUID()).orElseGet(SystemKeyspace::getLocalHostId)+}} returns the correct host uuid. This why I chose this approach instead of yours.
+ 
+It's also worth to mention that it's the first time I tried to suggest a PR and I don't have enough familiarity with all the context involved. :)
+
+Thanks [~abonacin] for the explanation. The PR mentioned about includes your fix, I've just pushed that down to {{StorageService}}. 
+Another thing is to ensure that {{SystemKeyspace.getLocalHostId}} will never return null - that's the other part of the PR.
+
+I think it can be reviewed at this point.
+
+
+I wanted to mention that in CEP-21 we're proposing to move the responsibility for assigning host identifiers from the local node itself to a cluster wide service. For compatibility, we have been representing these as UUIDs so that they can be used everywhere a host id is currently but this was intended as a temporary measure to make development more straightforward. Actually, these node ids are simple ints based on a global counter and one part of the remaining work on CEP-21 is to migrate to these fully.
+
+Of course, for upgrades we will need to retain a mapping between old and new ids to process hints and this is also marked as a todo.
+
+Nothing in the {{cep-21-tcm}} branch solves the problem described in this ticket, but something along the lines of what Jacek suggested sounds reasonable and feasible. I just wanted to mention this here in case you had chance to factor it the thinking about this ticket.
+
+Here's where we set the host id (including the updating from the old to new id in an upgrade, currently unfriendly to hints): [https://github.com/apache/cassandra/blob/cep-21-tcm/src/java/org/apache/cassandra/tcm/transformations/Register.java#L123]
+
+Thanks for the explanation, Sam. I think it will be better if we wait for this work in trunk so we do not need to fix that after it. (or you when integrating cep 21).
+
+But we still need to fix it for older branches, don't we? So what about fixing this in everything but trunk and we do it in trunk "the proper way"? 
+
+Reading it more closely: "Nothing in the {{cep-21-tcm}} branch solves the problem described in this ticket" ... yeah well ... what do you think, [~jlewandowski] ? Still good for trunk, after all?
+
+In {{cep-21-tcm}} we will 100% have a similar problem and what Jacek proposed sounds sensible, so I'm not suggesting to _not_ fix this in trunk. In the CEP branch, we will just have to look in slightly different places for pre-existing ids (TokenMetadata is completely gone, for instance). For brand new instances, how we deal with "conditionally create a host id...before touching schema or the commit log" is more of a question and something we need to consider.   
+
+
+[~samt] can I consider it as your review +1 on that?
+[~smiklosovic] - are you ok with the fix?
+
+[~jlewandowski] , I'm afraid I haven't looked at the actual PR yet, I was going only from your comments here. I'll do my best to check it out tomorrow, but don't block on that.
+
+thanks [~samt], frankly the PR has only few locs :)
+
+I think it would be generally useful to add a dtest that verifies the sstable metadata once the node is fully started in the 2 cases:  
+* a new node joins
+* an existing node restarts & replays log segments?
+This would also help a lot when we come to address this in the CEP-21 branch, so we can check whatever we do there is equivalent.
+
+Also, it's an issue from CASSANDRA-16619 really, but I was surprised that the originating host id isn't shown in {{sstablemetadata}} output, so the only way to check this is by using the debugger (or by triggering the bug). We should add it there, if not for older branches then at least in trunk as the output is already changed by CASSANDRA-18134.  
+
+Thank you for feedback. I'll try to add a dtest and address the missing host id in metadata output.
+
+Unfortunately it will have to be a Python DTest, JVM dtests have its startup code very different to what is really used when you start Cassandra.
+
+
+Yeah, that's true although we have made some progress toward bringing the JVM dtest startup in line with the real code in the {{cep-21-tcm}} branch. A python test would work well in the first instance though and we can look to port it later. Thanks! 
+
+Please have a look at these tests: https://github.com/apache/cassandra-dtest/pull/216
+
+
+dtest looks good to me.
+
+lgtm too
+
+Tests show something interesting - {{CQLSSTableWriter}} - it is a client application so it should not try to read data from sstables, in particular, from {{system.local}}. It stored {{null}} as a host ID and I will leave it as it is - that is, in order to fix the test, {{getLocalHostId}} will not go to {{system.local}} if the system is running in client mode.
+
+
+
+https://app.circleci.com/pipelines/github/jacek-lewandowski/cassandra/628/workflows/93a1362e-f205-4d60-a46f-64fb375b695e (3.0)
+
+3.0 - [PR|https://github.com/apache/cassandra/pull/2234], 
+[CI|https://ci-cassandra.apache.org/view/patches/job/Cassandra-devbranch/2363/] (/)
+
+3.11 - [PR|https://github.com/apache/cassandra/pull/2215], 
+[CI|https://ci-cassandra.apache.org/view/patches/job/Cassandra-devbranch/2364/] (/)
+
+4.0 - [PR|https://github.com/apache/cassandra/pull/2231], 
+[CI|https://ci-cassandra.apache.org/view/patches/job/Cassandra-devbranch/2373/] (!), 
+fixed just two unit tests, so rerunning the unit tests only: 
+[regular|https://ci-cassandra.apache.org/view/patches/job/Cassandra-devbranch-test/1775/] (/),
+[cdc|https://ci-cassandra.apache.org/view/patches/job/Cassandra-devbranch-test-cdc/1755/] (!), 
+[compression|https://ci-cassandra.apache.org/view/patches/job/Cassandra-devbranch-test-compression/1761/] (/)
+since some other unrelated unit test failed for CDC, I did repeatable runs in [CircleCI|https://app.circleci.com/pipelines/github/jacek-lewandowski/cassandra/644/workflows/42afa702-4500-46f3-96d6-b2e14f5e1b75](/)
+
+4.1 - [PR|https://github.com/apache/cassandra/pull/2232],
+[CI|https://ci-cassandra.apache.org/view/patches/job/Cassandra-devbranch/2378/] (!)
+there are failures in one jvm-dtest, the test was fixed and rerun in CircleCI, [1|https://app.circleci.com/pipelines/github/jacek-lewandowski/cassandra/648/workflows/0ff558cc-e975-4646-90ee-762d3799994c/jobs/6437](/), [2|https://app.circleci.com/pipelines/github/jacek-lewandowski/cassandra/648/workflows/0ff558cc-e975-4646-90ee-762d3799994c/jobs/6438] (/), [3|https://app.circleci.com/pipelines/github/jacek-lewandowski/cassandra/648/workflows/1aa7cde3-7845-4672-9a46-f177797e9f59/jobs/6441], [4|https://app.circleci.com/pipelines/github/jacek-lewandowski/cassandra/648/workflows/1aa7cde3-7845-4672-9a46-f177797e9f59/jobs/6440]
+
+5.0 - [PR|https://github.com/apache/cassandra/pull/2233],
+[CI|https://ci-cassandra.apache.org/view/patches/job/Cassandra-devbranch/2384/] (?)
+
+
+dtest - [PR|https://github.com/apache/cassandra-dtest/pull/216]
+
+
+Just FYI but it seems to me that {{SSTableIdGenerationTest}} depends in some degree on this broken behaviour. It seems to rely on the local host id being unavailable when the node restarts (at least in that test), which causes the mutations in the commitlog that have already been flushed to be replayed as the null local host id doesn't match the actual one in
+the sstable metadata.
+
+thanks [~samt] - the test takes that into account rather than rely on that. I was initially confused that I needed to expect one more sstable that I thought. Now the number of expected sstables match the number of flushes which is good I think.
+
+
+Yep, it had me scratching my head a bit when working on the TCM branch because there the host ID is available when the replay happens, so the test stared failing.
+
++1
+
+the latest rerun of jvm dtests:
+
+https://app.circleci.com/pipelines/github/jacek-lewandowski/cassandra/663/workflows/1c1c11a0-e202-4824-8a1b-995bb0d32a6a
+https://app.circleci.com/pipelines/github/jacek-lewandowski/cassandra/664/workflows/0aced992-fb32-468c-85fb-183a8f5e240e
+https://app.circleci.com/pipelines/github/jacek-lewandowski/cassandra/660/workflows/5daa9ea1-5c62-40bf-a3e9-80d8420c6f4c
+https://app.circleci.com/pipelines/github/jacek-lewandowski/cassandra/660/workflows/56cf5ddc-5bfe-4c4d-809c-0eed7b88a13b
+https://app.circleci.com/pipelines/github/jacek-lewandowski/cassandra/659/workflows/6f4cb147-11b1-40b7-a5b2-4f4ef3666ce3
+https://app.circleci.com/pipelines/github/jacek-lewandowski/cassandra/659/workflows/aeb7abc6-b97d-4faf-9c43-d80419d23c08
+https://app.circleci.com/pipelines/github/jacek-lewandowski/cassandra/661/workflows/8dce1230-b9ab-4b10-a87e-dec6548c1ce7
+
+the only failing tests are those recognized as flakies
+
+[~samt] I'm basically ready to merge it, if you have any objections please let me know. I know it is going to be largely overwritten by TCM, but we have to have something for now. 
+
+
+Nope, no objections from me (y)
+
+[~jlewandowski], the commit in trunk to CHANGES.txt is incorrect.
+
+In trunk there are no "Merge from…" sections. The change should go under the 4.1.2 section (and nothing under 5.0). When the first 5.0 release happens it is presumed (and understood) that all 4.1.x changes found in that same CHANGES.txt file are included.
+
+ref: https://github.com/apache/cassandra/commit/e07b8dfe8dc142356223e71e438c77ffe97140c1#diff-59130575b4fb2932c957db2922977d7d89afb0b2085357db1a14615a2fcad776R127-R131 
+
+There was a recent discussion in slack to clarify this common misunderstanding (and tribal knowledge).
+ref: https://the-asf.slack.com/archives/CK23JSY2K/p1679496071133719
+
+ninja fix has been committed: https://github.com/apache/cassandra/commit/4effa4efbe456d2f5335ef4b6db39804eab21042
+
+Also, why are there two "Merge branch 'cassandra-4.0' into cassandra-4.1" commits (14936d0bd3716ed251e799a264f5ab16d51b893b[|https://github.com/apache/cassandra/commit/14936d0bd3716ed251e799a264f5ab16d51b893b] and [f8dd1931eeacb290af9e246376468f3704891cc4|https://github.com/apache/cassandra/commit/f8dd1931eeacb290af9e246376468f3704891cc4])?
+

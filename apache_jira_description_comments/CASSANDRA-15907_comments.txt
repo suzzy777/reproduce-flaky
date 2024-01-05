@@ -1,0 +1,362 @@
+This affects 3.0.x and 3.11.x as well, and {{ReplicaFilteringProtection}} is almost entirely the same between 3.0.x and trunk. It could make sense to make the change in all three versions.
+
+CC [~adelapena] [~jwest]
+
+CC [~blerer] [~jasonstack]
+
+I've posted [some WIP|https://github.com/apache/cassandra/pull/659] on the raft of minor changes suggested above.
+
+I've also had some offline conversation w/ [~cscotta] and [~adelapena] around how we implement guardrails. One way forward might be to have two thresholds w/ different levels of enforcement (again partly taking inspiration from what we do w/ tombstones). The first threshold would drop a warning in the logs to make it plain that filtering protection is starting to encounter a significant number of potentially stale replica results ("silent" replicas) and is therefore keeping many more cached partial results on the heap than we would in the optimal case. The second threshold would be where we start to fail queries.
+
+If we base these on the number of materialized rows, there are at least two ways to quantify things. The first is just to use an absolute threshold for rows per query. The second is to determine an "expansion factor" or how many rows we can cache as a factor of the provided query limit or page size (whichever is lower). The former is simpler and probably more intuitive (and would do its job even if a query used an enormous LIMIT), but the second conceptually takes the user's intent around limits and page sizes into account.
+
+As discussed with caleb, the memory issue is that potentially outdated rows in the 1st phase of replica-filtering-protection(RFP) do not count towards merged counter, so short-read-protect(SRP) can potentially query and cache all data in the query range if only one replica has data.
+
+Some ideas to cap memory usage during RFP:
+ * Single phase approach:
+ ** Issue blocking RFP read immediately at {{MergeListener#onMergedRows}} when detecting potential outdated rows.
+ ** This guarantees coordinator will cache at most "limit * replicas" num of rows assuming there are no tombstone..
+ ** This should have similar performance as current 2-phase approach, but current approach can be optimized to execute RFP reads in parallel.
+ * two-phase approach with SRP only at 2nd phase:
+ ** the 1st phase is almost the same as current approach: collecting potentially outdated rows, but without SRP.
+ ** in the second phase, issue RFP reads in parallel based on collected rows in 1st phase.
+ *** When parallel RFP reads complete, merge the responses (original + RFP) again using the merger described in previous approach, but only do blocking RFP for rows requested by SRP.
+ ** With this approach, the amount of memory used is the same as single-phase approach. The num of blocking RFP reads from SRP rows are usually small.
+
+ 
+
+[~jasonstack] If the number of stale results is very large (i.e. a "silent" replica exists in the vast majority of responses), won't those two approaches result in about the same performance profile? The two-phase approach seems like it would still be exposed to having to make a large number of blocking RFP reads. (Of course, they also should be pretty similar with no stale results, but the single-phase approach would be optimal.)
+
+{quote}If the number of stale results is very large (i.e. a "silent" replica exists in the vast majority of responses), won't those two approaches result in about the same performance profile? 
+{quote}
+the second approach will execute RFP requests in two places:
+ # at the beginning of 2nd phase, based on the collected outdated rows from 1st phase. These RFP requests can run in parallel and the number can be large.
+ # at merge-listener, for additional rows requested by SRP. These RFP requests have to run in serial, but the number is usually small.
+
+ 
+
+{quote}
+the second approach will execute RFP requests in two places:
+ # at the beginning of 2nd phase, based on the collected outdated rows from 1st phase. These RFP requests can run in parallel and the number can be large.
+ # at merge-listener, for additional rows requested by SRP. These RFP requests have to run in serial, but the number is usually small.
+{quote}
+I understand that that would limit the number of cached results, at the expense of producing more queries during the second phase. As for parallelizing, that would help us a bit but I think it's not going to save us from the degenerate cases that worry us, which are those where everything is so out of sync that we have to read the entire database.
+
+Perhaps we might consider a more sophisticated way of finding a balance between the numbers of cached rows and grouped queries. We could try to not cache all the results but advance in blocks of a certain fixed number of cached results, so we limit the number of cached results while we can still group keys to do less queries. That is, we could have that pessimistic SRP read prefetching and caching N rows completed with extra queries to the silent replicas, plugged to another group of unmerged-merged counters to prefetch more results if (probably) needed, if that makes sense.
+
+Regarding the guardrails, a very reasonable threshold for in-memory cached results like, for example, 100 rows, can produce 100 internal queries if they are all in different partitions, which are definitively too many queries. Thus, we could also consider having another guardrail to limit the number of additional SRP/RFP internal queries per user query, so we can fail before getting to a timeout. That guardrail could however become obsolete for RFP if we implement multi-key queries and we can do the current second phase with a single query per replica.
+
+At this point, we're sitting on what appears to be 4 distinct approaches to addressing the problems in the current implementation. Before trying to contrast them all, I want to think through the kinds of usage we expect and the consequences of that. Future indexing implementations aside, neither filtering queries nor secondary index queries are currently meant to be used at scale (especially at CL > ONE/LOCAL_ONE) without partition restrictions. Optimizing for that case seems reasonable. The other big axis is how common out of sync replicas actually are, and how responsive we have to be from "rare" to "entire replica datasets are out of sync". What's currently in trunk does just fine if there is very little out-of-sync data, especially in the common case that we're limited to a partition. (i.e. The actual number of protection queries is very low, because we group by partition.) Its weakness is the edge case.
+
+bq. Issue blocking RFP read immediately at {{MergeListener#onMergedRows}} when detecting potential outdated rows
+
+This single-pass solution would excel in situations where there are very few silent replicas and put very little stress on the heap, given it could simply forgo caching merged rows that don't satisfy the query filter. It also appears to be a fairly simple change to the existing logic. The downside of this approach is that it would start to issue a pretty high volume of individual row protection queries as it came across more silent replicas, without even the benefit of mitigating partition grouping. It wouldn't require any new guardrails around memory usage, and the worst that could happen is a query timeout.
+
+bq. We could try to not cache all the results but advance in blocks of a certain fixed number of cached results, so we limit the number of cached results while we can still group keys to do less queries. That is, we could have that pessimistic SRP read prefetching and caching N rows completed with extra queries to the silent replicas, plugged to another group of unmerged-merged counters to prefetch more results if (probably) needed
+
+This seems to retain all the nice characteristics of the current trunk implementation (most importantly partition grouping for RFP queries), with the added benefit that it should only use heap proportional to the actual user limit (although not precisely, given the different between the batch size and the limit). It wouldn't really require any new guardrails around memory usage, given the tighter coupling to the limit or page size, and the worse case is also a timeout. The stumbling block feels like complexity, but that might just be my lack of creativity. [~adelapena] Wouldn't we have to avoid SRP in the first phase of the query to limit the size of the result cache during batches?
+
+I've been trying to figure out a way to merge these two ideas, i.e. to batch partition/completion reads in the RFP {{MergeListener}}. Combined w/ filtering, also in the {{MergeListener}}, we could discard (i.e. avoid caching) the rows that don't pass the filter. The problem is that the return value of {{onMergedRows()}} is what presently informs SRP/controls the counter.
+
+...and of course, if we want to punt on a redesign for now, we can always proceed w/ the [guardrails approach|https://issues.apache.org/jira/browse/CASSANDRA-15907?focusedCommentId=17148207&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-17148207], which is basically like [~adelapena]'s latest idea, but with a large N.
+
+{quote}neither filtering queries nor secondary index queries are currently meant to be used at scale (especially at CL > ONE/LOCAL_ONE) without partition restrictions. Optimizing for that case seems reasonable. The other big axis is how common out of sync replicas actually are, and how responsive we have to be from "rare" to "entire replica datasets are out of sync". What's currently in trunk does just fine if there is very little out-of-sync data, especially in the common case that we're limited to a partition. (i.e. The actual number of protection queries is very low, because we group by partition.) Its weakness is the edge case.
+{quote}
+Agree, the current approach is probably adequate for most of the cases described in 8272/8273, which are already kind of edge cases. The cases with lots of out-of-sync data should be even more uncommon, and probably would happen when something is already going badly in the cluster. So perhaps the guardrail guarding the number of cached keys is enough to give us some protection in such edge cases, and we can move to a more sophisticated later, if those cases prove to not be so uncommon, or as part of a second round of improvements. The downside of the guardrail is that if we later decide to move to a different SRP approach the guardrail config property will become deprecated, possibly after a very short life.
+
+{quote}
+The stumbling block feels like complexity, but that might just be my lack of creativity. [~adelapena] Wouldn't we have to avoid SRP in the first phase of the query to limit the size of the result cache during batches?
+{quote}
+Don't think that I have a clear idea about how to exactly do this, it's just a rough idea and I could be missing something. The idea is using a kind of internal pagination in the first phase, that would still need SRP for the same reason that it needs it with the current approach. Indeed it would be a more complex approach but, if it's not a delusion and it works it would indeed give us the best of both words: limited memory usage and query grouping. But, as I said, the cases creating excessive memory pressure might be so rare that we might be well with the just-in-case guardrail.
+
+{quote}
+Combined w/ filtering, also in the {{MergeListener}}, we could discard (i.e. avoid caching) the rows that don't pass the filter. The problem is that the return value of {{onMergedRows()}} is what presently informs SRP/controls the counter.
+{quote}
+I think all the rows collected during the current first phase pass the filter. Regarding fetching the entire partition in the merge listener, with a per-partition single phase approach, I think that sounds like the last implementation attempt we did before moving to the current two phase approach because of how it messed with SRP, although I might be missing something different here. 
+
+
+
+
+Thanks for the discussion so far!
+
+At this point, I'd like to move forward with an approach that roughly corresponds to the original description (i.e. making some reasonable optimizations and enforcing some basic memory guardrails for cases where an excessive number of silent replicas are present). Making the pathological cases both correct and fast seems to approach intractability.
+
+CC [~adelapena] [~jasonstack] [~jwest] [~samt]
+
+[~adelapena] I've got a prototype up and running that might bear some initial review: [branch (3.0)|https://github.com/apache/cassandra/pull/659], [CircleCI|https://app.circleci.com/pipelines/github/maedhroz/cassandra/19/workflows/1fde8474-26dc-4ff5-8832-78dcf59dd229].
+
+[~jwest] [~jasonstack] [~samt] This may be looking for a second reviewer in the near future if anyone is interested ;)
+
+[~maedhroz] I'm reviewing the PR. I agree that the memory guardrail is probably our best option here, given that the current approach seems adequate for the common case, while implementing that paged first phase could be a too complex optimization of the pathological case of what is already an uncommon scenario. If real life proves us wrong and such cases happen to not be so uncommon we'll see that guardrail frequently triggered, allowing us to easily spot the problem. That will be the signal to go back over this and try to find a balance between memory and number of RFP queries.
+
+Happy to review along with [~adelapena] 
+
+[~jwest] I've hopefully addressed the points from [~adelapena]'s first round of review, so I think this is officially ready for a second reviewer.
+
+3.0: [patch|https://github.com/apache/cassandra/pull/659], [CircleCI|https://app.circleci.com/pipelines/github/maedhroz/cassandra/74/workflows/633624df-d6b2-4904-b766-25d9684a9f6d]
+
+WIP (avoid review ATM)
+3.11: [patch|https://github.com/apache/cassandra/pull/665], [CircleCI|https://app.circleci.com/pipelines/github/maedhroz/cassandra/38/workflows/c3a3b51b-d105-49d9-91f8-2a149cf211b6]
+trunk: [patch|https://github.com/apache/cassandra/pull/666], [j8 CircleCI|https://app.circleci.com/pipelines/github/maedhroz/cassandra/37/workflows/84e48d9e-f3dd-45ff-b70a-b69a86f6eb96] [j11 Circle CI|https://app.circleci.com/pipelines/github/maedhroz/cassandra/37/workflows/79b581ab-94a1-4920-a894-7f0f91ef466b]
+
+If we're happy with the implementation, the next step will be to do some basic stress testing.
+
+Note: Existing issues described by CASSANDRA-14595 (Thrift dtest) and CASSANDRA-15881   (SASI memtable switching) are visible in the test results so far.
+
+I have left [here|https://github.com/adelapena/cassandra/commit/afb3aafbca48d9ec7b5810d8dee2b1b6d6e4dc50] some changes to {{ReplicaFilteringProtection}} to reduce the number of cached rows in some cases.
+
+The caching happens when we fully consume pessimistically SRP-protected results of the first iteration. This is done to collect the primary keys of the silent replicas that have to be queried. The suggested change avoids that full consumption of the first iteration results. Instead, it only consumes a partition each time the second phase iterators (those returned by {{queryProtectedPartitions}}) don't have a cached partition to offer. At that moment the first phase iterator is advanced one partition, so it caches and fetches all the partitions between the last SRP-protected partition and the next one. Note that consuming one more merged partition might involve reading an undefined number of partitions from the replica responses if they invalidate each other, so it doesn't eliminate the problem of caching, it just alleviates it in some cases.
+
+Caching is still done at the partition level, so it can ask the replicas with a single query per partition. Thus, this change would be beneficial mainly for multi-partition queries, for example the query in the following test will go down from 20 cached rows to just 4:
+{code:python}
+self._prepare_cluster(
+    create_table="CREATE TABLE t (k int PRIMARY KEY, v text)",
+    create_index="CREATE INDEX ON t(v)",
+    both_nodes=["INSERT INTO t (k, v) VALUES (5, 'old')",
+                "INSERT INTO t (k, v) VALUES (1, 'old')",
+                "INSERT INTO t (k, v) VALUES (8, 'old')",
+                "INSERT INTO t (k, v) VALUES (0, 'old')",
+                "INSERT INTO t (k, v) VALUES (2, 'old')",
+                "INSERT INTO t (k, v) VALUES (4, 'old')",
+                "INSERT INTO t (k, v) VALUES (7, 'old')",
+                "INSERT INTO t (k, v) VALUES (6, 'old')",
+                "INSERT INTO t (k, v) VALUES (9, 'old')",
+                "INSERT INTO t (k, v) VALUES (3, 'old')"],
+    only_node1=["INSERT INTO t (k, v) VALUES (5, 'new')",
+                "INSERT INTO t (k, v) VALUES (3, 'new')"])
+self._assert_all("SELECT * FROM t WHERE v = 'old'", rows=[[1, 'old'], [8, 'old'], [0, 'old'], [2, 'old'], [4, 'old'], [7, 'old'], [6, 'old'], [9, 'old']])
+{code}
+The number of both SRP and RFP requests remains the same in most cases, although in some particular cases the proposed approach can save us a few queries. That's for example the case of [{{test_complementary_deletion_with_limit_and_rows_after}}|https://github.com/apache/cassandra-dtest/blob/68f05b02842ccf4b2859d35a057d3be77d3313ab/replica_side_filtering_test.py#L284-L294], which goes down from 8 to 5 total SRP requests.
+
+We could also do something similar at the row level, so instead of advancing partition per partition we would advance row per row until we have a significant amount of either cached data and/or primary keys to fetch. However, even in that case it would still be possible to design (unlikely) scenarios where to advance the first phase iterator just a single row we would need to read (and cache) the entire db. Thus, we would still need the guardrail, and I'm not sure advancing row per row worths the additional complexity, given that the problematic cases are supposed to be unlikely and the implementation doesn't look as straightforward as the proposed partition-based change. Perhaps we could give it a go after 4.0, as an improvement.
+
+I haven't updated the guardrail tests, they would need minor changes for the proposed approach because some queries cache less rows than before.
+
+[~maedhroz] WDYT?
+
+
+[~adelapena] talked about the above idea, and it seems like it could work really well. Some specific points...
+
+1.) The refactoring of everything we need to produce merged protected partitions into {{PartitionBuilder}} is very clean, and we would probably do it even if we didn't proceed with the rest of the patch and continued to eagerly consume the first phase results.
+
+2.) I had one minor concern about not being able to free {{responses}} up for garbage collection after consuming the first phase results in {{DataResolver}}. [~adelapena] has the idea to simply do this immediately before fetching more results in {{DataResolver.ShortReadPartitionsProtection#moreContents()}}. Not only would it address my concern...it would just be generally useful. We're guaranteed to have consumed {{responses}} by that point.
+
+3.) There are a few of the new JVM dtests that might fail now, simply because the number of cached rows moved up and down as partitions are consumed. That should be pretty easy to address though.
+
+I'm going to work out #3 above, then work on pulling the concept into my 3.0 patch.
+
+CC [~jwest] [~jasonstack]
+
+[~adelapena] What do you think about pulling some of the common code from {{ReplicaFilteringProtection}} and {{DataResolver}} into a new parent abstract class above {{ResponseResolver}}, something like {{ResolverBase}}? We've got some state (keyspace, command, etc.) and methods ({{executeReadCommand()}}, etc.) that could move there.
+
+[~adelapena] I've updated the tests, made a few little cleanups, altered the inline documentation to sync it up with what's changed, and pushed the changes to my 3.0 patch branch. Tests are [looking good|https://app.circleci.com/pipelines/github/maedhroz/cassandra/51/workflows/4fd639f6-6523-4520-961e-5b5c384a13b3] so far...
+
+Minor note: Failures in the [latest test run|https://app.circleci.com/pipelines/github/maedhroz/cassandra/51/workflows/4fd639f6-6523-4520-961e-5b5c384a13b3/jobs/281] around {{cqlsh_tests.test_cqlsh.TestCqlsh}} are going to push me into a flaky test Jira. (I've seen these on other Jiras in the past couple weeks, but nobody's reported yet.)
+
+EDIT: Created CASSANDRA-15948
+
+[~maedhroz] I couldn't resist giving a try to the per-row lazy pre-fetch, I have left it [here|https://github.com/adelapena/cassandra/commit/accf2a47c341875942b0d8b06c016cc0d66d62cb].
+
+Instead of consuming all the contents of each merged partition, it consumes them row-per-row until there are replica contents. That way, if there are no conflicts, it only caches one row per replica, instead of an entire partition per replica. Also, iif it finds that there are rows to fetch from the replica, it advances the first phase merged row iterator a bit more until reaching a certain cache size, trying to find a balance between the cache size and the number of RFP queries. Right now that desired cache size is hardcoded to 100, but we could use a config property, or the query limit, for example. Also we could also just let it unbounded to minimize the number of RFP queries, the main advantage of this approach is that in the absence of conflicts nothing needs to be cached. That should benefit the most common case, which is when there are no conflicts.
+
+To illustrate how the per-row approach behaves, let's see this example:
+{code:python}
+self._prepare_cluster(
+    create_table="CREATE TABLE t (k int, c int, v text, PRIMARY KEY(k, c))",
+    create_index="CREATE INDEX ON t(v)",
+    both_nodes=["INSERT INTO t (k, c, v) VALUES (0, 0, 'old')",
+                "INSERT INTO t (k, c, v) VALUES (0, 1, 'old')",
+                "INSERT INTO t (k, c, v) VALUES (0, 2, 'old')",
+                "INSERT INTO t (k, c, v) VALUES (0, 3, 'old')",
+                "INSERT INTO t (k, c, v) VALUES (0, 4, 'old')",
+                "INSERT INTO t (k, c, v) VALUES (0, 5, 'old')",
+                "INSERT INTO t (k, c, v) VALUES (0, 6, 'old')",
+                "INSERT INTO t (k, c, v) VALUES (0, 7, 'old')",
+                "INSERT INTO t (k, c, v) VALUES (0, 8, 'old')",
+                "INSERT INTO t (k, c, v) VALUES (0, 9, 'old')"],
+    only_node1=["INSERT INTO t (k, c, v) VALUES (0, 4, 'new')",
+                "INSERT INTO t (k, c, v) VALUES (0, 6, 'new')"])
+self._assert_all("SELECT c FROM t WHERE v = 'old'", rows=[[0], [1], [2], [3], [5], [7], [8], [9]])
+{code}
+Without the per-row approach we cached 20 rows (10 per replica) and issued one single RFP query. In contrast, with the per-row approach the behaviour should be:
+ * If the target cache size is very high or unbounded, we will cache a max of 12 rows and we will need 1 RFP queries. There are less cached row because we don't cache rows until the first conflict is found in the fourth row.
+ * If the target cache size is 2, we will cache a max of 8 rows and we will need 1 RFP queries. This is because the two conflicts fit into the same window of cached rows, and once they are fetched we don't need to cache more rows.
+ * If we use a target cache size of 1, we will cache a max of 6 rows but, differently from before, we will need 2 separate RFP queries.
+ * If there are no conflicts we will only have one cached row per replica; the current one.
+
+Note that consuming rows from the first phase iterator to populate the cache can still produce an unlimited growth of the cache, so we still need the guardrail. The configurable target cache size that I mention is only used to try to find a balance between cache size and grouping of primary keys to fetch.
+
+bq. the main advantage of this approach is that in the absence of conflicts nothing needs to be cached
+
+Even though partition-restricted queries without digest mismatches will skip {{DataResolver}} entirely, this still helps in the case where we have a mismatch, but start with a large number of conflict-free rows, correct? If so, I think this is a benefit we should consider, given how likely we are to be dealing with partition-restricted queries.
+
+bq. Also we could also just let it unbounded to minimize the number of RFP queries
+
+The one thing that makes me a little uneasy about this is the extra logic we need to enforce the "target cache size". I propose we avoid that, simply leave the guardrails we've already got in place to avoid catastrophe (and excessive RFP queries), and see if that means we can simplify what remains (like having to clear the {{contents}} array list between batches). I'll try this and see how it looks and pull it into the main 3.0 branch if it works.
+
+Aside from that, I think the only remaining question would be verifying the safety of [aggressively clearing|https://github.com/apache/cassandra/pull/659/commits/30b8f4bebd95b3520b637d6d25d6bc16cb4d81a2] {{responses}}.
+
+[~adelapena] I tried to strip down the lazy rows approach a bit [here|https://github.com/maedhroz/cassandra/commit/c5abb49626da0141277de92e173fa8ed8062bcf3]. Now that I understand it a bit better, I'm a bit skeptical about whether we want to proceed. We already know that the partition-restricted case without a digest mismatch avoids all of this altogether. When there is a large number of non-conflicting rows at the start of the first-phase iterator, though, it seems like the price of avoiding row caching is creating a large number of {{CachedRowIterator}} objects. Maybe this is the right trade-off, but I'm not sure.
+
+[~maedhroz] I like the changes to the lazy rows approach. However, I'm afraid we need the snapshot of the cached rows done in [this local copy-and-clear|https://github.com/adelapena/cassandra/blob/accf2a47c341875942b0d8b06c016cc0d66d62cb/src/java/org/apache/cassandra/service/ReplicaFilteringProtection.java#L522-L524], otherwise the advances in the other replica can introduce new data and mess with it, producing multiple test failures. Or, we can do much better than in my previous patch and just track the number of contents in the snapshot and save us the queue copy, as it's done [here|https://github.com/adelapena/cassandra/blob/35d8e712bbbe03076ba867c11759664e8ff839e4/src/java/org/apache/cassandra/service/ReplicaFilteringProtection.java#L528-L568].
+
+Also I think that making {{currentMergedRows}} / {{unprotectedPartition}} to the partition iterator is not correct. It's a pointer to the current first iteration merged partition and it should be shared by all the builders in the RFP. If we make it local it can reduce the speed at which that pointer is advanced, producing in the end more RFP queries.
+{quote}When there is a large number of non-conflicting rows at the start of the first-phase iterator, though, it seems like the price of avoiding row caching is creating a large number of {{CachedRowIterator}} objects. Maybe this is the right trade-off, but I'm not sure.
+{quote}
+We can find a balance between max cache size and the number of {{CachedRowIterator}} instances if we try to grow the cache a bit further when there are no conflicts:
+{code:java}
+while (unprotectedPartition != null && unprotectedPartition.hasNext() 
+   && (toFetch != null || cachedRows.size() < min_cache_size))
+{code}
+Min cache/buffer size can be a constant, or a config property, or a function of the warning threshold, or something related the query limit. This would still limit the size of the cache in the absence of conflicts while quickly reducing the number of {{CachedRowIterator}} instances.
+
+Also, given that we are concerned about the cache size, we might want to consider tracking the max size that the cache reaches during the query, and add it to a new table metric that tracks the average max cache size.
+
+[~adelapena] and I had a quick Slack discussion, and I think we've landed on the following:
+
+1.) For now, we'll stop at a partition-based lazy first-phase iterator consumption approach (what's in the main patch branch right now). It's not clear that a {{min_cache_size}} (that avoid creating tons of "singleton" {{CachedRowIterator}} instances) would produce something meaningfully different.
+
+2.) In the interest of visibility, we'll explore adding a histogram that quantifies just how much row caching these queries are doing. It would put some data behind our assumptions here and might help with tuning the guardrails as well. (I'll try to have something up for this shortly...)
+
+In case we need to explore the per-row approach in the future, I'm leaving [here|https://github.com/adelapena/cassandra/commit/90900ec717958270bc38b501b4248dfb7d55958c] the most extensive prototype of it, that uses two properties to control the min cache size when we don't have conflicts yet and when we have found conflicts.
+
+[~maedhroz] Having a metric for the cache size is really nice. However, I think it would be more useful to track the max per-query cache size, rather than the per-partition size. This is because a single advance in the first phase merge iterator can still insert an indefinite amount of partitions in the cache. For example, let's consider this scenario when all the rows from an outdated replica are superseded by the updated replica:
+{code:java}
+self._prepare_cluster(
+    create_table="CREATE TABLE t (k int, c int, v text, PRIMARY KEY(k, c))",
+    create_index="CREATE INDEX ON t(v)",
+    both_nodes=["INSERT INTO t (k, c, v) VALUES (0, 0, 'old')",
+                "INSERT INTO t (k, c, v) VALUES (0, 1, 'old')",
+                "INSERT INTO t (k, c, v) VALUES (1, 0, 'old')",
+                "INSERT INTO t (k, c, v) VALUES (1, 1, 'old')",
+                "INSERT INTO t (k, c, v) VALUES (2, 0, 'old')",
+                "INSERT INTO t (k, c, v) VALUES (2, 1, 'old')",
+                "INSERT INTO t (k, c, v) VALUES (3, 0, 'old')",
+                "INSERT INTO t (k, c, v) VALUES (3, 1, 'old')"],
+    only_node1=["DELETE FROM t WHERE k = 0",
+                "DELETE FROM t WHERE k = 1",
+                "DELETE FROM t WHERE k = 2",
+                "DELETE FROM t WHERE k = 3"])
+self._assert_none("SELECT c FROM t WHERE v = 'old' LIMIT 1")
+{code}
+In this test all the 4 partitions are cached with a single advance of the merged iterator, so the cache contains 16 rows at its maximum. However, the metric records 8 times a per-partition cache size of 2. I think it would be more useful either having a single metric with that max cache size of 12, or two records (one per replica) with a value of 6. This would make it easier to detect cases as the exposed in the example.
+
+Also, being a per-query metric, it would be easier to advice operators to start worrying about the consistency among replicas when the RFP metric starts to get higher than the fetch size, independently of whether the queries are single-partition or not.
+
+As for tracking the cache size per replica o per query, I think it would be nice if we used the same criteria that is used in the guardrail, so they measure the same thing. That would mean either tracking the metric per query and leaving the guardrail as it is, or changing the guardrail to be per-replica instead of per-query. 
+
+WDYT?
+
+bq. As for tracking the cache size per replica o per query, I think it would be nice if we used the same criteria that is used in the guardrail, so they measure the same thing. That would mean either tracking the metric per query and leaving the guardrail as it is, or changing the guardrail to be per-replica instead of per-query.
+
+Tracking the metric per query rather than changing the existing guardrail sounds like the right move, although there isn't really a legitimate multi-partition use-case yet, so most of the time a per-partition metric should be equivalent to a per-query one. On the other hand, the whole point of the metric is to help provide guidance for operators looking to set appropriate warn/fail thresholds. I'll push something up today, along with slightly modified inline docs, etc.
+
+Apologies for the delay on the review. Left some minor comments / nits on the PR. Overall, these changes LGTM (+1). Thanks for the additional work on this!
+
+[~adelapena] Here are the final PRs and test runs (with not ALL commits squashed just yet, to make reviewing the small bits you might not have reviewed yet easier):
+
+3.0: [patch|https://github.com/apache/cassandra/pull/659/commits], [CircleCI|https://app.circleci.com/pipelines/github/maedhroz/cassandra/89/workflows/b6192a9d-774a-4453-95c1-34d46acedcf4]
+
+3.11: [patch|https://github.com/apache/cassandra/pull/665/commits], [CircleCI|https://app.circleci.com/pipelines/github/maedhroz/cassandra/88/workflows/4af8d5a3-280d-449a-a650-d3ff2db5b0f4]
+
+({{SASIIndexTest#testIndexMemtableSwitching}} is a known failure)
+
+trunk: [patch|https://github.com/apache/cassandra/pull/666/commits], [CircleCI J8|https://app.circleci.com/pipelines/github/maedhroz/cassandra/92/workflows/c59be4f8-329e-4d76-9c59-d49c38e58dd2], [CircleCI J11|https://app.circleci.com/pipelines/github/maedhroz/cassandra/92/workflows/56130350-62b0-48c3-b675-bdc45e3cebf2]
+
+The [one failure|https://app.circleci.com/pipelines/github/maedhroz/cassandra/92/workflows/c59be4f8-329e-4d76-9c59-d49c38e58dd2/jobs/448] in {{TestBootstrap}} is an existing problem, but it doesn't appear to have a flakey test Jira.
+
+Let me know if you'd like me to do a final squash at some point. Thanks for all your help on this one!
+
+[~maedhroz] Looks perfect to me, +1.
+
+[~jwest] Are we ready to commit?
+
+No objection here
+
+Great, ci-cassandra looks good too:
+
+||branch||utest||dtest||
+|  [3.0|https://github.com/apache/cassandra/pull/659]|[200|https://ci-cassandra.apache.org/view/all/job/Cassandra-devbranch-test/200]|[236|https://ci-cassandra.apache.org/view/all/job/Cassandra-devbranch-dtest/236]|
+| [3.11|https://github.com/apache/cassandra/pull/665]|[201|https://ci-cassandra.apache.org/view/all/job/Cassandra-devbranch-test/201]|[237|https://ci-cassandra.apache.org/view/all/job/Cassandra-devbranch-dtest/237]|
+|[trunk|https://github.com/apache/cassandra/pull/666]|[202|https://ci-cassandra.apache.org/view/all/job/Cassandra-devbranch-test/202]|[238|https://ci-cassandra.apache.org/view/all/job/Cassandra-devbranch-dtest/238]|
+
+ 
+
+Committed to 3.0 as [e5c3d08a1428d378b6690f0419a2b25724b9736e|https://github.com/apache/cassandra/commit/e5c3d08a1428d378b6690f0419a2b25724b9736e] and merged up to [3.11|https://github.com/apache/cassandra/commit/2ef1f1c150e3d3f297e86c2b2efedd964a43b3c9] and [trunk|https://github.com/apache/cassandra/commit/292650d968c30757a027905d12c7370c6342dbe3].
+
+FYI org.apache.cassandra.config.DatabaseDescriptorRefTest is failing
+https://app.circleci.com/pipelines/github/dcapwell/cassandra/379/workflows/83c3e1f6-3279-4426-8af8-a02926b10774/jobs/1975
+
+{code}
+git checkout trunk
+git pull --rebase upstream trunk
+ant realclean && ant && ant generate-idea-files
+ant testclasslist -Dtest.classlistfile=<(echo org/apache/cassandra/config/DatabaseDescriptorRefTest.java) -Dtest.classlistprefix=unit
+...
+[junit-timeout] Testcase: testDatabaseDescriptorRef(org.apache.cassandra.config.DatabaseDescriptorRefTest):     FAILED
+[junit-timeout] null
+[junit-timeout] junit.framework.AssertionFailedError
+[junit-timeout]         at org.apache.cassandra.config.DatabaseDescriptorRefTest.checkViolations(DatabaseDescriptorRefTest.java:303)
+[junit-timeout]         at org.apache.cassandra.config.DatabaseDescriptorRefTest.testDatabaseDescriptorRef(DatabaseDescriptorRefTest.java:287)
+[junit-timeout]
+[junit-timeout]
+[junit-timeout] Test org.apache.cassandra.config.DatabaseDescriptorRefTest FAILED
+[junitreport] Processing /Users/davidcapwell/src/github/apache/cassandra-trunk/build/test/TESTS-TestSuites.xml to /var/folders/cm/08cddl2s25j7fq3jdb76gh4r0000gn/T/null2013776906
+[junitreport] Loading stylesheet jar:file:/usr/local/Cellar/ant/1.10.7/libexec/lib/ant-junit.jar!/org/apache/tools/ant/taskdefs/optional/junit/xsl/junit-frames.xsl
+[junitreport] Transform time: 277ms
+[junitreport] Deleting: /var/folders/cm/08cddl2s25j7fq3jdb76gh4r0000gn/T/null2013776906
+BUILD FAILED
+/Users/davidcapwell/src/github/apache/cassandra-trunk/build.xml:1981: The following error occurred while executing this line:
+/Users/davidcapwell/src/github/apache/cassandra-trunk/build.xml:1871: Some test(s) failed.
+{code}
+
+
+looks like clear snapshot as well, not sure why it passed in circle ci
+
+{code}
+ant testclasslist -Dtest.classlistfile=<(echo org/apache/cassandra/tools/ClearSnapshotTest.java) -Dtest.classlistprefix=unit
+...
+[junit-timeout] Testsuite: org.apache.cassandra.tools.ClearSnapshotTest Tests run: 4, Failures: 3, Errors: 0, Skipped: 0, Time elapsed: 8.175 sec
+[junit-timeout]
+[junit-timeout] Testcase: testClearSnapshot_RemoveMultiple(org.apache.cassandra.tools.ClearSnapshotTest):       FAILED
+[junit-timeout] null
+[junit-timeout] junit.framework.AssertionFailedError
+[junit-timeout]         at org.apache.cassandra.tools.ToolRunner.assertEmptyStdErr(ToolRunner.java:338)
+[junit-timeout]         at org.apache.cassandra.tools.ToolRunner.waitAndAssertOnCleanExit(ToolRunner.java:333)
+[junit-timeout]         at org.apache.cassandra.tools.ClearSnapshotTest.testClearSnapshot_RemoveMultiple(ClearSnapshotTest.java:91)
+[junit-timeout]
+[junit-timeout]
+[junit-timeout] Testcase: testClearSnapshot_NoArgs(org.apache.cassandra.tools.ClearSnapshotTest):       FAILED
+[junit-timeout] null
+[junit-timeout] junit.framework.AssertionFailedError
+[junit-timeout]         at org.apache.cassandra.tools.ToolRunner.assertEmptyStdErr(ToolRunner.java:338)
+[junit-timeout]         at org.apache.cassandra.tools.ToolRunner.waitAndAssertOnCleanExit(ToolRunner.java:333)
+[junit-timeout]         at org.apache.cassandra.tools.ClearSnapshotTest.testClearSnapshot_NoArgs(ClearSnapshotTest.java:61)
+[junit-timeout]
+[junit-timeout]
+[junit-timeout] Testcase: testClearSnapshot_RemoveByName(org.apache.cassandra.tools.ClearSnapshotTest): FAILED
+[junit-timeout] null
+[junit-timeout] junit.framework.AssertionFailedError
+[junit-timeout]         at org.apache.cassandra.tools.ToolRunner.assertEmptyStdErr(ToolRunner.java:338)
+[junit-timeout]         at org.apache.cassandra.tools.ToolRunner.waitAndAssertOnCleanExit(ToolRunner.java:333)
+[junit-timeout]         at org.apache.cassandra.tools.ClearSnapshotTest.testClearSnapshot_RemoveByName(ClearSnapshotTest.java:75)
+[junit-timeout]
+[junit-timeout]
+[junit-timeout] Test org.apache.cassandra.tools.ClearSnapshotTest FAILED
+{code}
+
+
+[~dcapwell] good catch, I missed a change in {{DatabaseDescriptorRefTest}} during the merge. I have just fixed it. I can't reproduce the failure in {{ClearSnapshotTest}}, though. 
+
+Found the root cause for ClearSnapshotTest
+
+{code}
+java.lang.AssertionError: 
+Expecting empty but was:<"Picked up _JAVA_OPTIONS: -Djava.net.preferIPv4Stack=true
+">
+{code}
+
+Looks like the test was rewritten recently and asserts stderr is empty. The issue is that the JVM can print to stdout in some cases, so this check isn't portable.
+
+Here, I have used "_JAVA_OPTIONS" to globally make sure ipv4 is setup, in CI we make sure the error files get dumped to a location which can be saved; so failed for my CI and locally for this reason; since this is not related to this ticket, will file a different one.
+

@@ -1,0 +1,1991 @@
+Dev list discussion regarding this matter: https://markmail.org/thread/ufvbooarcu6dkfma
+
+I can see DUnit launching JVMs with the correct versions. My current theory is that maybe the old locator VM is hanging around (and so that locator is hanging around) after the new JVM+locator is launched.
+
+I notice that we always have four JVMs running in this test. One has id=-2 and I see this:
+
+{{LOCATOR_VM_NUM = -2}}
+
+So that JVM is "special" and it's reserved for a locator. TBD if it's actually running a locator.
+
+We see the test bouncing VM 2 to the current version:
+
+{code}
+[info 2020/06/11 14:44:37.744 PDT <main> tid=0x1] Bouncing 2 old pid is 19653 and version is 1.12.0
+…
+[info 2020/06/11 14:44:44.529 PDT <main> tid=0x1] Bounced 2.  New pid is 19744 and version is 10240.0.0
+{code}
+
+{{10240.0.0}} is secret code for _current version_.
+
+Right after that we see that we are indeed running the latest locator code:
+
+{code}
+[vm2] Product-Name: Apache Geode
+[vm2] Product-Version: 1.14.0-build.0
+{code}
+
+At this point VMs 0 and 1 have not yet been rolled to the current version.
+
+The new locator (VM 2) finds the current coordinator, which appears to be running the old version, as expected:
+
+{code}
+[vm2] [info 2020/06/11 14:44:45.247 PDT <RMI TCP Connection(1)-192.168.1.27> tid=0x12] received FindCoordinatorResponse(coordinator=192.168.1.27(vm0:19651)<v1>:41002(version:GEODE 1.12.0), fromView=true, viewId=-1, registrants=[192.168.1.27(vm2:19744:locator)<ec>:41001], senderId=192.168.1.27(vm2:19744:locator)<ec>:41001, network partition detection enabled=true, locators preferred as coordinators=true, view=View[192.168.1.27(vm2:19653:locator)<ec><v0>:41001(version:GEODE 1.12.0)|-1] members: [192.168.1.27(vm0:19651)<v1>:41002(version:GEODE 1.12.0){lead}, 192.168.1.27(vm1:19652)<v2>:41003(version:GEODE 1.12.0)]) from locator HostAndPort[bburcham-mbpro.hsd1.or.comcast.net:22878]
+{code}
+
+But notice the {{view=View[}} section of that log line: it appears that vm2 is running the old version, even though the {{registrants=[}} section seems to show that vm2 is running the currenty version we expect!
+
+And we can see vm0 preparing the first view that will contain this new vm2:
+
+{code}
+[vm0_v1.12.0] [info 2020/06/11 14:44:45.566 PDT <Geode Membership View Creator> tid=0x47] preparing new view View[192.168.1.27(vm0:19651)<v1>:41002|9] members: [192.168.1.27(vm0:19651)<v1>:41002{lead}, 192.168.1.27(vm1:19652)<v2>:41003, 192.168.1.27(vm2:19744:locator)<ec><v9>:41001]
+{code}
+
+This is view 9 being originated by vm0 and we can see that it appears that vm2 is running the _same_ version as the originator (vm0) and that is the old version.
+
+And when vm2 receives that view:
+
+{code}
+[vm2] [info 2020/06/11 14:44:45.573 PDT <unicast receiver,bburcham-mbpro-17341> tid=0x23] received new view: View[192.168.1.27(vm0:19651)<v1>:41002(version:GEODE 1.12.0)|9] members: [192.168.1.27(vm0:19651)<v1>:41002(version:GEODE 1.12.0){lead}, 192.168.1.27(vm1:19652)<v2>:41003(version:GEODE 1.12.0), 192.168.1.27(vm2:19744:locator)<ec><v9>:41001(version:GEODE 1.12.0)]
+{code}
+
+we see that the member identifier for vm2 in that record has the old version.
+
+The next place to look is in serialization/deserialization of {{MemberIdentifierImpl}} and classes it contains.
+
+
+
+
+I have a theory that maybe this commit from January, 2020, that went into 1.12.0:
+
+https://github.com/apache/geode/commit/40d6b47ffce96df1e1bc0da88dff661b57939d7e
+
+Which changed {{GMSMemberData.setVersionOrdinal(short)}} to call the new {{GMSMemberData.setVersionObject(short)}}:
+
+{code}
+  private void setVersionObject(short versionOrdinal) {
+    try {
+      this.versionObj = Version.fromOrdinal(versionOrdinal);
+    } catch (UnsupportedSerializationVersionException e) {
+      this.versionObj = Version.CURRENT;
+    }
+  }
+{code}
+
+That method is causing the {{versionObj}} member to be set to {{Version.CURRENT}} if the ordinal we attempt to set is unknown e.g. a newer version. If I'm right then with that method in place, any time a {{GMSMemberData}} is constructed from data serialized from a newer product version, the version will get "clamped" to the current product version.
+
+That commit was first introduced into Geode 1.12.0.
+
+Before that commit, the member was {{versionOrdinal}} and was set directly from the {{short}} argument—it was not validated through {{Version.fromOrdinal(versionOrdinal)}}
+
+I'm thinking to test this maybe I check out the 1.12 released version https://github.com/apache/geode/tree/rel/v1.12.0 and build it with a fix and deploy that to my local maven repo and make my DUnit upgrade test (for current {{develop}}) use that 1.12.x version.
+
+Bill commented on a change in pull request #5269:
+URL: https://github.com/apache/geode/pull/5269#discussion_r442241602
+
+
+
+##########
+File path: geode-membership/src/main/java/org/apache/geode/distributed/internal/membership/gms/GMSMemberData.java
+##########
+@@ -220,12 +220,16 @@ public InetAddress getInetAddress() {
+   @Override
+ 
+   public short getVersionOrdinal() {
+-    return this.versionObj.ordinal();
++    return versionOrdinal;
+   }
+ 
+   @Override
+   public Version getVersion() {
+-    return versionObj;
++    try {
++      return Version.fromOrdinal(versionOrdinal);
++    } catch (final UnsupportedSerializationVersionException e) {
+
+Review comment:
+       **This right here** is a big fat problem. We are silently throwing away information when the version ordinal represents an unknown version. One approach is to let the exception escape (as a checked exception.) But that entails fixing the 53 callers of this method. An alternative would be to "tunnel" the checked exception through an unchecked one.
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+Bill opened a new pull request #5273:
+URL: https://github.com/apache/geode/pull/5273
+
+
+   [GEODE-8240](https://issues.apache.org/jira/browse/GEODE-8240)
+   
+   This is an alternative solution to the one explored in https://github.com/apache/geode/pull/5269. This PR introduces a new interface `VersionOrdinal` to model not just versions we know about (as `Version` does) but also future versions. Formerly Geode modeled these as `short` but that presented difficulties in the many places where we need to compare versions. By unifying known and unknown versions under one interface, capable of providing generic comparison (`compareTo()`, `equals()`, and `hashCode()`) my hope is that we can eliminate this egregious loss of information (in that other PR's `Version` implementation):
+   
+   ```java
+     @Override
+     public Version getVersion() {
+     public Version getVersion() {
+       return versionObj;
+       try {
+         return Version.fromOrdinal(versionOrdinal);
+       } catch (final UnsupportedSerializationVersionException e) {
+         return Version.CURRENT;
+       } 
+   ```
+   
+   ### For all changes:
+   - [x] Is there a JIRA ticket associated with this PR? Is it referenced in the commit message?
+   
+   - [x] Has your PR been rebased against the latest commit within the target branch (typically `develop`)?
+   
+   - [x] Is your initial contribution a single, squashed commit?
+   
+   - [x] Does `gradlew build` run cleanly?
+   
+   - [ ] Have you written or updated unit tests to verify your changes?
+   
+   - [ ] If adding new dependencies to the code, are these dependencies licensed in a way that is compatible for inclusion under [ASF 2.0](http://www.apache.org/legal/resolved.html#category-a)?
+   
+   
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+Bill commented on a change in pull request #5273:
+URL: https://github.com/apache/geode/pull/5273#discussion_r442451532
+
+
+
+##########
+File path: geode-serialization/src/main/java/org/apache/geode/internal/serialization/internal/DSFIDSerializerImpl.java
+##########
+@@ -220,20 +220,6 @@ public void invokeToData(Object ds, DataOutput out) throws IOException {
+     }
+   }
+ 
+-  /**
+-   * Get the Version of the peer or disk store that created this {@link DataOutput}.
+-   * Returns
+-   * zero if the version is same as this member's.
+-   */
+-  public Version getVersionForDataStreamOrNull(DataOutput out) {
+-    // check if this is a versioned data output
+-    if (out instanceof VersionedDataStream) {
+-      return ((VersionedDataStream) out).getVersion();
+-    } else {
+-      return null;
+-    }
+-  }
+
+Review comment:
+       dead code
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+Bill commented on a change in pull request #5273:
+URL: https://github.com/apache/geode/pull/5273#discussion_r442452067
+
+
+
+##########
+File path: geode-serialization/src/main/java/org/apache/geode/internal/serialization/Version.java
+##########
+@@ -635,48 +569,4 @@ public boolean isPre65() {
+         .collect(Collectors.toList());
+   }
+ 
+-  public boolean isCurrentVersion() {
+-    return this.ordinal == CURRENT.ordinal;
+-  }
+
+Review comment:
+       this was used in exactly two places and is better accomplished via `Version.CURRENT.isEqual(someVersionOrdinal)`
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+Bill opened a new pull request #5278:
+URL: https://github.com/apache/geode/pull/5278
+
+
+   [GEODE-8240](https://issues.apache.org/jira/browse/GEODE-8240)
+   
+   This is the back-port, to 1.12, of this fix: https://github.com/apache/geode/pull/5273 on the `develop` branch.
+   
+   ### For all changes:
+   - [x] Is there a JIRA ticket associated with this PR? Is it referenced in the commit message?
+   
+   - [ ] Has your PR been rebased against the latest commit within the target branch (typically `develop`)?
+   
+   - [x] Is your initial contribution a single, squashed commit?
+   
+   - [x] Does `gradlew build` run cleanly?
+   
+   - [x] Have you written or updated unit tests to verify your changes?
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+with [~rhoughton]'s help I was able to convince geode-old-versions to vend my locally-modified old version (based on 1.12.0). Added a README out on my PR that’ll make it to develop eventually: https://github.com/apache/geode/blob/540db11040dbf01a84bd4c3f4e891ae3768ac20b/geode-old-versions/README.md
+
+So the fix for the proximate cause of the rolling upgrade bug has gotten some validation now (the test from [~alberto.gomez]'s PR passes in my development environment).
+
+PR is up with lots o' info in the description https://github.com/apache/geode/pull/5273 
+
+Bill commented on a change in pull request #5269:
+URL: https://github.com/apache/geode/pull/5269#discussion_r442241602
+
+
+
+##########
+File path: geode-membership/src/main/java/org/apache/geode/distributed/internal/membership/gms/GMSMemberData.java
+##########
+@@ -220,12 +220,16 @@ public InetAddress getInetAddress() {
+   @Override
+ 
+   public short getVersionOrdinal() {
+-    return this.versionObj.ordinal();
++    return versionOrdinal;
+   }
+ 
+   @Override
+   public Version getVersion() {
+-    return versionObj;
++    try {
++      return Version.fromOrdinal(versionOrdinal);
++    } catch (final UnsupportedSerializationVersionException e) {
+
+Review comment:
+       **This right here** is a big fat problem. We are silently throwing away information when the version ordinal represents an unknown version. One approach is to let the exception escape (as a checked exception.) But that entails fixing the 53 callers of this method. An alternative would be to "tunnel" the checked exception through an unchecked one. Lastly we could leave it as-is and try to go around and analyze whether or not the places calling this can survive this loss of information. That would be bad enough but what's worse is that we'd be introducing a maintenance trap.
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+Bill commented on pull request #5273:
+URL: https://github.com/apache/geode/pull/5273#issuecomment-650234882
+
+
+   > Is there any reason for this commented out line to be left here=
+   
+   @albertogpz for some reason I'm not able to request you as a reviewer. Thanks for the comments. Keep them coming!
+   
+   Allowing all the old versions again revealed that pre-1.9.0 versions are failing to upgrade with these changes. Once I've fixed that I'll push a new commit with your comments addressed.
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+bschuchardt commented on a change in pull request #5273:
+URL: https://github.com/apache/geode/pull/5273#discussion_r446240838
+
+
+
+##########
+File path: geode-core/src/main/java/org/apache/geode/cache/client/internal/ClientSideHandshakeImpl.java
+##########
+@@ -270,7 +271,7 @@ public ServerQueueStatus handshakeWithServer(Connection conn, ServerLocation loc
+   private InternalDistributedMember readServerMember(DataInputStream p_dis) throws IOException {
+ 
+     byte[] memberBytes = DataSerializer.readByteArray(p_dis);
+-    Version v = StaticSerialization.getVersionForDataStreamOrNull(p_dis);
++    final VersionOrdinal v = StaticSerialization.getVersionForDataStreamOrNull(p_dis);
+
+Review comment:
+       This should continue to use Version, not VersionOrdinal.  Using Version ensures that we never create a datastream with an unknown ordinal.  None of our serialization code will know what to do if that should happen.
+
+##########
+File path: geode-core/src/main/java/org/apache/geode/distributed/internal/membership/InternalDistributedMember.java
+##########
+@@ -549,7 +550,7 @@ public void setVersionObjectForTest(Version v) {
+   }
+ 
+   @Override
+-  public Version getVersionObject() {
++  public VersionOrdinal getVersionObject() {
+
+Review comment:
+       This should continue to return a Version, not a VersionOrdinal.  We already have a method for getting the ordinal.
+
+##########
+File path: geode-core/src/main/java/org/apache/geode/internal/HeapDataOutputStream.java
+##########
+@@ -48,7 +49,7 @@
+     org.apache.geode.internal.serialization.BufferDataOutputStream
+     implements ObjToByteArraySerializer, ByteBufferWriter {
+ 
+-  public HeapDataOutputStream(Version version) {
++  public HeapDataOutputStream(VersionOrdinal version) {
+
+Review comment:
+       same comment about retaining the use of Version in all serialization code.  We need assurance in place that we will never encounter an unknown ordinal during serialization/deserialization.
+
+##########
+File path: geode-serialization/src/main/java/org/apache/geode/internal/serialization/VersionOrdinalImpl.java
+##########
+@@ -0,0 +1,132 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more contributor license
++ * agreements. See the NOTICE file distributed with this work for additional information regarding
++ * copyright ownership. The ASF licenses this file to You under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance with the License. You may obtain a
++ * copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software distributed under the License
++ * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
++ * or implied. See the License for the specific language governing permissions and limitations under
++ * the License.
++ */
++
++package org.apache.geode.internal.serialization;
++
++public class VersionOrdinalImpl implements VersionOrdinal {
++
++  protected final short ordinal;
++
++  public VersionOrdinalImpl(final short ordinal) {
++    this.ordinal = ordinal;
++  }
++
++  @Override
++  public short ordinal() {
++    return ordinal;
++  }
++
++  @Override
++  public int compareTo(final VersionOrdinal other) {
++    if (other == null) {
++      return 1;
++    } else {
++      return compareTo(other.ordinal());
++    }
++  }
++
++  /**
++   * TODO: eliminate this legacy method in favor of requiring callers to construct a
++   * VersionOrdinalImpl. Inline this logic up in compareTo(VersionOrdinal).
++   */
++  public int compareTo(final short other) {
++    // short min/max can't overflow int, so use (a-b)
++    final int thisOrdinal = this.ordinal;
++    final int otherOrdinal = other;
++    return thisOrdinal - otherOrdinal;
++  }
++
++  @Override
++  public boolean equals(final Object other) {
++    if (other == this)
++      return true;
++    if (other instanceof VersionOrdinalImpl) {
++      return this.ordinal == ((VersionOrdinalImpl) other).ordinal;
++    } else {
++      return false;
++    }
++  }
++
++  public boolean equals(final VersionOrdinal other) {
++    return other != null && this.ordinal == other.ordinal();
++  }
++
++  @Override
++  public int hashCode() {
++    int result = 17;
++    final int mult = 37;
++    result = mult * result + this.ordinal;
++    return result;
++  }
++
++  @Override
++  public String toString() {
++    return toString(ordinal);
++  }
++
++  /**
++   * TODO: eliminate this legacy method in favor of requiring callers to construct a
++   * VersionOrdinalImpl. Inline this logic up in toString().
++   */
++  public static String toString(short ordinal) {
++    return "UNKNOWN[ordinal=" + ordinal + ']';
+
+Review comment:
+       could this find the name of a Version and use it?  Alternatively just use "VersionOrdinal" instead of "UNKNOWN"
+
+##########
+File path: geode-core/src/integrationTest/resources/org/apache/geode/codeAnalysis/sanctionedDataSerializables.txt
+##########
+@@ -578,9 +502,6 @@ org/apache/geode/internal/admin/remote/LicenseInfoResponse,2
+ fromData,18
+ toData,15
+ 
+-org/apache/geode/internal/admin/remote/MissingPersistentIDsRequest,1
+
+Review comment:
+       this removal of MissingPersistentIDsRequest surprised me.  The class still exists in my checkout and is a DSFID.
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+Bill commented on a change in pull request #5273:
+URL: https://github.com/apache/geode/pull/5273#discussion_r446354173
+
+
+
+##########
+File path: geode-core/src/main/java/org/apache/geode/distributed/internal/membership/InternalDistributedMember.java
+##########
+@@ -549,7 +550,7 @@ public void setVersionObjectForTest(Version v) {
+   }
+ 
+   @Override
+-  public Version getVersionObject() {
++  public VersionOrdinal getVersionObject() {
+
+Review comment:
+       Since `IDM` isa `MemberIdentifier` this method has to return a `VersionOrdinal` not a `Version` since, in general, a `MemberIdentifier` can be for a member that is running an unknown software version.
+   
+   I'm renaming `MemberIdentifier.getVersionObject()` => `MemberIdentifier.getVersionOrdinalObject()` and adding a method `IDM.getVersionObject()` to really return the version for callers that really need it.
+   
+   What's odd about the latter is that I don't see how that method could/should ever return anything but `Version.getCurrentVersion()` since the version, in this case, should be the version of the software running in the local JVM—which is always `Version.getCurrentVersion()`. 
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+Bill commented on a change in pull request #5273:
+URL: https://github.com/apache/geode/pull/5273#discussion_r446356827
+
+
+
+##########
+File path: geode-core/src/integrationTest/resources/org/apache/geode/codeAnalysis/sanctionedDataSerializables.txt
+##########
+@@ -578,9 +502,6 @@ org/apache/geode/internal/admin/remote/LicenseInfoResponse,2
+ fromData,18
+ toData,15
+ 
+-org/apache/geode/internal/admin/remote/MissingPersistentIDsRequest,1
+
+Review comment:
+       I re-ran `./gradlew :geode-core:integrationTest --tests=AnalyzeCoreSerializablesJUnitTest` and `sanctionedDataSerializables.txt` did not change. `MissingPersistentIDsRequest` is still not listed there. I see it ultimately derives from `DSFID`.
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+bschuchardt commented on a change in pull request #5273:
+URL: https://github.com/apache/geode/pull/5273#discussion_r446406321
+
+
+
+##########
+File path: geode-core/src/integrationTest/resources/org/apache/geode/codeAnalysis/sanctionedDataSerializables.txt
+##########
+@@ -578,9 +502,6 @@ org/apache/geode/internal/admin/remote/LicenseInfoResponse,2
+ fromData,18
+ toData,15
+ 
+-org/apache/geode/internal/admin/remote/MissingPersistentIDsRequest,1
+
+Review comment:
+       I see why - that class has no fromData/toData methods.  The test just searches for those in parsed class files.  It doesn't care if they're DataSerializable/DSFID.
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+Bill commented on a change in pull request #5273:
+URL: https://github.com/apache/geode/pull/5273#discussion_r446354173
+
+
+
+##########
+File path: geode-core/src/main/java/org/apache/geode/distributed/internal/membership/InternalDistributedMember.java
+##########
+@@ -549,7 +550,7 @@ public void setVersionObjectForTest(Version v) {
+   }
+ 
+   @Override
+-  public Version getVersionObject() {
++  public VersionOrdinal getVersionObject() {
+
+Review comment:
+       Since `IDM` isa `MemberIdentifier` this method has to return a `VersionOrdinal` not a `Version` since, in general, a `MemberIdentifier` can be for a member that is running an unknown software version.
+   
+   I'm renaming `MemberIdentifier.getVersionObject()` => `MemberIdentifier.getVersionOrdinalObject()` and adding a method `IDM.getVersionObject()` to really return the version for callers that really need it.
+   
+   ~What's odd about the latter is that I don't see how that method could/should ever return anything but `Version.getCurrentVersion()` since the version, in this case, should be the version of the software running in the local JVM—which is always `Version.getCurrentVersion()`.~ That was a brainf*rt.
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+Bill commented on a change in pull request #5273:
+URL: https://github.com/apache/geode/pull/5273#discussion_r446354173
+
+
+
+##########
+File path: geode-core/src/main/java/org/apache/geode/distributed/internal/membership/InternalDistributedMember.java
+##########
+@@ -549,7 +550,7 @@ public void setVersionObjectForTest(Version v) {
+   }
+ 
+   @Override
+-  public Version getVersionObject() {
++  public VersionOrdinal getVersionObject() {
+
+Review comment:
+       Since `IDM` isa `MemberIdentifier` this method has to return a `VersionOrdinal` not a `Version` since, in general, a `MemberIdentifier` can be for a member that is running an unknown software version.
+   
+   I'm renaming `MemberIdentifier.getVersionObject()` => `MemberIdentifier.getVersionOrdinalObject()` and adding a method `IDM.getVersionObject()` to really return the version for callers that really need it.
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+luissson commented on a change in pull request #5273:
+URL: https://github.com/apache/geode/pull/5273#discussion_r446436509
+
+
+
+##########
+File path: geode-serialization/src/main/java/org/apache/geode/internal/serialization/VersionOrdinalImpl.java
+##########
+@@ -0,0 +1,132 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more contributor license
++ * agreements. See the NOTICE file distributed with this work for additional information regarding
++ * copyright ownership. The ASF licenses this file to You under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance with the License. You may obtain a
++ * copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software distributed under the License
++ * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
++ * or implied. See the License for the specific language governing permissions and limitations under
++ * the License.
++ */
++
++package org.apache.geode.internal.serialization;
++
++public class VersionOrdinalImpl implements VersionOrdinal {
++
++  protected final short ordinal;
++
++  public VersionOrdinalImpl(final short ordinal) {
++    this.ordinal = ordinal;
++  }
++
++  @Override
++  public short ordinal() {
++    return ordinal;
++  }
++
++  @Override
++  public int compareTo(final VersionOrdinal other) {
++    if (other == null) {
++      return 1;
++    } else {
++      return compareTo(other.ordinal());
++    }
++  }
++
++  /**
++   * TODO: eliminate this legacy method in favor of requiring callers to construct a
++   * VersionOrdinalImpl. Inline this logic up in compareTo(VersionOrdinal).
++   */
++  public int compareTo(final short other) {
++    // short min/max can't overflow int, so use (a-b)
++    final int thisOrdinal = this.ordinal;
++    final int otherOrdinal = other;
++    return thisOrdinal - otherOrdinal;
++  }
++
++  @Override
++  public boolean equals(final Object other) {
++    if (other == this)
+
+Review comment:
+       we should have a null check on 'other' here
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+luissson commented on a change in pull request #5273:
+URL: https://github.com/apache/geode/pull/5273#discussion_r446445811
+
+
+
+##########
+File path: geode-serialization/src/main/java/org/apache/geode/internal/serialization/internal/AbstractSerializationContext.java
+##########
+@@ -25,10 +26,10 @@
+  */
+ public abstract class AbstractSerializationContext {
+ 
+-  <IO> Version getVersionForDataStream(final IO in) {
++  <IO> VersionOrdinal getVersionForDataStream(final IO in) {
+     // check if this is a versioned data input
+     if (in instanceof VersionedDataStream) {
+-      final Version v = ((VersionedDataStream) in).getVersion();
++      final VersionOrdinal v = ((VersionedDataStream) in).getVersion();
+       return v != null ? v : Version.getCurrentVersion();
+
+Review comment:
+       the return here may be either Version or VersionOrdinal, do we want to upcast or downcast to ensure returning a single type? Doesn't appear to be a problem currently though
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+Bill commented on a change in pull request #5273:
+URL: https://github.com/apache/geode/pull/5273#discussion_r446470516
+
+
+
+##########
+File path: geode-core/src/integrationTest/resources/org/apache/geode/codeAnalysis/sanctionedDataSerializables.txt
+##########
+@@ -578,9 +502,6 @@ org/apache/geode/internal/admin/remote/LicenseInfoResponse,2
+ fromData,18
+ toData,15
+ 
+-org/apache/geode/internal/admin/remote/MissingPersistentIDsRequest,1
+
+Review comment:
+       I wonder if it used to have fromData/toData and now does not? why else would it have showed up in this file previously?
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+Bill commented on a change in pull request #5273:
+URL: https://github.com/apache/geode/pull/5273#discussion_r446470545
+
+
+
+##########
+File path: geode-core/src/main/java/org/apache/geode/cache/client/internal/ClientSideHandshakeImpl.java
+##########
+@@ -270,7 +271,7 @@ public ServerQueueStatus handshakeWithServer(Connection conn, ServerLocation loc
+   private InternalDistributedMember readServerMember(DataInputStream p_dis) throws IOException {
+ 
+     byte[] memberBytes = DataSerializer.readByteArray(p_dis);
+-    Version v = StaticSerialization.getVersionForDataStreamOrNull(p_dis);
++    final VersionOrdinal v = StaticSerialization.getVersionForDataStreamOrNull(p_dis);
+
+Review comment:
+       fixed
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+Bill commented on a change in pull request #5273:
+URL: https://github.com/apache/geode/pull/5273#discussion_r446470589
+
+
+
+##########
+File path: geode-core/src/main/java/org/apache/geode/internal/HeapDataOutputStream.java
+##########
+@@ -48,7 +49,7 @@
+     org.apache.geode.internal.serialization.BufferDataOutputStream
+     implements ObjToByteArraySerializer, ByteBufferWriter {
+ 
+-  public HeapDataOutputStream(Version version) {
++  public HeapDataOutputStream(VersionOrdinal version) {
+
+Review comment:
+       fixed
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+Bill commented on a change in pull request #5273:
+URL: https://github.com/apache/geode/pull/5273#discussion_r446470594
+
+
+
+##########
+File path: geode-serialization/src/main/java/org/apache/geode/internal/serialization/VersionOrdinalImpl.java
+##########
+@@ -0,0 +1,132 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more contributor license
++ * agreements. See the NOTICE file distributed with this work for additional information regarding
++ * copyright ownership. The ASF licenses this file to You under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance with the License. You may obtain a
++ * copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software distributed under the License
++ * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
++ * or implied. See the License for the specific language governing permissions and limitations under
++ * the License.
++ */
++
++package org.apache.geode.internal.serialization;
++
++public class VersionOrdinalImpl implements VersionOrdinal {
++
++  protected final short ordinal;
++
++  public VersionOrdinalImpl(final short ordinal) {
++    this.ordinal = ordinal;
++  }
++
++  @Override
++  public short ordinal() {
++    return ordinal;
++  }
++
++  @Override
++  public int compareTo(final VersionOrdinal other) {
++    if (other == null) {
++      return 1;
++    } else {
++      return compareTo(other.ordinal());
++    }
++  }
++
++  /**
++   * TODO: eliminate this legacy method in favor of requiring callers to construct a
++   * VersionOrdinalImpl. Inline this logic up in compareTo(VersionOrdinal).
++   */
++  public int compareTo(final short other) {
++    // short min/max can't overflow int, so use (a-b)
++    final int thisOrdinal = this.ordinal;
++    final int otherOrdinal = other;
++    return thisOrdinal - otherOrdinal;
++  }
++
++  @Override
++  public boolean equals(final Object other) {
++    if (other == this)
++      return true;
++    if (other instanceof VersionOrdinalImpl) {
++      return this.ordinal == ((VersionOrdinalImpl) other).ordinal;
++    } else {
++      return false;
++    }
++  }
++
++  public boolean equals(final VersionOrdinal other) {
++    return other != null && this.ordinal == other.ordinal();
++  }
++
++  @Override
++  public int hashCode() {
++    int result = 17;
++    final int mult = 37;
++    result = mult * result + this.ordinal;
++    return result;
++  }
++
++  @Override
++  public String toString() {
++    return toString(ordinal);
++  }
++
++  /**
++   * TODO: eliminate this legacy method in favor of requiring callers to construct a
++   * VersionOrdinalImpl. Inline this logic up in toString().
++   */
++  public static String toString(short ordinal) {
++    return "UNKNOWN[ordinal=" + ordinal + ']';
+
+Review comment:
+       fixed
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+Bill commented on a change in pull request #5273:
+URL: https://github.com/apache/geode/pull/5273#discussion_r446470857
+
+
+
+##########
+File path: geode-serialization/src/main/java/org/apache/geode/internal/serialization/internal/AbstractSerializationContext.java
+##########
+@@ -25,10 +26,10 @@
+  */
+ public abstract class AbstractSerializationContext {
+ 
+-  <IO> Version getVersionForDataStream(final IO in) {
++  <IO> VersionOrdinal getVersionForDataStream(final IO in) {
+     // check if this is a versioned data input
+     if (in instanceof VersionedDataStream) {
+-      final Version v = ((VersionedDataStream) in).getVersion();
++      final VersionOrdinal v = ((VersionedDataStream) in).getVersion();
+       return v != null ? v : Version.getCurrentVersion();
+
+Review comment:
+       "fixed" this code by reverting it to deal exclusively with `Version` as before the PR
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+Bill commented on a change in pull request #5273:
+URL: https://github.com/apache/geode/pull/5273#discussion_r446470963
+
+
+
+##########
+File path: geode-serialization/src/main/java/org/apache/geode/internal/serialization/VersionOrdinalImpl.java
+##########
+@@ -0,0 +1,132 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more contributor license
++ * agreements. See the NOTICE file distributed with this work for additional information regarding
++ * copyright ownership. The ASF licenses this file to You under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance with the License. You may obtain a
++ * copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software distributed under the License
++ * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
++ * or implied. See the License for the specific language governing permissions and limitations under
++ * the License.
++ */
++
++package org.apache.geode.internal.serialization;
++
++public class VersionOrdinalImpl implements VersionOrdinal {
++
++  protected final short ordinal;
++
++  public VersionOrdinalImpl(final short ordinal) {
++    this.ordinal = ordinal;
++  }
++
++  @Override
++  public short ordinal() {
++    return ordinal;
++  }
++
++  @Override
++  public int compareTo(final VersionOrdinal other) {
++    if (other == null) {
++      return 1;
++    } else {
++      return compareTo(other.ordinal());
++    }
++  }
++
++  /**
++   * TODO: eliminate this legacy method in favor of requiring callers to construct a
++   * VersionOrdinalImpl. Inline this logic up in compareTo(VersionOrdinal).
++   */
++  public int compareTo(final short other) {
++    // short min/max can't overflow int, so use (a-b)
++    final int thisOrdinal = this.ordinal;
++    final int otherOrdinal = other;
++    return thisOrdinal - otherOrdinal;
++  }
++
++  @Override
++  public boolean equals(final Object other) {
++    if (other == this)
+
+Review comment:
+       I think we are ok. If `other` is `null` then it cannot be equal to `this`.
+   
+   if `other` is `null` the `instanceof` check will return `false`
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+Bill commented on a change in pull request #5273:
+URL: https://github.com/apache/geode/pull/5273#discussion_r446354173
+
+
+
+##########
+File path: geode-core/src/main/java/org/apache/geode/distributed/internal/membership/InternalDistributedMember.java
+##########
+@@ -549,7 +550,7 @@ public void setVersionObjectForTest(Version v) {
+   }
+ 
+   @Override
+-  public Version getVersionObject() {
++  public VersionOrdinal getVersionObject() {
+
+Review comment:
+       Since `IDM` isa `MemberIdentifier` this method has to return a `VersionOrdinal` not a `Version` since, in general, a `MemberIdentifier` can be for a member that is running an unknown software version.
+   
+   I'm renaming `MemberIdentifier.getVersionObject()` => `MemberIdentifier.getVersionOrdinalObject()`. In places where the `Version` is needed there are other ways to get it, given an ordinal. The `Version` class has these static methods:
+   
+   * `fromOrdinal(short ordinal) throws UnsupportedSerializationVersionException`
+   * `fromOrdinalOrCurrent(short ordinal)`
+   * `fromOrdinalNoThrow(short ordinal, boolean returnNullForCurrent)`
+   
+   There is some unfortunate duplication in those methods. Consolidating that logic is beyond the scope of this PR.
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+albertogpz commented on a change in pull request #5273:
+URL: https://github.com/apache/geode/pull/5273#discussion_r446910249
+
+
+
+##########
+File path: geode-core/src/upgradeTest/java/org/apache/geode/internal/cache/rollingupgrade/RollingUpgradeDUnitTest.java
+##########
+@@ -191,20 +207,26 @@ void doTestRollAll(String regionType, String objectType, String startingVersion)
+       }
+ 
+       putAndVerify(objectType, server1, regionName, 0, 10, server2);
+-      locator = rollLocatorToCurrent(locator, hostName, locatorPorts[0], getTestMethodName(),
+-          locatorString);
++      locator =
++          rollLocatorToCurrent(locator, hostName, locatorPort, locatorProps, getTestMethodName(),
++              locatorString);
+ 
+       server1 = rollServerToCurrentAndCreateRegion(server1, regionType, testingDirs[0],
+-          shortcutName, regionName, locatorPorts);
++          shortcutName, regionName, new int[] {locatorPort});
+       verifyValues(objectType, regionName, 0, 10, server1);
+       putAndVerify(objectType, server1, regionName, 5, 15, server2);
+       putAndVerify(objectType, server2, regionName, 10, 20, server1);
+ 
+       server2 = rollServerToCurrentAndCreateRegion(server2, regionType, testingDirs[1],
+-          shortcutName, regionName, locatorPorts);
++          shortcutName, regionName, ports);
+       verifyValues(objectType, regionName, 0, 10, server2);
+       putAndVerify(objectType, server2, regionName, 15, 25, server1);
+ 
++      String shutDownCommand = "shutdown --include-locators=true";
+
+Review comment:
+       The shutdown command had also issues. That's why the variable was there initially in the test case.
+   Could you add the execution of the shutdown command after the ```list members``` in order to verify that with your solution it works?
+   Otherwise, the variable must be removed.
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+Bill commented on a change in pull request #5273:
+URL: https://github.com/apache/geode/pull/5273#discussion_r447181500
+
+
+
+##########
+File path: geode-core/src/upgradeTest/java/org/apache/geode/internal/cache/rollingupgrade/RollingUpgradeDUnitTest.java
+##########
+@@ -191,20 +207,26 @@ void doTestRollAll(String regionType, String objectType, String startingVersion)
+       }
+ 
+       putAndVerify(objectType, server1, regionName, 0, 10, server2);
+-      locator = rollLocatorToCurrent(locator, hostName, locatorPorts[0], getTestMethodName(),
+-          locatorString);
++      locator =
++          rollLocatorToCurrent(locator, hostName, locatorPort, locatorProps, getTestMethodName(),
++              locatorString);
+ 
+       server1 = rollServerToCurrentAndCreateRegion(server1, regionType, testingDirs[0],
+-          shortcutName, regionName, locatorPorts);
++          shortcutName, regionName, new int[] {locatorPort});
+       verifyValues(objectType, regionName, 0, 10, server1);
+       putAndVerify(objectType, server1, regionName, 5, 15, server2);
+       putAndVerify(objectType, server2, regionName, 10, 20, server1);
+ 
+       server2 = rollServerToCurrentAndCreateRegion(server2, regionType, testingDirs[1],
+-          shortcutName, regionName, locatorPorts);
++          shortcutName, regionName, ports);
+       verifyValues(objectType, regionName, 0, 10, server2);
+       putAndVerify(objectType, server2, regionName, 15, 25, server1);
+ 
++      String shutDownCommand = "shutdown --include-locators=true";
+
+Review comment:
+       My latest commit eliminates `gfsh` entirely so the issue with `shutDownCommand` is moot.
+   
+   I eliminated use of `gfsh` because I found the test had become flaky on versions 1.3.0-1.8.0, at least on macOS. On Linux (CI) I did not see the flakiness. But rather than figuring that out, I decided to grab the view more directly: by accessing `InternalDistributedSystem` in the locator JVM.
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+Bill commented on a change in pull request #5273:
+URL: https://github.com/apache/geode/pull/5273#discussion_r446354173
+
+
+
+##########
+File path: geode-core/src/main/java/org/apache/geode/distributed/internal/membership/InternalDistributedMember.java
+##########
+@@ -549,7 +550,7 @@ public void setVersionObjectForTest(Version v) {
+   }
+ 
+   @Override
+-  public Version getVersionObject() {
++  public VersionOrdinal getVersionObject() {
+
+Review comment:
+       Since `IDM` isa `MemberIdentifier` this (overridden) method has to return a `VersionOrdinal` not a `Version` since, in general, a `MemberIdentifier` can be for a member that is running an unknown software version.
+   
+   I'm renaming `MemberIdentifier.getVersionObject()` => `MemberIdentifier.getVersionOrdinalObject()`. 
+   To summarize the state of `IDM` version methods this is what it looks like now:
+   
+   ```java
+     // inherited from MemberIdentifier. It has a new name to make the return type explicit
+     @Override
+     public VersionOrdinal getVersionOrdinalObject() {…}
+   
+     /**
+      * If this member runs a version known in this JVM then return that Version.
+      * If this member does not run a known version then return Version.CURRENT.
+      *
+      * In various serialization scenarios we want the well-known version for this
+      * member, or, if it doesn't have a well-known version, we want the current
+      * (in this JVM) software version. Rather than have that logic spread around in
+      * the serialization code, it is centralized here.
+      */
+     public Version getVersionObject() {…}
+   ```
+   
+   We still have lots of ways to get a `Version` from a `short` version ordinal. `Version` class has these static methods:
+   
+   * `fromOrdinal(short ordinal) throws UnsupportedSerializationVersionException`
+   * `fromOrdinalOrCurrent(short ordinal)`
+   * `fromOrdinalNoThrow(short ordinal, boolean returnNullForCurrent)`
+   
+   There is some unfortunate duplication in those methods. Consolidating that logic is beyond the scope of this PR.
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+bschuchardt commented on a change in pull request #5273:
+URL: https://github.com/apache/geode/pull/5273#discussion_r447282170
+
+
+
+##########
+File path: geode-serialization/src/main/java/org/apache/geode/internal/serialization/VersionOrdinal.java
+##########
+@@ -0,0 +1,83 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more contributor license
++ * agreements. See the NOTICE file distributed with this work for additional information regarding
++ * copyright ownership. The ASF licenses this file to You under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance with the License. You may obtain a
++ * copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software distributed under the License
++ * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
++ * or implied. See the License for the specific language governing permissions and limitations under
++ * the License.
++ */
++
++package org.apache.geode.internal.serialization;
++
++/**
++ * VersionOrdinal is able to represent not only currently-known
++ * Geode versions but future versions as well. This is necessary
++ * because during rolling upgrades Geode manipulates member
++ * identifiers for members running newer versions of the software.
++ * In that case we receive the ordinal over the network
++ * (serialization) but we don't know other version details such as
++ * major/minor/patch version, which are known to the Version class.
++ *
++ * Implementations must define equals() and hashCode() based on
++ * ordinal() result. And since this interface extends Comparable,
++ * implementations must define compareTo() as well.
++ *
++ * Unlike Version (a subtype of VersionOrdinal which acts like an
++ * enumerated type), VersionOrdinal does not, in general, guarantee
++ * that if vo1.equals(vo2) then vo1 == vo2.
++ *
++ * Use the Versioning factory class to construct objects implementing
++ * this interface. All instances of known versions are defined as
++ * constants in the Version class, e.g. Version.GEODE_1_11_0
++ */
++public interface VersionOrdinal extends Comparable<VersionOrdinal> {
+
+Review comment:
+       VersionOrdinal's methods should take VersionOrdinal arguments. 
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+Bill commented on a change in pull request #5273:
+URL: https://github.com/apache/geode/pull/5273#discussion_r447323644
+
+
+
+##########
+File path: geode-serialization/src/main/java/org/apache/geode/internal/serialization/VersionOrdinal.java
+##########
+@@ -0,0 +1,83 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more contributor license
++ * agreements. See the NOTICE file distributed with this work for additional information regarding
++ * copyright ownership. The ASF licenses this file to You under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance with the License. You may obtain a
++ * copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software distributed under the License
++ * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
++ * or implied. See the License for the specific language governing permissions and limitations under
++ * the License.
++ */
++
++package org.apache.geode.internal.serialization;
++
++/**
++ * VersionOrdinal is able to represent not only currently-known
++ * Geode versions but future versions as well. This is necessary
++ * because during rolling upgrades Geode manipulates member
++ * identifiers for members running newer versions of the software.
++ * In that case we receive the ordinal over the network
++ * (serialization) but we don't know other version details such as
++ * major/minor/patch version, which are known to the Version class.
++ *
++ * Implementations must define equals() and hashCode() based on
++ * ordinal() result. And since this interface extends Comparable,
++ * implementations must define compareTo() as well.
++ *
++ * Unlike Version (a subtype of VersionOrdinal which acts like an
++ * enumerated type), VersionOrdinal does not, in general, guarantee
++ * that if vo1.equals(vo2) then vo1 == vo2.
++ *
++ * Use the Versioning factory class to construct objects implementing
++ * this interface. All instances of known versions are defined as
++ * constants in the Version class, e.g. Version.GEODE_1_11_0
++ */
++public interface VersionOrdinal extends Comparable<VersionOrdinal> {
+
+Review comment:
+       Corrected this and went one better: added a new unit test for `VersionOrdinalImpl`.
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+albertogpz commented on a change in pull request #5273:
+URL: https://github.com/apache/geode/pull/5273#discussion_r447434620
+
+
+
+##########
+File path: geode-core/src/upgradeTest/java/org/apache/geode/internal/cache/rollingupgrade/RollingUpgradeDUnitTest.java
+##########
+@@ -191,20 +207,26 @@ void doTestRollAll(String regionType, String objectType, String startingVersion)
+       }
+ 
+       putAndVerify(objectType, server1, regionName, 0, 10, server2);
+-      locator = rollLocatorToCurrent(locator, hostName, locatorPorts[0], getTestMethodName(),
+-          locatorString);
++      locator =
++          rollLocatorToCurrent(locator, hostName, locatorPort, locatorProps, getTestMethodName(),
++              locatorString);
+ 
+       server1 = rollServerToCurrentAndCreateRegion(server1, regionType, testingDirs[0],
+-          shortcutName, regionName, locatorPorts);
++          shortcutName, regionName, new int[] {locatorPort});
+       verifyValues(objectType, regionName, 0, 10, server1);
+       putAndVerify(objectType, server1, regionName, 5, 15, server2);
+       putAndVerify(objectType, server2, regionName, 10, 20, server1);
+ 
+       server2 = rollServerToCurrentAndCreateRegion(server2, regionType, testingDirs[1],
+-          shortcutName, regionName, locatorPorts);
++          shortcutName, regionName, ports);
+       verifyValues(objectType, regionName, 0, 10, server2);
+       putAndVerify(objectType, server2, regionName, 15, 25, server1);
+ 
++      String shutDownCommand = "shutdown --include-locators=true";
+
+Review comment:
+       Overall, great work. Thanks, Bill.
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+Merged to {{develop}}. Waiting for CI to get further along before committing to 1.12, and 1.13 branches.
+
+In advance of that I'm making a new experimental 1.12 feature branch to test cherry-picking the fix back there.
+
+Bill commented on pull request #5278:
+URL: https://github.com/apache/geode/pull/5278#issuecomment-652050659
+
+
+   closing this PR. it's out of date. It was made with an early version of the GEODE-8240 fix on the `develop` branch. I'm about to make a brand new 1.12-based branch to test the latest version of that fix that just merged to `develop`.
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+Bill closed pull request #5278:
+URL: https://github.com/apache/geode/pull/5278
+
+
+   
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+Bill opened a new pull request #5334:
+URL: https://github.com/apache/geode/pull/5334
+
+
+   **not ready for review**
+   
+   This is a first try at a back port of GEODE-8240 to `support/1.12` to get a CI run.
+   
+   - [x] Is there a JIRA ticket associated with this PR? Is it referenced in the commit message?
+   
+   - [x] Has your PR been rebased against the latest commit within the target branch (typically `develop`)?
+   
+   - [x] Is your initial contribution a single, squashed commit?
+   
+   - [x] Does `gradlew build` run cleanly?
+   
+   - [x] Have you written or updated unit tests to verify your changes?
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+Bill commented on a change in pull request #5334:
+URL: https://github.com/apache/geode/pull/5334#discussion_r448446534
+
+
+
+##########
+File path: geode-core/src/main/java/org/apache/geode/distributed/internal/membership/InternalDistributedMember.java
+##########
+@@ -440,15 +441,21 @@ public boolean isPartial() {
+   }
+ 
+   @Override
+-  public boolean equals(Object o) {
++  public boolean equals(final Object o) {
+     if (this == o) {
+       return true;
+     }
+-    if (o == null || getClass() != o.getClass()) {
++    if (o == null) {
++      return false;
++    }
++    if (o instanceof InternalDistributedMember) {
++      final InternalDistributedMember that = (InternalDistributedMember) o;
++      return memberIdentifier.equals(that.memberIdentifier);
++    } else if (o instanceof MemberIdentifier) {
++      return memberIdentifier.equals(o);
++    } else {
+
+Review comment:
+       this `equals()` method needed repair to get `GMSJoinLeaveJUnitTest` passing
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+Bill commented on a change in pull request #5334:
+URL: https://github.com/apache/geode/pull/5334#discussion_r448568318
+
+
+
+##########
+File path: geode-core/src/integrationTest/java/org/apache/geode/distributed/internal/membership/gms/membership/GMSJoinLeaveJUnitTest.java
+##########
+@@ -1589,6 +1590,36 @@ public void testMulticastDiscoveryNotAllowed() {
+     }
+   }
+ 
++  // GEODE-8240 could cause this member's identifier to have the wrong version so patch it up
++  @Test
++  public void repairWrongVersionInView() throws Exception {
++
++    initMocks();
++
++    List<MemberIdentifier> viewmembers =
++        Arrays.asList(new MemberIdentifier[] {mockMembers[0], gmsJoinLeaveMemberId});
++
++    final GMSMembershipView<MemberIdentifier> viewWithWrongVersion =
++        new GMSMembershipView<>(mockMembers[0], 2, viewmembers);
++
++    // clone member ID
++    final MemberIdentifierImpl myMemberIDWithWrongVersion =
++        new MemberIdentifierImpl(gmsJoinLeaveMemberId.getMemberData());
++
++    // this test must live in the 1.12 and later lines so pick a pre-1.12 version
++    final Version oldVersion = Version.GEODE_1_11_0;
++    myMemberIDWithWrongVersion.setVersionObjectForTest(oldVersion);
++
++    viewWithWrongVersion.remove(gmsJoinLeaveMemberId);
++    viewWithWrongVersion.add(myMemberIDWithWrongVersion);
++
++    gmsJoinLeave.installView(viewWithWrongVersion);
++
++    assertThat(
++        gmsJoinLeave.getView().getCanonicalID(gmsJoinLeaveMemberId).getVersionOrdinalObject())
++            .isEqualTo(Version.getCurrentVersion());
++  }
+
+Review comment:
+       this is the new unit test for GEODE-8240
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+Bill commented on a change in pull request #5334:
+URL: https://github.com/apache/geode/pull/5334#discussion_r448569055
+
+
+
+##########
+File path: geode-core/src/upgradeTest/java/org/apache/geode/internal/cache/rollingupgrade/RollingUpgradeDUnitTest.java
+##########
+@@ -205,6 +210,22 @@ void doTestRollAll(String regionType, String objectType, String startingVersion)
+       verifyValues(objectType, regionName, 0, 10, server2);
+       putAndVerify(objectType, server2, regionName, 15, 25, server1);
+ 
++      final short versionOrdinalAfterUpgrade = Version.getCurrentVersion().ordinal();
++      locator.invoke(() -> {
++
++        final Locator theLocator = Locator.getLocator();
++        final DistributedSystem distributedSystem = theLocator.getDistributedSystem();
++        final InternalDistributedSystem ids =
++            (InternalDistributedSystem) distributedSystem;
++        final DistributionManager distributionManager = ids.getDistributionManager();
++        final MembershipView<InternalDistributedMember> view =
++            distributionManager.getDistribution().getView();
++
++        for (final InternalDistributedMember member : view.getMembers()) {
++          assertThat(member.getVersionOrdinal()).isEqualTo(versionOrdinalAfterUpgrade);
++        }
++      });
+
+Review comment:
+       This is the new rolling upgrade test logic that verifies that after the upgrade, all the `MemberIdentifiers` in the view, report the current version (not an old version.)
+   
+   This is adapted from the original Ericsson PR that showed us the bug that became GEODE-8240. Rather than use gfsh, we are delving into the `IDM` directly here.
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+Bill commented on a change in pull request #5334:
+URL: https://github.com/apache/geode/pull/5334#discussion_r448446534
+
+
+
+##########
+File path: geode-core/src/main/java/org/apache/geode/distributed/internal/membership/InternalDistributedMember.java
+##########
+@@ -440,15 +441,21 @@ public boolean isPartial() {
+   }
+ 
+   @Override
+-  public boolean equals(Object o) {
++  public boolean equals(final Object o) {
+     if (this == o) {
+       return true;
+     }
+-    if (o == null || getClass() != o.getClass()) {
++    if (o == null) {
++      return false;
++    }
++    if (o instanceof InternalDistributedMember) {
++      final InternalDistributedMember that = (InternalDistributedMember) o;
++      return memberIdentifier.equals(that.memberIdentifier);
++    } else if (o instanceof MemberIdentifier) {
++      return memberIdentifier.equals(o);
++    } else {
+
+Review comment:
+       this `equals()` method needed repair after the `git cherry-pick`, in order to get `GMSJoinLeaveJUnitTest` passing
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+Bill commented on a change in pull request #5334:
+URL: https://github.com/apache/geode/pull/5334#discussion_r448446534
+
+
+
+##########
+File path: geode-core/src/main/java/org/apache/geode/distributed/internal/membership/InternalDistributedMember.java
+##########
+@@ -440,15 +441,21 @@ public boolean isPartial() {
+   }
+ 
+   @Override
+-  public boolean equals(Object o) {
++  public boolean equals(final Object o) {
+     if (this == o) {
+       return true;
+     }
+-    if (o == null || getClass() != o.getClass()) {
++    if (o == null) {
++      return false;
++    }
++    if (o instanceof InternalDistributedMember) {
++      final InternalDistributedMember that = (InternalDistributedMember) o;
++      return memberIdentifier.equals(that.memberIdentifier);
++    } else if (o instanceof MemberIdentifier) {
++      return memberIdentifier.equals(o);
++    } else {
+
+Review comment:
+       this `equals()` method needed repair after the `git cherry-pick`, in order to get `GMSJoinLeaveJUnitTest` passing here in 1.12
+
+
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+Bill commented on pull request #5334:
+URL: https://github.com/apache/geode/pull/5334#issuecomment-652678946
+
+
+   > I trust this backport is pretty similar to the GEODE-8240 fix on develop and your PR checks and testing are good.
+   > 
+   > I am curious what the implications are for users currently running Geode 1.12.0. Should we advise that they upgrade to 1.12.1 to get this fix before attempting to upgrade to 1.13.0?
+   
+   This fix will be ported to `support/1.13` next. So 1.12.x users will be able to upgrade to the soon-to-be-released 1.13.0 version directly.
+   
+   > 
+   > What about upgrades from 1.11.0 to 1.12.0 or 1.11.0 to 1.12.1?
+   
+   The bug exists in the 1.12 line before this PR. I think this PR will go into a 1.12.1 or 1.12.2? 
+   
+   If that's right, then a 1.11.0 to 1.12.0 upgrade will see the bug, and a 1.11.0 to 1.12.1 (or whatever release this PR goes into) will not see the bug.
+   
+   Incidentally, I don't really know what versions of 1.12 actually exist after 1.12.0. I see a bunch of four-part version numbers here:
+   
+   <img width="149" alt="image" src="https://user-images.githubusercontent.com/4002/86296758-70d60800-bbae-11ea-96e1-702b5cf75bcc.png">
+   
+   I don't understand those four-part version numbers.
+   
+   But I can say that a 1.11.x upgrade to a 1.12.x version that has this fix, will work and the bug will be gone.
+   
+   > In general does this bug only affect upgrades between minors, or between patch versions too?
+   
+   My understanding is that Geode usually does not change `Version.CURRENT` between patch releases. On the other hand, I think I have heard that it has been done at least once.
+   
+   If you upgrade from one patch version to another patch version in the same line and `Version.CURRENT` doesn't change then you won't see this bug.
+   
+   If you upgrade from one patch version to another patch version in the same line and `Version.CURRENT` _does_ change then you _will_ see this bug.
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+Bill commented on pull request #5334:
+URL: https://github.com/apache/geode/pull/5334#issuecomment-652679430
+
+
+   > I don't think InternalDistributedMember should be changed in order to make this new unit test pass. Instead, the unit test should be changed to use MemberIdentifierImplFactory and MemberIdentifierImpl. That's what the test is doing in the develop branch. That was done a while ago & it just didn't make it over to the support branch.
+   
+   Right you are! I undid my change to `IDM.equals(other)` in favor of small changes to `GMSJoinLeaveJUnitTest`.
+   
+   Good advice!
+    
+   > Also, shouldn't this be ported to support/1.13 before it's ported to support/1.12?
+   
+   Ooh yeah. I'll go do that…
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+Bill opened a new pull request #5336:
+URL: https://github.com/apache/geode/pull/5336
+
+
+   Back-port to `support/1.13` branch, of https://github.com/apache/geode/pull/5273 fix for [GEODE-8240](https://issues.apache.org/jira/browse/GEODE-8240)
+   
+   I used `git cherry-pick -x bfe1ca113124ea958dc02dd9be90cdb0aabe5c4d`
+   
+   In resolving conflicts I mostly accepted all non-conflicting changes from 1.13. An exception was that in many places where we were using `version.compareTo(other) < 0` or `version.compareTo(other) >= 0`, I accepted the changes from the cherry-pick commit to replace those with `version.isOlderThan(other)` or `version.isNotOlderThan(other)`. Those changes were all made by @pivotal-jbarrett on `develop` and they improve readability.
+   
+   I did not change `InternalDistributedMember.equals(other)`—instead, I pulled in a couple minor changes to `GMSJoinLeaveJUnitTest` from the `develop` branch, to get that test running with the (wrong/unchanged) `IDM.equals(other)` functionality. Since this ticket is not about fixing `IDM` this was the better way to go.
+   
+   - [x] Is there a JIRA ticket associated with this PR? Is it referenced in the commit message?
+   
+   - [x] Has your PR been rebased against the latest commit within the target branch (typically `develop`)?
+   
+   - [x] Is your initial contribution a single, squashed commit?
+   
+   - [x] Does `gradlew build` run cleanly?
+   
+   - [x] Have you written or updated unit tests to verify your changes?
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+Bill commented on pull request #5334:
+URL: https://github.com/apache/geode/pull/5334#issuecomment-652726465
+
+
+   OK after https://github.com/apache/geode/pull/5336 is merged to 1.13, I'll merge this one to 1.12
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+Bill commented on pull request #5336:
+URL: https://github.com/apache/geode/pull/5336#issuecomment-653080336
+
+
+   Thanks for the 👍 @mkevo! 
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+Bill merged pull request #5336:
+URL: https://github.com/apache/geode/pull/5336
+
+
+   
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+Bill merged pull request #5334:
+URL: https://github.com/apache/geode/pull/5334
+
+
+   
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+Commit 1c18206887aac2defe5411b62a44951fc14429ef in geode's branch refs/heads/support/1.13 from Bill Burcham
+[ https://gitbox.apache.org/repos/asf?p=geode.git;h=1c18206 ]
+
+GEODE-8240: Member Identifier Future Versions
+
+cherry picked from commit bfe1ca113124ea958dc02dd9be90cdb0aabe5c4d
+
+Commit 9dfa7f1b79878bbbceca636275b4eda597bd7712 in geode's branch refs/heads/support/1.12 from Bill Burcham
+[ https://gitbox.apache.org/repos/asf?p=geode.git;h=9dfa7f1 ]
+
+GEODE-8240: Member Identifier Future Versions 
+
+cherry picked from commit bfe1ca113124ea958dc02dd9be90cdb0aabe5c4d
+
+Fixed on develop branch and both 1.12 and 1.13 support branches
+
+Bill opened a new pull request #5344:
+URL: https://github.com/apache/geode/pull/5344
+
+
+   **not ready for review**
+   
+   This is a follow-on PR to the versioning repair done in GEODE-8240. During the work for that ticket we saw lots of little things that needed cleaning up, but we didn't want to do them in that other PR because we had a couple releases waiting for that work. Also we didn't want to increase the complexity of the back-porting work.
+   
+   - [x] Is there a JIRA ticket associated with this PR? Is it referenced in the commit message?
+   
+   - [x] Has your PR been rebased against the latest commit within the target branch (typically `develop`)?
+   
+   - [x] Is your initial contribution a single, squashed commit?
+   
+   - [x] Does `gradlew build` run cleanly?
+   
+   - [x] Have you written or updated unit tests to verify your changes?
+   
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+Commit 868d4bc4298cdd77fe4677bb1535d486cade8693 in geode's branch refs/heads/develop from Bill Burcham
+[ https://gitbox.apache.org/repos/asf?p=geode.git;h=868d4bc ]
+
+GEODE-8330: Structural Improvements to Versioning
+
+Follow-on to GEODE-8240, this commit eliminates redundancy in 
+versioning code and provides a single way to convert a short
+to a version and a single way to acquire a known version from
+a (possibly unknown) version.
+
+Bill closed pull request #5269:
+URL: https://github.com/apache/geode/pull/5269
+
+
+   
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+
+Bill commented on pull request #5269:
+URL: https://github.com/apache/geode/pull/5269#issuecomment-655803678
+
+
+   I didn't end up using this PR—I took a different approach. Closing this one because it's not needed.
+
+
+----------------------------------------------------------------
+This is an automated message from the Apache Git Service.
+To respond to the message, please log on to GitHub and use the
+URL above to go to the specific comment.
+
+For queries about this service, please contact Infrastructure at:
+users@infra.apache.org
+
+

@@ -1,0 +1,680 @@
+Noticed we don't appear to have a JIRA for the S3AFileSystem integration.
+
+I'll grab this task unless you want it [~cnauroth].  I believe others are busy working on other components.
+
+I'm also open to splitting this up further if folks want to divide and conquer. 
+
+Minor status update, since this JIRA has a long gestation period. I'm working on this now.  So far I have code for:
+
+- New config values: {{fs.s3a.metadatastore.authoratitive}}, and {{fs.s3a.metadatastore.impl}}.
+- getFileStatus()
+- listStatus()
+- rename()
+- delete()
+- mkdirs()
+- copyFromLocalFile()
+- copyFile()
+
+What remains for this jira:
+- create().  Figuring out the OutputStream plumbing now 
+- More testing.
+
+What I'd like to do as separate jiras (because I favor smaller code reviews).
+- Delete tracking
+- Retries (i.e. eventual consistency retry policy).  Would love to see this in isolation since it is non-trivial.
+
+I'm inserting TODO comments as I go at key locations for those two items.
+
+Interesting things about my approach so far:
+
+I'm trying to minimize changes to {{S3AFileSystem}}
+   - diff stat so far: {quote}
+hadoop-tools/hadoop-aws/src/main/java/org/apache/hadoop/fs/s3a/S3AFileSystem.java                   | 116 ++++++++++++++++++++++++++++++------
+{quote}
+   - I introduce a "metadatastore s3a helper/glue" class S3Guard which is a bunch of static helper functions, so far.
+   - I introduce {{NullMetadataStore}} which is a no-op metadata store.   Goal was to simplify S3AFileSystem changes (always call MetadataStore, don't care if it is no-op), but I also like that it further clarifies {{MetadataStore}} semantics.  Turns out S3AFileSystem still sometimes wants to know if there is no MetadataStore to avoid allocating stuff that isn't needed.  Seems like ok tradeoff but I'll let folks comment when I post v1 patch.
+
+I'm trying to keep PathMetadata simple:  Either you have a PathMetadata, including S3AFileStatus, or  you don't.   There are some spots where it would be convenient to just record "this path exists, but we don't have metadata yet", (e.g. create() -> OutputStream.close() -> S3AFileSystem.writeFinished().. at that point I don't have a FileStatus.), but that would complicate S3AFileSystem logic.  We'll see.
+
+
+I don't have all tests passing yet, but I wanted to attach a v1 / RFC patch in case folks want to take a look.  See my previous comment for overview, (except I've now implemented create() in this patch).
+
+This patch has really benefited from the great work on integration and FS contract tests that folks has done, so thank you.
+
+The create() case was interesting:  On create, we need to put a FileStatus in the MetadataStore.  The main wart was on modification time:  S3A uses S3's server-side modification time to populate FileStatus's.  We cannot know that time value at create time, unless we blocked and polled S3 for results.  Those results would be subject to S3 consistency and multi-writer issues.  The other approach would be to put a PathMetadata in the MetadataStore that says "this file exists but we do not have FileStatus for it yet".. That complicates the client a bit, so for now, I just use local system time for modification time.
+ 
+The main issue I'm tackling next is {{S3AFileStatus#isEmptyDirectory()}}.. This one bit of state is a pain because it means you cannot simply cache a S3AFileStatus in isolation: it needs to be updated when the set of children changes.  Couple this with the fact that we do not require all metadata to be pre-loaded into the MetadataStore, and you have a nasty little problem.  I have an idea of how to tackle it.  I may post my solution to that part as a separate RFC patch on here so folks can comment on that part alone.
+
+
+Quick update: I have all but one of the unit and integration tests passing, with and without {{fs.s3a.metadatastore.authoratitive}} set.  I need to tidy up my patch and get the last test sorted and I'll post a v2 patch.
+
+Attaching v2 patch.   We should consider merging this soon as it makes a lot of changes in the MetadataStore test code around the new requirement for fully-qualified paths.
+
+ Implements keeping {{S3AFileStatus#isEmptyDirectory()}} updated.  Also hardens treatment of Path objects, so we are consistently dealing with fully qualified paths.
+
+All unit and integration tests pass as is.
+
+If you enable LocalMetadataStore with authoritative = true (See commented-out core-site.xml changes in patch), all tests pass except I see occasional failures in {{ ITestS3AContractRootDir>AbstractContractRootDirectoryTest.testRecursiveRootListing}}.  I'm still working on that one.
+
+If you enable LocalMetadataStore with authoritative = false, almost all tests are passing as well, but I think I need to fix a FS statistics delta test that is off-by-one still.
+
+
+
+Hi, [~fabbri]
+
+Thanks for posting this missing and critical piece.  
+Please see the reviews below:
+
+* In {{S3AFIleSystem#innerDelete()}}.   The deletion on metadata store should happen before on S3. Similar to how HDFS handles deletion, delete namespace before deleting actual blocks. We can either 1) throw IOE if the metadata store deletion fails.  It can make sure the other clients have a consistent view between namespace and data.  In general, it'd be nice if we do S3 first then {{MS}} for creation, and do {{MS}} then {{S3}} for deletion.
+
+* In {{getFileStatus()}}, 
+
+{code}
+    // Check MetadataStore, if any.
+    PathMetadata pm = metadataStore.get(path);
+    if (pm != null) {
+      // TODO handle deleted files, i.e. PathMetadata#isDeleted()
+      return (S3AFileStatus)pm.getFileStatus();
+    }
+{code}
+
+It might be problematic for {{delete-after-listing}} case. Lets say the client A delete file "s3a://bucket/a/b" and client B tries to run {{getFileStatus()}} on this file.  And because the eventual consistency of S3:  when client B call this function, {{pm == null}}, but in the following code, B is still able to get the metadata from S3, thus client B will put {{s3a://bucket/a/b}} back to metadata store and returns it as it has not been deleted. 
+
+Similar to the code in {{innerListStatus()}}:
+
+{code}
+ DirListingMetadata dirMeta = metadataStore.listChildren(path);
+ if (allowAuthoritative && dirMeta != null && dirMeta.isAuthoritative()) {
+     return S3Guard.dirMetaToStatuses(dirMeta);
+}
+{code}
+
+So listStatus will go through this code if either {{allowAuthoritative == false}} or {{dirMeta == null}} or {{dirMeta.isAuthorizative == null}}. I don't fully understand what scenarios each condition represents. Can you explain a little bit how each case happens?
+
+I think it is safer that after this point, just do retries to S3 (or both of them) until these two sets of files (from MS and S3) are equal.  Because in {{S3Guard.dirListingUnion()}}, {{s3guard}} overwrites the metadata store with the union of two sets and hides the fact that inconsistent results happened due to S3 eventual consistency.  
+
+IIRC, {{EMRFS}} only updates dynamodb for file / directory creations. It uses CLI to load pre-existed data. EMRFS might have the point that for reads like {{getFileStatus()}} and {{listStatus()}}, it is too difficult for the filesystem to tell what is happening, and which source is wrong. 
+
+* In {{finishedWrite()}}, you need also update the parent directory {{isEmptyDirectory()}} flag, similar to wha t{{deleteUnccessaryFakeDirectories(p.getParent())}} does.
+
+Some nits:
+
+* The checks for {{isNullMetadataStore()}} seems not necessary, as {{NullMetadataStore}} is supposed to do nothing. 
+* The patch seems not be able to be cleanly patched to the latest HADOOP-13345. 
+
+Thanks.
+
+
+
+Hey [~eddyxu], thank you for the thorough review!
+
+{quote}The deletion on metadata store should happen before on S3. {quote}
+
+Interesting idea. My thinking was, deletion of data is an important task (i.e. security concerns).  If MetadataStore fails, I'd rather delete underlying data, and risk subsequent eventual consistency (unexpected FileNotFound) on that path since MetadataStore did not get updated.
+
+If S3A fails in your proposal, then we mark file as deleted for MetadataStore clients, but the data is still there.  Technically the MetadataStore deletion would need to be rolled back, or else clients which retry the delete would fail (file does not exist, according to MetadataStore).  So your proposal, I think, requires the introduction of transactions in that we need logic to to rollbacks.  I prefer to just fail to update the MetadataStore after S3 modification, log an error, and suffer the consequences of eventual consistency on that path.  
+
+{quote}It might be problematic for delete-after-listing case. {quote}
+Yep good catch.. thus the TODO comment.  I mention above that I am not doing delete support in this patch and prefer to do it as a separate folllowup JIRA so it is easier to get a good code review.  That TODO comment is where we will check {{PathMetadata.isDeleted()}}, and treat the file as deleted.  There are a number of spots we need to do this.
+
+{quote}So listStatus will go through this code if either allowAuthoritative == false or dirMeta == null or dirMeta.isAuthorizative == null. I don't fully understand what scenarios each condition represents. Can you explain a little bit how each case happens?{quote}
+
+If {{fs.s3a.metadatastore.authoritative}} is set to false, the client always will consult S3 in addition to the Metadata store.  This has worse performance, but allows for use cases like an external process adding data to S3.
+
+If there is no dirMeta, the MetadataStore has no state, so we have to consult S3.
+
+If dirMeta.isAuthoritative is false, the MetadataStore is saying it does not have full state for this directory (i.e. client never did a put(DirMeta w/ authoritative=true), or MetadataStore does not support being authoritative for directory listing.
+
+{quote}I think it is safer that after this point, just do retries to S3 (or both of them) until these two sets of files (from MS and S3) are equal.{quote}
+Interesting.. or you could be more efficient, and retry only when the client actually tries to read the file.  Anyways, I purposely left retries out of this, preferring to do it in later JIRA.  Again, for easier code reviews.  For now there are TODO comments in most of the places it is needed.
+
+{quote}In finishedWrite(), you need also update the parent directory isEmptyDirectory() flag, similar to wha t{{deleteUnccessaryFakeDirectories(p.getParent())}} does.{quote}
+
+finishedWrite() calls MetadataStore.put(), which is where I'm updating isEmptyDirectory().. I don't love doing that in the MetadataStore, but out of 2 or 3 algorithms, it was the best I came up with.  isEmptyDirectory is a pain.
+
+{quote}
+The checks for isNullMetadataStore() seems not necessary, as NullMetadataStore is supposed to do nothing.
+{quote}
+I thought about omitting it, but we'd be creating a bunch of garbage with zero purpose.  Here's the function comment:
+
+{code}
+/**
+   * Although NullMetadataStore does nothing, callers may wish to avoid work
+   * (fast path) when the NullMetadataStore is in use.
+   * @param ms The MetadataStore to test
+   * @return true iff the MetadataStore is the null, or no-op, implementation.
+   */
+  public static boolean isNullMetadataStore(MetadataStore ms) {
+{code}
+
+{code}
+The patch seems not be able to be cleanly patched to the latest HADOOP-13345.
+{code}
+Yep.  It depends on HADOOP-13631 which needs to go in before I can submit this patch.
+
+
+
+Hi, [~liuml07] and [~fabbri]
+
+[~fabbri] and I had an offline discussion today, the followings are my notes
+
+* We agree that the atomic of creation / deletion / rename (between metadata store and s3) are difficult  to achieve, as S3 is always visible to some of the clients. We need more thoughts on these issues. My option is making sure namespace consistency first, but there are other understandable concerns. 
+* For {{rename}}, it should not expect that {{rename(recursive=true)}} can be atomic. 
+* {{LocalMetadataStore}} should not use {{LRU/MRU}}, which can not provide consistency due to that the metadata will be evicted. 
+* The current test suites (unit tests and integration tests) can not reliability test eventual consistency. New tests cases are necessary before merging this branch to branch.
+* This patch is large and many of the following works are depended to this patch. My CLI patch (HADOOP-13650) and DynamoDB metadata store (HADOOP-13449) for instance. 
+
+As this is a feature branch, I'd give a pending +1 once these concerns are appropriately documented (i.e., adding {{TODO}}).  Thanks.
+
+
+
+Thanks [~eddyxu].  I will post a new patch here shortly.
+
+This patch depends on HADOOP-13631, so we need to commit that one first.  Once that happens I can submit this latest patch so we can get a jenkins run on it.
+
+
+
+Attaching v3 patch.  Changes from previous:
+
+- Added comments to address [~eddyxu]'s comments above.  Move is not atomic.  LRU eviction in LocalMetadataStore needs replacement.
+- Added more tests around recursive delete logic in LocalMetadataStore.
+- Add more tests of Paths with and without scheme and host.
+- Fixed javadoc and checkstyle issues.
+
+
+
+Hello [~fabbri].  Thank you for sharing your patch.
+
+I have not yet reviewed everything, but first I would like to discuss the management of {{MetadataStore}} as a singleton.  This could be problematic for a process that wants to access multiple {{S3AFileSystem}} instances backed by different S3 buckets.  A concrete example of this would be a DistCp task copying data from one bucket to another.
+
+I had been thinking there would be a 1:1 cardinality relationship between {{S3AFileSystem}} instances and {{MetadataStore}} instances.  An {{S3AFileSystem}} instance accesses exactly one bucket, and likewise, a {{DynamoDBMetadataStore}} instance would access exactly one DynamoDB table.  (I also see this relationship is carried through into the latest HADOOP-13449 patch from [~liuml07].)
+
+I think this is overall the easiest implementation path that supports use of multiple {{S3AFileSystem}} instances in the same process.  I suppose the {{MetadataStore}} implementations could be made flexible to handle paths from multiple {{S3AFileSystem}} instances, but that seems to lead to more complexity to manage mapping tables and multiple AWS SDK client instances within the {{MetadataStore}} implementation.
+
+If the goal is to guard against costly repeated initialization, then I think the {{FileSystem}} cache already has us covered.  {{S3AFileSystem}} instances can get reused via the cache, and assuming the 1:1 relationship, the corresponding {{MetadataStore}} would get reused too.
+
+Thanks for comments [~cnauroth]!
+
+{quote}
+would like to discuss the management of MetadataStore as a singleton. 
+{quote}
+
+I'm in general agreement with you here.  How do you feel about me creating a followup jira to change that to 1-to-1?
+
+My thoughts were: both cases, (A) singleton per JVM and (B) per-S3AFileSystem are interesting.
+
+I was concerned about wasting things like memory and connection pools.  I'll go study the FileSystem cache now  (i.e. does it guarantee one instance per-bucket, or get close to that?)
+
+I started with (A) because it is an easy starting point that we can start integration against.  However, I think we want to be able to treat DynamoDB tables as 1-to-1 with S3 buckets (makes auto-provisioning much saner, for example).  As an aside, (A) has actually helped me catch more bugs when getting all the integration tests working (hint: they leave behind only some data, so if delete is not perfect, all sorts of things break since my singleton lives the whole time.  Also, having different buckets hit the same MetadataStore helped me harden treatment of Paths as a side effect).
+
+Let's assume for sake of discussion that (B) is what most people want.  As an author of LocalMetadataStore, who wants to use this as an ephemeral directory entry cache for certain cases, couldn't I implement my own singleton behind the scenes?  If for some reason, I wanted a single shared memory pool across S3AFileSystem's.
+
+In short, I see no reason not to replace the singleton allocation with a per-S3AFileSystem.
+
+{quote}
+this relationship is carried through into the latest HADOOP-13449 patch from Mingliang Liu.
+{quote}
+which is by design. I prefer to live in a world where {{DynamoDBMetadataStore}} is immutable and confined by one S3AFileSystem. I don't expect it being initialized multiple times. What do we lose in the current implicit 1:1 mapping?
+
+bq. I'll go study the FileSystem cache now (i.e. does it guarantee one instance per-bucket, or get close to that?)
+
+Yes, the relevant piece to look at is the cache {{Key}} class inside {{FileSystem}}.  This data structure defines a composite key for entries in the cache:
+
+{code}
+    /** FileSystem.Cache.Key */
+    static class Key {
+      final String scheme;
+      final String authority;
+      final UserGroupInformation ugi;
+      final long unique;   // an artificial way to make a key unique
+{code}
+
+The {{scheme}} will be "s3a", and the {{authority}} will be the S3 bucket, so it will guarantee the same instance is reused for the same bucket, so long as it's the same user running the code that allocates the {{FileSystem}}.  The {{unique}} field is an artifical cache buster used for callers that explicitly do not want to share an instance and instead request a unique one by calling {{FileSystem#newInstance}}.  Calling {{FileSystem#close}} evicts the instance from the cache.  There are some pretty big gotchas that can come up related to this {{FileSystem}} cache, but for the sake of this discussion, we can say that it works as expected.
+
+I don't have any objection to a plan of proceeding with this patch and converting to an instance per {{S3AFileSystem}} in a later patch if that's helpful for the development process.  We have the freedom to work that way on a feature branch.  However, I wonder if that's problematic for tests that access multiple buckets, like the tests that read from the public landsat-pds bucket.
+
+bq. can not reliability test eventual consistency
+
+oh, it's worse than that: it's very, very hard to trigger consistency problems today. Writing tests for the newer stuff is going to be even harder. Hopefully someone can prove their algorithms work. Any volunteers?
+
++1 with an instance per FS instance. S3A FS instances are becoming more expensive; with a thread pool for uploads, soon one for copy and metadata operations; adding a metadata store may make them more expensive. 
+
+But
+* an instance with no metadata is no more expensive than now
+* when all filesystems for a user are released, their resources get cleaned up. This matters in things like hive, which call {{FileSystem.closeAllForUGI(ugi)}} to release the resources after fielding a user's request.
+
+
+If there is trouble, and it's important to be ready for, is that if two users connect to the same bucket in separate RPC calls, they are going to end up with separate FS instances, hence separate MD stores. When using dynamo backed stores it's (probably) moot, but for local stores, it's going to complicate things. If one caller modifies the state, the other will not pick it up. But if you shared the store, then a user without write permission may be able to manipulate the metadata seen by the other (at least if a delete() goes through on the MD before the FS permissions are checked)
+
+This raises another question: what does happen with security here?
+
+To make the test deterministic, I was thinking that we should populate the metadata store and a *testing* file system separately (i.e., files are in metadata store , but are not in the testing file system, to simulate list after create). And similarly for the listing after delete scenarios. 
+
+Regarding the prove of algorithms, I found that, it is easy to prove that metadata store can detect the inconsistency between itself and s3, it was hard to me to prove that what is the actual cause of the inconsistency between metadata store and S3, within the context of S3AFileSystem. 
+
+
+
+
+
+comments on patch 003
+
+{{LocalMetadataStore.listChildren(). get(), put}} are going to be *very* expensive as the iterative loop is called even when the logging doesn't take place. Wrap with a LOG.isDebugEnabled(), or have {{DirListingMetadata}} implement a toString() method with all the log info, and just reference that.
+
+
+There's a fairly complex interdependency between S3AFS and the metadatastore (now that LocalMetadataStore is checking for its FS being S3A). The is empty dir logic here is getting ugly already. I think it may be best to revisit that entire empty-dir logic and see how it can be moved into this world, rather than just making things more complex. Currently, there's a couple of main ways the {{isEmptyDirectory}} bit is used 
+
+* when deciding whether to delete an entry during parent delete walks {{deleteUnnecessaryFakeDirectories}}. This code has already been replaced in trunk.
+* when validating some operations which only apply to an empty directory. It's essentially being a shortcut to for the predicate "has-no-children", which again, is expensive in s3-land. If, instead of asking of the s3a status, it was just something which could be queried off the metadata store, then it gets to implement the logic behind {{S3Guard.isEmptyDirectory(metadatastore, s3afilestatus)}}
+  
+The base metadatastore (which would have to be renamed something like DefaultMetadataStore) would implement its check by passthrough from the file status:
+{code}
+boolean isEmptyDirectory(S3AFileStatus stat) { return stat.isEmptyDirectory;}
+{code}
+
+Other implementations can actually do a listing. It should be possible to require that there should be no accesses of that flag in the status except through an MD store class. ({{S3AFileStatus}}) is tagged as private/evolving, no external code should be using that field.
+
+Finally, now that this starts hooking up to S3, it's going to need to have a security story consistent with S3A. Which is currently: you get R/O or R/W filesystems, as well as filesystems an unauthed user may not read. We expect all FS operations to fail on an unauthed user; if they have read only rights then mkdirs/delete, rename and file writing must all fail, leaving the FS in the same state it was before. Which implies that (a) there will have to be isolation between users and (b) things which update the MD store after, say , "delete", will have to take place after the s3 call succeeds, doing nothing on a failure.
+
+That should be testable: try to delete the landsat CSV, verify that it is still there on the next list/stat/open. Do bear in mind that other test infras may not have that file, or supply one in an R/W bucket ( a new complication, given there aren't yet any tests for attempting a write in an R/O bucket).
+
+That test setup would work: one s3aFS using the MD store, one S3AFS going direct, with the direct one manipulating state behind the MD, and allowing for assertions about the state (paths deleted, etc). 
+
+Great comments, thank you. 
+
+{quote}
+Wrap with a LOG.isDebugEnabled()
+{quote}
+Good call, will do.  I'll roll another patch later today with this.
+
+{quote}
+The is empty dir logic here is getting ugly already. I think it may be best to revisit that entire empty-dir logic 
+{quote}
+
+Totally agree.  Having a FileStatus which is cacheable (doesn't change based on activity in other files)  is sort of a prerequisite for playing nicely with the MetadataStore division of labor.  I can reason about the logic here, but the isS3A flag in LocalMetadataStore is a layering violation, IMO.
+
+My thought was to work on isEmptyDirectory as a separate effort after S3Guard v1 is merged.  I kept the isS3A stuff separated for that reason.  I think we may want to revisit the invariants around the empty directory blobs as well.  E.g. instead of "exists(empty directory blob) iff directory is empty" the condition would be "exists(empty directory blob) implies there is a directory at that path", which is only necessary if there are no other keys with a matching prefix.  I wonder if being lazier about cleaning up those blobs would improve s3a perf, etc.
+
+{quote}
+ If, instead of asking of the s3a status, it was just something which could be queried off the metadata store, then it gets to implement the logic behind S3Guard.isEmptyDirectory(metadatastore, s3afilestatus)
+{quote}
+MetadataStore may give one of three answers to this question:
+
+(1) Yes, that path is an empty directory
+(2) No, that path is not an empty directory
+(3) I do not have full state for that directory, I cannot answer.
+
+This could be used to do the right thing in the client, but it may take some refactoring.  Let me know how you want to tackle this part.  I'd vote to defer work on this part to a separate jira because we want to keep other parts of the project moving/integrated, and i think this will be tricky enough to benefit from a separate code review and discussion.  The existing solution is bad layering but keeps the semantics of isEmptyDirectory as is for S3A. 
+
+Also, on TODOs in code in the feature branch. Intent is to commit frequently so folks can keep working in parallel, and that all TODOs will be addressed before merging the feature branch.
+
+
+
+
+Following up your security comments, [~stevel@apache.org].  To make sure I'm understanding, is it correct to say that:
+
+- S3A FileSystem authorization is delegated to the AWS S3 SDK client.
+- S3A code does not check hadoop user permissions, nor map hadoop users to AWS credentials.
+   - So authorization is not "per user" in the hadoop sense, but "per configuration" as that is where S3A credentials / instance roles / etc. are defined.
+
+- If a user tries to open a s3a:// FileSystem and they do not supply/config proper AWS credentials, S3AFileSystem.initialize() will throw an exception in verifyBucketExists() -> s3.doesBucketExist()
+
+- It should be sufficient to only allow MetadataStore read/write operations after success of S3 read/write operation (respectively).
+
+Questions:
+
+- If a user has valid AWS credentials, but no read permissions for given bucket, what happens?  Does initialize() succeed? (I can test this if needed)
+
+- What needs to be done before we can commit this patch (besides the LOG.isDebugEnabled thing)?  I'd like to get this basic support in the feature branch so [~eddyxu] and [~liuml07] can integrate with it.  I agree we need to address security and add tests to demonstrate its correctness.  I'd be happy to take a followup JIRA on that as well, or we can hold this patch up.
+
+
+
+
+
+
+
+# I've actually been talking with [~rajesh.balamohan] about pulling that initial bucket check (HADOOP-13379)  . It adds measurable delays to all FS instance creation —and permission errors will show up later on anyway. The tricky bit is having a later 40x failure be uprated to a "there is no such bucket" rather than "you can't access a file". You can save 500+mS by removing an otherwise needless HTTP request; sometimes it can even take longer. I think I would like to cut it, if the failure can be graceful (some tracking of if a request has ever succeeded, on first auth failure, go from simple translation to adding "check bucket exists"/actually falling back to a second check)
+
+# if a user has valid read credentials, bucket exist check (currently) fails in init. IF this is delayed, then the first s3 read/write will fail
+# bucket nonexistent -> 404? 410? -> FNFE
+# bucket exists but caller not authed -> 401? 403? -> AccessDeniedException 
+# if a user has read but not write credentials, any attempt to do multipart purge will fail; that's now caught & downgraded.
+# if a user has no credentials, then, if the auth chain has to be set up to allow anonymous access, then they'll try an anonymous auth (not a default option), and they'll get read access to any bucket declared public readable.
+
+
+
+bq. What needs to be done before we can commit this patch (besides the LOG.isDebugEnabled thing)? 
+
+Well, it is just a branch, so it's not expected to be perfect.
+
+What will happen is once the merge is in, the branch is going to have to be kept in sync with a piece of code which still has a major rate of change. Someone is going to have to volunteer to do that regularly, or share the workload. I'd recommend a process of:
+
+# checkout and build trunk
+# run the hadoop-aws integration tests on trunk
+# if the tests all worked, checkout this branch, rebase onto it, rerun those integration tests
+# if the tests didn't work: and they used to: consider reporting a problem, ideally after checking to see if something hasn't been opened already/your test setup hasn't regressed.
+
+Step 2 makes sure that you don't rebase on broken code, and so get confused that test failures are your fault.
+
+I'd recommend doing this weekly, or if there's been a big change gone into s3a. It's already time to do this, given the current difference between the branch and trunk
+
+..regarding the isEmptyDir logic, if you have a plan to address that, then yes, get the merge in, with a separate task to clean up the logic. It may render HADOOP-13736 obsolete too, so maybe hold back on that change until there's redone empty dir checks. This would keep the cache more generic
+
+Attaching v4 patch.  Changes from v3:
+
+- Wrap expensive debug operations in {{if (LOG.isDebugEnabled())}}
+- MetadataStore instances are now per-S3AFileSystem, not a singleton.
+- Skip file modification time check in ITestS3AFileContextURI when MetadataStore is enabled (due to the way we handle create).
+- Add a couple of assertions around recursive delete MetadataStore tests.
+
+I see one checkstyle issue about the length of {{S3AFileSystem#innerRename()}} being over 150.  Not sure if I pushed it over the edge or that was existing.
+
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 22s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 9 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  4m 30s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  7m 59s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  8m  4s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 31s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 30s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  1m 58s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 58s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m  3s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 17s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m  3s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  7m 26s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  7m 26s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  1m 37s{color} | {color:orange} root: The patch generated 1 new + 6 unchanged - 0 fixed = 7 total (was 6) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 41s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 43s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} xml {color} | {color:green}  0m  3s{color} | {color:green} The patch has no ill-formed XML file. {color} |
+| {color:red}-1{color} | {color:red} findbugs {color} | {color:red}  0m 49s{color} | {color:red} hadoop-tools/hadoop-aws generated 3 new + 0 unchanged - 0 fixed = 3 total (was 0) {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 30s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  9m 16s{color} | {color:green} hadoop-common in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}  0m 38s{color} | {color:red} hadoop-aws in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 34s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 80m  2s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| FindBugs | module:hadoop-tools/hadoop-aws |
+|  |  Dead store to date in org.apache.hadoop.fs.s3a.S3AUtils.createUploadFileStatus(Path, boolean, long, long)  At S3AUtils.java:org.apache.hadoop.fs.s3a.S3AUtils.createUploadFileStatus(Path, boolean, long, long)  At S3AUtils.java:[line 244] |
+|  |  Load of known null value in org.apache.hadoop.fs.s3a.s3guard.LocalMetadataStore.get(Path)  At LocalMetadataStore.java:in org.apache.hadoop.fs.s3a.s3guard.LocalMetadataStore.get(Path)  At LocalMetadataStore.java:[line 130] |
+|  |  Load of known null value in org.apache.hadoop.fs.s3a.s3guard.LocalMetadataStore.listChildren(Path)  At LocalMetadataStore.java:in org.apache.hadoop.fs.s3a.s3guard.LocalMetadataStore.listChildren(Path)  At LocalMetadataStore.java:[line 140] |
+| Failed junit tests | hadoop.fs.s3a.s3guard.TestNullMetadataStore |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:9560f25 |
+| JIRA Issue | HADOOP-13651 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12836962/HADOOP-13651-HADOOP-13345.004.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  xml  findbugs  checkstyle  |
+| uname | Linux 0db0c4cef62b 3.13.0-96-generic #143-Ubuntu SMP Mon Aug 29 20:15:20 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | HADOOP-13345 / 5d280b9 |
+| Default Java | 1.8.0_101 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HADOOP-Build/10981/artifact/patchprocess/diff-checkstyle-root.txt |
+| findbugs | https://builds.apache.org/job/PreCommit-HADOOP-Build/10981/artifact/patchprocess/new-findbugs-hadoop-tools_hadoop-aws.html |
+| unit | https://builds.apache.org/job/PreCommit-HADOOP-Build/10981/artifact/patchprocess/patch-unit-hadoop-tools_hadoop-aws.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/10981/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common hadoop-tools/hadoop-aws U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/10981/console |
+| Powered by | Apache Yetus 0.4.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+I will address above pre-commit issues after I get the feature branch rebased on trunk.
+
+[~stevel@apache.org], when feature branches get merged to trunk, is it as a fast-forward, or as a merge commit?
+
+Many of the commits on this feature branch need reworking for trunk s3a changes, and I'm wondering if I should go through the history one by one, rewriting those commits to work against trunk (e.g. S3AFileStatus constructor args changed), or just add a Fixup commit on top of the feature branch to get it to compile on trunk's S3A code.)
+
+Given that nothing is in trunk, just do a merge commit + fixup if it's easiest. Tip: always tag the top of the branch before you start anything like that; helps you compare before-after in the IDE.
+
+Attaching v5 patch.  Changes from v4:
+
+- Rebase on latest trunk.
+  - [~steve_l], please review new changes to S3ABlockOutputStream.  Let me know if you want to account for file size some other way.
+  - S3AFileStatus constructor changed.
+
+- Minor checkstyle / javadoc cleanup.
+
+All unit tests passed for me.  All integration tests pass (except for a couple of unrelated, sometimes-flaky tests).
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 21s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 9 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  7m 33s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  7m  3s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  6m 58s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 27s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m 25s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  2m 39s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 54s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m  1s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 18s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 59s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  6m 57s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  6m 57s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  1m 31s{color} | {color:orange} root: The patch generated 2 new + 12 unchanged - 0 fixed = 14 total (was 12) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 26s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 37s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} xml {color} | {color:green}  0m  3s{color} | {color:green} The patch has no ill-formed XML file. {color} |
+| {color:red}-1{color} | {color:red} findbugs {color} | {color:red}  0m 42s{color} | {color:red} hadoop-tools/hadoop-aws generated 3 new + 0 unchanged - 0 fixed = 3 total (was 0) {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m  7s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  7m 51s{color} | {color:green} hadoop-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 32s{color} | {color:green} hadoop-aws in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 29s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 79m  0s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| FindBugs | module:hadoop-tools/hadoop-aws |
+|  |  Dead store to date in org.apache.hadoop.fs.s3a.S3AUtils.createUploadFileStatus(Path, boolean, long, long, String)  At S3AUtils.java:org.apache.hadoop.fs.s3a.S3AUtils.createUploadFileStatus(Path, boolean, long, long, String)  At S3AUtils.java:[line 271] |
+|  |  Load of known null value in org.apache.hadoop.fs.s3a.s3guard.LocalMetadataStore.get(Path)  At LocalMetadataStore.java:in org.apache.hadoop.fs.s3a.s3guard.LocalMetadataStore.get(Path)  At LocalMetadataStore.java:[line 130] |
+|  |  Load of known null value in org.apache.hadoop.fs.s3a.s3guard.LocalMetadataStore.listChildren(Path)  At LocalMetadataStore.java:in org.apache.hadoop.fs.s3a.s3guard.LocalMetadataStore.listChildren(Path)  At LocalMetadataStore.java:[line 140] |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:9560f25 |
+| JIRA Issue | HADOOP-13651 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12837931/HADOOP-13651-HADOOP-13345.005.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  xml  findbugs  checkstyle  |
+| uname | Linux 49dd84d4aff2 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | HADOOP-13345 / 56b715f |
+| Default Java | 1.8.0_101 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HADOOP-Build/11018/artifact/patchprocess/diff-checkstyle-root.txt |
+| findbugs | https://builds.apache.org/job/PreCommit-HADOOP-Build/11018/artifact/patchprocess/new-findbugs-hadoop-tools_hadoop-aws.html |
+|  Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/11018/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common hadoop-tools/hadoop-aws U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/11018/console |
+| Powered by | Apache Yetus 0.4.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+LGTM
+
+bq. All integration tests pass (except for a couple of unrelated, sometimes-flaky tests).
+
+which tests? I'd encourage you to still declare them in the "tests worked" report, just so we can track their reliability
+
+h3. S3ABlockOutputStream
+
+{code}
+  /** Total bytes for downloads submitted so far. */
+  private int bytesSubmitted;
+{code}
+
+best to change the comment, make a long as we support (tested) uploads > 4GB. I Think {{putObject()}} can still return an int, but safest to make
+that a long too.
+
+h3. S3AFileSystem
+
+* good to see you counting errors ignored on MD updates. I was going to suggest that, but looked closer and you'd already done it. Nice. You may want to make it a separate metric, "metadata update failure", so they can be monitored —they're more serious than a recoverable read error on a stream, which is what that counter was put in to track.
+* as/when I move to parallel renaming, this code is going to break again. I don't see an easy workaround, given that patch doesn't exist. FWIW it will involve taking the recursive directory listing, sorting by size and then submitting to the same thread pool which supported writes, ("slow IO operations").
+
+h3. DirListingMetadata
+
+* {{prettyPrint}} s/Authorit/r/Authoritive; break up append with + inside into an append chain.
+
+h3. S3Guard
+
+regarding that race condition between listStatus and delete, we always warn that it always exists in a DFS: there's no guarantee a file returned in a list is there by thte time you come to use it, and if you use one of the remote iterator methods, the risk of that or more dramatic things like parent dir deletion increase. There's not even any guarantee that a an iterated listing is consistent; even in HDFS you could rename a a file "z9999" to "a0000" and have it never get found in an ongoing list operation.
+So: no need ta havesnapshot consistency between list and use, just go for "as good as the spec says you need to". 
+
+h3. MetadataStoreTestBase
+
+L285: please use a different filename.
+
+
+
+Thanks for the good review [~steve_l].
+
+Two questions:
+
+{quote}
+I'd encourage you to still declare them in the "tests worked" report,
+{quote}
+
+What is that, just a JIRA comment?
+
+{quote}
+MetadataStoreTestBase
+L285: please use a different filename.
+{quote}
+Can you pick an alternate name?  AbstractMetadataStoreTestBase?  I was trying to follow contract test conventions so I'll name it whatever you like. 
+
+The other comments I'm addressing in next patch.  Thank you!
+
+# yes, just a comment "tested against s3 ireland"
+# the word "bollocks", actually
+
+# yes, just a comment "tested against s3 ireland"
+# the word "bollocks", actually
+
+Ok thanks.. And I should have put an asterisk next to "I'll name it whatever you want".  Haha.
+
+Attaching v6 patch.  Changes from previous:
+
+- Address [~steve_l]'s comments.  
+- Fix a couple of findbugs warnings.
+- Change some "TODO" in comments to JIRA numbers (delete tracking, retries).
+
+
+
+On v6 patch, all unit tests pass.  Ran integration tests with default endpoint in US West 2, with default settings (NullMetadataStore). 
+
+Tests run: 482, Failures: 1, Errors: 2, Skipped: 98
+
+Three failures appear unrelated:
+
+Failed tests:
+  ITestJets3tNativeS3FileSystemContract>NativeS3FileSystemContractBaseTest.testListStatusForRoot:66 Root directory is not empty;  expected:<0> but was:<3>
+
+Tests in error:
+  ITestS3AMiniYarnCluster.testWithMiniCluster:104->getResultAsMap:121 ArrayIndexOutOfBounds
+  ITestJets3tNativeS3FileSystemContract>FileSystemContractBaseTest.testLSRootDir:727->FileSystemContractBaseTest.assertListFilesFinds:742 » FileNotFound
+
+Full list of tests attached as v6-test-report.txt
+
+the MiniYarnCluster is HADOOP-13801; need to spend more time with git blame to idenfity what changed there. It's doing wordcount, and the format of the response has changed ... not sure it's in s3a tests, or the output format really has changed from text to hadoop writeable output.
+
+Root dir tests on object stores are always fussy.
+
+This patch is in good shape now. Thanks for the good work, [~fabbri].
+
+ As we all agree that many other JIRAs depends on this patch, and the urgent of merging it to trunk, I'd give a +1 for the {{v6}} patch. 
+
++1 for into the feature branch
+
+Before pulling it into trunk, let's see if we need to make changes to the API to flesh out integration. In particular, to use dynamodb as the mechanism for atomic PUTs, a check needs to go in before the PUT.
+
+Re-attaching to get Jenkins past the .txt attachment (hopefully)
+
++1
+
+Thanks for the contribution. This is one of the most important for S3Guard.
+
+The latest patch in [HADOOP-13449] has tried to understand the code path and to minimize conflicts, but I'm afraid we still have some minor conflicts. Do you guys want this patch committed first, or [HADOOP-13449]? I'm addressing the checkstyle/javac warnings there.
+
+| (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 26s{color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 9 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  2m 36s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  6m 53s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  6m 54s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 27s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 25s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 38s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m  7s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m  3s{color} | {color:green} HADOOP-13345 passed {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 17s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m  3s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  8m 17s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  8m 17s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  1m 35s{color} | {color:orange} root: The patch generated 2 new + 12 unchanged - 0 fixed = 14 total (was 12) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 37s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green}  0m 35s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} xml {color} | {color:green}  0m  3s{color} | {color:green} The patch has no ill-formed XML file. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 22s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m  8s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  8m 17s{color} | {color:green} hadoop-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  0m 31s{color} | {color:green} hadoop-aws in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 28s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 72m 51s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker |  Image:yetus/hadoop:9560f25 |
+| JIRA Issue | HADOOP-13651 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12839591/HADOOP-13651-HADOOP-13345.006.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  xml  findbugs  checkstyle  |
+| uname | Linux 1a7ff9fdc4e7 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/hadoop/patchprocess/precommit/personality/provided.sh |
+| git revision | HADOOP-13345 / 56b715f |
+| Default Java | 1.8.0_111 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HADOOP-Build/11099/artifact/patchprocess/diff-checkstyle-root.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HADOOP-Build/11099/testReport/ |
+| modules | C: hadoop-common-project/hadoop-common hadoop-tools/hadoop-aws U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HADOOP-Build/11099/console |
+| Powered by | Apache Yetus 0.4.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Committed to HADOOP-13345 branch.  Thank you everyone who commented and reviewed.
+
+Sorry I just noticed your question.  I just committed this and I think we should get your patch integrated on top of it and working with the integration tests.  They are likely to find some bugs that the MetadataStore contract tests miss.
+
+Is there anything I can help with there?   Would love to help.
+

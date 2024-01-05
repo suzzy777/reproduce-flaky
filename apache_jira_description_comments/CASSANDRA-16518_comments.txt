@@ -1,0 +1,328 @@
+To work around the issue:
+Adding the following to jvm opts in the cassandra-env
+-Dcassandra.disable_max_protocol_auto_override=true
+Works fine to get the node back up on v4
+
+Without digging into this, it seems to me the bug is having the bootstrapping (ie, non-member) node listed in the peers table before it has become a full member of the ring.
+
+I was not able to reproduce this on 3.11.10, if you check the source of these messages, it is here in DynamicLimit which extends ConfiguredLimit in its private method "maybeUpdateVersion":
+{code:java}
+        private void maybeUpdateVersion(boolean allowLowering)
+        {
+            boolean enforceV3Cap = SystemKeyspace.loadPeerVersions()
+                                                 .values()
+                                                 .stream()
+                                                 .anyMatch(v -> v.compareTo(MIN_VERSION_FOR_V4) < 0);
+
+            if (!enforceV3Cap)
+            {
+                maxVersion = ProtocolVersion.MAX_SUPPORTED_VERSION;
+                return;
+            }
+
+            if (ProtocolVersion.V3.isSmallerThan(maxVersion) && !allowLowering)
+            {
+                logger.info("Detected peers which do not fully support protocol V4, but V4 was previously negotiable. " +
+                            "Not enforcing cap as this can cause issues for older client versions. After the next " +
+                            "restart the server will apply the cap");
+                return;
+            }
+
+            logger.info("Detected peers which do not fully support protocol V4. Capping max negotiable version to V3");
+            maxVersion = ProtocolVersion.V3;
+        }
+    }
+{code}
+So in order to get to the places where the first message is logged, "enforceV3Cap" has to be true so if (!enforceV3Cap) is false and it is skipped. Then, allowLowering has to be false. That means that maybeUpdateVersion accepts allowLowering as false. That is ever happening in DynamicLimit's method
+{code:java}
+        public void updateMaxSupportedVersion()
+        {
+            maybeUpdateVersion(false);
+        }
+{code}
+updateMaxSupportedVersion is ever called only in NativeTransportService:
+{code:java}
+    public void refreshMaxNegotiableProtocolVersion()
+    {
+        // lowering the max negotiable protocol version is only safe if we haven't already
+        // allowed clients to connect with a higher version. This still allows the max
+        // version to be raised, as that is safe.
+        if (initialized)
+            protocolVersionLimit.updateMaxSupportedVersion();
+    }
+{code}
+That is called in CassandraDaemon:
+{code:java}
+    public void refreshMaxNativeProtocolVersion()
+    {
+        if (nativeTransportService != null)
+            nativeTransportService.refreshMaxNegotiableProtocolVersion();
+    }
+{code}
+That is called in StorageService:
+{code:java}
+    private void refreshMaxNativeProtocolVersion()
+    {
+        if (daemon != null)
+        {
+            daemon.refreshMaxNativeProtocolVersion();
+        }
+    }
+{code}
+Now this is finally called at two places:
+
+1) In StorageService#onChange where a respective node gets info from Gossip or so:
+{code:java}
+    case RELEASE_VERSION:
+        SystemKeyspace.updatePeerReleaseVersion(endpoint, value.value, this::refreshMaxNativeProtocolVersion, executor);
+{code}
+The other place is in StorageService#updatePeerInfo which is called from StorageService#handleStateNormal so that treats the case when a node enters NORMAL state.
+
+When you take the first place into account for now, lets see what it is doing:
+{code:java}
+    public static void updatePeerReleaseVersion(final InetAddress ep, final Object value, Runnable postUpdateTask, ExecutorService executorService)
+    {
+        if (ep.equals(FBUtilities.getBroadcastAddress()))
+            return;
+
+        String req = "INSERT INTO system.%s (peer, release_version) VALUES (?, ?)";
+        executorService.execute(() -> {
+            executeInternal(String.format(req, PEERS), ep, value);
+            postUpdateTask.run();
+        });
+    }
+{code}
+So, if the peer is not myself, insert the release version of that peer into system.peers AND AFTER THAT run the post update task, which happens to be our refreshMaxNativeProtocolVersion method.
+
+So as I said before, the fact that it would get so far to actually log that first message means that enforceV3Cap has to be true in the first place, so the result of this has to be true:
+{code:java}
+    boolean enforceV3Cap = SystemKeyspace.loadPeerVersions()
+        .values()
+        .stream()
+        .anyMatch(v -> v.compareTo(MIN_VERSION_FOR_V4) < 0);
+{code}
+Hence this clearly means that some version found in peers table has to be lower than MIN_VERSION_FOR_V4 which is:
+
+static final CassandraVersion MIN_VERSION_FOR_V4 = new CassandraVersion("3.0.0");
+
+But I wonder how is that even possible you get that version (hypothetically lower than 3.0.0) because you said that you are running on a cluster which has all nodes of same version, so lets dig deeper a bit:
+{code:java}
+    /**
+     * Return a map of IP address to C* version. If an invalid version string, or no version
+     * at all is stored for a given peer IP, then NULL_VERSION will be reported for that peer
+     */
+    public static Map<InetAddress, CassandraVersion> loadPeerVersions()
+    {
+        Map<InetAddress, CassandraVersion> releaseVersionMap = new HashMap<>();
+        for (UntypedResultSet.Row row : executeInternal("SELECT peer, release_version FROM system." + PEERS))
+        {
+            InetAddress peer = row.getInetAddress("peer");
+            if (row.has("release_version"))
+            {
+                try
+                {
+                    releaseVersionMap.put(peer, new CassandraVersion(row.getString("release_version")));
+                }
+                catch (IllegalArgumentException e)
+                {
+                    logger.info("Invalid version string found for {}", peer);
+                    releaseVersionMap.put(peer, NULL_VERSION);
+                }
+            }
+            else
+            {
+                logger.info("No version string found for {}", peer);
+                releaseVersionMap.put(peer, NULL_VERSION);
+            }
+        }
+        return releaseVersionMap;
+    }
+{code}
+So if all nodes are of a bigger release than 3.0.0, the only place where we would get versoin lower than 3.0.0 is, as you debugged, the returned NULL_VERSION.
+
+But I am failing to see how is that possible because if we recall what updatePeerReleaseVersion does:
+{code:java}
+        executorService.execute(() -> {
+            executeInternal(String.format(req, PEERS), ep, value);
+            postUpdateTask.run();
+        });
+{code}
+So we insert the record into system.peers but we fail to read it back? How is that possible? Any ideas?
+
+This might eventually mean that we insert NULL into DB, right ... so it means that onChange was invoked with RELEASE_VERSION state but its VersionedValue.value returns null which is even more interesting.
+
+To get the second log message (logger.info("Detected peers which do not fully support protocol V4. Capping max negotiable version to V3");), for that, allowFiltering has to be true and that is called only in DynamicLimit's constructor which is initialised when a node starts - hence likely upon its start and it does not receive any state changes from the other nodes so system.peers has to contain that invalid value already.
+
+Hence it _seems_ like a joining node propagates is release version with null when it is joining or a restarted node upon its start receives a RELEASE_VERSION which is null while a node is joining.
+
+ 
+
+Edit 1) I was not able to see that there is NULL in system.peers. In 3.11.10, there are only peers which are joined. During whole joining, all nodes already participating in the ring were containing only other nodes, not the nodes which were about to join yet.
+
+[~brandon.williams] maybe you could proofread my thinking here? Thanks in advance.
+
+[~samt] looping you in as you wrote that feature.
+
+Few more observations to consider for [~JosephClay]
+
+If you check what StorgeService#prepareToJoin does:
+{code:java}
+            getTokenMetadata().updateHostId(localHostId, FBUtilities.getBroadcastAddress());
+            appStates.put(ApplicationState.NET_VERSION, valueFactory.networkVersion());
+            appStates.put(ApplicationState.HOST_ID, valueFactory.hostId(localHostId));
+            appStates.put(ApplicationState.RPC_ADDRESS, valueFactory.rpcaddress(FBUtilities.getBroadcastRpcAddress()));
+            appStates.put(ApplicationState.RELEASE_VERSION, valueFactory.releaseVersion());
+{code}
+Release version is populated from FBUtilities.getReleaseVersionString():
+{code:java}
+    public static String getReleaseVersionString()
+    {
+        try (InputStream in = FBUtilities.class.getClassLoader().getResourceAsStream("org/apache/cassandra/config/version.properties"))
+        {
+            if (in == null)
+            {
+                return System.getProperty("cassandra.releaseVersion", UNKNOWN_RELEASE_VERSION);
+            }
+            Properties props = new Properties();
+            props.load(in);
+            return props.getProperty("CassandraVersion");
+        }
+        catch (Exception e)
+        {
+            JVMStabilityInspector.inspectThrowable(e);
+            logger.warn("Unable to load version.properties", e);
+            return "debug version";
+        }
+    }
+{code}
+Are you sure that you have this file present? Also, are you sure that the version string is indeed 3.11.6? It might be different if you are building your own Cassandra distribution so it might have some unpredictable consequencies when there is some abritrary version in it and you gossip it to other nodes and so on. Does it strictly follow major.minor.patch format? If that resource is not found, as you see, it will default to system property and if that one is not set either, it will return "Unknown".
+
+Then the Gossip is started:
+{code:java}
+Gossiper.instance.start(SystemKeyspace.incrementAndGetGeneration(), appStates); // needed for node-ring gathering.
+{code}
+Check what incrementAndGetGeneration is doing, if that node is starting, system.local is empty so it will generate its own generation but that generation is ignored in case it is lower than the generations of other nodes which might happen when time is "behind" on the joining node. Are you sure the time is same on all nodes?
+
+[~stefan.miklosovic] 
+We are building cassandra ourselves, the version is actually 3.11.6.1, the last .1 is our build number, i.e. first build (in case we ever need to differentiate multiple builds). I definitely saw NULL for version in system.peers for the joining node, do you think the custom version number causes this? For all UN nodes the version is properly populated.
+
+Regarding gossip and time, all nodes have NTP which i'm reasonably sure was working correctly at the time.
+
+3.11.6.1 should be parsed by CassandraVersion just fine. I ll try couple more times and I might downgrade to 3.11.6 to be exactly on par.
+
+I am sorry [~JosephClay], I can not reproduce this.
+
+I was finally able to reproduce. So the issue only reproduces if you configure cassandra so that it uses preferred_ip. You need to set cassandra so that it has two ip address per node and broadcast address a different ip to listen address.
+
+Here is how i reproduced it in CCM:
+{noformat}
+# Set ccm directory here
+CCM_DIR=~/.ccm
+
+# create cluster but don't start it
+ccm create test -v 3.11.11 -n 3
+
+# Configure cluster to use GossipingPropertyFileSnitch with prefer_local and different ips for broadcast and listen addresses
+rm $CCM_DIR/test/node*/conf/cassandra-topology.properties
+sed -i 's/# prefer_local=true/prefer_local=true/' $CCM_DIR/test/node*/conf/cassandra-rackdc.properties
+sed -i 's/endpoint_snitch.*/endpoint_snitch: GossipingPropertyFileSnitch/' $CCM_DIR/test/node*/conf/cassandra.yaml
+sed -i 's/  - seeds:.*/  - seeds: 127.0.1.1/' $CCM_DIR/test/node*/conf/cassandra.yaml
+echo 'broadcast_address: 127.0.1.1' >> $CCM_DIR/test/node1/conf/cassandra.yaml
+echo 'broadcast_address: 127.0.1.2' >> $CCM_DIR/test/node2/conf/cassandra.yaml
+echo 'broadcast_address: 127.0.1.3' >> $CCM_DIR/test/node3/conf/cassandra.yaml
+echo 'listen_on_broadcast_address: true' >> $CCM_DIR/test/node1/conf/cassandra.yaml
+echo 'listen_on_broadcast_address: true' >> $CCM_DIR/test/node2/conf/cassandra.yaml
+echo 'listen_on_broadcast_address: true' >> $CCM_DIR/test/node3/conf/cassandra.yaml
+
+# Start nodes1 and 2 need to skip wait as the above config breaks it
+ccm node1 start --skip-wait-other-notice
+ccm node2 start --skip-wait-other-notice
+
+# Wait for both nodes to be UN then put roughly a GB of data into the cluster
+ccm stress write n=5000000
+
+# Slow down streaming so joining takes long enough to see issue then start 3rd node
+ccm node1 nodetool setstreamthroughput 1
+ccm node2 nodetool setstreamthroughput 1
+sed -i 's/auto_bootstrap.*/auto_bootstrap: true/' $CCM_DIR/test/node3/conf/cassandra.yaml
+ccm node3 start --skip-wait-other-notice
+
+# Wait for streaming to start then check which node that node3 is streaming off
+ccm node3 nodetool netstats
+# On my cluster node1 was streaming so i stop & started node 2
+ccm node2 stop
+ccm node2 start --skip-wait-other-notice{noformat}
+After that the restarted node logged this:
+INFO [main] 2021-10-07 17:54:40,637 ConfiguredLimit.java:108 - Detected peers which do not fully support protocol V4. Capping max negotiable version to V3
+
+Also if you tried to cqlsh to the restarted node:
+Connection error: ('Unable to connect to any servers', \{'127.0.0.2:9042': DriverException('ProtocolError returned from server while using explicitly set client protocol_version 4')})
+
+Errors in the node logs corresponding to attempted connection:
+WARN [epollEventLoopGroup-2-6] 2021-10-07 17:56:04,822 NoSpamLogger.java:94 - Protocol exception with client networking: org.apache.cassandra.transport.ProtocolException: Invalid or unsupported protocol version (4); supported versions are (3/v3, 4/v4, 5/v5-beta)
+
+You can cqlsh if you force the protocol version: cqlsh 127.0.0.2 --protocol-version=3
+
+Peers table:
+{noformat}
+ peer      | data_center | host_id                              | preferred_ip | rack  | release_version | rpc_address | schema_version                       | tokens
+-----------+-------------+--------------------------------------+--------------+-------+-----------------+-------------+--------------------------------------+--------------------------
+ 127.0.1.1 |         dc1 | d4d86d82-d12b-4bae-a1a4-7f0ded9d9b79 |    127.0.0.1 | rack1 |         3.11.11 |   127.0.0.1 | d25c2da9-b17e-3aba-8682-6cf063aaca51 | {'-9223372036854775808'}
+
+ 127.0.1.3 |        null |                                 null |    127.0.0.3 |  null |            null |        null |                                 null |                     null{noformat}
+As you can see node3 the joining node has all nulls except for peer and preferred_ip columns. I believe the null in the release_version column causes the version check to fail.
+
+ 
+
+ 
+
+Your analysis looks spot on to me.  I believe the check from CASSANDRA-15193 is seeing the unknown version and capping the protocol. One possible way to solve this may be to get of preferred_ip altogether, an idea I've floated on CASSANDRA-16718, which is another problem regarding it. [~samt] wdyt?
+
+After my analysis I think it is enough if we just filter out versions which are null from here
+
+{code}
+         boolean enforceV3Cap = SystemKeyspace.loadPeerVersions()
+                                                 .values()
+                                                 .stream()
+                                                 .anyMatch(v -> v.compareTo(MIN_VERSION_FOR_V4) < 0);
+{code}
+
+I have tried it manually and it will not hit that bug again.
+
+This should be done for 3.0 and 3.11. I ll provide patch soon.
+
+PR: [https://github.com/apache/cassandra/pull/1465]
+
+build: [https://app.circleci.com/pipelines/github/instaclustr/cassandra/769/workflows/c3892242-fe82-449f-85e5-0e6bcdaae5c3]
+
+[~brandon.williams]  would you mind to review?
+
+I think the real issue here is that we've allowed a null release_version that never gets resolved, and this patch works around that by ignoring unset versions.  That said, we've released versions that do this, so working around it seems like the only solution.  Can we add a test for this?
+
+I've already tested this as well my colleagues and they are saying it just works as expected. Given how complex the test is going to be, I am admitting I am quite hesitant to spend too much time on this. Additioanlly, I am not completely sure what test I should write, in-jvm dtest or python one? There is a lot of moving parts here and I am afraid I am going to introduce another flaky eventually.
+
+Or maybe I could narrow down the scope of the test to test just stuff around ConfigLimit? What is your opinion on the scope the test should cover here?
+
+I guess you're right, this is a little tricky to test since you really need to be able to control gossip states to reproduce and then check the client protocol.  I'd still like [~samt] to take a look, but I'm +1.
+
+I think the ultimate explanation why this is happening is like this (maybe handy for future readers / for reference)
+
+In Gossipper#applyStateLocally, it gets to:
+{code:java}
+for (IEndpointStateChangeSubscriber subscriber : subscribers)
+    subscriber.onJoin(ep, epState);
+{code}
+One of subscribers is ReconnectableSnitchHelper, which will eventually call "SystemKeyspace.updatePreferredIP" which will write only peer and preferred ip. So for a joining node, it will insert only peer and preferred ip hence all other fields are null.
+
+Then, we kind of assume that the node will join, all is streamed etc. Once / upon it is fully joined, all other fields are populated so when another subscriber is triggered calling its onJoin again, the capping logic where it currently fails is called and it will do all the happy path with version populated and so on.
+
+However, if we stop the node while some other node is joining a cluster, once we restart it, we hit this bug, because only the first subscriber has managed to be called so other subscriber with capping logic will see nulls because nothing has updated them - because we just stopped it while other node was joining.
+
+Basically, we introduced nulls, never managed to fill the columns with non-nulls and the node crashed so restarted node sees nulls again and the capping logic will go south because it expects all stuff to be fully populated, which didnt happen, due to the node's failure.
+
+Yeah, I don't really see another way around this bug in the short term, so I'm +1 on the proposed patch.
+
+3.0 [https://ci-cassandra.apache.org/view/patches/job/Cassandra-devbranch/1481/]
+
+3.11 [https://ci-cassandra.apache.org/view/patches/job/Cassandra-devbranch/1480/]
+

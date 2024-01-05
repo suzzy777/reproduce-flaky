@@ -1,0 +1,104 @@
+Failed again: https://app.circleci.com/pipelines/github/dcapwell/cassandra/307/workflows/a5d97246-2f81-489e-81e9-55c311ad65ae/jobs/1542
+
+The timeout occurs [waiting for this close future|https://github.com/aholmberg/cassandra/blob/CASSANDRA-15958/test/unit/org/apache/cassandra/net/ConnectionTest.java#L268], failing intermittently due to a race condition. The test [closes|https://github.com/aholmberg/cassandra/blob/CASSANDRA-15958/test/unit/org/apache/cassandra/net/ConnectionTest.java#L723] the inbound connection [twice|https://github.com/aholmberg/cassandra/blob/CASSANDRA-15958/test/unit/org/apache/cassandra/net/ConnectionTest.java#L268]. If the first execution finishes and [shuts down the executor|https://github.com/aholmberg/cassandra/blob/CASSANDRA-15958/src/java/org/apache/cassandra/net/InboundSockets.java#L128] before the second, the [FutureCombiner|https://github.com/aholmberg/cassandra/blob/CASSANDRA-15958/src/java/org/apache/cassandra/net/InboundSockets.java#L125-L126] fails to [addListener|https://github.com/aholmberg/cassandra/blob/CASSANDRA-15958/src/java/org/apache/cassandra/net/FutureCombiner.java#L83] to the channel, and the [done future|https://github.com/aholmberg/cassandra/blob/CASSANDRA-15958/src/java/org/apache/cassandra/net/InboundSockets.java#L131] will never complete.
+
+Looks like there are some additional sources of flakiness in this test.
+https://app.circleci.com/pipelines/github/aholmberg/cassandra/25/workflows/536c8ec1-51d3-4ef0-95c6-7dd9677225dc/jobs/207
+
+Hi Adam, thanks for the analysis! 
+I agree with the cause, and I can reproduce the timeout exception (at closing) by inserting a pause between those 2 close call sites. 
+
+The patch looks good to me. The {{closeFuture}} is updated/read within the synchronized block.
+
+Only one thing to bring up is that there is a slight side effect introduced. With the patch, only the {{Consumer<? super ExecutorService> shutdownExecutors}} in the first call site will be registered. The other call sites, if supplying a different consumer, are all ignored. Maybe update the method docs for such behavior. 
+
+Thanks, Yifan, for taking a look. I'll revisit that before submitting for review.
+
+In the mean time, I looked some at the other flakiness.
+
+{noformat}
+java.lang.RuntimeException: java.util.concurrent.TimeoutException
+	at org.apache.cassandra.net.ConnectionTest.lambda$testMessagePurging$36(ConnectionTest.java:700)
+	at org.apache.cassandra.net.ConnectionTest.lambda$testMessagePurging$40(ConnectionTest.java:730)
+	at org.apache.cassandra.net.ConnectionTest.doTestManual(ConnectionTest.java:263)
+	at org.apache.cassandra.net.ConnectionTest.testManual(ConnectionTest.java:236)
+	at org.apache.cassandra.net.ConnectionTest.testMessagePurging(ConnectionTest.java:679)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:62)
+	at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+Caused by: java.util.concurrent.TimeoutException
+	at java.base/java.util.concurrent.CompletableFuture.timedGet(CompletableFuture.java:1886)
+	at java.base/java.util.concurrent.CompletableFuture.get(CompletableFuture.java:2021)
+	at org.apache.cassandra.net.ConnectionTest.lambda$testMessagePurging$36(ConnectionTest.java:693)
+{noformat}
+
+Timeout waiting for message to be purged. It will never purge.
+
+Identified another race condition where the next expiration can be set to Long.MAX_VALUE, and pruning will never happen.
+
+[Periodic pruning|https://github.com/aholmberg/cassandra/blob/eb1c9bf59c7faba3e65be7fc45359611c7242672/src/java/org/apache/cassandra/net/OutboundMessageQueue.java#L203-L209] runs in the background. It might run against an empty queue, producing a [pruner|https://github.com/aholmberg/cassandra/blob/eb1c9bf59c7faba3e65be7fc45359611c7242672/src/java/org/apache/cassandra/net/OutboundMessageQueue.java#L288] with {{earliestExpiresAt = Long.MAX_VALUE}}. In the mean time a message is added and the current deadline matches that message. If our nowNanos was established more than the clock resolution after the message expire time was set, the earliestExpiresAt time is [set|https://github.com/aholmberg/cassandra/blob/eb1c9bf59c7faba3e65be7fc45359611c7242672/src/java/org/apache/cassandra/net/OutboundMessageQueue.java#L228-L229] to {{Long.MAX_VALUE}}.
+
+I have another tweak for this issue. Still looking at some other related unit tests.
+
+Looked at the {{OutboundMessageQueue}} issue a bit more. Put more simply, there's a race [adding to this queue and updating the expiration deadline|https://github.com/apache/cassandra/blob/405e2dd8b5610208596ab4cb0bb6b9be7a159f5e/src/java/org/apache/cassandra/net/OutboundMessageQueue.java#L89-L92] while another thread is draining ( [1|https://github.com/apache/cassandra/blob/405e2dd8b5610208596ab4cb0bb6b9be7a159f5e/src/java/org/apache/cassandra/net/OutboundMessageQueue.java#L256] [2|https://github.com/apache/cassandra/blob/405e2dd8b5610208596ab4cb0bb6b9be7a159f5e/src/java/org/apache/cassandra/net/OutboundMessageQueue.java#L148] [3|https://github.com/apache/cassandra/blob/405e2dd8b5610208596ab4cb0bb6b9be7a159f5e/src/java/org/apache/cassandra/net/OutboundMessageQueue.java#L484] ) and also updating ( [1|https://github.com/apache/cassandra/blob/405e2dd8b5610208596ab4cb0bb6b9be7a159f5e/src/java/org/apache/cassandra/net/OutboundMessageQueue.java#L288] [2|https://github.com/apache/cassandra/blob/405e2dd8b5610208596ab4cb0bb6b9be7a159f5e/src/java/org/apache/cassandra/net/OutboundMessageQueue.java#L488] ). The race is there, but I'm not certain it would be a problem in an operating server, since nothing is spinning on an inactive queue waiting for messages to be evacuated, like this test is. In other words, new incoming messages and ongoing delivery would break this loose naturally.
+
+Two ways to proceed:
+1.) We can agree that it's not a problem, and I can make this test not susceptible to the timeout.
+2.) We try to fix by adding synchronization around both the external queue and expiry update. I would need to expand the analysis quite a bit to understand what performance implications that might have (since the apparent point of the two queue design is efficiency).
+
+[~yifanc] I'm interested in your take.
+also /cc [~benedict] [~aleksey] for ideas since this is part of your newish messaging rewrite.
+
+A third alternative would be to skip synchronization and computation and just make it periodic. I'm not sure what the genesis of the more precise calculation was.
+
+Nice finding! 
+I am able to reproduce the race, as long as the {{nextExpirationDeadlineUpdater}} that sets {{earliestExpiresAt}} to {{Long.MAX_VALUE}} in {{pruneInternalQueueWithLock}} happens after the updater in the *last* {{add()}} message call in the test. 
+
+The impact is that the prune task might not be able to prune the queue when there is no new message with expiration time that can trigger {{pruneWithLock()}} enqueued. But in an operating system, there should be new messages enqueued continuously. Therefore, the chance that messages not being pruned should be low. 
+In the worst case that an expired message is not pruned in the queue, the message is still discarded when outbound connection sends the message. It checks {{shouldSend()}} when polling from the queue. 
+Therefore, it seems a special case in the test. It should not harm in production.
+
+Regarding the third alternative, if I understand correctly, without updating the {{nextExpirationDeadline}} in the {{add()}} message method, no prune task will be scheduled. Because the {{nextExpirationDeadline}} remains {{Long.MAX_VALUE}} and {{clock.isAfter(nowNanos, nextExpirationDeadline)}} always returns false in the {{maybePruneExpired()}} method.
+
+Sorry I wasn't more precise on the third option. There, I was suggesting that we stop trying to calculate the earliest possible prune, and just make it prune periodically -- say every 10ms. Then there's no deadline to adjust forward or backward and synchronize relative to new messages coming in -- it's just a periodic task.
+
+>Therefore, it seems a special case in the test. It should not harm in production.
+It sound like in this paragraph you're agreeing with my option #1. If that is the case (and we don't hear any opposition), when I get back to it I'll update the test to be robust against this.
+
+Hi Adam. Yes. I agree with option 1. 
+
+IMO, the periodic prune task and the condition to guard entering the actual prune operation is a best effort optimization to reduce the messages in the outbound queue. 
+The contention for the lock (between poll and prune) would be increased, if removing the condition. The periodic prune task will try to acquire the lock every time it is triggered (every 100 ms). Prune is an O({{n}}) operation. It could become expensive when the outbound queue is large and block the poll more likely. So having a condition to guard the entry makes sense to me, even though the condition could become inaccurate (, best effort). The exact impact on the queue performance need to be benchmarked. Intuitively, I think having the guard provides benefit. 
+
+Ping [~sbtourist] / CASSANDRA-15700
+
+Thanks for the link Aleksey. 
+
+Returning to this, option #1 seems a bit absurd to me: changing a test to work around a flaw in the thing it was meant to test. I also think this class could benefit from some simplification, but I don't think we have the appetite to bite off and perf test a change like that at this point (and I think we've agreed this particular case is not a danger in a running system). 
+
+Here's a [patch|https://github.com/aholmberg/cassandra/pull/4/files], updated according to Yifan's input, and augmented to make sure the test will not race with the background pruning, and timeout.
+
+Not seeing the link to the CI run.
+
+Attaching one: [https://app.circleci.com/pipelines/github/yifan-c/cassandra?branch=C-15958]
+
+ 
+
+Unit test and dtest passed.
+
+[https://app.circleci.com/pipelines/github/yifan-c/cassandra/96/workflows/ddf05402-e19d-4a74-a14b-90a105dea475]
+
+ 
+
++1 to the patch.
+
+Thanks for kicking that off.
+
+Is a second reviewer needed?
+
+I apparently forgot to put my +1 for the patch.
+
+Could not mark the ticket as committed. Will try again once the problem has been fixed.
+
+Committed into trunk at ba63fa3c951cb5c18d0fa4f9483577c6e18389c4
+

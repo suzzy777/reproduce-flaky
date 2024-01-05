@@ -1,0 +1,170 @@
+To clarify, this has nothing to do with CDC other than it being the first feature that's changed system tables since 3.0 hit. In a post CASSANDRA-8099 world, the fact that we send across all system tables and reject queries with unknown columns means that any changes to the system schema would cause this. CDC just happens to be the first feature we've added since then that changes schema.
+
+ Also - at the time that I added that message to NEWS.txt, from discussion offline we didn't realize those exceptions would lead to internode communication breaks.
+
+Two ways to approach this have come up in offline discussions. The first and less invasive method would be to suppress sending schema information about the cdc param status on versions >= 3.8 unless cdc_enabled:true is set in the cassandra.yaml. Specifically, removing the addition of the cdc param [here|https://github.com/apache/cassandra/blob/cassandra-3.8/src/java/org/apache/cassandra/schema/SchemaKeyspace.java#L514] and instead adding it conditionally [here|https://github.com/apache/cassandra/blob/cassandra-3.8/src/java/org/apache/cassandra/schema/SchemaKeyspace.java#L476]. The upgrade path for users that want to enable cdc would be: don't enable CDC until your entire cluster is updated to a version >= 3.8. Then enable it and bounce your cluster. Since schema information is hard-coded in SchemaKeyspace.java and we don't actually care about the value in that param if cdc is not enabled on the cluster, it seems a reasonable workaround until we get to versioned sub-systems in Cassandra.
+
+The second and more invasive method (at least from the perspective of the # of versions it touches and potential side-effects) would be to allow null columns during deserialization in [Columns.java|https://github.com/apache/cassandra/blob/cassandra-3.8/src/java/org/apache/cassandra/db/Columns.java#L433] if the mutation is for a schema table. This would apply to 3.0.x and 3.8+. This would get us back to a functionality somewhat similar to pre-CASSANDRA-8099, in that mutations for schema tables on different versions would no longer interrupt inter-node communication during an upgrade process via RTE.
+
+I'm by no means an expert on schema dissemination - [~iamaleksey] / [~slebresne]: either of you have any feedback on the above two or other, better ideas on this front?
+
+I'm unsure, but looking at CASSANDRA-12192, it seems we get this error in a mixed version cluster that has no schema changes during the upgrade.
+
+Conditionally adding the cdc param only if cdc is enabled and tell user "don't enable cdc until everything is on 3.8+" sounds simple and reasonable to me (until we have a better way to handle those schema changes that is).
+
+Ignoring unknown columns at deserialization is in fact much trickier since deserializing the value depends on the type of the column, and we can't really infer that out of thin air.
+
+We went the way we went under the assumption that users would not see this exception unless the made explicit schema changes during the mixed-version period. Looks like you hit the issue even if the user is *not* explicitly performing any schema changes on the cluster, which is arguably less acceptable. My guess is that this is caused by setting up auth, tracing, and system_distributed keyspaces on startup.
+
+Seems to me that the only reasonable way it so add the cdc param conditionally, and have an ugly null default instead of the proper empty frozen set, but, what can you do?
+
+I'll see if that is indeed sufficient and can be done super fast. That said, if it's not, I feel like the fix can wait until 3.9, as I don't believe that this problem is critical enough do delay the already very late 3.8. You are only going to have the session broken once per tuple of (source, destination) nodes while they are upgrading. While not harmless, I don't believe it to be a big enough deal to block an even 3.8 release. 
+
+We don't need to mess with null vs. empty set since cdc is a boolean on the table level with the "v2" design and DC enabled/disabled is handled on the consumer level. It already defaults to false in {{SchemaKeyspace.createTableParamsFromRow}} for backwards compatibility from older nodes.
+
+Attaching a trivial patch to only add the param in {{SchemaKeyspace.addTableParamsToSchemaMutation}} if cdc is enabled on the node.
+
+Edit: Went ahead and pushed a branch so we can run CI against it and see how things fare w/null in the cdc field:
+
+||branch||testall||dtest||
+|[12236|https://github.com/josh-mckenzie/cassandra/tree/12236]|[testall|http://cassci.datastax.com/view/Dev/view/josh-mckenzie/job/josh-mckenzie-12236-testall]|[dtest|http://cassci.datastax.com/view/Dev/view/josh-mckenzie/job/josh-mckenzie-12236-dtest]|
+
+[~philipthompson] / [~mambocab]: What are the chances we could get upgrade tests run against the above branch?
+
++1, assuming tests pass and the driver handles null appropriately.
+
+That said, a slightly better way would be to add the column conditionally on {{params.cdc}} rather than on {{DatabaseDescriptor.isCDCEnabled()}}.
+
+Changed that and force-pushed. That also gives us the ability to tell people "don't enable CDC on a table until all nodes are updated" instead of forcing the per-node yaml change w/cluster bounce to get the feature.
+
+Shouldn't change the outcome of the utests/dtests I triggered as the outcome is identical (false by default, doesn't send).
+
++1
+
+[~JoshuaMcKenzie] I'll take care of this. I'll link to the job when it's up and running.
+
+running here: http://cassci.datastax.com/view/Dev/view/knifewine/job/knifewine-joshupgrade12236-upgrade/1/
+
+2 things:
+
+# had a bad dtest run so re-running (bad as in spot checking some failing dtests locally w/this branch passes)
+# Sending the cdc param as part of the schema only if it's enabled on the table leads to a situation where we can enable CDC on a table but can't turn it back off. Reverted to the DD check and added a conditional skip on CDCStatementTest since the statement won't toggle that param on and off in schema if the feature is disabled.
+
+technical difficulties -- trying another run here: http://cassci.datastax.com/view/Dev/view/knifewine/job/knifewine-joshupgrade12236-upgrade/3/
+
+I'm in the same boat on the [dtest front|http://cassci.datastax.com/job/josh-mckenzie-12236-dtest/4/testReport/junit/schema_metadata_test/TestSchemaMetadata/durable_writes_test/]
+
+Current status: Not entirely sure what to make of that [upgrade test run|http://cassci.datastax.com/view/Dev/view/knifewine/job/knifewine-joshupgrade12236-upgrade/3/testReport/].
+
+65 failures out of ~1350 tests runs, so if the driver was bailing on the null in cdc I'd expect we'd see far more than that. The errors I'm seeing are all over the map though, and I don't know how many upgrade test errors we "expect" at this point (3.7 upgrade job not on cassci that I'm seeing):
+* [Timeouts|http://cassci.datastax.com/view/Dev/view/knifewine/job/knifewine-joshupgrade12236-upgrade/3/testReport/junit/upgrade_tests.paging_test/TestPagingDataNodes3RF3_Upgrade_current_3_0_x_To_indev_3_x/basic_paging_test/]
+* [LegacyPagedRangeCommandSerializer.deserialize assertions|http://cassci.datastax.com/view/Dev/view/knifewine/job/knifewine-joshupgrade12236-upgrade/3/testReport/junit/upgrade_tests.paging_test/TestPagingDataNodes3RF3_Upgrade_current_3_0_x_To_indev_3_x/basic_paging_test_2/] - see CASSANDRA-12249. I haven't dug deeply into that code but from initially looking into it, I'm not sure how an added column in schema would lead to us sending a deprecated PAGED_RANGE from a 3.8 to a 3.0.x node. That being said, I don't see any "guards" in general around a PartitionRangedReadCommand.createMessage with a paging data range, and that predated the changes in CASSANDRA-11393 so that would require more inspection to figure out what's going on.
+* [Secondary index paging timeouts|http://cassci.datastax.com/view/Dev/view/knifewine/job/knifewine-joshupgrade12236-upgrade/3/testReport/junit/upgrade_tests.paging_test/TestPagingDataNodes3RF3_Upgrade_current_3_x_To_indev_3_x/test_paging_using_secondary_indexes/]
+* [Failure to find unrelated columns|http://cassci.datastax.com/view/Dev/view/knifewine/job/knifewine-joshupgrade12236-upgrade/3/testReport/junit/upgrade_tests.cql_tests/TestCQLNodes2RF1_Upgrade_current_3_0_x_To_indev_3_x/select_with_alias_test/]
+
+As for how we want to proceed from here: I'd say we a) re-run the upgrade jobs to see if timeouts were flaky environment (had a lot of problems with that yesterday across a lot of jobs, b) commit this change to 3.8/3.9/trunk, and c) Start working the CASSANDRA-12249 angle since that error showed up considerably more frequently than any other single error in the upgrade test runs I saw.
+
+As for what this means for the 3.8 release, my .02 is that I'd want to delta it against what upgrade tests looked like for 3.6, 3.4, 3.2. This is an even release, meaning we don't recommend rolling it out in production, and as long as our load of upgrade test failures for 3.8 isn't a regression from the load we had for 3.6, I'd say we move forward, potentially even before hammering out CASSANDRA-12249. Currently even releases are "feature" releases and odd are "stable", so there's no real need to hold up an even release for upgrade-only, mixed-version specific cluster problems in my opinion.
+
+Also - since Aleksey is out today and Monday, swapping reviewer to [~slebresne]
+
+If the problem here isn't fixed, then it can cause random timeouts in tests because of the internode connection being broken. So for those tests failing from timeouts you should check the logs and see if they have the RTE in them.
+
+Good call - I'll check with TE on accessing the box w/these test failures. We're doing a re-run of upgrade tests from the SHA immediately before the cdc commit which should help us eliminate about 1/2 of 3.8's commits as being potential offenders, and I'll also try and track down older 3.8 runs since those are supposed to be run weekly.
+
+There's a logical issue w/this approach - spoke to Sylvain offline. Going to swap assignee to him and take review.
+
+So the idea of not sending the {{cdc}} boolean to old node is correct (I think), but unfortunately we use {{RowUpdateBuilder}} to construct the mutation and that class is a bit naive and includes all the known columns from the metadata in the header of the mutation it sends (out of simplicity), even if there is not value for some of the columns.
+
+Now, the {{RowUpdateBuilder}} and the way we use it building schema mutation is a bit of a mess as we sometimes reuse a particular {{PartitionUpdate}}, but not in all path and without a good way to distinguish, which, long story short, makes it harder to figure out which columns will actually be used in the PartitionUpdate (and {{PartitionUpdate}} needs to know that upfront). Truth being told, I think {{RowUpdateBuilder}} has overgrown its initial intention and it's imo time for a small refactor.
+
+So I'm attaching a patch that refactor {{RowUpdateBuilder}}, and make it only include the column it needs to so that Josh's patch work as intended. It moves a bit of code around, but I think the result is overall a lot cleaner (and potentially more reusable). I do will note that {{RowUpdateBuilder}} was used quite a bit in tests now (in fact, some of the features of {{RowUpdateBuilder}} only existed for tests) so I didn't removed the class, but simply moved it to the tests.
+
+| [12236-trunk|https://github.com/pcmanus/cassandra/commits/12236-trunk] | [utests|http://cassci.datastax.com/job/pcmanus-12236-trunk-testall] | [dtests|http://cassci.datastax.com/job/pcmanus-12236-trunk-dtest] |
+
+Btw, I haven't run the upgrade tests at all, so I haven't verified this fixes the upgrade problem. If someone could trigger those (once maybe the utest and dtests shows the patch isn't too broken), that would be great.
+
+Kicking review over to [~iamaleksey] since this outgrew the initial scope and we're blocking 3.8 on this. Better to have him review since it's in the same domain as things he reviewed for CASSANDRA-8099 and I'd prefer not to delay release longer just to make sure I get up to speed appropriately.
+
+bq. I do will note that RowUpdateBuilder was used quite a bit in tests now (in fact, some of the features of RowUpdateBuilder only existed for tests) so I didn't removed the class, but simply moved it to the tests.
+
+Sounds like the tests use one row update builder and the actual code uses another. That's probably not the best idea.
+
+[~rhatch]: Can [~slebresne] simply prefix his branch name with 'upgrade' now to get the upgrade suite run against it, or is there still some manual intervention required on this?
+
+Russ is out sick, but I believe the answer is yes.
+
+Reviewing now. Do we have upgrade test results yet?
+
+No, I still don't know how to run those upgrade tests (I was told something about creating a branch with name starting with {{upgrade_}}, which I tried yesterday, but either that didn't worked or I don't know where or when that triggers the tests). In any case, it's worth noting I updated the branch today to
+1) make the {{RowUpdateBuilder}} in the tests be a thin wrapper over the newly added builder, to address Jake's comment above. I still kept the {{RowUpdateBuilder}} class cause it's used by many tests and I didn't think it was a good use oa my time to go modify all those tests for no particular reason. It's just a pretty minor test "helper" now.
+2) while working on that I noticed that there was another reason why all the columns were actually send, and that's because the {{unfilteredIterator()}} method in {{PartitionUpdate}}, which is used during serialization, was basically overriding the columns used to be all columns. I fixed that too.
+
+Anyway, I think the branch is more of less complete, but I just got the result of the last test run (normal tests, not upgrade ones) and it's not clean so I must have broken something in the tests. This will have to wait tomorrow however for me to look at it. Still very much interested in understanding how to run the upgrade test on CI though. 
+
+ping [~rhatch] / [~philipthompson]
+
+Yep, there are some legit test failures - including HintTest, PartitionUpdateTest, RangeTombstoneTest - with the latest commits included.
+
+With any luck we'll get results on the autojobs created job here:
+
+http://cassci.datastax.com/view/All_Jobs/job/pcmanus-upgrade_12236-upgrade/1/
+
+I fixed the unit test failures (mainly due to various minor errors in the change to {{RowUpdateBuilder}} I did in the tests) in a new commit. There is 2 dtests failures for cqlsh DESCRIBE but that's just because a consequence of this patch is that the {{cdc}} table properly won't be displayed by DESCRIBE by default, which is imo fine. I have a trivial fix of that locally that I'll push on commit. The rest of the dtest failures "seems" unrelated.
+
+I seem to be have been able to start upgrade tests on that last branch which I include below, but they haven't finished at the time of this writing so we'll see the results.
+
+| [12236-trunk|https://github.com/pcmanus/cassandra/commits/12236-trunk] | [utests|http://cassci.datastax.com/job/pcmanus-12236-trunk-testall] | [dtests|http://cassci.datastax.com/job/pcmanus-12236-trunk-dtest] | [upgrade tests|http://cassci.datastax.com/view/Dev/view/pcmanus/job/pcmanus-upgrade_12236-upgrade/] |
+
+
+The upgrade test has finished, but something went wrong. Looking at the console output, at least some tests "seems" to have run successfully, but there is some timeout during the "POST BUILD TASK". I'm not entirely sure what to make of that so I'll restart the job in case that was a temporary env issue.
+
+Alright.
+
+Two issues:
+1. {{SimpleBuilders#AbstractBuilder#nowInSec() method has an invalid argument ({{int ttl}} instead of {{int nowInSec}}), making the method a no-op
+2. SimpleBuilders#RowBuilder#add() in the {{SET}} case in the for loop is using the incorrect variable in {{toByteBuffer()}} call ({{value}} instead of {{elt}})
+
+One nit: the change in MigrationManager is contaminating git blame, no need for it
+
+One subjective preference: not a fan of {{addNoOverride()}} name. Maybe just replace with {{append()}}?
+
+Otherwise LGTM conditional on tests passing.
+
+Pushed a commit with fix for those and re-started the tests. I did got a run of upgrade test to finish previously and there was still 72 failures. I start looking at the reports and it's not immediately clear than any of those is due to this issue, but at the same time the reports aren't full of details in many cases (if we have a node logs, I'm not aware of it). It could be worth noting there is an overwhelming number of paging tests fails, and it doesn't sound like paging tests would more sensible to this than other (I've hinted at some possible explanation for paging upgrade test failures on CASSANDRA-10848 but I'm not even sure of that), but I'm fishing a bit here.
+
+In any case, I think we want to do this change as it was never intended to ship columns for which we had no values, but this is probably not the end of our upgrade test problems.
+
+bq. One nit: the change in MigrationManager is contaminating git blame, no need for it
+
+Not sure to follow that one. Even if the change wasn't pulling the {{Collections.singletonList()}} call out, which I happen to think is slightly cleaner (and thus prefer over {{git blame}} concerns), the code would still need to call the {{build()}} method so the pollution would be the same. I'm surely missing your point though.
+
+bq. Not sure to follow that one
+
+My eyes failed me, never mind.
+
+bq.  I did got a run of upgrade test to finish previously and there was still 72 failures. 
+
+Absolute most of them have been failing since before CDC AFAIK, not related to this ticket, and it will take a while to address them (likely not before 3.10).
+
+bq. Absolute most of them have been failing since before CDC AFAIK, not related to this ticket, and it will take a while to address them (likely not before 3.10).
+Somewhat off-topic from this ticket proper, but do we have a good idea of what # are test-only failures and what # represent actual problems? If actual problems, I'd expect we'd not cut a release until we get those tests cleaned up.
+
+bq. Absolute most of them have been failing since before CDC AFAIK
+
+I don't know. The test report for 3.7, which is [here|https://docs.google.com/document/d/16xfq7xeLuD93EVIery0VQLMHMkOfYp7wlyQ7cSg0xwI/edit#heading=h.a7qrmlkpqup2], pretends that not that long ago there was only 2 upgrade tests failures. Maybe it's not accurate, and I'll admit I'm a little skeptical of only 2 failures, but it would sound like we have add a big increase in those failures in the last 2 months. Doesn't prove at all that it's CDC related though.
+
+bq. Doesn't prove at all that it's CDC related though
+In the context of this discussion here, I'm less concerned about the immediate root-causing and more concerned about:
+
+bq. it will take a while to address them (likely not before 3.10).
+I don't think we should be in the habit of cutting releases with failing upgrade tests.
+
+I had [~philipthompson] attempt an upgrade test run against the SHA right before CDC with results [here|http://cassci.datastax.com/view/Dev/view/josh-mckenzie/job/josh-mckenzie-upgrade_pre_cdc_3.8-upgrade/8/#showFailuresLink]. 22 failures on that SHA, so the upgrade tests weren't in a good place even before this schema-propagation issue.
+
+Given the paging failures (potentially CASSANDRA-10848/CASSANDRA-10730 related) and the failures we already had going into this commit, I think we've just had multiple fairly large upgrade test regressions during the 3.8 time window that we're just going to have to grind through.
+
+Alright, so as far as this issue is concerned, the unit and dtest runs were clean (outside of the dtest failure on cqlsh DESCRIBED due to the cdc option not being there by default and for which I've committed a fix to the dtest for), so committed, thanks.
+
+It's a bit unclear how much upgrade tests this actually fix as there is a bit too much noise currently, but it at the very least remove one know reason for failure.
+

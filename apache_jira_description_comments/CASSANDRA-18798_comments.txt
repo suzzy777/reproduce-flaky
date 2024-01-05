@@ -1,0 +1,713 @@
+Either way this is a protocol bug, as if the insert by process 6 has a lower timestamp than the insert by process 7 then it should occur before, and so the read by process 5 should be deferred until the insert has completed.
+
+I won't spend time debugging this as a result, as we have several known protocol bugs that could cause this, that we have been deferring fixing until now (I plan to address over the next 2-3 weeks). If you have a simulator seed that produces this we could perhaps confirm which protocol bug if any might have caused this, as it is always nice to know which protocol bugs we have reproductions for via which routes. 
+
+It's great to have some further external validation that these bugs can be found via this form of testing.
+
+Okay, finally got to the bottom of this. Report of findings follows:
+
+ 
+
+TL:DR; Accord is correctly propagating the {{executeAt}} timestamp into the legacy {{timestamp}} and {{executeNow}} fields. There's loss of precision though, so appending  to the list twice within the same millisecond is the likely explanation of this particular symptom. Underneath this, it's however the {{ListType}} itself that is broken, at least for the read path. 
+
+Part of the reason to write all of the below is that I'm seeking guidance on the ListType. What is it even supposed to do?
+
+ 
+h2. Accord
+
+The ListType is internally like a table/partition of BTreeRow's, that are sorted by their timestamp. This makes lists ecentualy consistent: The application can append entries to a list from two clients simultaneously, and the ordering of the resulting list, once all elements have "arrived", is deterministic. The initial hyptohesis for my research was that the Accord executeAt timestamp isn't correctly propagated into each list element (BTreeRow). However, this is not the case:
+
+ 
+
+Once an Accord transaction has determined its transaction id, called executeAt in Cassandra, and we arrive at the write portion of the exeuction phase, we have this:
+
+{{        cfk.updateLastExecutionTimestamps(executeAt, true);}}
+{{        long timestamp = cfk.current().timestampMicrosFor(executeAt, true);}}
+{{        // TODO (low priority - do we need to compute nowInSeconds, or can we just use executeAt?)}}
+{{        int nowInSeconds = cfk.current().nowInSecondsFor(executeAt, true);}}
+
+        _modules/accord/accord-core/src/main/java/accord/primitives/Timestamp.java_
+
+This eventually reaches 
+
+ 
+
+{{    public Row updateAllTimestamp(long newTimestamp)}}
+    
+{{        LivenessInfo newInfo = primaryKeyLivenessInfo.isEmpty() ? primaryKeyLivenessInfo : primaryKeyLivenessInfo.withUpdatedTimestamp(newTimestamp);}}
+{{        // If the deletion is shadowable and the row has a timestamp, we'll forced the deletion timestamp to be less than the row one, so we}}
+{{        // should get rid of said deletion.}}
+{{        Deletion newDeletion = deletion.isLive() || (deletion.isShadowable() && !primaryKeyLivenessInfo.isEmpty())}}
+{{                             ? Deletion.LIVE}}
+{{                             : new Deletion(new DeletionTime(newTimestamp - 1, deletion.time().localDeletionTime()), deletion.isShadowable());}}
+
+{{        return transformAndFilter(newInfo, newDeletion, (cd) -> cd.updateAllTimestamp(newTimestamp));}}
+   
+
+    _src/java/org/apache/cassandra/db/rows/BTreeRow.java_
+
+ 
+
+The only problem I can see is loss of precision: This call will use the hlc() part of the executeAt timestamp, and not the node id (nor epoch). It seems possible and even likely that two different nodes will append to the same list during the same millisecond. After this, the ordering of those two (BTreeRow) elements is deterministic but arbitrary, and not guaranteed to be the same as the Accord transactions that wrote them.
+
+Also note the loss of precision is unnecessary! Cassandra legacy timestamps are microseconds, but Accord has only millisecond precision. A better implementation here would be to use the last 3 digits of the timestamp field to encode the node id, and maybe also epoch.
+
+The Accord originated timestamps are easy to spot with their 3 trailing zeros:
+
+{{$ tools/bin/sstabledump -d -t data/data/myspace/listtest-8574ceb057c611eeb5787dbb261b6e16/nc-5-big-Data.db  }}
+{{[2]@241 Row[info=[ts=1695222739434337] ]:  | del(names)=deletedAt=1695222739434336, localDeletion=1695222739, [names[177f79d0-57c8-11ee-b578-7dbb261b6e16]=Albert ts=1695222739434337], [names[177f79da-57c8-11ee-b578-7dbb261b6e16]=Ebba ts=1695222739434337], [names[3d4371d0-}}
+{{57c8-11ee-b578-7dbb261b6e16]=poppari ts=1695222802794082]}}
+
+ 
+
+$ tools/bin/sstabledump -d -t data/data/myspace/listtest-8574ceb057c611eeb5787dbb261b6e16/nc-26-big-Data.db  
+[2]@0 Row[info=[ts=-9223372036854775808] ]:  | , [names[6d8b88c0-5979-11ee-9ee4-1ff7dd1e5050]=HENKKA ts=1695408855885000]
+
+ 
+h2. ListType
+
+My understanding is that a ListType is expected to return the elements of the list sorted by their timestamp. Some elements don't have a timestamp of their own, in which case they use the timestamp from the row header + physical order.
+
+When a ListType is read from disk and deserialized, a good point to start observing what happens is in BTreeRow.Builder.build():
+
+ 
+
+{{        public Row build()}}
+{{        {}}
+{{            if (isSorted || !isSorted)}}
+{{                getCells().sort();}}
+{{            // we can avoid resolving if we're sorted and have no complex values}}
+{{            // (because we'll only have unique simple cells, which are already in their final condition)}}
+{{            if (!isSorted | hasComplex)}}
+{{                getCells().resolve(CellResolver.instance);}}
+{{            Object[] btree = getCells().build();}}{{            if (deletion.isShadowedBy(primaryKeyLivenessInfo))}}
+{{                deletion = Deletion.LIVE;}}{{            int minDeletionTime = minDeletionTime(btree, primaryKeyLivenessInfo, deletion.time());}}
+{{            Row row = BTreeRow.create(clustering, primaryKeyLivenessInfo, deletion, btree, minDeletionTime);}}
+{{            reset();}}
+{{            return row;}}
+
+{
+
+{        }
+
+}}
+
+{\{    }}{_}src/java/org/apache/cassandra/db/rows/BTreeRow.java{_}
+
+ 
+
+In my tests ListType cells always come from disk with isSorted set to true. I didn't test across multiple partitions/nodes but at least locally, if I force isSorted to false, it doesn't sort anything at all...
+
+ 
+
+The problems begin elsewhere in BTreeRow.java:
+
+ 
+
+{{        private BTree.Builder<Cell<?>> getCells()}}
+{{        {}}
+{{            if (cells_ == null)}}
+{{            {}}
+{{                cells_ = BTree.builder(ColumnData.comparator);}}
+{{                cells_.auto(false);}} \{{            }}}
+{{            return cells_;}}
+
+{\\{        }
+
+}}
+
+ 
+
+When _cells is first accessed, it is initialized to an Array. However, this already seems out of place. The first elemet in the list is nowa different type than the rest, and also the first entry at index 0 includes all the list elements as a ComplexColumnData object, whereas the following entries then have one list element per entry:
+
+!image-2023-09-26-20-05-25-846.png|width=1186,height=164!
+
+ 
+
+Then in the next line, we set ColumnData.comparator as the comparator to use. However, this comparator will just use the column name (in this case, actually it is "names"...) to sort. Which of course is the same for all elements/rows, so the sort will think that all elements are equal and retain the current ordering.
+
+ 
+
+{{    public static final Comparator<ColumnData> comparator = (cd1, cd2) -> cd1.column().compareTo(cd2.column());}}
+
+ 
+
+Next steps:
+ * Ask someone with more experience what hey think should happen in cases where the timestamps and physical order differ.
+ * Propose on cassandra-dev to use the last three zeros in the timestamp to include the nodeId from the executeAt timestamp.
+ * [~kijanowski] will rerun the original test and attach sstables to this ticket.
+
+Hey [~henrik.ingo] 
+
+I've run the list-append Elle test with sstabledump
+The Elle transaction checker found an incompatible order for the register "5". 
+{code:java}
+{:type :ok, :process 10, :value [[:r 3 []] [:r 5 []]], :tid 8, :n 1, :time 1695795515655894713}
+{:type :ok, :process 1, :value [[:r 3 []] [:append 5 1501]], :tid 3, :n 1, :time 1695795515678515373}
+{:type :ok, :process 7, :value [[:r 1 [3002]] [:r 5 [1501]]], :tid 0, :n 1, :time 1695795515722077204}
+{:type :ok, :process 4, :value [[:append 5 3501]], :tid 7, :n 1, :time 1695795515732133433}
+{:type :ok, :process 5, :value [[:append 5 2501]], :tid 5, :n 1, :time 1695795515747637933}
+{:type :ok, :process 2, :value [[:append 5 2001]], :tid 4, :n 1, :time 1695795515762421482}
+{:type :ok, :process 1, :value [[:append 5 1502] [:append 1 1503]], :tid 3, :n 2, :time 1695795516713422487}
+{:type :ok, :process 9, :value [[:append 4 1002] [:append 5 1003]], :tid 2, :n 2, :time 1695795516750631050}
+{:type :ok, :process 7, :value [[:append 3 1] [:append 5 2]], :tid 0, :n 2, :time 1695795516768838437}
+{:type :ok, :process 6, :value [[:append 1 4502] [:append 5 4503]], :tid 9, :n 2, :time 1695795516822389151}
+{:type :ok, :process 1, :value [[:append 5 1504] [:append 3 1505]], :tid 3, :n 3, :time 1695795517729108770}
+{:type :ok, :process 4, :value [[:append 4 3503] [:append 5 3504]], :tid 7, :n 3, :time 1695795517807197845}
+{:type :ok, :process 10, :value [[:append 5 4003] [:append 3 4004]], :tid 8, :n 4, :time 1695795518717487386}
+{:type :ok, :process 1, :value [[:r 5 [2001 1501 2501 3501 1502 1003 2 4503 1504 3504 4003]] [:append 2 1506]], :tid 3, :n 4, :time 1695795518748688923} {code}
+Process 10 reads an empty array.
+Process 1 appends 1501.
+Process 7 reads that 1501.
+Then there are several appends starting with process 4.
+Finally process 1 reads 2001 1501 2501 ...
+The value 2001 written by process 2 is preceding the value 1501 read by process 7 earlier.
+
+Now to the sstabledump output:
+{code:java}
+{
+  "partition": {
+    "key": [
+      "5"
+    ],
+    "position": 0
+  },
+  "rows": [
+    {
+      "type": "row",
+      "position": 18,
+      "cells": [
+        {
+          "name": "contents",
+          "path": [
+            "b169b440-5cfd-11ee-ac8a-0dac7fcac316"
+          ],
+          "value": 2001,
+          "tstamp": "1695795516969001"
+        },
+        {
+          "name": "contents",
+          "path": [
+            "b169b44a-5cfd-11ee-ac8a-0dac7fcac316"
+          ],
+          "value": 1501,
+          "tstamp": "1695795516963000"
+        },
+        {
+          "name": "contents",
+          "path": [
+            "b16b61f0-5cfd-11ee-834b-b92cec395904"
+          ],
+          "value": 2501,
+          "tstamp": "1695795516969000"
+        },
+        {
+          "name": "contents",
+          "path": [
+            "b16c2540-5cfd-11ee-834b-b92cec395904"
+          ],
+          "value": 3501,
+          "tstamp": "1695795516965000"
+        },
+...
+      ]
+    }
+  ]
+} {code}
+In short, the order of the list in the sstable is:
+{code:java}
+2001 1695795516969001 appended by process 2
+1501 1695795516963000 appended by process 1 and read by process 7, before process 2 appended 2001 above
+2501 1695795516969000 appended by process 5
+3501 1695795516965000 appended by process 4 {code}
+And when sorted by the tstamp value:
+{code:java}
+1501 1695795516963000
+3501 1695795516965000
+2501 1695795516969000
+2001 1695795516969001  {code}
+... which would be a valid order.
+
+Here's another example. Here we have an anomaly for register "3":
+{code:java}
+{:type :ok, :process 2, :value [[:r 3 [2001 2002 4001]] [:append 3 2501]], :tid 5, :n 3, :time 1695632953765285595}
+{:type :ok, :process 1, :value [[:append 3 503] [:append 4 504]], :tid 1, :n 3, :time 1695632953772299980}
+{:type :ok, :process 10, :value [[:r 5 [4501 502 1 2]] [:r 3 [2001 2002 4001 503 2501]]], :tid 2, :n 3, :time 1695632953815153926} {code}
+The Elle checker prints:
+{code:java}
+Let:
+  T1 = {:index 46, :time 1695632953765285595, :type :ok, :process 2, :f nil, :value [[:r 3 [2001 2002 4001]] [:append 3 2501]], :tid 5, :n 3}
+  T2 = {:index 47, :time 1695632953772299980, :type :ok, :process 1, :f nil, :value [[:append 3 503] [:append 4 504]], :tid 1, :n 3}
+
+Then:
+  - T1 < T2, because T1 did not observe T2's append of 503 to 3.
+  - However, T2 < T1, because T1 appended 2501 after T2 appended 503 to 3: a contradiction! {code}
+An sstable dump:
+{code:java}
+{
+  "partition": {
+    "key": [
+      "3"
+    ],
+    "position": 21943
+  },
+  "rows": [
+    {
+      "type": "row",
+      "position": 21961,
+      "cells": [
+        {
+          "name": "contents",
+          "path": [
+            "31c0b3e0-5b83-11ee-b108-ab7b34917b80"
+          ],
+          "value": 2001,
+          "tstamp": "1695632953016000"
+        },
+        {
+          "name": "contents",
+          "path": [
+            "328ba500-5b83-11ee-a2ab-6fb50612de54"
+          ],
+          "value": 2002,
+          "tstamp": "1695632954193000"
+        },
+        {
+          "name": "contents",
+          "path": [
+            "331a2960-5b83-11ee-b108-ab7b34917b80"
+          ],
+          "value": 4001,
+          "tstamp": "1695632955126000"
+        },
+        {
+          "name": "contents",
+          "path": [
+            "331ce880-5b83-11ee-bca8-a35a0bbb26a1"
+          ],
+          "value": 503,
+          "tstamp": "1695632955154000"
+        },
+        {
+          "name": "contents",
+          "path": [
+            "331d36a0-5b83-11ee-a2ab-6fb50612de54"
+          ],
+          "value": 2501,
+          "tstamp": "1695632955147000"
+        },
+...
+      ]
+    }
+  ]
+} {code}
+In short, the table order is:
+{code:java}
+2001 1695632953016000
+2002 1695632954193000
+4001 1695632955126000
+ 503 1695632955154000
+2501 1695632955147000{code}
+But if it would be timestamp ordered it would be valid:
+{code:java}
+2001 1695632953016000
+2002 1695632954193000
+4001 1695632955126000
+2501 1695632955147000
+ 503 1695632955154000
+{code}
+
+Thanks! This somewhat confirms the theory then. The only exception is that this isn't about loss of precision at all. All of those timestamps are unique and the problem is just that the ListType isn't sorting at all now.
+
+[~kijanowski] When you wake up, can you  try this:
+
+{code}
+diff --git a/src/java/org/apache/cassandra/db/rows/UnfilteredRowIteratorSerializer.java b/src/java/org/apache/cassandra/db/rows/UnfilteredRowIteratorSerializer.java
+index 1be3d54558..3b0d7b78cc 100644
+--- a/src/java/org/apache/cassandra/db/rows/UnfilteredRowIteratorSerializer.java
++++ b/src/java/org/apache/cassandra/db/rows/UnfilteredRowIteratorSerializer.java
+@@ -230,7 +230,7 @@ public class UnfilteredRowIteratorSerializer
+         final SerializationHeader sHeader = header.sHeader;
+         return new AbstractUnfilteredRowIterator(metadata, header.key, header.partitionDeletion, sHeader.columns(), header.staticRow, header.isReversed, sHeader.stats())
+         {
+-            private final Row.Builder builder = BTreeRow.sortedBuilder();
++            private final Row.Builder builder = BTreeRow.unsortedBuilder();
+ 
+             protected Unfiltered computeNext()
+             {
+diff --git a/src/java/org/apache/cassandra/db/rows/UnfilteredSerializer.java b/src/java/org/apache/cassandra/db/rows/UnfilteredSerializer.java
+index d528a70a18..22bdbc745b 100644
+--- a/src/java/org/apache/cassandra/db/rows/UnfilteredSerializer.java
++++ b/src/java/org/apache/cassandra/db/rows/UnfilteredSerializer.java
+@@ -455,7 +455,7 @@ public class UnfilteredSerializer
+     throws IOException
+     {
+         // It wouldn't be wrong per-se to use an unsorted builder, but it would be inefficient so make sure we don't do it by mistake
+-        assert builder.isSorted();
++        //assert builder.isSorted();
+ 
+         int flags = in.readUnsignedByte();
+         if (isEndOfPartition(flags))
+
+{code}
+
+ 
+
+ Note the funny naming:
+
+sortedBuilder = data is already sorted, builder not sorting
+unsortedBuilder = data is not sorted, builder makes it sorted
+
+After applying [the patch|https://gist.githubusercontent.com/kijanowski/31e9534467d2c96ac3fcc7e9fff50465/raw/d6b0514c34dcd193e154d49184cd956909aac157/list-order.patch] the anomaly is still present. For register "1":
+{code:java}
+{:type :ok, :process 2, :value [[:r 3 []] [:r 1 []]], :tid 0, :n 1, :time 1695883304794618396}
+{:type :ok, :process 3, :value [[:append 1 2001] [:append 4 2002]], :tid 4, :n 1, :time 1695883304832554708}
+{:type :ok, :process 7, :value [[:r 1 [2001]]], :tid 1, :n 1, :time 1695883304854012471}
+{:type :ok, :process 1, :value [[:append 1 4501]], :tid 9, :n 1, :time 1695883304869167769}
+{:type :ok, :process 6, :value [[:r 4 [2002]] [:append 1 1501]], :tid 3, :n 1, :time 1695883304885126603}
+{:type :ok, :process 2, :value [[:r 1 [4501 2001 1501]] [:append 5 1]], :tid 0, :n 2, :time 1695883305831707192} {code}
+Process 7 reads 2001 and then process 2 reads 4501 2001 1501.
+
+sstable dump output:
+{code:java}
+[1]@5724 Row[info=[ts=-9223372036854775808] ]:  | , 
+[contents[17b726c0-5dca-11ee-a720-095e87595144]=4501 ts=1695883305918000], 
+[contents[17b774e0-5dca-11ee-a7e1-9776011062ce]=2001 ts=1695883305913000], 
+[contents[17b774ea-5dca-11ee-a7e1-9776011062ce]=1501 ts=1695883305922000], 
+... {code}
+Based on the timestamps 2001 should come before 4501.
+
+I thought that entries are sorted by cell path rather than timestamp; Timestamp is used to determine cell liveness rather than for sorting. The cellpath in this is case is a TimeUUID, which is obtained using unique time uuid generator. 
+
+Yes. Sorry, Branimir educated me on Friday about this. I thought a fix would be trivial aftert that, so didn't bother to summarize a comment here by then. Now 4 days later it's obvious I should have...
+
+Basically, the TimeUUID also needs to be (re)generated from the Accord executeAt timestamp. This way operations like appending to a list will result in a correct and consistent ordering of the list elements.
+
+Ok, so clearly I cannot brute force my way through this with late nights. I've pushed a branch which contains my work so far. I'm stuck with the unit test, I expect the actual fix to be a one liner.
+
+Status: 
+
+Blocked by org.apache.cassandra.exceptions.WriteTimeoutException
+for debugging accord transactions.
+
+Beyond that, I know what I have to do wrt how timestamps affect ordering
+of List elements. However in the unit test I created the ts
+value still is 0, and therefore all the inserted rows end up deleted.
+
+https://github.com/henrikingo/cassandra/tree/C-18798-ListType-Accord
+
+As far as I understand the problem, the issue is that the cell paths for new items are evaluated when the TransactionStatement is preprocessed on the coordinator, before the transaction is submitted. Obviously, if the execution is delayed for whatever reason, including repair, although it finishes much further in time, it may turn out that the items added by it will be in front of the items added by transactions that finished much earlier.
+
+However, there seems to be a second evaluation of updates - those that refer to the data that needs to be read first - so-called referential operations. Those updates are evaluated as a part of the application phase - thus, after reading and before writing, so that no other transaction can interleave those operations for that particular cell (partition).
+
+To me, the easiest way to fix this problem would be to make the append operation to be recognized as a referential operation. Or, discriminate the operations that can be computed on the submission time and those that need to be evaluated later, during the application phase. Or evaluate all the updates at the application phase.
+
+
+Ok, so I have taken a quick look at the code, and I can see the problem. We have implemented an {{AccordUpdateParameters} that 1) sets the ClientState timestamp and nowInSec to 42 on the assumption that all updates will be computed on the replica side. 2) does not copy over the logic from CASUpdateParameters for ensuring list appends are performed correctly.
+
+What I can say is that the time used for the cell path's TimeUUID definitely needs to be set deterministically. This could be set on the replicas using CommandsForKey's timestamp bounds, but it must handle the additional complexity of List appends a la CASUpdateParameters. If we are currently deriving these on the coordinator, we're going to be having a very bad time as the coordinator seems to always use a timestamp of {{42}}.
+
+This is another spot where I suspect we really want to update Accord to generate unique HLCs, as it would simplify this a great deal.
+
+
+After pulling the most recent cep-15-accord branch, it seems this issue is fixed: https://github.com/apache/cassandra/blob/cep-15-accord/src/java/org/apache/cassandra/service/accord/AccordKeyspace.java#L361-L363
+
+I'll rerun Jaroslaw's original consistency test tomorrow to verify.
+
+Confirmed:
+
+First run --list-append on an old branch of cep-15-accord:
+
+{code}
+hingo@odysseus:~/Documents/github/accordclient$ java -jar elle-cli/target/elle-cli-0.1.6-standalone.jar --model list-append --anomalies G0 --consistency-models strict-serializable --directory out-la --verbose test-la.edn
+
+java.lang.AssertionError: Assert failed: No transaction wrote 5 12
+t2
+        at elle.list_append$dirty_update_cases$fn__1930$fn__1935.invoke(list_append.clj:377)
+        at clojure.lang.PersistentVector.reduce(PersistentVector.java:343)
+        at clojure.core$reduce.invokeStatic(core.clj:6829)
+        at clojure.core$reduce.invoke(core.clj:6812)
+        at elle.list_append$dirty_update_cases$fn__1930.invoke(list_append.clj:372)
+        at clojure.core$map$fn__5884.invoke(core.clj:2759)
+        at clojure.lang.LazySeq.sval(LazySeq.java:42)
+        at clojure.lang.LazySeq.seq(LazySeq.java:51)
+        at clojure.lang.Cons.next(Cons.java:39)
+        at clojure.lang.RT.boundedLength(RT.java:1793)
+        at clojure.lang.RestFn.applyTo(RestFn.java:130)
+        at clojure.core$apply.invokeStatic(core.clj:667)
+        at clojure.core$mapcat.invokeStatic(core.clj:2787)
+        at clojure.core$mapcat.doInvoke(core.clj:2787)
+        at clojure.lang.RestFn.invoke(RestFn.java:423)
+        at elle.list_append$dirty_update_cases.invokeStatic(list_append.clj:370)
+        at elle.list_append$dirty_update_cases.invoke(list_append.clj:361)
+        at elle.list_append$check$dirty_update_task__2257.invoke(list_append.clj:875)
+        at jepsen.history.task.Task.run(task.clj:282)
+        at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1128)
+        at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:628)
+        at java.base/java.lang.Thread.run(Thread.java:829)
+
+{code}
+
+Then today's checkout of cep-15-accord
+
+{code}
+
+hingo@odysseus:~/Documents/github/accordclient$ java -jar elle-cli/target/elle-cli-0.1.6-standalone.jar --model list-append --anomalies G0 --consistency-models strict-serializable --directory out-la --verbose test-la.edn
+{"valid?":true}
+
+{code}
+
+(Full list of steps as in description of this ticket)
+
+According to the test mentioned below it is not fixed simply because it was not fixed yet. The test is still failing because items are added in transaction submission order rather than completion order which makes it possible to see items being prepended to the list.
+
+{code:java}
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.distributed.test.accord;
+
+import java.io.IOException;
+import java.util.List;
+import java.util.Vector;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.ForkJoinTask;
+import java.util.concurrent.TimeUnit;
+
+import com.google.common.util.concurrent.Uninterruptibles;
+import org.junit.BeforeClass;
+import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.service.accord.AccordService;
+import org.apache.cassandra.utils.concurrent.CountDownLatch;
+import org.jboss.byteman.contrib.bmunit.BMRule;
+import org.jboss.byteman.contrib.bmunit.BMUnitRunner;
+
+import static org.junit.Assert.assertArrayEquals;
+
+@RunWith(BMUnitRunner.class)
+public class AccordListTest extends AccordTestBase
+{
+    private static final Logger logger = LoggerFactory.getLogger(AccordListTest.class);
+
+    @Override
+    protected Logger logger()
+    {
+        return logger;
+    }
+
+    @BeforeClass
+    public static void setupClass() throws IOException
+    {
+        AccordTestBase.setupClass();
+        SHARED_CLUSTER.schemaChange("CREATE TYPE " + KEYSPACE + ".person (height int, age int)");
+    }
+
+    public static volatile long midTime;
+
+
+    public static void trx1PreAcceptEntryWait()
+    {
+        midTime = System.currentTimeMillis();
+        Uninterruptibles.sleepUninterruptibly(100, TimeUnit.MILLISECONDS);
+    }
+
+    @Test
+    @BMRule(name = "trx1PreAcceptEntry",
+    targetClass = "accord.messages.PreAccept",
+    targetMethod = "apply",
+    targetLocation = "AT ENTRY",
+    condition = "org.apache.cassandra.distributed.test.accord.AccordListTest.midTime == 0",
+    action = "org.apache.cassandra.distributed.test.accord.AccordListTest.trx1PreAcceptEntryWait()")
+    public void testListAddition() throws Exception
+    {
+        SHARED_CLUSTER.schemaChange("CREATE TABLE " + currentTable + " (k int PRIMARY KEY, l list<int>)");
+        SHARED_CLUSTER.forEach(node -> node.runOnInstance(() -> AccordService.instance().setCacheSize(0)));
+
+        CountDownLatch latch = CountDownLatch.newCountDownLatch(1);
+
+        Vector<Integer> completionOrder = new Vector<>();
+        try
+        {
+            ForkJoinTask<?> add1 = ForkJoinPool.commonPool().submit(() -> {
+                latch.awaitThrowUncheckedOnInterrupt();
+                SHARED_CLUSTER.get(1).executeInternal("BEGIN TRANSACTION " +
+                                                      "UPDATE " + currentTable + " SET l = l + [1] WHERE k = 1; " +
+                                                      "COMMIT TRANSACTION");
+                completionOrder.add(1);
+            });
+
+            ForkJoinTask<?> add2 = ForkJoinPool.commonPool().submit(() -> {
+                latch.awaitThrowUncheckedOnInterrupt();
+                SHARED_CLUSTER.get(1).executeInternal("BEGIN TRANSACTION " +
+                                                      "UPDATE " + currentTable + " SET l = l + [2] WHERE k = 1; " +
+                                                      "COMMIT TRANSACTION");
+                completionOrder.add(2);
+            });
+            latch.decrement();
+            add1.join();
+            add2.join();
+
+            String check = "BEGIN TRANSACTION\n" +
+                           "  SELECT l FROM " + currentTable + " WHERE k=1;\n" +
+                           "COMMIT TRANSACTION";
+
+            Object[][] result = SHARED_CLUSTER.get(1).executeInternal(check);
+            List<Integer> insertionOrder = (List<Integer>) result[0][0];
+
+            assertArrayEquals(insertionOrder.toArray(), completionOrder.toArray());
+        }
+        finally
+        {
+            SHARED_CLUSTER.filters().reset();
+        }
+    }
+}
+{code}
+
+
+
+Hmm...
+
+It did pass for me, but you're right, if repeating the test multiple times it does fail quite soon, at runs 2 to 4.
+
+Btw I added:
+
+{code}
+try
+        {
+            for (int i=0; i<100; i++)
+            {
+
+                ForkJoinTask<?> add1 = ForkJoinPool.commonPool().submit(() -> {
+{code}
+
+...so that the test is practically guáranteed to fail. (Otherwise it would be a flaky test if it passes 50% of the time...)
+
+I should note that I did rerun the --list-append test that is the test that discovered this bug in the first place, and it can no longer repro this. It passes even a fairly lengthy run.
+
+...
+I would say the addition of https://github.com/apache/cassandra/blame/cep-15-accord/src/java/org/apache/cassandra/service/accord/AccordKeyspace.java#L361-L363 clearly helps. The  {{BufferCell[] ListType.elements}} now get their timestamps updated. But what's missing?
+
+One possibility is that the list items now have their timestamps correctly aligned with Accord, but the list is never re-sorted after this?
+
+update: Working on what Branimir suggested earlier:
+
+{quote}
+Could we do this by adding an updatePathTimestamps method in AbstractType that does nothing by default but is implemented by ListType to adjust all the timestamp part of its path UUIDs, and call it from ColumnData.updateAllTimestamps?
+{quote}
+
+Will continue and elaborate tomorrow.
+
+[~henrik.ingo] I think you are focused on timestamps but timestamps is not the problem which causes incorrect order of items in the list. It is the cell path content, which is populated with timeuuid collected too early. Therefore, I'm afraid that manipulating timestamps will gives us nothing - cell path needs to be populated at the application time.
+
+Pushed new snapshot of progress: https://github.com/henrikingo/cassandra/commit/4b2292bfa52ed713163abbc4f72b8300bf630e8e
+
+This commit "fixes" the issue in the sense that {{updateAllTimestampAndLocalDeletionTime()}} will now also update the {{path}} variable for elements of a ListType. However, this does not actualy fix the issue. In the unit test that's also part of the patch, the transactions end up always having the same timestamp, and hence generate the same TimeUUID().
+
+(Note that separately we might wonder what would happen if we append 2 list elements in the same transaction?)
+
+To emphasize  the point that the above does the right thing given the original assumptions, if I just use { {nextTimeUUID()}}, which generates new UUIDs, not just maps the current timestamp to a deterministic UUID, then the test "passes", though I doubt that would be correct in a real cluster with multiple nodes. IT works on a single node because this code executes serially in the accord execution phase, so newly generated UUIDs are ordered correctly, even if they are not the correct UUIDs. (...as in derived from the Accord transaction id)
+
+But ok, debugging this I realized another issue, which I first thought was with the test setup, but might be some kind of race condition. It turns out the two transactions in the unit test end up executing with the exact same timestamps.
+
+{noformat}
+lastmicros 0
+DEBUG [node2_CommandStore[1]:1] node2 2023-10-17 15:39:35,579 AccordMessageSink.java:167 - Replying ACCORD_APPLY_RSP ApplyApplied to /127.0.0.1:7012
+DEBUG [node1_RequestResponseStage-1] node1 2023-10-17 15:39:35,580 AccordCallback.java:49 - Received response ApplyApplied from /127.0.0.2:7012
+lastmicros 0
+raw 0  (NO_LAST_EXECUTED_HLC=-9223372036854775808
+lastExecutedTimestamp [0,0,0,0]
+lastmicros 1697546374434000
+raw 0  (NO_LAST_EXECUTED_HLC=-9223372036854775808
+raw -9223372036854775808  (NO_LAST_EXECUTED_HLC=-9223372036854775808
+lastExecutedTimestamp [0,0,0,0]
+lastExecutedTimestamp [10,1697546374434000,10,1]
+lastmicros 1697546374434000
+raw -9223372036854775808  (NO_LAST_EXECUTED_HLC=-9223372036854775808
+lastExecutedTimestamp [10,1697546374434000,10,1]
+timestamp 1697546374434000    executeAt[10,1697546374434000,10,1]
+timestamp 1697546374434000    executeAt[10,1697546374434000,10,1]
+{noformat}
+
+But adding a sleep to one thread, it resolves the issue (also makes the test pass, actually):
+{code}
+                ForkJoinTask<?> add2 = ForkJoinPool.commonPool().submit(() -> {
+                    try {
+                        Thread.sleep(1000);
+                    }catch (InterruptedException e){
+                        // It's ok
+                    }
+
+                    latch.awaitThrowUncheckedOnInterrupt();
+                    SHARED_CLUSTER.get(1).executeInternal("BEGIN TRANSACTION " +
+                            "UPDATE " + currentTable + " SET l = l + [2] WHERE k = 1; " +
+                            "COMMIT TRANSACTION");
+                    completionOrder.add(2);
+                });
+
+{code}
+
+{noformat}
+lastmicros 1697544893676000
+raw 1697544893676000  (NO_LAST_EXECUTED_HLC=-9223372036854775808
+lastExecutedTimestamp [10,1697544893676000,10,1]
+lastmicros 1697544894677000
+raw -9223372036854775808  (NO_LAST_EXECUTED_HLC=-9223372036854775808
+lastExecutedTimestamp [10,1697544894677000,10,1]
+timestamp 1697544894677000    executeAt[10,1697544894677000,10,1]
+DEBUG [node2_CommandStore[1]:1] node2 2023-10-17 15:14:54,728 AccordMessageSink.java:167 - Replying ACCORD_APPLY_RSP ApplyApplied to /127.0.0.1:7012
+DEBUG [node1_RequestResponseStage-1] node1 2023-10-17 15:14:54,728 AccordCallback.java:49 - Received response ApplyApplied from /127.0.0.1:7012
+DEBUG [node2_Messaging-EventLoop-3-4] node2 2023-10-17 15:14:54,728 AccordVerbHandler.java:54 - Receiving PreAccept{txnId:[10,1697544894711000,0,1], txn:{read:TxnRead{TxnNamedRead{name='RETURNING:', key=distributed_test_keyspace:DecoratedKey(-4069959284402364209, 00000001), update=Read(distributed_test_keyspace.tbl0 columns=*/[l] rowFilter= limits= key=1 filter=names(EMPTY), nowInSec=0)}}}, scope:[distributed_test_keyspace:-4069959284402364209]} from /127.0.0.1:7012
+DEBUG [node1_CommandStore[1]:1] node1 2023-10-17 15:14:54,730 AbstractCell.java:144 - timestamp: 1697544894677000   buffer: 0    newPath: java.nio.HeapByteBuffer[pos=0 lim=16 cap=16]
+lastmicros 1697544893676000
+raw 1697544893676000  (NO_LAST_EXECUTED_HLC=-9223372036854775808
+lastExecutedTimestamp [10,1697544893676000,10,1]
+lastmicros 1697544894677000
+raw -9223372036854775808  (NO_LAST_EXECUTED_HLC=-9223372036854775808
+lastExecutedTimestamp [10,1697544894677000,10,1]
+DEBUG [node1_RequestResponseStage-1] node1 2023-10-17 15:14:54,734 AccordCallback.java:49 - Received response ApplyApplied from /127.0.0.2:7012
+timestamp 1697544894677000    executeAt[10,1697544894677000,10,1]
+{noformat}
+
+{noformat}
+{noformat}
+
+
+
+The fact that the sleep helps makes me suspicious this is not a test setup issue, but actual race condition.
+
+Okay actually bug was in my own code after all. I had lost 10 microseconds granularity. Seems to work now, pushed a commit, taking a break.
+
+New branch btw: https://github.com/apache/cassandra/pull/2830
+
+This seems to work now. Key was to understand what each method in TimeUUID class really does.
+
+I'll add some source code commentary in that regard on Monday, then submit for review. 
+
+[~kijanowski] to confirm whether the Elle test now passes
+
+Ok, above PR now ready for review [~jlewandowski]. Let me know if I need to squash commits or something first?
+
+Status: The issue with TimeUUID() generating different values on each replica is a universal problem. Halting this work while waiting for discussion in #cassandra-accord
+
+The list path timestamp update issue is going to be fixed in the live migration branch that will probably merge today. Sorry I didn't catch this JIRA earlier. Your approach updating the timestamp once it is known is roughly correct.
+

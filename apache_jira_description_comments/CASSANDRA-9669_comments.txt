@@ -1,0 +1,361 @@
+So, I've been mulling this over and would like to outline the tradeoffs and get agreement before implementation:
+
+The simplest approach is to _delay flush completion_ until all prior flushes have succeeded. i.e., all flushes for a given table will complete in the order they are submitted, i.e. in CommitLog order. They will remain as tmp files, and the memtables will continue to service requests for that data, until all earlier flushes for that table have also completed. There is one serious flaw here, though, which is that CASSANDRA-7275 becomes even more devastating. In this scenario, the server's memtable space will rapidly be completely exhausted, and there is simply no escaping it. 
+
+In 2.1+ we can mitigate this by "opening early" (even though it's a flush) and evicting the memtable immediately, only upgrading it to a permanent file once prior flushes have completed. However 2.0's stability for some users may be significantly affected.
+
+Another possibility is to begin saving the start replay position with sstables (on top of end), and on restart ensure we replay anything present in a gap. This would mean a number of small changes with e.g. metadata, but would also introduce some extra compaction complexity, which I'm reticent to introduce: we would have to prevent compaction from being permitted on any sstable that was "ahead" of its prior flushes. Compaction logic is already unpleasantly complex around these kinds of decisions, especially in 2.1, and introduces risks to 2.0 and 2.1 I would like to avoid.
+
+Any solution is going to be more involved than I would like for 2.0 or 2.1, though.
+
+[~xedin]: your input would be appreciated here, since you're the only user we know of to have encountered CASSANDRA-7275 (though no doubt there are others).
+
+I've pushed branches for [2.0|https://github.com/belliottsmith/cassandra/tree/9669-2.0] [2.1|https://github.com/belliottsmith/cassandra/tree/9669-2.1] and [2.2|https://github.com/belliottsmith/cassandra/tree/9669-2.2]
+
+All of them are ugly.
+
+So, I am liking this approach less and less. It may be the least effort, but it has too many sharp edges, in critical portions of the system. It's also literally a custom endeavour for 2.0, 2.1, 2.2 _and_ 3.0.
+
+I think I will introduce a new commit log expiration ledger, and just write to it whenever we perform a {{discardCompletedSegments()}} call. This is then replayed prior to CL replay, to build the state of what records we consider replayable. Initially, I will limit this to a simple statement of "latest replayposition we can be certain to have replayed to" since this is a uniform behaviour for 2.0+. 2.1+ easily supports ranges, which can be implemented when we deliver CASSANDRA-8496.
+
+Ick. So, thinking about it from a 2.0 perspective, this is even more of a problem for counters. Since CL replay of a counter that is already persisted causes a double-count. 
+
+Question is: do we care? If we do, we should probably stick with the solution I already posted for 2.0. For 2.1+ I think a ledger is a better route.
+
+[~benedict] I like min/max replay range tracking per sstable idea from CASSANDRA-8496 you've also mentioned here. I'm pretty sure some extra complexity in the compaction path is worth having safe reply.
+
+So, I have a patch available for this [here|https://github.com/belliottsmith/cassandra/tree/9669-2.0]
+
+I managed to make it less invasive than I had anticipated, but it still requires an sstable version increment. The patch:
+
+* Introduces a commitLogLowerBound to the memtable, which tracks the commit log position at its creation
+* Changes sstable metadata's "replayPosition" into "commitLogLowerBound" and "commitLogUpperBound" in the new sstable version
+* Delays exposing a new sstable to the compaction strategy until all of its preceding flushes have completed
+* On compaction, extends the new sstable's lower/upper bounds to the min/max of all sstables we're replacing. Given (3), we only extend over ranges that are known to already be covered by other sstables.
+* On replay, we take any range covered by an sstable to not need replay (and any range prior to the earliest known safe range is also ignored)
+
+Test Engineering: there are failures on dtests, but I cannot tell if these are new or existing. Mostly the look like flakey tests. The one that looks most worrisome to me is counter upgrade test, but could you take a look and tell me what you think of the test situation in general? Modifying 2.0 makes me uncomfortable
+
+First round of review, focussing at the replay logic:
+
+{{ReplayPosition.add}} is suspect, as [in extending the end|https://github.com/apache/cassandra/compare/trunk...belliottsmith:9669-2.0#diff-2b76f3efa4aaa38339ab8f4869c9b7bfR70] {{extend != null}} implies {{extend.getKey().compareTo(end) >= 0}} and this makes the branch reachable only if {{end == entend.getKey()}} which I don't think is what you want.
+
+The other direction appears correct, but the two can't be symmetrical as we can only key into starts. This is sufficient as {{range\[i\].key/lower < range\[i\].value/upper < range\[i+1\].key/lower}} (which I think you should clarify in a comment) and thus the entry we want to extend us on the right is the one before the first start larger than our end. {{end = max(end, floorEntry(end).value)}} should do it.
+
+There's no need to recursively rerun, extending in either direction has no effect on the other side so you can do the two in sequence.
+
+{{ReplayPosition.min}} should be a bit more descriptively named, e.g. "minUpperBound" or "firstNotCovered".
+
+I'd call [CommitLogReplayer.replay|https://github.com/apache/cassandra/compare/trunk...belliottsmith:9669-2.0#diff-348a1347dacf897385fb0a97116a1b5eR166] "shouldReplay". Consider moving the containment logic (the last two lines) into {{ReplayPosition}} to keep the details of the range format within the class. I believe the intervals are start-inclusive, end-exclusive, thus the [final comparison|https://github.com/apache/cassandra/compare/trunk...belliottsmith:9669-2.0#diff-348a1347dacf897385fb0a97116a1b5eR172] should be {{<=}}.
+
+Could you update the JavaDoc, especially returned values (e.g. [here|https://github.com/apache/cassandra/compare/trunk...belliottsmith:9669-2.0#diff-98f5acb96aa6d684781936c141132e2aR2498] and [here|https://github.com/apache/cassandra/compare/trunk...belliottsmith:9669-2.0#diff-f0a15c3588b56c5ce53ece7c48e325b5R247])? The comment [here|https://github.com/apache/cassandra/compare/trunk...belliottsmith:9669-2.0#diff-348a1347dacf897385fb0a97116a1b5eR333] is outdated.
+
+Is [FlushRunnable.runMayThrow|https://github.com/apache/cassandra/compare/trunk...belliottsmith:9669-2.0#diff-f0a15c3588b56c5ce53ece7c48e325b5R352] still needed? DiskAwareRunnable?
+
+I'll continue looking at rest of the code tomorrow.
+
+Thanks. Looking at the patch, it's clear I wrote it in a bit of a rush, as there's another problem with it: it doesn't actually delay compaction with STCS. I will need to make STCS rely on the notifyAdded, much as LCS does, or introduce a new collection in {{DataTracker}} (this latter being less invasive, but uglier)
+
+I will look to introduce at least a basic unit test for this problem, as well as fix these problems, tomorrow. However the main thrust of the patch is still good, so it's up to you if you want to abort review in lieu of this.
+
+Should we really ignore the timespan before the first known sstable interval? This can break correct replay for a fresh table, can't it (if the first two flushes are initiated close together and the node dies after the latter completes early)?
+
+{{CompactionManager.instance.submitBackground(cfstore)}} in [permitCompactionOfFlush|https://github.com/apache/cassandra/compare/trunk...belliottsmith:9669-2.0#diff-06edf300ef64021a42929f19d0cfba3bR185] is new and appears to be a change in behaviour. Could you explain in a comment why it is now necessary?
+
+[SSTableMetadata.deserialize|https://github.com/apache/cassandra/compare/trunk...belliottsmith:9669-2.0#diff-0c40f7e67fc53dd15d5fe193e55b2b04R494]: is there a reason to pass {{hasCommitLogLowerBound}} around separately when it always matches the one in the passed descriptor?
+
+bq. Should we really ignore the timespan before the first known sstable interval? This can break correct replay for a fresh table, can't it (if the first two flushes are initiated close together and the node dies after the latter completes early)?
+
+You mean the global position, I assume? I wasn't really sure the best thing to do here, since it's a major performance optimisation to skip large chunks of commit log. I'm not so sure about regressing 2.0 replay for a border case during replay of a fresh table, when we've been so broken for all tables. I'm also reticent to make more changes than absolutely necessary; tracking the commit log replay position at construction of a table would be the better solution, but I would rather wait until 3.0+ for that.
+
+I'm working on improving the comments as well as addressing the other issues.
+
+I've pushed an update that I hope addresses most of your (current) concerns. I'll now work on introducing some basic unit tests, before giving it another final review of my own.
+
+I've updated the patch to include a unit test, and to fix two more problems. One typo, and the {{shouldReplay}} logic was still incorrect. Whenever I interface with ReplayPosition I have a strong urge to rewrite it. It is terribly counterintuitive, but I guess that's what we have unit tests for.
+
+Long story short, the ranges are inclusive-start, exclusive-end, the inverse of what you expected. This confusion stems from the fact we use points to represent ranges (i.e. commit log entries) and points that demarcate ranges (those that have been persisted), which doesn't really make sense. But during replay, and on a write, the {{ReplayPosition}} for a record is the position in the segment _directly proceeding_ its serialization location, i.e. it is the exclusive upper bound of its bytes. It is, in effect, represented by the one number that falls outside of its on disk representation.
+
+Anyway, it's good for a proper review now. I accidentally collapsed the most recent follow up commit with the one I uploaded this morning, but mostly this was just the unit test, plus those two items (one removed {{!}}, and the inverted bounds checking)
+
+The code looks good now, +1.
+
+bq. the ranges are inclusive-start, exclusive-end, the inverse of what you expected
+
+Yes, they are the inverse of what I expected, but that's actually start-exclusive, end-inclusive, the [shouldReplay comment|https://github.com/apache/cassandra/commit/459b96333c84837fe757d706c2a6be91b8b27f2e#diff-2b76f3efa4aaa38339ab8f4869c9b7bfR88] is correct. I'd also add "as a mutation's replay position is assigned after it is added to the log" to it.
+
+Deleting the files at [the start of the test|https://github.com/apache/cassandra/commit/459b96333c84837fe757d706c2a6be91b8b27f2e#diff-b3802331f8dcba05356ad47ee54fe6dfR321] may cause problems on Windows, but I don't know how to this safely in 2.0.
+
+
+There was a consensus that it was too late in 2.0's lifecycle to fix this there, however the patch is available for anyone that wants to apply it.
+
+I've merged/rebased with 2.1 [here|https://github.com/belliottsmith/cassandra/tree/9669-2.1], which necessarily changes it not insignificantly. It's ready for another round of review (although CI is screwy right now, so hard to say with certainty it hasn't introduced any regressions).
+
+
+[Memtable.isCleanAfter|https://github.com/apache/cassandra/compare/trunk...belliottsmith:9669-2.1#diff-f0a15c3588b56c5ce53ece7c48e325b5R171] doesn't look right. This guarantees that it does not contain data _before_ the given position, and thus {{CFS.forceFlush(ReplayPosition)}} does not appear to use it correctly.
+
+[Descriptor.Version.isCompatible|https://github.com/apache/cassandra/compare/trunk...belliottsmith:9669-2.1#diff-d1b9592895e36631679f1d5cab0f61f1R97] is suspect in the context of this ticket, "ka" reader says compatible with "kb" data but read will fail. Later readers (e.g. "la") will also fail to read these tables but say they are compatible. Could this cause trouble?
+
+The new format needs to be added to {{LegacySSTableTest}} and {{test/data/legacy-sstables}} and included in 2.2 and 3.0 versions of the patch.
+
+\\
+\\
+Nits:
+
+[Memtable.approximateCommitLogLowerBound|https://github.com/belliottsmith/cassandra/blob/d190c29d5e24e0b2a93a844d250695107e8bb942/src/java/org/apache/cassandra/db/Memtable.java#L64]: This must satisfy {{approximateCommitLogLowerBound <= commitLogLowerBound}} (after discarding predecessor), mustn't it? Could you add a comment to say so?
+
+[Memtable.forceFlush(ReplayPosition)|https://github.com/apache/cassandra/compare/trunk...belliottsmith:9669-2.1#diff-98f5acb96aa6d684781936c141132e2aR972] no longer loops through index CFSes, can you add a comment to state why this is the right thing to do?
+
+[writeSortedContents|https://github.com/apache/cassandra/compare/trunk...belliottsmith:9669-2.1#diff-f0a15c3588b56c5ce53ece7c48e325b5R379]: duplicate log?
+
+[Descriptor.Version version text|https://github.com/apache/cassandra/compare/trunk...belliottsmith:9669-2.1#diff-d1b9592895e36631679f1d5cab0f61f1R56]: 2._1_.7; j versions are compatible according to {{isCompatible}}, shouldn't comment be retained?
+
+[LegacyMetadataSerializer.serialize|https://github.com/apache/cassandra/compare/trunk...belliottsmith:9669-2.1#diff-0f1c5b6135b34548f033e5168f6761a5R96]: No need to declare {{commitLogUpperBound}} here. Declare with assignment below to ease reading.
+
+[SSTableMetadataViewer|https://github.com/apache/cassandra/compare/trunk...belliottsmith:9669-2.1#diff-63785fd0e03996f22c0c2c38eb137f7fR71]: Could use some text describing what's being printed.
+
+
+bq. Memtable.isCleanAfter doesn't look right. 
+
+Good catch, I have inverted the implementation and meaning, and renamed it to {{mayContainDataSince}}
+
+bq.  "ka" reader says compatible with "kb" data but read will fail
+
+Hmm. This is a bit of a problem. I must admit I didn't look too closely at compatibility, since I assumed the whole point of the major/minor chars was to permit intra- and extra-version sstable version increments. Without that, this seems to be a bit of a mess. I guess we will need to increment all of the sstable versions past the max of the current. We should perhaps rethink accepting all versions <= first char of current, as it doesn't permit much flexibility.
+
+Thanks. I'll address this, your nits, and what looks like a relatively innocuous problem with DTCS shortly.
+
+
+
+
+
+bq. Hmm. This is a bit of a problem. 
+
+I remember now why it is not. We don't generally permit downgrades, and when upgrading you must upgrade via the latest of any intervening minor version. 
+
+Whether or not this is a problem, I think it's probably better left for another ticket, but I think we would be best off fixing it so a given c* version knows the maximum sstable version it can read for each prior (and equal) minor cassandra version. So long as the main data format is the same (which is the case here) there shouldn't be a problem, as we only stream the data contents between nodes, so there's no reason for an old version to see a new file. However we should probably make that more robust to sstable version changes also.
+
+FWIW we do have startup checks that do this - https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/service/StartupChecks.java#L209
+
+Except that this won't fail the startup checks if you downgrade patch versions. Or upgrade to a non-latest patch version when upgrading your major/minor.
+
+I've addressed your nits, but giving the patch another review, I realise that the approach I've taken with the new parent compaction strategy isn't going to cut it in 2.1. This isn't the complete set of operations that can mark things compacting, and if we e.g. redistribute summaries (or attempt an "all sstable" operation) we may screw up the state badly. 
+
+In 2.1, we can instead safely mark compacting before we make the sstable available in the live set, however this too has problems: any "all sstable" operation will fail if flushes have gotten far behind, or secondary index flushes are taking too long. So we will probably have to introduce a new of sstables into the DataTracker.View that tracks these _almost complete_ sstables, and filters them from any "all sstable" operation. This is a really rather ugly edge case to behaviour, and in 3.X I'll see if there's anything we can do to make it more apparent to consumers of the API.
+
+I've pushed a new version of this [here|https://github.com/belliottsmith/cassandra/tree/9669-2.2]. This introduces a new {{premature}} set into {{lifecycle.View}}, which any sstable is maintain in until all preceding (and custom 2i) writes have completed.
+
+This version is against 2.2, as 2.1 will go EOL soon, and I don't feel comfortable changing these semantics without any recourse if something isn't right.
+
+The code looks good to me.
+
+Nit: [Comment to {{Memtable}} contructor|https://github.com/apache/cassandra/compare/trunk...belliottsmith:9669-2.2#diff-f0a15c3588b56c5ce53ece7c48e325b5R96] appears wrong as it is the one e.g. {{CFS.Flush}} uses.
+
+[~blambov] As Benedict is currently out, do you mind pushing the branch with your nit fixed and running CI on it to be sure (as I don't see a recent CI run for this).
+
+Rebased and uploaded [here|https://github.com/blambov/cassandra/tree/belliottsmith-9669-2.2]. [Testall|http://cassci.datastax.com/job/blambov-belliottsmith-9669-2.2-testall/] is clean, [dtest|http://cassci.datastax.com/job/blambov-belliottsmith-9669-2.2-dtest/] has a [test_closing_connections failure|http://cassci.datastax.com/job/blambov-belliottsmith-9669-2.2-dtest/lastCompletedBuild/testReport/thrift_hsha_test/ThriftHSHATest/test_closing_connections/].
+
+The same failure appeared on the [second dtest run|http://cassci.datastax.com/view/Dev/view/blambov/job/blambov-belliottsmith-9669-2.2-dtest/2/testReport/], and isn't present in any of the [base runs|http://cassci.datastax.com/job/cassandra-2.2_dtest/]. Looks like this is a real regression.
+
+Rebased and run tests again, they are flaky but doesn't appear there's any repeatable problem:
+|[code|https://github.com/blambov/cassandra/tree/belliottsmith-9669-2.2]|[utests|http://cassci.datastax.com/view/Dev/view/blambov/job/blambov-belliottsmith-9669-2.2-testall/]|[dtests|http://cassci.datastax.com/view/Dev/view/blambov/job/blambov-belliottsmith-9669-2.2-dtest/]|
+
+There do seem to be some failures not on stock 2.2, but they do not seem to be plausibly related.  The snitch problem appears to literally be a snitch problem, for instance.
+
+There do appear to be an unpleasantly large number of flaky tests for 2.2, however, so it's very hard to say much with clarity.
+
+According to [https://wiki.apache.org/cassandra/CompatibilityGuarantees] this may have to be delayed until 4.0
+
+bq. According to https://wiki.apache.org/cassandra/CompatibilityGuarantees this may have to be delayed until 4.0
+
+Can you clarify which rule would be broken by this patch? If that's the downgrading one due a change to the commit log format, then that's a good point but I think I'd be personally fine amending that rule slightly to say that you can downgrade but you have to drain before doing so. The other option being to proceed in 2 steps: have an intermediate version that is able to read both the old and new format of the commit log, but still write the old one, and switching to the new one in the following version. Or of course to wait for 4.0.
+
+The sstable version is also modified, and that clause seems to prohibit such a change.
+
+That clause doesn't prevent all sstable version changes. It's ok to do a "minor" sstable version bump by adding new fields at the end of the sstable metadata since older version will just ignore it. From a quick glance to the patch, it does seem to change the metadata in a way that is not backward compatible, but it looks trivial to change it so that it is. This is listed at the end of the compatibility document btw.
+
+The only way to make it backwards compatible is to carry on blithely if the value is not present.  I'm not sure I'm a particular fan of this approach, because this is pretty critical to correctness, and simply ignoring its absence is ripe for future bugs screwing it up.
+
+At the very least we should create a 4.0 line where this can be implemented properly
+
+It's possible I'm missing something here, but say we commit this to 3.4, we can still bump the sstable version to {{"mb"}}, writting the new lower bound replay position at the end of the metadata and 3.4 would still _always_ expect that lower bound to be present when reading {{"mb"}} sstables. But if someone decides to use a {{"mb"}} sstable with 3.3, this will still work because 1) to the best of my knowledge, 3.3 doesn't reject (sstable) version in the future (and it's the same "major" sstable version so streaming and such are not impacted) and 2) it'll just ignore the additional data it doesn't know at the end of the metadata file.
+
+The only ugliness I see is that in the sstable metadata the lower and upper bound are not serialized close from each other, but that's a very minor and very localized (in the code) ugliness and can be easily fixed later in 4.0.
+
+
+Hmm, I guess I was getting confused with CL versions - I thought we refused to startup if we had a newer version than we know about.  My mistake
+
+I would still consider updating the guide to specify clearly that a drain is necessary on downgrade.  In fact - and I realise this is completely off-topic now - I think we need to ensure that after a drain we leave no intact segment.  Even an empty segment would cause a downgrade to fail if it's the wrong version.
+
+You're right, I'll add that.
+
+I believe the patch needs at least the changes discussed above, of making the changes to the sstable metadata only be new appends to the end. [~benedict] could you make those changes?
+
+Also, I'm slightly confused on the versions here: I see the patch for 2.2 with CI results but nothing for 3.0. Surely the patch doesn't merge up cleanly, does it?
+
+I've already made the changes and am working on a merge (you assume correctly; it is in fact quite painful).
+
+Patch for 3.0 available [here|https://github.com/belliottsmith/cassandra/tree/9669-3.0]
+
+Seems we have both the 2.2 and 3.0 version now. [~blambov] can you do a last round of review, especially on the 3.0 version, when you have a minute?
+
+Rebased patches with a couple of extra tests:
+
+|[2.2|https://github.com/blambov/cassandra/tree/belliottsmith-9669-2.2-rebased-2]|[utest|http://cassci.datastax.com/job/blambov-belliottsmith-9669-2.2-rebased-2-testall/]|[dtest|http://cassci.datastax.com/job/blambov-belliottsmith-9669-2.2-rebased-2-dtest/]|
+|[3.0|https://github.com/blambov/cassandra/tree/belliottsmith-9669-3.0-rebased-2]|[utest|http://cassci.datastax.com/job/blambov-belliottsmith-9669-3.0-rebased-2-testall/]|[dtest|http://cassci.datastax.com/job/blambov-belliottsmith-9669-3.0-rebased-2-dtest/]|
+
+The code looks good to me in both, tests are still running.
+
+The test failures appear to be flakes -- mainly timeouts, and the failing tests pass when I run them locally. Patch is thus ready to commit.
+
+Wanted to commit, but the 3.0 code doesn't merge cleanly to 3.7/trunk at all. [~blambov] could you attach branches/tests for those version too (there is also a minor conflict on 2.2/3.0 due to a recent commit. I was planning to fix that during commit before seeing that merging up was more complex, but if you could rebase and squahs those branches too, that would make my life easier). 
+
+Squashed and rebased again, added CHANGES.txt line and commit message, and made 3.7 and trunk versions:
+
+|[2.2|https://github.com/blambov/cassandra/tree/belliottsmith-9669-2.2-rebased-2]|[utest|http://cassci.datastax.com/job/blambov-belliottsmith-9669-2.2-rebased-2-testall/]|[dtest|http://cassci.datastax.com/job/blambov-belliottsmith-9669-2.2-rebased-2-dtest/]|
+|[3.0|https://github.com/blambov/cassandra/tree/belliottsmith-9669-3.0-rebased-2]|[utest|http://cassci.datastax.com/job/blambov-belliottsmith-9669-3.0-rebased-2-testall/]|[dtest|http://cassci.datastax.com/job/blambov-belliottsmith-9669-3.0-rebased-2-dtest/]|
+|[3.7|https://github.com/blambov/cassandra/tree/belliottsmith-9669-3.7]|[utest|http://cassci.datastax.com/job/blambov-belliottsmith-9669-3.7-testall/]|[dtest|http://cassci.datastax.com/job/blambov-belliottsmith-9669-3.7-dtest/]|
+|[trunk|https://github.com/blambov/cassandra/tree/belliottsmith-9669-trunk]|[utest|http://cassci.datastax.com/job/blambov-belliottsmith-9669-trunk-testall/]|[dtest|http://cassci.datastax.com/job/blambov-belliottsmith-9669-trunk-dtest/]|
+
+Tests look okay.
+
+Perfect, committed, thanks.
+
+This seems to have broken something.  A bunch of test we have started failing to truncate things with timeouts, and a bunch of threads blocked like so:
+
+{code}
+"SharedPool-Worker-15" 
+   java.lang.Thread.State: BLOCKED
+        at org.apache.cassandra.db.ColumnFamilyStore.truncateBlocking(ColumnFamilyStore.java:1973)
+        at org.apache.cassandra.db.TruncateVerbHandler.doVerb(TruncateVerbHandler.java:40)
+        at org.apache.cassandra.net.MessageDeliveryTask.run(MessageDeliveryTask.java:67)
+        at java.util.concurrent.Executors$RunnableAdapter.call(Executors.java:511)
+        at org.apache.cassandra.concurrent.AbstractLocalAwareExecutorService$FutureTask.run(AbstractLocalAwareExecutorService.java:164)
+        at org.apache.cassandra.concurrent.AbstractLocalAwareExecutorService$LocalSessionFutureTask.run(AbstractLocalAwareExecutorService.java:136)
+        at org.apache.cassandra.concurrent.SEPWorker.run(SEPWorker.java:105)
+        at java.lang.Thread.run(Thread.java:745)
+{code}
+
+On cassandra-3.0@78a3d2bba95b9efcda152a157f822f4970f22636
+
+Probably blocked by:
+{code}
+"SharedPool-Worker-1" 
+   java.lang.Thread.State: WAITING
+        at sun.misc.Unsafe.park(Native Method)
+        at java.util.concurrent.locks.LockSupport.park(LockSupport.java:175)
+        at java.util.concurrent.FutureTask.awaitDone(FutureTask.java:429)
+        at java.util.concurrent.FutureTask.get(FutureTask.java:191)
+        at org.apache.cassandra.utils.FBUtilities.waitOnFuture(FBUtilities.java:380)
+        at org.apache.cassandra.db.ColumnFamilyStore.forceBlockingFlush(ColumnFamilyStore.java:894)
+        at org.apache.cassandra.db.ColumnFamilyStore.truncateBlocking(ColumnFamilyStore.java:1975)
+        at org.apache.cassandra.db.TruncateVerbHandler.doVerb(TruncateVerbHandler.java:40)
+        at org.apache.cassandra.net.MessageDeliveryTask.run(MessageDeliveryTask.java:67)
+        at java.util.concurrent.Executors$RunnableAdapter.call(Executors.java:511)
+        at org.apache.cassandra.concurrent.AbstractLocalAwareExecutorService$FutureTask.run(AbstractLocalAwareExecutorService.java:164)
+        at org.apache.cassandra.concurrent.AbstractLocalAwareExecutorService$LocalSessionFutureTask.run(AbstractLocalAwareExecutorService.java:136)
+        at org.apache.cassandra.concurrent.SEPWorker.run(SEPWorker.java:105)
+        at java.lang.Thread.run(Thread.java:745)
+{code}
+
+And
+{code}
+"MemtablePostFlush:1" 
+   java.lang.Thread.State: BLOCKED
+        at org.apache.cassandra.index.SecondaryIndexManager.flushIndexesBlocking(SecondaryIndexManager.java:466)
+        at org.apache.cassandra.index.SecondaryIndexManager.flushAllNonCFSBackedIndexesBlocking(SecondaryIndexManager.java:484)
+        at org.apache.cassandra.db.ColumnFamilyStore$PostFlush.call(ColumnFamilyStore.java:936)
+        at org.apache.cassandra.db.ColumnFamilyStore$PostFlush.call(ColumnFamilyStore.java:901)
+        at java.util.concurrent.FutureTask.run(FutureTask.java:266)
+        at java.util.concurrent.Executors$RunnableAdapter.call(Executors.java:511)
+        at java.util.concurrent.FutureTask.run(FutureTask.java:266)
+        at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1142)
+        at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:617)
+        at java.lang.Thread.run(Thread.java:745)
+{code}
+
+I'm not sure if the behaviour for locking on the base table when flushing indexes was present when I wrote this patch, but both that sync (in SecondaryIndexManager), and this one (in truncation), are ill advised:
+
+* Synchronizing on a base table for an action that is triggered by an acton that itself must synchronize on the base table is asking for trouble
+* Synchronizing in either case over a lengthy operation that may itself synchronize is also asking for trouble
+
+As it is, I threw the synchronized in there along with some other modifications to make the truncation of views less obviously broken.  I think it's probably still broken, just less obviously so, so it may as well be taken out to make this right.
+
+I've been able to reproduce this with a plain custom 2i that doesn't have a backing CF:
+
+{noformat}
+cqlsh> CREATE KEYSPACE truncation_test WITH replication = {'class': 'NetworkTopologyStrategy' , 'DC1': '1'};
+cqlsh> use truncation_test ;
+cqlsh:truncation_test> CREATE TABLE simple_table (id text, value text, PRIMARY KEY (id));
+cqlsh:truncation_test> CREATE CUSTOM INDEX value_index ON simple_table (value) USING 'c.d.b.util.DummyIndex';
+cqlsh:truncation_test> INSERT INTO simple_table(id,value) VALUES('1','value1');
+cqlsh:truncation_test> TRUNCATE simple_table;
+OperationTimedOut: errors={}, last_host=127.0.0.1
+{noformat}
+
+Patch to remove the synchronization from {{truncateBlocking}} here:
+|[3.0|https://github.com/blambov/cassandra/tree/9669-fix-sync-3.0]|[utest|http://cassci.datastax.com/job/blambov-9669-fix-sync-3.0-testall/]|[dtest|http://cassci.datastax.com/job/blambov-9669-fix-sync-3.0-dtest/]|
+|[trunk|https://github.com/blambov/cassandra/tree/9669-fix-sync-trunk]|[utest|http://cassci.datastax.com/job/blambov-9669-fix-sync-trunk-testall/]|[dtest|http://cassci.datastax.com/job/blambov-9669-fix-sync-trunk-dtest/]|
+(3.0 patch applies cleanly upwards)
+
+This is a temporary fix; I will think more seriously about the safety of this as part of {{PostFlush}} removal (CASSANDRA-8496).
+
+I don't know if there are other implications of removing that synchronized, but my tests work again on that branch.
+
+I assume that there is no 2.2 patch for that removal because 2.2 is not affected?
+
+That's correct, no sync was added in the 2.2 version.
+
+Actually.... I did move the synchronized out one step to encompass the {{forceBlockingFlush}} in 2.2, so it is affected.
+
+
+Oops, I've managed to overlook that. The sync in the index manager that causes the deadlock in combination with it is not present, though.
+
+Anyway, it is probably best to revert the synchronization change in 2.2 as well. Patch here:
+|[2.2|https://github.com/blambov/cassandra/tree/9669-fix-sync-2.2]|[utest|http://cassci.datastax.com/job/blambov-9669-fix-sync-2.2-testall/]|[dtest|http://cassci.datastax.com/job/blambov-9669-fix-sync-2.2-dtest/]|
+(tests still running)
+
+We should probably also add a dtest or unit test to cover this case so we don't over synchronize in the future.
+
+  [~benedict]: Care to take review of these small fix-up patches?
+
+Sure; +1
+
+Committed as 2837ec65b91abd78ec1bb37f1d69565b976e42e6
+
+I'm suspicious that there may still be issues related to the synchronization here as there are regressions in CassandraIndexTest on both trunk and 3.0 since this was committed. 
+
+FTR, the extra synchronization in SecondaryIndexManager isn't necessary in the post flush task because there we're only concerned with non-CFS backed indexes. It is currently present because {{flushAllNonCfsIndexesBlocking}} in 3.0+ reuses the main {{flushAllIndexes}} method, which is called from other contexts and so does have to take care to coordinate. 
+
+Removing that sync from SIM can be easily done, so may be better solution to the deadlock. I've pushed a commit based on 3.0 [here|https://github.com/beobal/cassandra/commit/8404f3bc44bdd3f2b5f636b25e6b2eabe3faa261]
+
+[~blambov] or [~benedict], would one of you have some time to look at [~beobal] patch above?
+
+To be clear, my patch addresses the deadlock during flush, but it seems that the regressions in {{CassandraIndexTest}} started when the initial patch was committed (at least I don't see any before then and they happen pretty regularly since) - http://cassci.datastax.com/view/cassandra-3.0/job/cassandra-3.0_utest/747/
+
++1 on Sam's patch
+
+I will look into the test failures next week.
+
+Test failure patch:
+|[2.2|https://github.com/blambov/cassandra/tree/9669-regression-2.2]|[utest|http://cassci.datastax.com/job/blambov-9669-regression-2.2-testall/]|[dtest|http://cassci.datastax.com/job/blambov-9669-regression-2.2-dtest/]|
+|[3.0|https://github.com/blambov/cassandra/tree/9669-regression-3.0]|[utest|http://cassci.datastax.com/job/blambov-9669-regression-3.0-testall/]|[dtest|http://cassci.datastax.com/job/blambov-9669-regression-3.0-dtest/]|
+|[trunk|https://github.com/blambov/cassandra/tree/9669-regression]|[utest|http://cassci.datastax.com/job/blambov-9669-regression-testall/]|[dtest|http://cassci.datastax.com/job/blambov-9669-regression-dtest/]|
+(2.2 patch applies cleanly upwards)
+
+Removed synchronization over {{forceFlush}} let base table flushes happen while index build was still in progress.
+
+LGTM & haven't had a {{CassandraIndexTest}} failure in > 30 runs. 
+
+Although it isn't strictly needed after the previous commit, I've added my {{SIM}} change as the sync when flushing non-CFS indexes is totally unnecessary. I also added a test in that commit, which would've caught the deadlock in the first place. If we're all good with that, I'll commit once CI finishes.
+
+||branch||testall||dtest||
+|[9669-follow-up-2.2|https://github.com/beobal/cassandra/tree/9669-follow-up-2.2]|[testall|http://cassci.datastax.com/view/Dev/view/beobal/job/beobal-9669-follow-up-2.2-testall]|[dtest|http://cassci.datastax.com/view/Dev/view/beobal/job/beobal-9669-follow-up-2.2-dtest]|
+|[9669-follow-up-3.0|https://github.com/beobal/cassandra/tree/9669-follow-up-3.0]|[testall|http://cassci.datastax.com/view/Dev/view/beobal/job/beobal-9669-follow-up-3.0-testall]|[dtest|http://cassci.datastax.com/view/Dev/view/beobal/job/beobal-9669-follow-up-3.0-dtest]|
+|[9669-follow-up-trunk|https://github.com/beobal/cassandra/tree/9669-follow-up-trunk]|[testall|http://cassci.datastax.com/view/Dev/view/beobal/job/beobal-9669-follow-up-trunk-testall]|[dtest|http://cassci.datastax.com/view/Dev/view/beobal/job/beobal-9669-follow-up-trunk-dtest]|
+
+
+I'm happy with this version of the fix, CI looks ok. Let's commit.
+
+ok, committed Branimir's patch to 2.2 in {{66c8f2b7f79fe794cc1e0594d9add260c209a9a2}} and mine to 3.0 in {{81ffc4601952ff3a9fec8493cd27fe52544ea115}}.
+

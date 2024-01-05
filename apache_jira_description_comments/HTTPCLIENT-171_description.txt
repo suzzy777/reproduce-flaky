@@ -1,0 +1,716 @@
+1. HttpMethodBase#execute(HttpState, HttpConnection) will enter the while loop 
+and call processRequest(HttpState, HttpConnection).
+
+    public int execute(HttpState state, HttpConnection conn)
+        throws HttpException, HttpRecoverableException,
+            IOException, NullPointerException {
+
+        LOG.trace("enter HttpMethodBase.execute(HttpState, HttpConnection)");
+
+        // this is our connection now, assign it to a local variable so
+        // that it can be released later
+        this.responseConnection = conn;
+
+        checkExecuteConditions(state, conn);
+        inExecute = true;
+
+        try {
+            //pre-emptively add the authorization header, if required.
+            Authenticator.authenticate(this, state);
+            if (conn.isProxied()) {
+                Authenticator.authenticateProxy(this, state);
+            }
+
+            realms = new HashSet();
+            proxyRealms = new HashSet();
+            int forwardCount = 0; //protect from an infinite loop
+
+            while (forwardCount++ < MAX_FORWARDS) {
+                // on every retry, reset this state information.
+                conn.setLastResponseInputStream(null);
+
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("Execute loop try " + forwardCount);
+                }
+
+                //write the request and read the response, will retry
+                processRequest(state, conn);
+
+                //if SC_CONTINUE write the request body
+                writeRemainingRequestBody(state, conn);
+
+                if (!isRetryNeeded(statusLine.getStatusCode(), state, conn)) {
+                    // nope, no retry needed, exit loop.
+                    break;
+                }
+
+                // retry - close previous stream.  Caution - this causes
+                // responseBodyConsumed to be called, which may also close the
+                // connection.
+                if (responseStream != null) {
+                    responseStream.close();
+                }
+
+            } //end of retry loop
+
+            if (forwardCount >= MAX_FORWARDS) {
+                LOG.error("Narrowly avoided an infinite loop in execute");
+                throw new HttpRecoverableException("Maximum redirects ("
+                    + MAX_FORWARDS + ") exceeded");
+            }
+
+        } finally {
+            inExecute = false;
+            // If the response has been fully processed, return the connection
+            // to the pool.  Use this flag, rather than other tests (like
+            // responseStream == null), as subclasses, might reset the stream,
+            // for example, reading the entire response into a file and then
+            // setting the file as the stream.
+            if (doneWithConnection) {
+                ensureConnectionRelease();
+            }
+        }
+
+        return statusLine.getStatusCode();
+    }
+
+
+2. processRequest(HttpState, HttpConnection) will call writeRequest(HttpState, 
+HttpConnection).
+
+    private void processRequest(HttpState state, HttpConnection connection)
+    throws HttpException, IOException {
+        LOG.trace(
+            "enter HttpMethodBase.processRequest(HttpState, HttpConnection)");
+
+        //try to do the write
+        int retryCount = 0;
+        do {
+            retryCount++;
+            if (LOG.isTraceEnabled()) {
+                LOG.trace("Attempt number " + retryCount + " to write 
+request");
+            }
+            try {
+                if (!connection.isOpen()) {
+                    LOG.debug("Opening the connection.");
+                    connection.open();
+                }
+                writeRequest(state, connection);
+                used = true; //write worked, mark this method as used
+                break; //move onto the write
+            } catch (HttpRecoverableException httpre) {
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("Closing the connection.");
+                }
+
+                // update the recoverable exception count.
+                recoverableExceptionCount++;
+
+                connection.close();
+                LOG.info("Recoverable exception caught when writing request");
+                if (retryCount == maxRetries) {
+                    LOG.warn(
+                        "Attempt to write request has reached max retries: "
+                        + maxRetries);
+                    throw httpre;
+                }
+            }
+        } while (retryCount <= maxRetries);
+
+
+        // Should we expect a response at this point?
+        boolean responseExpected = true;
+        if (!this.bodySent) {
+
+            if (connection.waitForResponse(RESPONSE_WAIT_TIME_MS)) {
+                responseExpected = true;
+                LOG.debug("Response available");
+            } else {
+                responseExpected = false;
+
+                // Something is wrong.
+                if (getRequestHeader("Expect") != null) {
+                    // Most probably Expect header is not recongnized
+                    // Remove the header to signal the method
+                    // that it's okay to go ahead with sending data
+                    removeRequestHeader("Expect");
+                }
+                LOG.debug("Response not available. Send the request body");
+            }
+        }
+        if (responseExpected) {
+            //try to do the read
+            try {
+                readResponse(state, connection);
+            } catch (HttpRecoverableException httpre) {
+                LOG.warn("Recoverable exception caught when reading response");
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("Closing the connection.");
+                }
+
+                connection.close();
+                throw httpre;
+            }
+        }
+        //everything should be OK at this point
+    }
+
+
+3. In writeRequest(HttpState, HttpConnection), call writeRequestLine
+(HttpState, HttpConnection), writeRequestHeaders(HttpState, HttpConnection), 
+and then try to write the request body by calling 
+EntityEnclosingMethod#writeRequestBody(HttpState, HttpConnection).  The 
+request header contains an "Expect", and statusLine is NULL because we are 
+expecting a response.  Thus, writeRequestBody(HttpState, HttpConnection) will 
+return false, setting the bodySent to false.
+
+    protected void writeRequest(HttpState state, HttpConnection conn)
+    throws IOException, HttpException {
+        LOG.trace(
+            "enter HttpMethodBase.writeRequest(HttpState, HttpConnection)");
+        writeRequestLine(state, conn);
+        writeRequestHeaders(state, conn);
+        conn.writeLine(); // close head
+        bodySent = writeRequestBody(state, conn);
+    }
+
+    protected boolean writeRequestBody(HttpState state, HttpConnection conn)
+    throws IOException, HttpException {
+        LOG.trace(
+            "enter EntityEnclosingMethod.writeRequestBody(HttpState, 
+HttpConnection)");
+
+        if (getRequestHeader("Expect") != null) {
+            if (getStatusLine() == null) {
+                LOG.debug("Expecting response");
+                return false;
+            }
+            if (getStatusLine().getStatusCode() != HttpStatus.SC_CONTINUE) {
+                LOG.debug("Expecting 100-continue");
+                return false;
+            }
+        }
+
+        int contentLength = getRequestContentLength();
+
+        if ((contentLength == CONTENT_LENGTH_CHUNKED) && !isHttp11()) {
+            throw new HttpException(
+                "Chunked transfer encoding not allowed for HTTP/1.0");
+        }
+        InputStream instream = getRequestBody();
+        if (instream == null) {
+            LOG.debug("Request body is empty");
+            return true;
+        }
+
+        if ((this.repeatCount > 0) && (this.buffer == null)) {
+            throw new HttpException(
+                "Unbuffered entity enclosing request can not be repeated.");
+        }
+
+        this.repeatCount++;
+
+        OutputStream outstream = conn.getRequestOutputStream();
+        if (contentLength == CONTENT_LENGTH_CHUNKED) {
+            outstream = new ChunkedOutputStream(outstream);
+        }
+        if (contentLength >= 0) {
+            // don't need a watcher here - we're reading from something local,
+            // not server-side.
+            instream = new ContentLengthInputStream(instream, contentLength);
+        }
+
+        byte[] tmp = new byte[4096];
+        int total = 0;
+        int i = 0;
+        while ((i = instream.read(tmp)) >= 0) {
+            outstream.write(tmp, 0, i);
+            total += i;
+        }
+        // This is hardly the most elegant solution to closing chunked stream
+        if (outstream instanceof ChunkedOutputStream) {
+            ((ChunkedOutputStream) outstream).writeClosingChunk();
+        }
+        if ((contentLength > 0) && (total < contentLength)) {
+            throw new IOException("Unexpected end of input stream after "
+                + total + " bytes (expected " + contentLength + " bytes)");
+        }
+        LOG.debug("Request body sent");
+        return true;
+    }
+
+
+4. In processRequest(HttpState, HttpConnection), we wait for a response.  
+connection.waitForResponse(RESPONSE_WAIT_TIME_MS) returns false because 3 
+seconds has passed without a response being available.
+
+
+5. Set responseExpected boolean to false, and removeRequestHeader("Expect") is 
+called.  Also, since responseExpected is false, readResponse(HttpState, 
+HttpConnection) is not invoked, and statusLine, responseBody, and 
+responseStream are NULL.
+
+
+6. In the while loop, in execute(HttpState, HttpConnection), 
+writeRemainingRequestBody(HttpState, HttpConnection) is called.  Since the 
+statusLine is NULL, the writeRemaining is set to true.  bodySent boolean is 
+false, so writeRequestBody() is called.
+
+    private void writeRemainingRequestBody(HttpState state,
+                                           HttpConnection connection)
+    throws HttpException, IOException {
+        LOG.trace("enter writeRemainingRequestBody(HttpState, 
+HttpConnection)");
+
+        boolean writeRemaining = false;
+        boolean continueReceived = false;
+        if (statusLine == null) {
+            writeRemaining = true;
+        } else {
+            if (statusLine.getStatusCode() == HttpStatus.SC_CONTINUE) {
+                writeRemaining = true;
+                continueReceived = true;
+            }
+        }
+
+        if (writeRemaining) {
+            if (!bodySent) {
+                bodySent = writeRequestBody(state, connection);
+            } else {
+                if (continueReceived) {
+                    LOG.warn("Received status CONTINUE but the body has 
+already been sent");
+                    // According to RFC 2616 this respose should be ignored
+                }
+            }
+            readResponse(state, connection);
+        }
+    }
+
+
+7. In EntityEnclosingMethod#writeRequestBody(HttpState, HttpConnection), 
+getRequestHeader("Expect") will return NULL since it was previously removed.  
+The request body is written, so EntityEnclosingMethod#writeRequestBody
+(HttpState, HttpConnection) returns true, setting bodySent in 
+writeRemainingRequestBody(HttpState, HttpConnection) to true.
+
+
+8. readResponse(HttpState, HttpConnection) is called for the first time.  
+readStatusLine(HttpState, HttpConnection) is called, which in this case makes 
+the status 100-Continue.  Although, we are not status 100-Continue at this 
+point.  The problem is that we are reading the response that was not available 
+in step 4.  Instead, we should be reading the response for the request body 
+written in step 7.
+
+    protected void readResponse(HttpState state, HttpConnection conn)
+    throws HttpException {
+        LOG.trace(
+            "enter HttpMethodBase.readResponse(HttpState, HttpConnection)");
+        try {
+            readStatusLine(state, conn);
+            processStatusLine(state, conn);
+            readResponseHeaders(state, conn);
+            processResponseHeaders(state, conn);
+            readResponseBody(state, conn);
+            processResponseBody(state, conn);
+        } catch (IOException e) {
+            throw new HttpRecoverableException(e.toString());
+        }
+    }
+
+    protected void readStatusLine(HttpState state, HttpConnection conn)
+    throws IOException, HttpRecoverableException, HttpException {
+        LOG.trace("enter HttpMethodBase.readStatusLine(HttpState, 
+HttpConnection)");
+
+        //read out the HTTP status string
+        String statusString = conn.readLine();
+        while ((statusString != null) && !statusString.startsWith("HTTP/")) {
+            statusString = conn.readLine();
+        }
+        if (statusString == null) {
+            // A null statusString means the connection was lost before we got 
+a
+            // response.  Try again.
+            throw new HttpRecoverableException("Error in parsing the status "
+                + " line from the response: unable to find line starting with"
+                + " \"HTTP/\"");
+        }
+
+        //create the status line from the status string
+        statusLine = new StatusLine(statusString);
+
+        //check for a valid HTTP-Version
+        String httpVersion = statusLine.getHttpVersion();
+        if (httpVersion.equals("HTTP/1.0")) {
+            http11 = false;
+        } else if (httpVersion.equals("HTTP/1.1")) {
+            http11 = true;
+        } else {
+            throw new HttpException("Unrecognized server protocol: '"
+                                    + httpVersion + "'");
+        }
+
+    }
+
+
+9. readResponse(HttpState, HttpConnection) calls readResponseBody(HttpState 
+state, HttpConnection conn), which calls readResponseBody(HttpConnection).  
+transferEncodingHeader and lengthHeader are both NULL, and canResponseHaveBody
+(statusLine.getStatusCode()) returns false since the status is 100, which is 
+incorrect.  So, readResponseBody(HttpConnection) returns NULL. 
+responseBodyConsumed() is called, and sets the responseStream to NULL.  At 
+this point, responseBody is also NULL.  writeRemainingRequestBody(HttpState, 
+HttpConnection) returns.
+
+    protected void readResponseBody(HttpState state, HttpConnection conn)
+    throws IOException, HttpException {
+        LOG.trace(
+            "enter HttpMethodBase.readResponseBody(HttpState, 
+HttpConnection)");
+
+        // assume we are not done with the connection if we get a stream
+        doneWithConnection = false;
+        InputStream stream = readResponseBody(conn);
+        if (stream == null) {
+            // done using the connection!
+            responseBodyConsumed();
+        } else {
+            conn.setLastResponseInputStream(stream);
+            setResponseStream(stream);
+        }
+    }
+
+    private InputStream readResponseBody(HttpConnection conn)
+        throws IOException {
+
+        LOG.trace("enter HttpMethodBase.readResponseBody(HttpConnection)");
+
+        LOG.debug("readResponseBody() setting responseBody to null");
+        responseBody = null; // is this desired?
+        Header lengthHeader = getResponseHeader("Content-Length");
+        Header transferEncodingHeader = getResponseHeader("Transfer-Encoding");
+        InputStream is = conn.getResponseInputStream();
+        if (WIRE_LOG.isDebugEnabled()) {
+            is = new WireLogInputStream(is);
+        }
+        InputStream result = null;
+        // We use Transfer-Encoding if present and ignore Content-Length.
+        // RFC2616, 4.4 item number 3
+        if (null != transferEncodingHeader) {
+            if ("chunked".equalsIgnoreCase(transferEncodingHeader.getValue())) 
+{
+                result = new ChunkedInputStream(is, this);
+            }
+        } else if (null != lengthHeader) {
+
+            // we're using this just in case the content length is duplicated
+            // i.e. '57, 57'
+            HeaderElement[] lengthElements = lengthHeader.getValues();
+            String lengthValue = null;
+
+            if (lengthElements.length > 1) {
+                // looks like the content length header was duplicated. if so
+                // they won't be key=value pairs so we just want to get
+                // the name not the value (which should be null)
+                // take the first value and ignore any others
+                lengthValue = lengthElements[0].getName();
+            } else {
+                lengthValue = lengthHeader.getValue();
+            }
+
+            if(statusLine != null) {
+              LOG.debug("readResponseBody(): lengthValue=" + lengthValue + ", 
+status=null");
+            } else {
+              LOG.debug("readResponseBody(): lengthValue=" + lengthValue + ", 
+status=" + statusLine.getStatusCode());
+            }
+
+            try {
+                int expectedLength = Integer.parseInt(lengthValue);
+                // FIXME: what if the content length is 0, perhaps we should
+                // just return an empty stream in that case
+                result = new ContentLengthInputStream(is, expectedLength);
+            } catch (NumberFormatException e) {
+                throw new HttpException(
+                    "Unable to parse server response content length: '"
+                    + lengthValue + "'"
+                );
+
+            }
+
+        } else if (canResponseHaveBody(statusLine.getStatusCode())
+                && !getName().equals(ConnectMethod.NAME)) {
+            result = is;
+        }
+
+        // if there is a result - ALWAYS wrap it in an observer which will
+        // close the underlying stream as soon as it is consumed, and notify
+        // the watcher that the stream has been consumed.
+        if (result != null) {
+
+            result = new AutoCloseInputStream(
+                result,
+                new ResponseConsumedWatcher() {
+                    public void responseConsumed() {
+                        responseBodyConsumed();
+                    }
+                }
+            );
+        }
+
+        return result;
+    }
+
+    private static boolean canResponseHaveBody(int status) {
+
+        boolean result = true;
+
+        if ((status >= 100 && status <= 199) || (status == 204)
+            || (status == 304)) { // NOT MODIFIED
+            result = false;
+        }
+
+        return result;
+    }
+
+
+10. In the while loop, in execute(HttpState, HttpConnection), isRetryNeeded
+(statusLine.getStatusCode(), state, conn) returns false, and causes the loop 
+to break.  Then execute(HttpState, HttpConnection) retuns with the status code 
+100-Continue.
+
+    private boolean isRetryNeeded(int statusCode, HttpState state, 
+HttpConnection conn) {
+        switch (statusCode) {
+            case HttpStatus.SC_UNAUTHORIZED:
+            case HttpStatus.SC_PROXY_AUTHENTICATION_REQUIRED:
+                LOG.debug("Authorization required");
+                if (doAuthentication) { //process authentication response
+                    //if the authentication is successful, return the 
+statusCode
+                    //otherwise, drop through the switch and try again.
+                    if (processAuthenticationResponse(state)) {
+                        return false;
+                    }
+                } else { //let the client handle the authenticaiton
+                    return false;
+                }
+                break;
+
+            case HttpStatus.SC_MOVED_TEMPORARILY:
+            case HttpStatus.SC_MOVED_PERMANENTLY:
+            case HttpStatus.SC_SEE_OTHER:
+            case HttpStatus.SC_TEMPORARY_REDIRECT:
+                LOG.debug("Redirect required");
+
+                if (!processRedirectResponse(conn)) {
+                    return false;
+                }
+                break;
+
+            default:
+                // neither an unauthorized nor a redirect response
+                return false;
+        } //end of switch
+
+        return true;
+    }
+
+
+11. When we call getResponseBody(), getResponseBodyAsStream() returns NULL 
+since the responseStream and the responseBody are both NULL at this point.  
+When getResponseBody() tries to read the InputStream, a NullPointerException 
+is thrown since the InputStream is NULL.
+
+
+
+
+To remedy this NullPointerException problem, I made the following changes to 
+my local copy of the code (for processRequest(HttpState, HttpConnection) and 
+writeRemainingRequestBody(HttpState, HttpConnection)).  Any feedback, or an 
+alternative solution, on this would be appreciated.
+
+    private void processRequest(HttpState state, HttpConnection connection)
+    throws HttpException, IOException {
+        LOG.trace(
+            "enter HttpMethodBase.processRequest(HttpState, HttpConnection)");
+
+        //try to do the write
+        int retryCount = 0;
+        do {
+            retryCount++;
+            if (LOG.isTraceEnabled()) {
+                LOG.trace("Attempt number " + retryCount + " to write 
+request");
+            }
+            try {
+                if (!connection.isOpen()) {
+                    LOG.debug("Opening the connection.");
+                    connection.open();
+                }
+                writeRequest(state, connection);
+                used = true; //write worked, mark this method as used
+                break; //move onto the write
+            } catch (HttpRecoverableException httpre) {
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("Closing the connection.");
+                }
+
+                // update the recoverable exception count.
+                recoverableExceptionCount++;
+
+                connection.close();
+                LOG.info("Recoverable exception caught when writing request");
+                if (retryCount == maxRetries) {
+                    LOG.warn(
+                        "Attempt to write request has reached max retries: "
+                        + maxRetries);
+                    throw httpre;
+                }
+            }
+        } while (retryCount <= maxRetries);
+
+
+        // Should we expect a response at this point?
+        boolean responseExpected = true;
+        if (!this.bodySent) {
+
+////////////////////// ADDITION STARTS HERE //////////////////////
+            boolean resReady = false;
+
+            int attemptCount = 0;
+
+            while(attemptCount < RESPONSE_WAIT_LIMIT) {
+              resReady = connection.waitForResponse(RESPONSE_WAIT_TIME_MS);
+              LOG.debug("waiting for response, attempt # " + (attemptCount+1) 
++ ": ready? " + resReady);
+
+              if(resReady) {
+                break;
+              }
+
+              attemptCount++;
+            }
+
+            if (resReady) {
+                responseExpected = true;
+                LOG.debug("Response available");
+            } else {
+                responseExpected = false;
+
+                // Something is wrong.
+                if (getRequestHeader("Expect") != null) {
+                    // Most probably Expect header is not recongnized
+                    // Remove the header to signal the method
+                    // that it's okay to go ahead with sending data
+                    removeRequestHeader("Expect");
+                }
+                LOG.debug("Response not available. Send the request body");
+            }
+
+////////////////////// ADDITION ENDS HERE //////////////////////
+
+////////////////////// COMMENT BELOW OUT //////////////////////
+//            if (connection.waitForResponse(RESPONSE_WAIT_TIME_MS)) {
+//                responseExpected = true;
+//                LOG.debug("Response available");
+//            } else {
+//                responseExpected = false;
+//
+//                // Something is wrong.
+//                if (getRequestHeader("Expect") != null) {
+//                    // Most probably Expect header is not recongnized
+//                    // Remove the header to signal the method
+//                    // that it's okay to go ahead with sending data
+//                    removeRequestHeader("Expect");
+//                }
+//                LOG.debug("Response not available. Send the request body");
+//            }
+////////////////////// COMMENT ABOVE OUT //////////////////////
+
+        }
+        if (responseExpected) {
+            //try to do the read
+            try {
+                readResponse(state, connection);
+            } catch (HttpRecoverableException httpre) {
+                LOG.warn("Recoverable exception caught when reading response");
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("Closing the connection.");
+                }
+
+                connection.close();
+                throw httpre;
+            }
+        }
+        //everything should be OK at this point
+    }
+
+
+    private void writeRemainingRequestBody(HttpState state,
+                                           HttpConnection connection)
+    throws HttpException, IOException {
+        LOG.trace("enter writeRemainingRequestBody(HttpState, 
+HttpConnection)");
+
+        boolean writeRemaining = false;
+        boolean continueReceived = false;
+        if (statusLine == null) {
+            writeRemaining = true;
+        } else {
+            if (statusLine.getStatusCode() == HttpStatus.SC_CONTINUE) {
+                writeRemaining = true;
+                continueReceived = true;
+            }
+        }
+
+        if (writeRemaining) {
+            if (!bodySent) {
+                bodySent = writeRequestBody(state, connection);
+            } else {
+                if (continueReceived) {
+                    LOG.warn("Received status CONTINUE but the body has 
+already been sent");
+                    // According to RFC 2616 this respose should be ignored
+                }
+            }
+            readResponse(state, connection);
+
+////////////////////// ADDITION STARTS HERE //////////////////////
+            if(statusLine != null &&
+               statusLine.getStatusCode() == HttpStatus.SC_CONTINUE) {
+
+              LOG.debug("writeRemainingRequestBody(): status code is 
+HttpStatus.SC_CONTINUE, try reading another response");
+
+              try {
+                readResponse(state, connection);
+
+                if(statusLine == null) {
+                  LOG.debug("writeRemainingRequestBody(): status line after 
+second readResponse is null.");
+
+                } else {
+                  LOG.debug("writeRemainingRequestBody(): status code after 
+second readResponse: " + statusLine.getStatusCode());
+                }
+
+              } catch(HttpException httpe) {
+                LOG.error("writeRemainingRequestBody(): while reading another 
+response", httpe);
+              } catch(Throwable t) {
+                LOG.error("writeRemainingRequestBody(): while reading another 
+response", t);
+              }
+            }
+////////////////////// ADDITION ENDS HERE //////////////////////
+
+        }
+    }
+
+
+Thank you,
+Randy

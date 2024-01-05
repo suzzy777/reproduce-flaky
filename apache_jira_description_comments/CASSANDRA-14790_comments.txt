@@ -1,0 +1,72 @@
+There are some minor races in the test, but the big problem seems to be the calculation for how much buffer memory the worker threads should allocate.  Instead of dividing the poolSize across the workers, it instead allocates more and more memory the more threads a machine has.
+
+Created a pull request to fix up the test so it runs reliably on machines with 8 / 12 logical cores now.
+
+Against 3.0 - [PR #279|https://github.com/apache/cassandra/pull/279] has most of the fixes
+Against trunk - [PR #280|https://github.com/apache/cassandra/pull/280] initializes the buffer pool test correctly.
+
+ 
+
+Hi [~jmeredithco], I left some comments on the PR (minor nits mostly). Also, could we fix the known races in the test?
+
+Thanks for the review on the longbuffer stuff
+
+I've rebased and updated my local branch to amend the commits and have force-pushed the branch it back so it's ready to re-review, hopefully GitHub can handle that these days
+
+For your requested fixing the remaining races, did you mean the possible races around setting the makingProgress atomics [https://github.com/jonmeredith/cassandra/blob/CASSANDRA-14790-3.0/test/burn/org/apache/cassandra/uti...|https://github.com/jonmeredith/cassandra/blob/CASSANDRA-14790-3.0/test/burn/org/apache/cassandra/utils/memory/LongBufferPoolTest.java#L219]  or did you mean the race in the actual allocation code itself [https://github.com/jonmeredith/cassandra/blob/CASSANDRA-14790-3.0/src/java/org/apache/cassandra/util...|https://github.com/jonmeredith/cassandra/blob/CASSANDRA-14790-3.0/src/java/org/apache/cassandra/utils/memory/BufferPool.java#L248]
+
+I'm happy to fix the makingProgress atomics - I've managed to convince myself the races should be harmless as they should be caught on the next iteration and decided to minimize the amount of change for no benefit I could see.
+
+For the minor allocation bugfix I thought that should be a separate JIRA ticket that I would open after merging this, but I could also fix it as part of this too if that's the normal way to handle things.
+
+bq. or did you mean the race in the actual allocation code itself
+
+Why do you say this is a race?
+
+[benedict] if MACRO_CHUNK_SIZE / CHUNK_SIZE allocations take place between the call to allocateMoreChunks and the chunks.poll() the thread that was originally calling allocateMoreChunks gets null returned and ends up allocating the memory off the heap instead.  I temporarily added a logging statement for that case and the LongBufferPoolTest does manage to hit it.
+
+In real world usage I think it's a harmless race - every now and again, but probably mostly at startup, a buffer pool request is allocated from the heap when it could have been from the pool.
+
+[~jmeredithco] I haven't looked too closely at this, but I _think_ you may be reading this backwards.  If {{allocateMoreChunks}} is successful, the loop continues and a 'safe' attempt to read the result is made - if a race occurs here, {{allocateMoreChunks}} will be invoked again.  On the branch you pointed to, it would be acceptable to simply {{return null}}, immediately requiring the caller to allocate on heap, but as the comment suggests, we are polling the queue of chunks just in case we have had a _beneficial_ race wherein somebody has deposited a recycled chunk during our invocation of {{allocateMoreChunks}}
+
+[~benedict] I think we're reading it the same way - my argument was that it can cause buffers to be allocated from the heap when MEMORY_USAGE_THRESHOLD has not been exceeded yet. I'd describe it as a benign race rather than beneficial. The calling thread has to pay the price of allocating chunks that other threads stole and then an extra allocation which could possibly result in a blocking system call to get more memory. Instead allocateMoreChunks could return one of the chunks to it's caller and add one less chunks to the queue.
+
+I'm not even sure it's worth changing anything, but [~djoshi3] wanted to see what you thought about it.
+
+--8<--
+ Here's the example I wrote up before I read your comment more carefully.
+
+Start with no allocations from any of the thread local or buffer pools yet.
+
+CHUNK_SIZE=64 KiB
+ MACRO_CHUNK_SIZE = 1024 KiB
+ MEMORY_USAGE_THRESHOLD = 16384 KiB (for the unit test)
+
+1) T1 calls BufferPool.get(1) and ends up in GlobalPool:get. chunks.poll returns null so it calls allocateMoreChunks which allocates a macro chunk, divides it up into 16 (1024KiB / 64KiB) Chunks that are added to BufferPool.GlobalPool.chunks.
+
+2) Between the adding the last chunk and the 'one last attempt' to pull it in Chunk.get, 16 other calls to GlobalPool::get take place on other threads, emptying GlobalPool.chunks
+
+3) T1 returns from allocateMoreChunks, back in Chunk::get chunks.poll() returns null and which gets passed up the call chain with the null causing a call to BufferPool.allocate which allocates memory outside of the pool, despite the current pool memory usage being at ~1MiB, which is less than the usage threshold and should have been satisfied by the pool.
+
+As I said, I don't think it's really a big deal as memory allocated outside the pool should be freed/garbage collected just fine and the buffer pool is just an optimization.
+
+It's also possible for T1, T2 to both arrive in allocateMoreBuffers with BufferPool.GlobalPool.chunk
+ empty and cause harmless allocation of extra buffers, but it looks like it uses atomics
+ to make sure the MEMORY_USAGE_THRESHOLD invariant isn't exceeded.
+
+I still think you're reading it wrong.  Perhaps we should hop on a call to discuss it?  
+
+FWIW, outside of this being a bug or not, your proposed change is absolutely fine - and an improvement over the current code.  So we could simply make the change, since it is trivial.  But I don't believe this is a _bug_ (which, if the behaviour were as you describe, it would certainly be in my book, even one of low impact).
+
+So, to your example.  T1 has _successfully_ called {{allocateMoreChunks}}, right?  So at step 3, it goes to the beginning of the loop to poll.  {{null}} is returned, _but_ it immediately goes to invoke {{allocateMoreChunks}} again (and again, etc, if necessary)
+
+There is by definition no 'one last attempt' performed by any thread until it has _itself_ witnessed {{MEMORY_USAGE_THRESHOLD}} being exceeded.
+
+You're right, I was reading it wrong and I agree it's not a bug - thanks for looking at it.
+
+I've already got a patch for the change, should it go on this ticket or open a new one?
+
+For good hygiene, it's generally considered better not to commit changes that are orthogonal to the ticket in question, especially when the ticket is only fixing a failing test.  But it's such a tiny change it doesn't really warrant its own JIRA, and people definitely don't always stick to the scope of the JIRA.  So, whatever you prefer.
+
+Committed to 3.0 as [e07d53aaec94a498028d988f7d2c7ae7e6b620d0|https://github.com/apache/cassandra/commit/e07d53aaec94a498028d988f7d2c7ae7e6b620d0] and merged upwards, thanks.
+

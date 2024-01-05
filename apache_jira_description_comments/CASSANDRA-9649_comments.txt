@@ -1,0 +1,119 @@
+I believe you're right. We need ballots to be globally unique, which given we provide our own timestamp to {{UUIDGen.getTimeUUID()}} means that we must ensure said timestamp is locally unique. And that has been broken by CASSANDRA-5667 (before that we were letting {{UUIDGen}} pick the timestamp which does the right thing).
+
+And dividing {{state.getTimestamp()}} is only one of the problems, we have 2 others: the fact that {{state.getTimestamp()}} is currently only unique to a connection not a VM, and the fact that 2 racy operations that do get a {{summary}} might see the same {{mostRecentInProgressCommit}} and thus pick the same timestamp.
+
+So anyway, I've pushed [here|https://github.com/pcmanus/cassandra/commits/9649] a commit to fix that. I'm also going to bump the priority since unless I'm forgetting a reason why this is not a problem, it's kind of a big deal.
+
+I do want to note one point: due to the conjonction of CASSANDRA-7801 and CASSANDRA-5667, if a node has its clock in the future, other nodes might "synchronize" themselves on that clock through Paxos operations. While this is probably ok for small drift (this may even be considered a good thing), this could be rather problematic if a node ends up with a clock far in the future (even temporarily, due to an operator error for instance). This is a risk for our Paxos by design, but CASSANDRA-7801 makes the consequences potentially affect other operation as well. This makes me nervous and while I still think CASSANDRA-7801 is theoreticaly a good idea, I'm starting to think that it might not be worth the risk and so I wanted to float the idea of reversing it. I've pushed a branch [here|https://github.com/pcmanus/cassandra/commits/9649-without-7801] with an additional (simple) commit to show what I have in mind.
+
+The patch is against 2.1. C* 2.0 is affected too but the patch won't apply because it builds on top of CASSANDRA-7801 which isn't on 2.0. I'm a bit reluctant to mess too much with 2.0 at this point so I would suggest to basically revert CASSANDRA-5667 by simply relying on {{UUIGen.getTimeUUID()}} without providing our own timestamp.
+
+
+[~slebresne], I wanted to ask why we don't use µs precision here - answered while lurking to your branch. The changes LGTM.
+The main problem (_dear operator, do never ever set the wrong system time_) is indeed a big one - a problem that we can detect and react to these situations:
+# check whether the system time of a starting/joining node is within some allowed range and prevent it to join the ring
+# detect abrupt/big clock skews of a node via gossip and issue warnings
+# detect abrupt/big clock skews by comparing the diff of {{System.currentTimeMillis()}} and {{nanoTime()}} and issue warnings
+
+The consequences of an abrupt/big clock skew could be mitigated by de-coupling {{System.currentTimeMillis()}} from {{UUIDGen}} and {{ClientState}} and only allow it to go faster/slower at a max rate - basically preventing an _immediate_ system clock change from 06/25/2015-16:18:30 to 06/25/2015-16:48:30 (what NTP usually does, advance slowly) - or even do not allow the "internal clock" to ever go backwards. WDYT? (I think there was some discussion around that a while ago - but honestly I cannot recall.)
+
+You may be interested in this ticket, CASSANDRA-6680. It's assigned to me but I haven't really had any time to work on it so far.
+
+[~slebresne] thanks for the patch. I made a tiny change to pick up as much of your code as possible in the unit tests. I created a pull request [here|https://github.com/pcmanus/cassandra/pull/52]. Sorry about the rebase.
+
+The patch seems to apply to 2.2 so nothing to do other than monitoring CI.
+
+For 2.0 I'm not sure if it helps but rather than just calling {{UUIDGen.getTimeUUID()}} I modified {{UUIDGen.getTimeUUID(long when)}} to do the same thing as the override without any arguments. It seems to be called only by a test method and by {{StorageProxy.beginAndRepairPaxos()}}. One thing that is not clear to me is why isn't {{UUIDGen.lastNanos}} an atomic long?
+
+I guess you could put yourself as the author and myself as the reviewer.
+
+My branches:
+
+https://github.com/stef1927/cassandra/tree/9649-2.0
+https://github.com/stef1927/cassandra/tree/9649-2.1
+https://github.com/stef1927/cassandra/tree/9649-2.2
+
+The CI views:
+
+http://cassci.datastax.com/job/stef1927-9649-2.0-testall/lastCompletedBuild/testReport/
+http://cassci.datastax.com/job/stef1927-9649-2.0-dtest/lastCompletedBuild/testReport/
+http://cassci.datastax.com/job/stef1927-9649-2.1-testall/lastCompletedBuild/testReport/
+http://cassci.datastax.com/job/stef1927-9649-2.1-dtest/lastCompletedBuild/testReport/
+http://cassci.datastax.com/job/stef1927-9649-2.2-testall/lastCompletedBuild/testReport/
+http://cassci.datastax.com/job/stef1927-9649-2.2-dtest/lastCompletedBuild/testReport/
+
+
+
+bq. I modified UUIDGen.getTimeUUID(long when) to do the same thing as the override without any arguments.
+
+The problem is that this ends up potentially modifying the {{UUIGen}} clock, so a big clock skew of a node in the future can now "screw up" any generated time UUID in other nodes, which is scary. The idea being just getting back to the no arg {{UUIDGen.getTimeUUID()}} is that it's the simplest thing that is basically guaranteed to not create any unintended consequence for other parts of the code. All we're giving up is CASSANDRA-5667 but that was "just an optimization" in the first place.
+
+bq. One thing that is not clear to me is why isn't UUIDGen.lastNanos an atomic long?
+
+It doesn't have to because the only method that ever read/modify it is synchronized (I don't know if much though went into doing it this way rather than using an atomic long (and no synchronized method) but I do know that such considerations are out of scope for this ticket :))
+
+
+bq. The problem is that this ends up potentially modifying the UUIGen clock, so a big clock skew of a node in the future can now "screw up" any generated time UUID in other nodes, which is scary. The idea being just getting back to the no arg UUIDGen.getTimeUUID() is that it's the simplest thing that is basically guaranteed to not create any unintended consequence for other parts of the code. All we're giving up is CASSANDRA-5667 but that was "just an optimization" in the first place.
+
+I see, thanks for the explanation. I force pushed a commit to revert back to getTimeUUID(). Is this enough or do we need to revert the entire change introduced by CASSANDRA-5667?
+
+bq. It doesn't have to because the only method that ever read/modify it is synchronized (I don't know if much though went into doing it this way rather than using an atomic long (and no synchronized method) but I do know that such considerations are out of scope for this ticket )
+
+Agreed.
+
+bq. Is this enough or do we need to revert the entire change introduced by CASSANDRA-5667?
+
+It is enough. Most of the other change from CASSANDRA-5667 were either not directly related in the first place, or have been changed since then by other patches. So I'm good with the current version of you branches and if we're good with that I'll commit once CI has finished re-running on every branch.
+
+I've moved the discussion about potentially reverting CASSANDRA-7801 to CASSANDRA-9655 since it's largely orthogonal to this issue (the problem exists with or without this patch).
+
+Great, thank you.
+
+So there seems to be some test failure on all branches. I tried to compare with the tests failing on the non-patched branch but not all tests are failing there, but I haven't looked closely enough to see if the tests are just flaky or not. It's mostly dtests though (except for [that|http://cassci.datastax.com/job/stef1927-9649-2.1-testall/lastCompletedBuild/testReport/] that looks completely unrelated to this issue). [~stefania] can you see if you can force cassci to re-run on your branch to see if we can shake some potential shakiness?
+
+I've run the tests one more time. Here is my analysis, all tests are either flacky and have failed at least once in the past on the unpatched branches, or quite simply fail all the time. For some we definitely have JIRAs but I have not mentioned them here as I don't have the numbers at hand.
+
+* 2.0 testall:
+** no failures
+
+* 2.0 dtest:
+** jmxmetrics_test.TestJMXMetrics.begin_test: failed on unpatched 2.0, build #80
+** counter_tests.TestCounters.upgrade_test: failed on unpatched 2.0, build #78
+** compaction_test.TestCompaction_with_DateTieredCompactionStrategy.sstable_deletion_test: failed on unpatched 2.0, build #80
+** compaction_test.TestCompaction_with_SizeTieredCompactionStrategy.sstable_deletion_test: failed on unpatched 2.0, build #80
+** thrift_hsha_test.ThriftHSHATest.test_closing_connections: failed on unpatched 2.0, build #76
+** repair_test.TestRepair.dc_repair_test: failed on unpatched 2.0, build #69
+** paging_test.TestPagingWithDeletions.test_single_partition_deletions: failed on unpatched 2.0, build #72
+** paging_test.TestPagingWithDeletions.test_single_row_deletions: failed on unpatched 2.0, build #62
+
+* 2.1 testall:
+** org.apache.cassandra.concurrent.LongSharedExecutorPoolTest.testPromptnessOfExecution: failed on unpatched 2.1, build #106
+
+* 2.1 dtest:
+** jmxmetrics_test.TestJMXMetrics.begin_test: failed on unpatched 2.1, build #154
+** repair_test.TestRepair.dc_repair_test: failed on unpatched 2.1, build #154
+** compaction_test.TestCompaction_with_DateTieredCompactionStrategy.sstable_deletion_test: failed on unpatched 2.1, build #154
+** compaction_test.TestCompaction_with_SizeTieredCompactionStrategy.sstable_deletion_test: failed on unpatched 2.1, build #154
+** thrift_hsha_test.ThriftHSHATest.test_closing_connections: failed on unpatched 2.1, build #102
+** upgrade_supercolumns_test.TestSCUpgrade.upgrade_with_counters_test: failed on unpatched 2.1, build #122
+** cql_tests.MiscellaneousCQLTester.prepared_statement_invalidation_test: failed on unpatched 2.1, build #149
+
+* 2.2 testall:
+** org.apache.cassandra.db.lifecycle.ViewTest.testSSTablesInBounds: failed on unpatched 2.2, build #88
+** org.apache.cassandra.db.lifecycle.ViewTest.testSSTablesInBounds-compression: failed on unpatched 2.2, build #88
+
+* 2.2 dtest:
+** consistency_test.TestConsistency.short_read_test: failed on unpatched 2.2, build #72
+** jmx_test.TestJMX.cfhistograms_test: failed on unpatched 2.2, build #115
+** upgrade_internal_auth_test.TestAuthUpgrade.upgrade_to_30_test: failed on unpatched 2.2, build #120
+** compaction_test.TestCompaction_with_DateTieredCompactionStrategy.sstable_deletion_test: failed on unpatched 2.2, build #120
+** compaction_test.TestCompaction_with_LeveledCompactionStrategy.sstable_deletion_test: failed on unpatched 2.2, build #120
+
+Thanks Stefania for looking into this in details. Hopefully we get tests less flaky in the future. Anyway, committed.
+
+Thanks!
+
+cc [~slebresne] Did you create a JIRA to fix issue introduced in this JIRA? Please let me know. 
+
+I did, CASSANDRA-11991, sorry for not mentioning it here earlier.
+

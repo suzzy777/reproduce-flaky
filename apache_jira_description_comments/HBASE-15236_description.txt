@@ -1,0 +1,43 @@
+ If there are two bulkloaded hfiles in a region with same seqID, same timestamps and duplicate keys*, get and scan may return different values for a key. Not sure how this would happen, but one of our customer uploaded a dataset with 2 files in a single region and both having same bulk load timestamp. These files are small ~50M (I couldn't find any setting for max file size that could lead to 2 files). The range of keys in two hfiles are overlapping to some extent, but not fully (so the two files are because of region merge).
+In such a case, depending on file sizes (used in StoreFile.Comparators.SEQ_ID), we may get different values for the same cell (say "r", "cf:50") depending on what we call: get "r" "cf:50" or get "r" "cf:".
+To replicate this, i ran ImportTsv twice with 2 different csv files but same timestamp (-Dimporttsv.timestamp=1). Collected two resulting hfiles in a single directory and loaded with LoadIncrementalHFiles. Here are the commands.
+{noformat}
+//CSV files should be in hdfs:///user/hbase/tmp
+sudo -u hbase hbase org.apache.hadoop.hbase.mapreduce.ImportTsv  -Dimporttsv.columns=HBASE_ROW_KEY,c:1,c:2,c:3,c:4,c:5,c:6 -Dimporttsv.separator='|' -Dimporttsv.timestamp=1 -Dimporttsv.bulk.output=hdfs:///user/hbase/1 t tmp
+{noformat}
+tables_data.zip contains three tables: t, t2, and t3.
+To load these tables and test with them, use the attached TestWithSingleHRegion.java. (Change ROOT_DIR and TABLE_NAME variables appropriately)
+
+Hfiles for table 't':
+1) 07922ac90208445883b2ddc89c424c89 : length = 1094: KVs = (c:5, 55) (c:6, 66)
+2) 143137fa4fa84625b4e8d1d84a494f08 : length = 1192: KVs = (c:1, 1) (c:2, 2) (c:3, 3) (c:4, 4) (c:5, 5) (c:6, 6)
+
+Get returns 5  where as Scan returns 55.
+
+On the other hand if I make the first hfile, the one with values 55 and 66 bigger in size than second hfile, then:
+Get returns 55  where as Scan returns 55.
+This can be seen in table 't2'.
+
+Weird things:
+1. Get consistently returns values from larger hfile.
+2. Scan consistently returns 55.
+
+Reason:
+Explanation 1: We add StoreFileScanners to heap by iterating over list of store files which is kept sorted in DefaultStoreFileManger using StoreFile.Comparators.SEQ_ID. It sorts the file first by increasing seq id, then by decreasing filesize. So our larger files sizes are always in the start.
+
+Explanation 2: In KeyValueHeap.next(), if both current and this.heap.peek() scanners (type is StoreFileScanner in this case) point to KVs which compare as equal, we put back the current scanner into heap, and call pollRealKV() to get new one. While inserting, KVScannerComparator is used which compares the two (one already in heap and the one being inserted) as equal and inserts it after the existing one. \[1\]
+Say s1 is scanner over first hfile and s2 over second.
+1. We scan with s2 to get values 1, 2, 3, 4
+2. see that both scanners have c:5 as next key, put current scanner s2 back in heap, take s1 out
+4. return 55, advance s1 to key c:6
+5. compare c:6 to c:5, put back s2 in heap since it has larger key, take out s1
+6. ignore it's value (there is code for that too), advance s2 to c:6
+Go back to step 2 with both scanners having c:6 as next key
+
+This is wrong because if we add a key between c:4 and c:5 to first hfile, say (c:44, foo)  which makes s1 as the 'current' scanner when we hit step 2, then we'll get the values - 1, 2, 3, 4, foo, 5, 6.
+(try table t3)
+
+Fix:
+Assign priority ids to StoreFileScanners when inserting them into heap, latest hfiles get higher priority, and use them in KVComparator instead of just seq id.
+
+\[1\] [PriorityQueue.siftUp()|http://grepcode.com/file/repository.grepcode.com/java/root/jdk/openjdk/6-b14/java/util/PriorityQueue.java#586]

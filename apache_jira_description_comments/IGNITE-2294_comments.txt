@@ -1,0 +1,193 @@
+Parsing support for DML clauses (insert, update, delete) added. INSERT backend implementation in progress.
+
+Mailing list discussion on this issue is here: http://apache-ignite-developers.2346864.n4.nabble.com/IGNITE-2294-implementation-details-td9968.html
+Everyone that has anything to add is welcome to join it.
+
+I have implemented "naive" version of MERGE statement (YAY!, though of course it still is a very long way to go).
+As for now, it only supports inserting at per row basis ("merge into XXX(cols) values(row1), (row2)" kind of thing), and does not support subqueries, functions and any other fancy stuff. Also it does not, and most likely will not, support custom merge key (KEY clause of MERGE statement, see http://www.h2database.com/html/grammar.html#merge for grammar details) because it violates the idea of strictly set key. (We explicitly set both key and value types when we create cache configuration, remember?)
+Still, I think one important and interesting thing about this contribution is that it includes concept of the key computed/provided by value object. On the mailing list Alexey Goncharuk raised concern about how we supply keys for newly inserted values - and that's exactly what that concept addresses. So, as for now, there is two ways to supply keys for new values - either via literals (familiar _key column), or via special field or method. My pull request (that is of course to be updated in the nearest future) linked to this issue includes demo of both ways in the form of a test - please see IgniteCacheMergeSqlQuerySelfTest if you are interested.
+Also, the test showcases this feature in "direct" fashion - without using JDBC driver: it just invokes newly introduced IgniteCache.update() operation. JDBC support is on the way.
+
+Have a nice weekend everyone!
+
+After discussion on dev list, I've removed update() operation from the API as well as @GridCacheKey annotation. Working on binary marshalling support and integration w/JDBC driver.
+
+JDBC driver integration for modifying operations almost finished, removed public API overhead introduced together with those operations, it's unchanged after all.
+
+OK, I guess it's time to sum up what has been done by now.
+
+First, in order to make modifying SQL operations possible I had to modify hierarchy of classes corresponding to SQL statements - to do so, class *GridSqlStatement* had been introduced. It's the parent both for *GridSqlQuery* as well as new folks *GridSqlMerge*, *GridSqlInsert*, *GridSqlUpdate*, and *GridSqlDelete*. The reason for introducing common parent is that *GridSqlQuery* has query specific stuff, and mixing it with details for updates would make things rather messy.
+
+Modifying operations take form of familiar *SqlFieldsQuery*, public API is unchanged. What has changed is behavior of *GridSqlQuerySplitter*, *GridReduceQueryExecutor*, and *IgniteH2Indexing* (they now have condition branches/methods to handle update operations).
+
+Results of an update query are returned as a *QueryCursor*<*List*<?>>, just like they would be with any select query. Such a cursor for an update operation bears single *List* element, which in its turn has only one item in it which is number of affected items.
+
+Currently implemented MERGE operation simply utilizes *put*/*putAll* methods of *IgniteCache*.
+
+Binary marshalling support has been added - in order to instantiate and properly populate new objects in binary form, *GridQueryProperty* and *GridQueryTypeDescriptor* had to be changed (to include more information about real types of key and value stored in cache). However, there is an issue with binary marshalling: we don't know hash code of new object at its build time, so we have to come up with something after all. One viable solution seen now is that we supply hash code explicitly, via new 'synthetic' column we will have to introduce - say, _hashcode. Dev list thread:
+http://apache-ignite-developers.2346864.n4.nabble.com/All-BinaryObjects-created-by-BinaryObjectBuilder-stored-at-the-same-partition-by-default-td8042.html
+
+While discussing binary marshalling support, one more important problem was discovered - objects without any hash code are simply put to cache with hash code of 0, which hardly is an expected behavior, so it was proposed by Dima that we throw an exception on attempt of putting an object w/o hash code to cache, and Denis Magda suggested that we distinguish objects with hash code of 0 from objects without hash code set at all by using reference comparison - details here:
+http://apache-ignite-developers.2346864.n4.nabble.com/All-BinaryObjects-created-by-BinaryObjectBuilder-stored-at-the-same-partition-by-default-tp8042p10330.html
+
+(To be continued)
+
+With respect to what has been done to support modifying operations, JDBC driver has been updated accordingly.
+
+First, to compare type of query from the string against one requested by JDBC driver (requested by calling definite operation, say, *executeQuery* or *executeUpdate*), has been introduced a helper class *JdbcSqlFieldsQuery* that carries additional flag of expected operation type.
+
+Then, to distinguish update cursors from those of result sets, *QueryCursorImpl* received result type flag as well.
+
+*executeUpdate* and *executeBatch* methods have been properly implemented in *JdbcStatement* and *JdbcPreparedStatement*, the latter also received its deserved specific handling of arguments. Currently batch statements are simply executed one by one, which most likely has to be improved for bulk data loading.
+
+Therefore, after having looked at MySQL and its JDBC driver, I would like to make a proposal about possible use of *data streamer* to optimize bulk inserts/merges.
+
+First, let's define batch inserts as batch statements in JDBC terms (single query with many sets of params) and bulk statements (multi row INSERT query, for example). Currently *bulk* statements are efficiently handled with *IgniteCache.putAll*, as long as in this case the query arrives to the server in full, one piece. However, the whole point of data streamer is to handle amount of data that is unknown in advance. Therefore I see *batch* JDBC statements as a nice abstraction to data streamer, and the use might be as follows:
+
+When the user issues an *addBatch* command on the driver, we fire either individual *IgniteDataStreamer.addData(K, V)*, or *IgniteDataStreamer.addData(Map)* (could use some splitting into chunks for efficiency here). When the user calls *executeBatch* command, we flush data streamer.
+
+And use of data streamer might be made optional, say, via parameter of connection string. If the user opts not to enable data streamer and still uses batch, we could apply the technique that MySQL uses - namely, *rewrite* multiple items in batch into *single bulk insert*.
+
+For example, suppose we have a prepared statement with query of *insert into Person(_key, name, surname) values (?, ?, ?)*, and then we supply two sets of arguments via *addBatch*. Then, when *executeBatch* is fired, we turn it all into *single* query *insert into Person(_key, name, surname) values (?, ?, ?), (?, ?, ?)* with a single set of arguments (with 3 x 2 = 6 items) that will be handled by *putAll*.
+
+Again, above example is for the case when data streamer is disabled - if it's not, we just feed batch items to it as described above. And also we could leave one-by-one processing of batch items as one more option for this behavior.
+
+To sum up: what is proposed is that we add to connection string new param with 2 or 3 possible values, it will control how batch statements are handled - either items will be processed individually, or they will be fed to data streamer, or they will be squashed to single query then processed by *putAll*.
+
+The main downside that I see for this approach is that this logic will have to be reimplemented in some way in other SQL interfaces of Ignite (.NET, ODBC, Visor (?)).
+
+The issue regarding hash code checks when binary builder is used: IGNITE-3633
+
+# I don't think you can pass parameters into JDBC {{addBatch(...)}} method, so I am not sure your batch insert example is valid.
+# The semantics of {{executeBatch}} are absolutely different form the {{flush}} method on Data Streamer.
+
+Generally speaking, I don't think that using {{addBatch(...)}} for data streamer is a good idea. However, it should be used with {{putAll(...)}} calls, as they fit much better.
+
+I am beginning to think that streamer should be enabled based on some property in the connection string.
+
+1. You're not quite right. {{addBatch}} method of *{{PreparedStatement}}* (not {{Statement}}!) does not assign params by itself (and does not take any args at all), but rather tells driver that a new row has to be added to the batch, and for it the current set of values is copied. You set params by calling series of, say, {{setInt(column, value)}} (or whatever the type of param is), then call {{addBatch}}, and so forth, for each of the rows.
+
+2. Could you please elaborate on difference in semantics?
+
+We could of course turn data streamer on by setting connection string param, but still there's the question: how and when do we flush then? By forcing the user to set auto flush timeout? (Sounds like an option to me.) I don't think that it would be a good idea to introduce our "own" SQL statements for data streamer flush, and can't come up with how we could let the driver and cache know about the flush otherwise.
+
+Finished with INSERT support, working on support for DELETE and UPDATE. These are tricky because they involve digging into SQL map reduce engine, and UPDATE is especially tricky as long as it has to include cross field evaluation logic for new values (like {{update Something set field = field + 1}}).
+
+{{IgniteDataStreamer}} does not wait for user to call {{flush(...)}} in order to update the cache. As a matter of fact, it calls {{flush(...)}} internally many times throughout the process. This is very different from the {{execute(...)}} method on the batch.
+
+If you add a connection string parameter, the {{flush(...)}} should be called at the time of connection close.
+
+Thanks for clarification. As for now, it seems like it all boils down to having connection string param for flush timeout as well as invoking {{flush(...)}} explicitly on client disconnect. Am I right?
+
+I think you are right. Would be nice if Sergi would confirm.
+
+Working on UPDATE and DELETE. While doing it, a good idea came about how overall DML architecture can be made more lightweight and straightforward by using H2 features more - instead of manually constructing rows and trying to juggle columns in UPDATE, we can simply let H2 do all this RDBMS dirty stuff and then simply translate results of its manipulations with rows to cache operations with respect to particular type of the query being run. This approach is possible with further customization of {{GridH2Table}}.
+
+Following this discussion on dev list: http://apache-ignite-developers.2346864.n4.nabble.com/Default-hash-code-generation-strategy-for-new-binary-objects-td11433.html
+
+Here's how probably should look interface for hash code resolver:
+
+{code:java}
+interface BinaryObjectHashCodeResolver {
+     int hash(BinaryObject obj);
+}
+{code}
+
+And here's proposed example of cache query engine configuration - without classes for key and value, only described by the list of fields. Please note that this example specifically addresses case when there's no class for the key and pay attention to "affinityKey" and "hashCodeResolverClass" properties.
+
+{code:xml}
+<property name="queryEntities">
+    <list>
+        <bean class="org.apache.ignite.cache.QueryEntity">
+            <property name="keyType" value="TestKey"/>
+            <property name="valueType" value="TestType"/>
+            
+            <property name="hashCodeResolverClass" value="com.corp.ignite.HashCodeResolver"/>
+
+            <property name="fields">
+                <map>
+                    <entry key="i32Field" value="java.lang.Integer"/>
+                    <entry key="strField" value="java.lang.String"/>
+                    <entry key="boolField" value="java.lang.Boolean"/>
+                    <entry key="timestampField" value="java.sql.Timestamp"/>
+                </map>
+            </property>
+
+            <property name="keyFields">
+                <set>
+                    <value>strField</value>
+                    <value>i32Field</value>
+                </set>
+            </property>
+
+            <property name="affinityKey" value="i32Field"/>
+
+            <property name="indexes">
+                <list>
+                    <bean class="org.apache.ignite.cache.QueryIndex">
+                        <constructor-arg value="i32Field"/>
+                    </bean>
+                    <bean class="org.apache.ignite.cache.QueryIndex">
+                        <constructor-arg value="timestampField"/>
+                    </bean>
+                </list>
+            </property>
+        </bean>
+    </list>
+</property>     
+{code}
+
+Alex, my comments on all change except of deep SQL-related stuff:
+
+1) {{ignite-clients}} - tests are not included into suite, so they will not run on TC
+2) {{ignite-yardstick}} - looks like there are way too much benchmarks. I doubt we will really ever run them. At the very least, let's move them from {{cache}} package to {{dml}} package.
+3) {{QueryEntity}} is {{Serializable}}. We add a field to it, so compatibility could be broken.
+4) {{X.defaultPrimitiveValue}}, {{X.DEFAULTS}} - unused code
+5) {{X.ensureX}} - this method concerns me a lot. First, it appears that you use it to check internal conditions in some places. Assertions should be used instead. Second, it leads to invalid exception chains in some other places. E.g. {{GridSqlStatementSplitter.splitUpdateQuery}} - if you throw {{IgniteCheckedException}} from there, then it will be caught by catch block in {{IgniteH2Indexing.queryTwoStep0}}, what will result in the following exception chain which is very hard to understand:
+{code}
+"Failed to bind parameters ..." caused by "Failed to retrieve target for SQL update operation". 
+{code}
+6) Several class have unused imports.
+7) {{PlatformConfigurationUtils}} - you read key fields, but I do not see relevant code in .NET and CPP classes. It means, that quering is broken for platforms. This change should be reverted.
+8) {{CacheObjectBinaryProcessor.registerType}} - unused method.
+9) {{JdbcQueryTask}}, {{QueryResult}} - new field which breaks compatibility contract.
+10) Tests in "indexing" module: not added to any suite. Probably they should be in {{IgniteCacheQuerySelfTestSuite}}.
+11) Tests in "indexing" module: no need to duplicate them for binary and optimized marshallers. It is already handled by {{IgniteCacheQuerySelfTestSuite}} and {{IgniteBinaryCacheQueryTestSuite}} classes.
+
+Fixed almost everything. Outstanding issues:
+1) Correct tests management for {{ignite-clients}} and {{ignite-indexing}} modules.
+2) Correct placement for new Yardstick benchmarks. I would also remove them from default {{benchmark-multicast.properties}} and placed them aside, so that DML stuff is executed separately, not in the main suite.
+3) {{JdbcQueryTask}}/{{QueryResult}} compatibility.
+
+Made fixes for all comments given by Vlad (here) and Sergi (on github) where needed (few points had been agreed on).
+
+Additionally made DML logic more "flat" (after a statement has been analyzed and cached for the first time, subsequent runs will perform faster than the first one) and got rid of some new code duplication.
+
+Old classes (IgniteH2Indexing, GridSqlQuerySplitter, GridReduceQueryExecutor) remain virtually unchanged.
+
+Please advise on the next steps.
+
+Made full tests run on TC. Status available here: http://ci.ignite.apache.org/project.html?projectId=IgniteTests&branch_IgniteTests=pull/886/head
+
+Detected few {{GridQueryProcessor}} related problems with JDBC tests, made a patch that fixes them, will push later today.
+
+Also there seem to be some problems with new identity related tests for INSERT and MERGE, there's 2 of them. Investigating, hardly anything serious, so most likely will fix today. Main identity tests in {{GridCacheBinaryObjectsAbstractSelfTest}} still run fine.
+
+As for the rest of the failing tests, either they appear to be unrelated flaky ones (like .NET, or some transactions/partitioning multinode stuff), or their failures do not reproduce locally (like failures of {{IgniteCacheJoinQueryWithAffinityKeyTest}} in binary suite - locally it runs fine).
+
+Fixed all comments and failing tests. Waiting for results of post-fix full TC run (in progress now).
+
+I suggest that we leave alone {{JdbcQueryTaskV2}} with its UUID as long as this UUID is also used in {{JdbcResultSet}}. Currently UUID in old {{JdbcQueryTask}} does not seem to make any problems right away, so I think it would be better to shift this UUID -> IgniteUuid transition till 2.0 is released - by that time, we'll be able to fix all related classes in the right way without worrying about breaking anything.
+
+Use {{Object uuid;}} in {{JdbcResultSet}} and cast it when passing to either {{JdbcQueryTask}} or {{JdbcQueryTaskV2}}.
+
+There are few tests that seem to be broken since *ignite-4011-1* (Vlad's work on auto hashing). They all live in {{IgniteBinaryCacheQueryTestSuite}} (list:  http://ci.ignite.apache.org/viewLog.html?buildId=363344&tab=buildResultsDiv&buildTypeId=IgniteTests_IgniteBinaryObjectsSimpleMapperQueries) and hardly are DML related as long as in non binary mode they run fine and as they fail in last commit of *ignite-4011-1* as well. Investigating.
+
+As I see it now, this is solely problem of correcting tests. Also there is some problem with few (new DML related) tests in {{IgniteJdbcDriverTestSuite}}. Also looks like purely test problem - tests run fine one by one and fail only when run within suite. Investigating.
+
+[~sergi.vladykin] ok, I hear you. Smells fishy if you ask me tho.
+
+Comments fixed, issue resolved, and patch for it has been incorporated into 1.8 branch. Thanks Vlad and Sergi for help!
+
+However, there still are few failing/suite unfriendly tests (see above, issues IGNITE-4279, IGNITE-4280) and two feature issues that will have to be fixed later - IGNITE-4268 and IGNITE-4269
+

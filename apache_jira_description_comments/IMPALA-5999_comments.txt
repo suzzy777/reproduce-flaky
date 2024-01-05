@@ -1,0 +1,970 @@
+[~tarmstrong] I have a hunch that this may be related to:
+https://github.com/apache/incubator-impala/commit/852e1bb728c790f27b49ebee2857f68860272c70
+
+Could you have a look when you get the time?
+
+[~sailesh] why do you think it's related? That's been in there for quite a while.
+
+An impalad process crashed. Unfortunately we don't have the backtrace but I found this in a log:
+
+{noformat}
+error: Linking globals named 'global_array_2': symbol multiply defined!
+mpalad.ip-172-31-7-198.ubuntu.log.ERROR.20170929-022801.31953pure virtual method called
+...
+terminate called without an active exception 
+{noformat}
+
+https://jenkins.impala.io/job/ubuntu-16.04-from-scratch/353/artifact/Impala/logs_static/logs/ee_tests/impalad.ip-172-31-7-198.ubuntu.log.ERROR.20170929-022801.31953/*view*/
+
+The original error comes from here https://github.com/llvm-mirror/llvm/blob/bad5f185df2d4a88145025b7ec93c8e008c9cd80/lib/Linker/LinkModules.cpp#L325 . I don't think that should be fatal and I can't be 100% sure that that's the cause of the pure virtual function problem but it looks suspicious.
+
+I'm going to see if I can reproduce this locally. Unfortunately we don't get core dumps or anything useful from failed jenkins.impala.io jobs
+
+Thanks for taking a look [~tarmstrong]. That was the last commit that touched both the UDF code and the spilling code, so I thought they may be related to the test failures we see here. (Maybe that in conjunction with the LLVM upgrade had something to do with this?)
+
+I can reproduce a crash locally by slightly modifying the IR UDFs (branch is here: https://github.com/timarmstrong/incubator-impala/tree/impala-5999-udf-crash)
+
+{code}
+commit fe688802bdb3b238c0f40ae769025061a7f906fe
+Author: Tim Armstrong <tarmstrong@cloudera.com>
+Date:   Fri Sep 29 14:14:57 2017 -0700
+
+    Repro
+
+diff --git a/be/src/testutil/test-udfs.cc b/be/src/testutil/test-udfs.cc
+index 894ce61..8ccb50a 100644
+--- a/be/src/testutil/test-udfs.cc
++++ b/be/src/testutil/test-udfs.cc
+@@ -23,6 +23,13 @@ using namespace impala_udf;
+ #define NO_INLINE __attribute__((noinline))
+ #define WEAK_SYM  __attribute__((weak))
+ 
++namespace impala {
++class AggregateFunctions {
++  static constexpr int HLL_PRECISION = 10;
++};
++constexpr int AggregateFunctions::HLL_PRECISION;
++}
++
+ // These functions are intended to test the "glue" that runs UDFs. Thus, the UDFs
+ // themselves are kept very simple.
+{code}
+
+I get a similar error and the impalad process disappears.
+{code}
+error: Linking globals named '_ZN6impala18AggregateFunctions13HLL_PRECISIONE': symbol multiply defined!
+Picked up JAVA_TOOL_OPTIONS: -agentlib:jdwp=transport=dt_socket,address=30000,server=y,suspend=n 
+{code}
+
+Might be overactive C+\+17 {{inline}} variables (even though we compile with C++14), added in Clang 3.9:
+
+http://www.open-std.org/jtc1/sc22/wg21/docs/papers/2016/p0386r2.pdf
+
+https://clang.llvm.org/cxx_status.html
+
+I think there are two separate questions:
+* Why does it think there are duplicate definitions of that variable? Could we be linking the module twice?
+* Why doesn't LLVM bubble up the error cleanly?
+
+On my local repro I can see that LLVM is calling exit(1) here:
+{noformat}
+(gdb) bt
+#0  __GI_exit (status=1) at exit.c:104
+#1  0x0000000002b29a60 in llvm::LLVMContext::diagnose (this=<optimized out>, DI=...) at /home/tarmstrong/Impala/native-toolchain/source/llvm/llvm-3.9.1-debug.src/lib/IR/LLVMContext.cpp:277
+#2  0x0000000001f2c325 in (anonymous namespace)::ModuleLinker::emitError (Message=..., this=0x7f8cfd99a130) at /home/tarmstrong/Impala/native-toolchain/source/llvm/llvm-3.9.1-debug.src/lib/Linker/LinkModules.cpp:63
+#3  (anonymous namespace)::ModuleLinker::shouldLinkFromSource (this=this@entry=0x7f8cfd99a130, LinkFromSrc=@0x7f8cfd999f90: true, Dest=..., Src=...) at /home/tarmstrong/Impala/native-toolchain/source/llvm/llvm-3.9.1-debug.src/lib/Linker/LinkModules.cpp:350
+#4  0x0000000001f2d583 in (anonymous namespace)::ModuleLinker::shouldLinkFromSource (Src=..., Dest=..., LinkFromSrc=@0x7f8cfd999f90: true, this=0x7f8cfd99a130) at /home/tarmstrong/Impala/native-toolchain/source/llvm/llvm-3.9.1-debug.src/lib/Linker/LinkModules.cpp:141
+#5  (anonymous namespace)::ModuleLinker::linkIfNeeded (this=this@entry=0x7f8cfd99a130, GV=...) at /home/tarmstrong/Impala/native-toolchain/source/llvm/llvm-3.9.1-debug.src/lib/Linker/LinkModules.cpp:413
+#6  0x0000000001f2d9f0 in (anonymous namespace)::ModuleLinker::run (this=this@entry=0x7f8cfd99a130) at /home/tarmstrong/Impala/native-toolchain/source/llvm/llvm-3.9.1-debug.src/lib/Linker/LinkModules.cpp:548
+#7  0x0000000001f2fc26 in llvm::Linker::linkInModule (this=this@entry=0x7f8cfd99a240, Src=std::unique_ptr<llvm::Module> containing 0x0, Flags=Flags@entry=0, GlobalsToImport=GlobalsToImport@entry=0x0)
+    at /home/tarmstrong/Impala/native-toolchain/source/llvm/llvm-3.9.1-debug.src/lib/Linker/LinkModules.cpp:607
+#8  0x0000000001f2fd72 in llvm::Linker::linkModules (Dest=..., Src=std::unique_ptr<llvm::Module> containing 0x0, Flags=0) at /home/tarmstrong/Impala/native-toolchain/source/llvm/llvm-3.9.1-debug.src/lib/Linker/LinkModules.cpp:622
+#9  0x00000000018ab13e in impala::LlvmCodeGen::LinkModule (this=0xb4e4f40, file="/tmp/test-udfs.21320.0.ll") at be/src/codegen/llvm-codegen.cc:307
+#10 0x00000000018b05cb in impala::LlvmCodeGen::LoadFunction (this=0xb4e4f40, fn=..., symbol="_Z8IdentityPN10impala_udf15FunctionContextERKNS_10BooleanValE", return_type=0xb500148, arg_types=std::vector of length 1, capacity 1 = {...}, num_fixed_args=1, has_varargs=false, 
+    llvm_fn=0x7f8cfd99aeb8, cache_entry=0xb500008) at be/src/codegen/llvm-codegen.cc:870
+#11 0x0000000001bc1ffb in impala::ScalarFnCall::GetCodegendComputeFn (this=0xb500000, codegen=0xb4e4f40, fn=0x7f8cfd99b348) at be/src/exprs/scalar-fn-call.cc:312
+#12 0x00000000015b7227 in impala::RuntimeState::CodegenScalarFns (this=0xacf2080) at be/src/runtime/runtime-state.cc:138
+#13 0x0000000001654306 in impala::FragmentInstanceState::Prepare (this=0xa3cf900) at be/src/runtime/fragment-instance-state.cc:209
+#14 0x0000000001652bb9 in impala::FragmentInstanceState::Exec (this=0xa3cf900) at be/src/runtime/fragment-instance-state.cc:73
+#15 0x0000000001619282 in impala::QueryState::ExecFInstance (this=0x8290d00, fis=0xa3cf900) at be/src/runtime/query-state.cc:369
+#16 0x0000000001617c06 in impala::QueryState::<lambda()>::operator()(void) const (__closure=0x7f8cfd99bd28) at be/src/runtime/query-state.cc:317
+#17 0x0000000001619ecd in boost::detail::function::void_function_obj_invoker0<impala::QueryState::StartFInstances()::<lambda()>, void>::invoke(boost::detail::function::function_buffer &) (function_obj_ptr=...)
+    at toolchain/boost-1.57.0-p3/include/boost/function/function_template.hpp:153
+#18 0x000000000158807e in boost::function0<void>::operator() (this=0x7f8cfd99bd20) at toolchain/boost-1.57.0-p3/include/boost/function/function_template.hpp:767
+#19 0x00000000018591af in impala::Thread::SuperviseThread(std::string const&, std::string const&, boost::function<void ()>, impala::Promise<long>*) (name="exec-finstance (finst:554ea03408517ec7:4afccc1500000000)", category="fragment-execution", functor=..., 
+    thread_started=0x7f8cfe19bbe0) at be/src/util/thread.cc:352
+#20 0x0000000001861d42 in boost::_bi::list4<boost::_bi::value<std::string>, boost::_bi::value<std::string>, boost::_bi::value<boost::function<void ()> >, boost::_bi::value<impala::Promise<long>*> >::operator()<void (*)(std::string const&, std::string const&, boost::function<void ()>, impala::Promise<long>*), boost::_bi::list0>(boost::_bi::type<void>, void (*&)(std::string const&, std::string const&, boost::function<void ()>, impala::Promise<long>*), boost::_bi::list0&, int) (this=0xb4fffc0, 
+    f=@0xb4fffb8: 0x1858e90 <impala::Thread::SuperviseThread(std::string const&, std::string const&, boost::function<void ()>, impala::Promise<long>*)>, a=...) at toolchain/boost-1.57.0-p3/include/boost/bind/bind.hpp:457
+#21 0x0000000001861c85 in boost::_bi::bind_t<void, void (*)(std::string const&, std::string const&, boost::function<void ()>, impala::Promise<long>*), boost::_bi::list4<boost::_bi::value<std::string>, boost::_bi::value<std::string>, boost::_bi::value<boost::function<void ()> >, boost::_bi::value<impala::Promise<long>*> > >::operator()() (this=0xb4fffb8) at toolchain/boost-1.57.0-p3/include/boost/bind/bind_template.hpp:20
+#22 0x0000000001861c48 in boost::detail::thread_data<boost::_bi::bind_t<void, void (*)(std::string const&, std::string const&, boost::function<void ()>, impala::Promise<long>*), boost::_bi::list4<boost::_bi::value<std::string>, boost::_bi::value<std::string>, boost::_bi::value<boost::function<void ()> >, boost::_bi::value<impala::Promise<long>*> > > >::run() (this=0xb4ffe00) at toolchain/boost-1.57.0-p3/include/boost/thread/detail/thread.hpp:116
+#23 0x0000000001e1dbfa in thread_proxy ()
+#24 0x00007f8d9fa3b6ba in start_thread (arg=0x7f8cfd99c700) at pthread_create.c:333
+#25 0x00007f8d9f7713dd in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:109
+(gdb) up
+{noformat}
+
+After looking at the LLVM code I have the answer to the second part: we didn't install a diagnostic handler in the LLVMContext and the default behaviour is to log an error and exit the process. http://llvm.org/doxygen/DiagnosticHandler_8h_source.html
+
+I can reproduce a similar crash with a query that refers to two IR udfs in different modules that have the same symbol. It's still not clear why there would be two separate modules loaded.
+
+{noformat}
+[localhost:21000] > create function identity(boolean) returns boolean
+location '/test-warehouse/test-udfs.ll' symbol='Identity';
+Query: create function identity(boolean) returns boolean
+location '/test-warehouse/test-udfs.ll' symbol='Identity'
+Fetched 0 row(s) in 0.21s
+[localhost:21000] > create function identity(int) returns int
+location '/test-warehouse/test-udfs2.ll' symbol='Identity';
+Query: create function identity(int) returns int
+location '/test-warehouse/test-udfs2.ll' symbol='Identity'
+Fetched 0 row(s) in 0.04s
+[localhost:21000] > select identity(bool_col), identity(int_col) from functional.alltypestiny;
+Query: select identity(bool_col), identity(int_col) from functional.alltypestiny
+Query submitted at: 2017-09-29 15:36:27 (Coordinator: http://tarmstrong-box:25000)
+Error communicating with impalad: TSocket read 0 bytes
+{noformat}
+
+In the error log:
+{noformat}
+error: Linking globals named 'global_array_2': symbol multiply defined!
+{noformat}
+
+The failure handling in and around LlvmCodeGen::LinkModules() is suspect. I think if module linking fails things can get into a bad state. E.g. if Linker::linkModules() fails we don't add the module to linked_modules_ but potentially things could blow up if we try to relink the modules. We don't treat codegen errors as ending the query, so codegening another function could result in another attempt to link the same module.
+
+Thanks for taking a look at this Tim. I encountered the same error in one of my GVO builds, added it to the description.
+
+The earliest commits we saw this happen on were based on master at:
+
+{noformat}
+commit 439f245d34fa7a76508a5a620a0d69e7bed947a4
+Author: Zachary Amsden <zamsden@cloudera.com>
+Date:   Fri Sep 22 18:38:58 2017 -0700
+
+    IMPALA-5975: Work around broken beeline clients
+{noformat}
+
+All of the failed builds also included some version of this commit:
+{noformat}
+Move tests related to the old join node. 
+
+No tests were added/dropped or modified. 
+
+They are consolidated into fewer .test files. 
+
+Change-Id: Idda4b34b5e6e9b5012b177a4c00077aa7fec394c 
+{noformat}
+
+The recent commits are:
+{noformat}
+commit 439f245d34fa7a76508a5a620a0d69e7bed947a4
+Author: Zachary Amsden <zamsden@cloudera.com>
+Date:   Fri Sep 22 18:38:58 2017 -0700
+
+    IMPALA-5975: Work around broken beeline clients
+    
+    To make statements execute, some clients require always appending
+    a semi-colon to the end.  The workaround is quite simple.
+    
+    Change-Id: Id8b9f3dde4445513f1f389785a002c6cc6b3dada
+    Reviewed-on: http://gerrit.cloudera.org:8080/8132
+    Reviewed-by: Joe McDonnell <joemcdonnell@cloudera.com>
+    Tested-by: Impala Public Jenkins
+
+commit dd340b8810ecd00ad2ffe79845ca137e941aefb7
+Author: Dimitris Tsirogiannis <dtsirogiannis@cloudera.com>
+Date:   Mon Aug 14 11:05:20 2017 -0700
+
+    IMPALA-5538: Use explicit catalog versions for deleted objects
+    
+    This commit changes the way deletions are handled in the catalog and
+    disseminated to the impalad nodes through the statestore. Previously,
+    deletions of catalog objects were not explicitly annotated with the
+    catalog version in which the deletion occured and the impalads were
+    using the max catalog version in a catalog update in order to decide
+    whether a deletion should be applied to the local catalog cache or not.
+    This works correctly under the assumption that
+    all the changes that occurred in the catalog between an update's min
+    and max catalog version are included in that update, i.e. no gaps or
+    missing updates. With the upcoming fix for IMPALA-5058, that constraint
+    will be relaxed, thus allowing for gaps in the catalog updates.
+    
+    To avoid breaking the existing behavior, this patch introduced the
+    following changes:
+    * Deletions in the catalog are explicitly recorded in a log with
+    the catalog version in which they occurred. As before, added and deleted
+    catalog objects are sent to the statestore.
+    * Topic entries associated with deleted catalog objects have non-empty
+    values (besided keys) that contain minimal object metadata including the
+    catalog version.
+    * Statestore is no longer using the existence or not of
+    topic entry values in order to identify deleted topic entries. Deleted
+    topic entries should be explicitly marked as such by the statestore
+    subscribers that produce them.
+    * Statestore subscribers now use the 'deleted' flag to determine if a
+    topic entry corresponds to a deleted item.
+    * Impalads use the deleted objects' catalog versions when updating the
+    local catalog cache from a catalog update and not the update's maximum
+    catalog version.
+    
+    Testing:
+    - No new tests were added as these paths are already exercised by
+    existing tests.
+    - Run all core tests.
+    
+    Change-Id: I93cb7a033dc8f0d3e0339394b36affe14523274c
+    Reviewed-on: http://gerrit.cloudera.org:8080/7731
+    Reviewed-by: Dimitris Tsirogiannis <dtsirogiannis@cloudera.com>
+    Tested-by: Impala Public Jenkins
+
+commit d565386b245128cedaa07367a2ff8407988aeaa2
+Author: John Russell <jrussell@cloudera.com>
+Date:   Tue Sep 5 11:44:10 2017 -0700
+
+    [DOCS] Fill in release note subtopics for Apache Impala 2.10
+    
+    Primarily just pointing to the list of issues in the changelog.
+    Those cover the different use cases for the different parts
+    of the release notes -- fixed issues, new features, and
+    incompatible changes.
+    
+    Change-Id: Ide38c1e1c64dac287b180b39ebb8e7735d457ce3
+    Reviewed-on: http://gerrit.cloudera.org:8080/7958
+    Reviewed-by: Michael Brown <mikeb@cloudera.com>
+    Tested-by: Impala Public Jenkins
+commit 79dc220bd75eb5dc333aeeff3f65fc5dbfe3a6e8
+Author: Thomas Tauber-Marshall <tmarshall@cloudera.com>
+Date:   Wed Sep 6 12:29:38 2017 -0700
+
+    IMPALA-3360: Codegen inserting into runtime filters
+    
+    This patch codegens PhjBuilder::InsertRuntimeFilters() and
+    FilterContext::Insert().
+    
+    This allows us to unroll the loop over all the filters in
+    PhjBuilder::ProcessBuildBatch(), eliminate the branch on type that
+    happens in RawValue::GetHashValue(), and eliminate the AVX check
+    that happens in BloomFilter::Insert().
+    
+    Testing:
+    - Ran existing runtime filter tests.
+    - Ran perf tests locally (all avg. over three runs):
+      - Four way self join on tpch_parquet.lineitem. Should be a good case
+        for this as there's several large hash join build sides that will
+        benefit from the codegen. Total query running time improved ~7%
+        (from 16.07s to 14.91s).
+      - Single join of tpch_parquet.lineitem against a selectively
+        filtered tpch_parquet.lineitem. Should be a bad case for this
+        patch, as the build side of the join is very small. Total query
+        running time regressed by about ~2% (from 0.73s to 0.75s) due to
+        an increase in codegen time (from 295ms to 309ms for the fragment
+        containing the hash join).
+    
+    Change-Id: I79cf23ad92dadaab996a50a2ca07ef9ebe8639bb
+    Reviewed-on: http://gerrit.cloudera.org:8080/8029
+    Reviewed-by: Thomas Tauber-Marshall <tmarshall@cloudera.com>
+    Tested-by: Impala Public Jenkins
+
+commit 646920810f581698c5150553d6bccc0f82c0fe6b
+Author: Vuk Ercegovac <vercegovac@cloudera.com>
+Date:   Thu Sep 21 13:47:37 2017 -0700
+
+    IMPALA-1767 Adds predicate to test boolean values true, false, unknown.
+    
+    Adds a new expression to represent the following boolean predicate:
+    <expr> IS [NOT] (TRUE | FALSE | UNKNOWN)
+    The expression is expanded in the parser to istrue/false for the checks
+    against true and false respectively and to isnull for the check against
+    unknown. Compared to the other approaches (rewrites, extended backend expr),
+    this change is the simplest. Main downside is that error messages are
+    in terms of the lowered expression.
+    
+    Testing:
+    - fe: parser, tosql, analyze exprs
+    - e2e: query exprs
+    
+    Change-Id: I9d5fba65ef6c87dfc55a25d2c45246f74eb48c40
+    Reviewed-on: http://gerrit.cloudera.org:8080/8122
+    Reviewed-by: Alex Behm <alex.behm@cloudera.com>
+    Tested-by: Impala Public Jenkins
+commit d53f43b42c7c41f72d6a31505344f0393bdbe8a5
+Author: Zoram Thanga <zoram@cloudera.com>
+Date:   Fri Sep 15 15:27:44 2017 -0700
+
+    IMPALA-5599: Fix for mis-use of TimestampValue
+    
+    The TimestampValue class is being used for non-database purposes
+    in many places, such as in log messages.
+    
+    This change proposes to introduce APIs to convert Unix timetamps
+    into the corresponding date-time strings. We provide a series of
+    functions for different input time units, and also give the user
+    control over the precision of the output date-time string. APIs
+    are provided to format in UTC and local time zones. The new APIs
+    can be used to replace (or instead of) TimestampValue::ToString()
+    in those places where Unix timestamps are being converted to
+    strings for printing.
+    
+    The current commit implements the APIs and replaces calls to
+    TimestampValue::ToString() in be/src/service.
+    
+    A new unit test, time-test, has been added to the back-end tests.
+    
+    Other uses of TimestampValue in be/src/service, such as to track
+    start and end times of queries, etc., will be analyzed and changed
+    as appropriate in a follow-up commit.
+    
+    Change-Id: I9b0ae06f6d94968c87a199625aa3332b26988142
+    Reviewed-on: http://gerrit.cloudera.org:8080/8084
+    Reviewed-by: Dan Hecht <dhecht@cloudera.com>
+    Tested-by: Impala Public Jenkins
+
+{noformat}
+
+My guess is that either:
+* The issue was latent and somehow triggered by a change in test ordering.
+* It was caused by the runtime filters codegen, since this is the only significant recent change
+
+Hit again: https://jenkins.impala.io/job/ubuntu-16.04-from-scratch/410/
+
+I saw this happen on a precommit job without Bikram's error handler fix: https://jenkins.impala.io/job/ubuntu-16.04-from-scratch/474/ (the symbol multiply defined error was in the .ERROR log).
+
+I saw this happen on an internal job with Bikram's error handler fix:
+{noformat}
+query_test.test_udfs.TestUdfExecution.test_ir_functions[exec_option: {'disable_codegen_rows_threshold': 0, 'disable_codegen': False, 'exec_single_node_rows_threshold': 0, 'enable_expr_rewrites': True} | table_format: text/none] (from pytest)
+Failing for the past 1 build (Since Failed#157 )
+Took 1 min 58 sec.
+add description
+Error Message
+
+query_test/test_udfs.py:309: in test_ir_functions     self.run_test_case('QueryTest/udf', vector, use_db=unique_database) common/impala_test_suite.py:391: in run_test_case     result = self.__execute_query(target_impalad_client, query, user=user) common/impala_test_suite.py:600: in __execute_query     return impalad_client.execute(query, user=user) common/impala_connection.py:160: in execute     return self.__beeswax_client.execute(sql_stmt, user=user) beeswax/impala_beeswax.py:173: in execute     handle = self.__execute_query(query_string.strip(), user=user) beeswax/impala_beeswax.py:341: in __execute_query     self.wait_for_completion(handle) beeswax/impala_beeswax.py:361: in wait_for_completion     raise ImpalaBeeswaxException("Query aborted:" + error_log, None) E   ImpalaBeeswaxException: ImpalaBeeswaxException: E    Query aborted:Problem linking /tmp/test-udfs.14186.9.ll to main module. LLVM diagnostic error: Linking globals named 'global_array_2': symbol multiply defined!
+
+Stacktrace
+
+query_test/test_udfs.py:309: in test_ir_functions
+    self.run_test_case('QueryTest/udf', vector, use_db=unique_database)
+common/impala_test_suite.py:391: in run_test_case
+    result = self.__execute_query(target_impalad_client, query, user=user)
+common/impala_test_suite.py:600: in __execute_query
+    return impalad_client.execute(query, user=user)
+common/impala_connection.py:160: in execute
+    return self.__beeswax_client.execute(sql_stmt, user=user)
+beeswax/impala_beeswax.py:173: in execute
+    handle = self.__execute_query(query_string.strip(), user=user)
+beeswax/impala_beeswax.py:341: in __execute_query
+    self.wait_for_completion(handle)
+beeswax/impala_beeswax.py:361: in wait_for_completion
+    raise ImpalaBeeswaxException("Query aborted:" + error_log, None)
+E   ImpalaBeeswaxException: ImpalaBeeswaxException:
+E    Query aborted:Problem linking /tmp/test-udfs.14186.9.ll to main module. LLVM diagnostic error: Linking globals named 'global_array_2': symbol multiply defined!
+
+Standard Error
+
+SET sync_ddl=False;
+-- executing against localhost:21000
+DROP DATABASE IF EXISTS `test_ir_functions_b0aa81e2` CASCADE;
+
+SET sync_ddl=False;
+-- executing against localhost:21000
+CREATE DATABASE `test_ir_functions_b0aa81e2`;
+
+MainThread: Created database "test_ir_functions_b0aa81e2" for test ID "query_test/test_udfs.py::TestUdfExecution::()::test_ir_functions[exec_option: {'disable_codegen_rows_threshold': 0, 'disable_codegen': False, 'exec_single_node_rows_threshold': 0, 'enable_expr_rewrites': True} | table_format: text/none]"
+SET disable_codegen_rows_threshold=0;
+SET disable_codegen=False;
+SET exec_single_node_rows_threshold=0;
+SET enable_expr_rewrites=True;
+-- executing against localhost:21000
+
+create function test_ir_functions_b0aa81e2.identity(boolean) returns boolean
+location '/test-warehouse/test-udfs.ll' symbol='Identity';
+
+SET disable_codegen_rows_threshold=0;
+SET disable_codegen=False;
+SET exec_single_node_rows_threshold=0;
+SET enable_expr_rewrites=True;
+-- executing against localhost:21000
+
+
+create function test_ir_functions_b0aa81e2.identity(tinyint) returns tinyint
+location '/test-warehouse/test-udfs.ll' symbol='Identity';
+
+SET disable_codegen_rows_threshold=0;
+SET disable_codegen=False;
+SET exec_single_node_rows_threshold=0;
+SET enable_expr_rewrites=True;
+-- executing against localhost:21000
+
+
+create function test_ir_functions_b0aa81e2.identity(smallint) returns smallint
+location '/test-warehouse/test-udfs.ll' symbol='Identity';
+
+SET disable_codegen_rows_threshold=0;
+SET disable_codegen=False;
+SET exec_single_node_rows_threshold=0;
+SET enable_expr_rewrites=True;
+-- executing against localhost:21000
+
+
+create function test_ir_functions_b0aa81e2.identity(int) returns int
+location '/test-warehouse/test-udfs.ll' symbol='Identity';
+
+SET disable_codegen_rows_threshold=0;
+SET disable_codegen=False;
+SET exec_single_node_rows_threshold=0;
+SET enable_expr_rewrites=True;
+-- executing against localhost:21000
+
+
+create function test_ir_functions_b0aa81e2.identity(bigint) returns bigint
+location '/test-warehouse/test-udfs.ll' symbol='Identity';
+
+SET disable_codegen_rows_threshold=0;
+SET disable_codegen=False;
+SET exec_single_node_rows_threshold=0;
+SET enable_expr_rewrites=True;
+-- executing against localhost:21000
+
+
+create function test_ir_functions_b0aa81e2.identity(float) returns float
+location '/test-warehouse/test-udfs.ll' symbol='Identity';
+
+SET disable_codegen_rows_threshold=0;
+SET disable_codegen=False;
+SET exec_single_node_rows_threshold=0;
+SET enable_expr_rewrites=True;
+-- executing against localhost:21000
+
+
+create function test_ir_functions_b0aa81e2.identity(double) returns double
+location '/test-warehouse/test-udfs.ll' symbol='Identity';
+
+SET disable_codegen_rows_threshold=0;
+SET disable_codegen=False;
+SET exec_single_node_rows_threshold=0;
+SET enable_expr_rewrites=True;
+-- executing against localhost:21000
+
+
+create function test_ir_functions_b0aa81e2.identity(string) returns string
+location '/test-warehouse/test-udfs.ll'
+symbol='_Z8IdentityPN10impala_udf15FunctionContextERKNS_9StringValE';
+
+SET disable_codegen_rows_threshold=0;
+SET disable_codegen=False;
+SET exec_single_node_rows_threshold=0;
+SET enable_expr_rewrites=True;
+-- executing against localhost:21000
+
+
+create function test_ir_functions_b0aa81e2.identity(timestamp) returns timestamp
+location '/test-warehouse/test-udfs.ll'
+symbol='_Z8IdentityPN10impala_udf15FunctionContextERKNS_12TimestampValE';
+
+SET disable_codegen_rows_threshold=0;
+SET disable_codegen=False;
+SET exec_single_node_rows_threshold=0;
+SET enable_expr_rewrites=True;
+-- executing against localhost:21000
+
+
+create function test_ir_functions_b0aa81e2.identity(decimal(9,0)) returns decimal(9,0)
+location '/test-warehouse/test-udfs.ll'
+symbol='_Z8IdentityPN10impala_udf15FunctionContextERKNS_10DecimalValE';
+
+SET disable_codegen_rows_threshold=0;
+SET disable_codegen=False;
+SET exec_single_node_rows_threshold=0;
+SET enable_expr_rewrites=True;
+-- executing against localhost:21000
+
+
+create function test_ir_functions_b0aa81e2.identity(decimal(18,1)) returns decimal(18,1)
+location '/test-warehouse/test-udfs.ll'
+symbol='_Z8IdentityPN10impala_udf15FunctionContextERKNS_10DecimalValE';
+
+SET disable_codegen_rows_threshold=0;
+SET disable_codegen=False;
+SET exec_single_node_rows_threshold=0;
+SET enable_expr_rewrites=True;
+-- executing against localhost:21000
+
+
+create function test_ir_functions_b0aa81e2.identity(decimal(38,10)) returns decimal(38,10)
+location '/test-warehouse/test-udfs.ll'
+symbol='_Z8IdentityPN10impala_udf15FunctionContextERKNS_10DecimalValE';
+
+SET disable_codegen_rows_threshold=0;
+SET disable_codegen=False;
+SET exec_single_node_rows_threshold=0;
+SET enable_expr_rewrites=True;
+-- executing against localhost:21000
+
+
+create function test_ir_functions_b0aa81e2.all_types_fn(
+    string, boolean, tinyint, smallint, int, bigint, float, double, decimal(2,0))
+returns int
+location '/test-warehouse/test-udfs.ll' symbol='AllTypes';
+
+SET disable_codegen_rows_threshold=0;
+SET disable_codegen=False;
+SET exec_single_node_rows_threshold=0;
+SET enable_expr_rewrites=True;
+-- executing against localhost:21000
+
+
+create function test_ir_functions_b0aa81e2.no_args() returns string
+location '/test-warehouse/test-udfs.ll'
+symbol='_Z6NoArgsPN10impala_udf15FunctionContextE';
+
+SET disable_codegen_rows_threshold=0;
+SET disable_codegen=False;
+SET exec_single_node_rows_threshold=0;
+SET enable_expr_rewrites=True;
+-- executing against localhost:21000
+
+
+create function test_ir_functions_b0aa81e2.var_and(boolean...) returns boolean
+location '/test-warehouse/test-udfs.ll' symbol='VarAnd';
+
+SET disable_codegen_rows_threshold=0;
+SET disable_codegen=False;
+SET exec_single_node_rows_threshold=0;
+SET enable_expr_rewrites=True;
+-- executing against localhost:21000
+
+
+create function test_ir_functions_b0aa81e2.var_sum(int...) returns int
+location '/test-warehouse/test-udfs.ll' symbol='VarSum';
+
+SET disable_codegen_rows_threshold=0;
+SET disable_codegen=False;
+SET exec_single_node_rows_threshold=0;
+SET enable_expr_rewrites=True;
+-- executing against localhost:21000
+
+
+create function test_ir_functions_b0aa81e2.var_sum(double...) returns double
+location '/test-warehouse/test-udfs.ll' symbol='VarSum';
+
+SET disable_codegen_rows_threshold=0;
+SET disable_codegen=False;
+SET exec_single_node_rows_threshold=0;
+SET enable_expr_rewrites=True;
+-- executing against localhost:21000
+
+
+create function test_ir_functions_b0aa81e2.var_sum(string...) returns int
+location '/test-warehouse/test-udfs.ll' symbol='VarSum';
+
+SET disable_codegen_rows_threshold=0;
+SET disable_codegen=False;
+SET exec_single_node_rows_threshold=0;
+SET enable_expr_rewrites=True;
+-- executing against localhost:21000
+
+
+create function test_ir_functions_b0aa81e2.var_sum(decimal(4,2)...) returns decimal(18,2)
+location '/test-warehouse/test-udfs.ll' symbol='VarSum';
+
+SET disable_codegen_rows_threshold=0;
+SET disable_codegen=False;
+SET exec_single_node_rows_threshold=0;
+SET enable_expr_rewrites=True;
+-- executing against localhost:21000
+
+
+create function test_ir_functions_b0aa81e2.var_sum_multiply(double, int...) returns double
+location '/test-warehouse/test-udfs.ll'
+symbol='_Z14VarSumMultiplyPN10impala_udf15FunctionContextERKNS_9DoubleValEiPKNS_6IntValE';
+
+SET disable_codegen_rows_threshold=0;
+SET disable_codegen=False;
+SET exec_single_node_rows_threshold=0;
+SET enable_expr_rewrites=True;
+-- executing against localhost:21000
+
+
+create function test_ir_functions_b0aa81e2.var_sum_multiply2(double, int...) returns double
+location '/test-warehouse/test-udfs.ll'
+symbol='_Z15VarSumMultiply2PN10impala_udf15FunctionContextERKNS_9DoubleValEiPKNS_6IntValE';
+
+SET disable_codegen_rows_threshold=0;
+SET disable_codegen=False;
+SET exec_single_node_rows_threshold=0;
+SET enable_expr_rewrites=True;
+-- executing against localhost:21000
+
+
+create function test_ir_functions_b0aa81e2.xpow(double, double) returns double
+location '/test-warehouse/test-udfs.ll'
+symbol='_ZN6impala13MathFunctions3PowEPN10impala_udf15FunctionContextERKNS1_9DoubleValES6_';
+
+SET disable_codegen_rows_threshold=0;
+SET disable_codegen=False;
+SET exec_single_node_rows_threshold=0;
+SET enable_expr_rewrites=True;
+-- executing against localhost:21000
+
+
+create function test_ir_functions_b0aa81e2.to_lower(string) returns string
+location '/test-warehouse/test-udfs.ll'
+symbol='_Z7ToLowerPN10impala_udf15FunctionContextERKNS_9StringValE';
+
+SET disable_codegen_rows_threshold=0;
+SET disable_codegen=False;
+SET exec_single_node_rows_threshold=0;
+SET enable_expr_rewrites=True;
+-- executing against localhost:21000
+
+
+create function test_ir_functions_b0aa81e2.to_upper(string) returns string
+location '/test-warehouse/test-udfs.ll'
+symbol='_Z7ToUpperPN10impala_udf15FunctionContextERKNS_9StringValE';
+
+SET disable_codegen_rows_threshold=0;
+SET disable_codegen=False;
+SET exec_single_node_rows_threshold=0;
+SET enable_expr_rewrites=True;
+-- executing against localhost:21000
+
+
+create function test_ir_functions_b0aa81e2.constant_timestamp() returns timestamp
+location '/test-warehouse/test-udfs.ll' symbol='ConstantTimestamp';
+
+SET disable_codegen_rows_threshold=0;
+SET disable_codegen=False;
+SET exec_single_node_rows_threshold=0;
+SET enable_expr_rewrites=True;
+-- executing against localhost:21000
+
+
+create function test_ir_functions_b0aa81e2.validate_arg_type(string) returns boolean
+location '/test-warehouse/test-udfs.ll' symbol='ValidateArgType';
+
+SET disable_codegen_rows_threshold=0;
+SET disable_codegen=False;
+SET exec_single_node_rows_threshold=0;
+SET enable_expr_rewrites=True;
+-- executing against localhost:21000
+
+
+create function test_ir_functions_b0aa81e2.count_rows() returns bigint
+location '/test-warehouse/test-udfs.ll' symbol='Count' prepare_fn='CountPrepare' close_fn='CountClose';
+
+SET disable_codegen_rows_threshold=0;
+SET disable_codegen=False;
+SET exec_single_node_rows_threshold=0;
+SET enable_expr_rewrites=True;
+-- executing against localhost:21000
+
+
+create function test_ir_functions_b0aa81e2.constant_arg(int) returns int
+location '/test-warehouse/test-udfs.ll' symbol='ConstantArg' prepare_fn='ConstantArgPrepare' close_fn='ConstantArgClose';
+
+SET disable_codegen_rows_threshold=0;
+SET disable_codegen=False;
+SET exec_single_node_rows_threshold=0;
+SET enable_expr_rewrites=True;
+-- executing against localhost:21000
+
+
+create function test_ir_functions_b0aa81e2.validate_open(int) returns boolean
+location '/test-warehouse/test-udfs.ll' symbol='ValidateOpen'
+prepare_fn='ValidateOpenPrepare' close_fn='ValidateOpenClose';
+
+SET disable_codegen_rows_threshold=0;
+SET disable_codegen=False;
+SET exec_single_node_rows_threshold=0;
+SET enable_expr_rewrites=True;
+-- executing against localhost:21000
+
+
+create function test_ir_functions_b0aa81e2.mem_test(bigint) returns bigint
+location '/test-warehouse/test-udfs.ll' symbol='MemTest'
+prepare_fn='MemTestPrepare' close_fn='MemTestClose';
+
+SET disable_codegen_rows_threshold=0;
+SET disable_codegen=False;
+SET exec_single_node_rows_threshold=0;
+SET enable_expr_rewrites=True;
+-- executing against localhost:21000
+
+
+create function test_ir_functions_b0aa81e2.mem_test_leaks(bigint) returns bigint
+location '/test-warehouse/test-udfs.ll' symbol='MemTest'
+prepare_fn='MemTestPrepare';
+
+SET disable_codegen_rows_threshold=0;
+SET disable_codegen=False;
+SET exec_single_node_rows_threshold=0;
+SET enable_expr_rewrites=True;
+-- executing against localhost:21000
+
+
+-- Regression test for IMPALA-1475
+create function test_ir_functions_b0aa81e2.unmangled_symbol() returns bigint
+location '/test-warehouse/test-udfs.ll' symbol='UnmangledSymbol';
+
+SET disable_codegen_rows_threshold=0;
+SET disable_codegen=False;
+SET exec_single_node_rows_threshold=0;
+SET enable_expr_rewrites=True;
+-- executing against localhost:21000
+
+
+create function test_ir_functions_b0aa81e2.four_args(int, int, int, int) returns int
+location '/test-warehouse/test-udfs.ll' symbol='FourArgs';
+
+SET disable_codegen_rows_threshold=0;
+SET disable_codegen=False;
+SET exec_single_node_rows_threshold=0;
+SET enable_expr_rewrites=True;
+-- executing against localhost:21000
+
+
+create function test_ir_functions_b0aa81e2.five_args(int, int, int, int, int) returns int
+location '/test-warehouse/test-udfs.ll' symbol='FiveArgs';
+
+SET disable_codegen_rows_threshold=0;
+SET disable_codegen=False;
+SET exec_single_node_rows_threshold=0;
+SET enable_expr_rewrites=True;
+-- executing against localhost:21000
+
+
+create function test_ir_functions_b0aa81e2.six_args(int, int, int, int, int, int) returns int
+location '/test-warehouse/test-udfs.ll' symbol='SixArgs';
+
+SET disable_codegen_rows_threshold=0;
+SET disable_codegen=False;
+SET exec_single_node_rows_threshold=0;
+SET enable_expr_rewrites=True;
+-- executing against localhost:21000
+
+
+create function test_ir_functions_b0aa81e2.seven_args(int, int, int, int, int, int, int) returns int
+location '/test-warehouse/test-udfs.ll' symbol='SevenArgs';
+
+SET disable_codegen_rows_threshold=0;
+SET disable_codegen=False;
+SET exec_single_node_rows_threshold=0;
+SET enable_expr_rewrites=True;
+-- executing against localhost:21000
+
+
+create function test_ir_functions_b0aa81e2.eight_args(int, int, int, int, int, int, int, int) returns int
+location '/test-warehouse/test-udfs.ll' symbol='EightArgs';
+
+SET disable_codegen_rows_threshold=0;
+SET disable_codegen=False;
+SET exec_single_node_rows_threshold=0;
+SET enable_expr_rewrites=True;
+-- executing against localhost:21000
+
+
+create function test_ir_functions_b0aa81e2.twenty_args(int, int, int, int, int, int, int, int, int, int,
+    int, int, int, int, int, int, int, int, int, int) returns int
+location '/test-warehouse/test-udfs.ll' symbol='TwentyArgs';
+
+SET disable_codegen_rows_threshold=0;
+SET disable_codegen=False;
+SET exec_single_node_rows_threshold=0;
+SET enable_expr_rewrites=True;
+-- executing against localhost:21000
+
+
+create function test_ir_functions_b0aa81e2.twenty_one_args(int, int, int, int, int, int, int, int, int, int,
+    int, int, int, int, int, int, int, int, int, int, int) returns int
+location '/test-warehouse/test-udfs.ll' symbol='TwentyOneArgs';
+
+-- executing against localhost:21000
+use test_ir_functions_b0aa81e2;
+
+SET disable_codegen_rows_threshold=0;
+SET disable_codegen=False;
+SET exec_single_node_rows_threshold=0;
+SET enable_expr_rewrites=True;
+-- executing against localhost:21000
+select identity(true);
+
+-- executing against localhost:21000
+select identity(cast(10 as tinyint));
+
+-- executing against localhost:21000
+select identity(cast(10 as smallint));
+
+-- executing against localhost:21000
+select identity(cast(10 as int));
+
+-- executing against localhost:21000
+select identity(cast(10 as bigint));
+
+-- executing against localhost:21000
+select identity(cast(10.0 as float));
+
+-- executing against localhost:21000
+select identity(cast(10.0 as double));
+
+-- executing against localhost:21000
+select identity("why hello there");
+
+-- executing against localhost:21000
+select identity(now());
+
+-- executing against localhost:21000
+select identity(cast(1 as decimal(9,0)));
+
+-- executing against localhost:21000
+select identity(cast(1 as decimal(18,1)));
+
+-- executing against localhost:21000
+select identity(cast(1 as decimal(38,10)));
+
+-- executing against localhost:21000
+select identity(NULL);
+
+-- executing against localhost:21000
+select constant_timestamp();
+
+-- executing against localhost:21000
+select from_utc_timestamp(constant_timestamp(), "UTC");
+
+-- executing against localhost:21000
+select all_types_fn("1", true, 2, 3, 4, 5, 6.0, 7.0, cast(8 as decimal(2,0)));
+
+-- executing against localhost:21000
+select no_args();
+
+-- executing against localhost:21000
+select sum(identity(bigint_col)) from functional.alltypes;
+
+-- executing against localhost:21000
+select identity(a) from functional.tinytable;
+
+-- executing against localhost:21000
+select identity(d1),
+identity(cast(d3 as decimal(38,10))), identity(cast(d5 as decimal(38,10)))
+from functional.decimal_tbl;
+
+-- executing against localhost:21000
+select identity(bool_col), identity(tinyint_col),
+       identity(smallint_col), identity(int_col),
+       identity(bigint_col), identity(float_col),
+       identity(double_col), identity(string_col),
+       identity(timestamp_col), identity(year)
+from functional.alltypestiny;
+
+-- executing against localhost:21000
+select sum(all_types_fn(
+    string_col, bool_col, tinyint_col, smallint_col,
+    int_col, bigint_col, float_col, double_col, cast(tinyint_col as decimal(2,0))))
+from functional.alltypes;
+
+-- executing against localhost:21000
+select no_args() from functional.alltypes limit 1;
+
+-- executing against localhost:21000
+select identity(no_args());
+
+-- executing against localhost:21000
+select identity(cast(identity(3.0) as bigint));
+
+-- executing against localhost:21000
+select count(*) from functional.alltypessmall having identity(count(*)) > 1;
+
+-- executing against localhost:21000
+select count(identity(id)) from functional.alltypessmall
+having identity(count(*)) > 1;
+
+-- executing against localhost:21000
+select count(identity(id)) from functional.alltypessmall
+group by identity(int_col)
+having identity(count(*)) > 10;
+
+-- executing against localhost:21000
+select identity(a.tinyint_col),
+       identity(b.id),
+       identity(a.string_col)
+from functional.alltypesagg a join functional.alltypessmall b on
+  (identity(a.tinyint_col) = identity(b.id))
+and identity(a.tinyint_col + b.tinyint_col) < 5
+where identity(a.month) = identity(1)
+and identity(a.day) = identity(1)
+and identity(a.string_col) > identity('88')
+and identity(b.bool_col) = identity(false)
+order by identity(a.string_col)
+limit 5;
+
+-- executing against localhost:21000
+select identity(int_col),
+       identity(min(identity(bool_col))),
+       identity(max(identity(tinyint_col))),
+       identity(max(identity(smallint_col))),
+       identity(max(identity(int_col))),
+       identity(max(identity(bigint_col))),
+       identity(max(identity(float_col))),
+       identity(max(identity(double_col))),
+       identity(max(identity(string_col))),
+       identity(max(identity(timestamp_col)))
+from functional.alltypesagg
+where identity(identity(tinyint_col) > identity(1))
+group by identity(int_col)
+having identity(identity(int_col) > identity(998));
+{noformat}
+
+Looking at the logs, it seems like impala removes the cached lib and adds it back again, this causes the lib to be linked again and hence we get the error. The lib-cache code (in GetCacheEntryInternal ) says that it checks if the cached copy has been changed and then it attempts to remove it. Any idea why test-udfs.ll would be modified between tests?
+
+
+{noformat}
+I1020 01:50:38.795361 15508 query-state.cc:364] Executing instance. instance_id=e4b0a860ae08ae7:8f51e6ae00000004 fragment_idx=1 per_fragment_instance_idx=0 coord_state_idx=2 #in-flight=3
+I1020 01:50:38.808332 15513 query-state.cc:364] Executing instance. instance_id=e4b0a860ae08ae7:8f51e6ae00000001 fragment_idx=2 per_fragment_instance_idx=0 coord_state_idx=2 #in-flight=4
+I1020 01:50:38.813390 15513 hdfs-scan-node.cc:160] Max row batch queue size for scan node '0' in fragment instance 'e4b0a860ae08ae7:8f51e6ae00000001': 60
+I1020 01:50:39.408159 14660 lib-cache.cc:244] Removing lib cache entry: hdfs://localhost:20500/test-warehouse/test-udfs.ll, local path: /tmp/test-udfs.14186.6.ll
+I1020 01:50:39.467031 15513 lib-cache.cc:378] Adding lib cache entry: hdfs://localhost:20500/test-warehouse/test-udfs.ll, local path: /tmp/test-udfs.14186.9.ll
+I1020 01:50:39.621112 15513 llvm-codegen.cc:1628] Query e4b0a860ae08ae7:8f51e6ae00000000 encountered a LLVM diagnostic error: Linking globals named 'global_array_2': symbol multiply defined!
+I1020 01:50:39.626725 15513 status.cc:122] Problem linking /tmp/test-udfs.14186.9.ll to main module. LLVM diagnostic error: Linking globals named 'global_array_2': symbol multiply defined!
+    @          0x1940ce7  impala::GetStackTrace()
+    @          0x139d333  impala::Status::Status()
+    @          0x1a8c91b  impala::LlvmCodeGen::LinkModule()
+    @          0x1a92e8a  impala::LlvmCodeGen::LoadFunction()
+    @          0x1edfaf1  impala::ScalarFnCall::GetCodegendComputeFn()
+    @          0x1d110ae  impala::PartitionedAggregationNode::CodegenUpdateSlot()
+    @          0x1d1362a  impala::PartitionedAggregationNode::CodegenUpdateTuple()
+    @          0x1d014c2  impala::PartitionedAggregationNode::CodegenProcessBatchStreaming()
+    @          0x1d00faf  impala::PartitionedAggregationNode::Codegen()
+    @          0x17186c8  impala::FragmentInstanceState::Prepare()
+    @          0x1716fd8  impala::FragmentInstanceState::Exec()
+    @          0x16c0f63  impala::QueryState::ExecFInstance()
+    @          0x15f3c13  boost::function0<>::operator()()
+    @          0x1a14ea8  impala::Thread::SuperviseThread()
+    @          0x1a1fc26  boost::_bi::list4<>::operator()<>()
+    @          0x1a1faa2  boost::_bi::bind_t<>::operator()()
+    @          0x23c196a  thread_proxy
+    @       0x3a07c07851  (unknown)
+    @       0x3a078e894d  (unknown)
+{noformat}
+
+
+Interesting! It seems like there are a few reasons RemoveEntryInternal() can be called - not sure which one is most likely.
+
+It does seem wrong that we're using the local file path as the key to deduplicate modules when it can change underneath us. Maybe we should be using the hdfs path?
+
+https://github.com/apache/incubator-impala/commit/1ca3adf46c5ef5055c13fd3ce57e7c53218c219c
+
+Some test runs are currently failing randomly in test_ir_functions due
+to LLVM linkage error. This happens when impala tries to link a function
+from  a lib file on hdfs, but it somehow got removed from the lib cache
+before it could link. This results in a new file being cached but with
+a slightly different local filename, and since impala only uses local
+filenames to check for collision for linking of LLVM modules, it ends
+up linking the same file twice and hence encounters an error.
+This patch fixes this issue by using the hdfs file path to check for
+collision of lib files.
+
+Testing:
+Added a backend test that tries to link the same lib twice.
+
+Change-Id: Iefa23bbf47998fe7e84011e1edf8e794e94a1757
+Reviewed-on: http://gerrit.cloudera.org:8080/8487
+Reviewed-by: Tim Armstrong <tarmstrong@cloudera.com>
+Tested-by: Impala Public Jenkins
+

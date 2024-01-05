@@ -1,0 +1,180 @@
+Nice find! Looks like a bug. Feel free to fill in the "affected versions" and link the jira that broke this.
+
+More findings. It looks like after alter db, not only lose functions, tables under that db also get lost.
+{code:java}
+[localhost:21000] xm> show tables;
+Query: show tables
++------+
+| name |
++------+
+| xm |
+| xms |
+| xmt |
++------+
+Fetched 3 row(s) in 0.01s
+[localhost:21000] xm> alter database xm set owner user impala258;
+Query: alter database xm set owner user impala258
++-------------------+
+| summary |
++-------------------+
+| Updated database. |
++-------------------+
+Fetched 1 row(s) in 0.51s
+[localhost:21000] xm> show tables;
+Query: show tables
+Fetched 0 row(s) in 0.01s
+[localhost:21000] xm> invalidate metadata;
+Query: invalidate metadata
+Query submitted at: 2019-04-18 15:00:40 (Coordinator: http://xiaomeng-OptiPlex-9020:25000)
+Query progress can be monitored at: http://xiaomeng-OptiPlex-9020:25000/query_plan?query_id=404c09dd94296d20:b994e9fa00000000
+Fetched 0 row(s) in 3.71s
+[localhost:21000] xm> show tables;
+Query: show tables
++------+
+| name |
++------+
+| xm |
+| xms |
+| xmt |
++------+
+Fetched 3 row(s) in 0.01s
+
+
+{code}
+
+Can you share the commit hash that you're running? Are you running Impala with an non-default flags, e.g. the event processor?
+
+I just run with default configs: $IMPALA_HOME/bin/start-impala-cluster.py. 
+
+The hash of my git master is 
+{code:java}
+commit 5c2d211a88c1190a02ce7720fda7b0871f1e5cf5
+
+Author: Bharath Krishna <bharath@cloudera.com>
+
+Date:   Wed Apr 17 09:54:13 2019 -0700
+
+ 
+
+    IMPALA-8430: Fix flakiness in testCreateDropCreateDatabase
+
+    
+
+    The test fails because of two Databases getting created with
+
+    same CREATION_TIME. Hence, adding a sleep of 2 seconds to
+
+    avoid this case. Also fixing other tests with similar use-case.
+
+    
+
+    Testing
+
+     - Fixed the unit tests
+
+    
+
+    Change-Id: I30bf4535d54c9cd8d257b528dc7a1b42f106800d
+
+    Reviewed-on: http://gerrit.cloudera.org:8080/13058
+
+    Reviewed-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+
+    Tested-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+{code}
+ 
+
+Thanks for your patience with my questions, this is a really nice find :)
+
+The root cause is in [https://github.com/apache/impala/blob/master/fe/src/main/java/org/apache/impala/catalog/ImpaladCatalog.java#L395]
+{code:java}
+private void addDb(TDatabase thriftDb, long catalogVersion) {
+    Db existingDb = getDb(thriftDb.getDb_name());
+    if (existingDb == null ||
+        existingDb.getCatalogVersion() < catalogVersion) {
+      Db newDb = Db.fromTDatabase(thriftDb);
+      newDb.setCatalogVersion(catalogVersion);
+      addDb(newDb);
+      if (existingDb != null) {
+        CatalogObjectVersionSet.INSTANCE.updateVersions(
+            existingDb.getCatalogVersion(), catalogVersion);
+        CatalogObjectVersionSet.INSTANCE.removeAll(existingDb.getTables());
+        CatalogObjectVersionSet.INSTANCE.removeAll(
+            existingDb.getFunctions(null, new PatternMatcher()));
+      } else {
+        CatalogObjectVersionSet.INSTANCE.addVersion(catalogVersion);
+      }
+    }
+  }
+{code}
+AlterDb will trigger method addDb to replace existing Db with thriftDb. But thriftDb doesn't have table and function inside. So after alterDb, impalad lose table and function info, require "invalidate metadata".
+
+I tried to fix it by not removing table & function version, adding table & function back into new created Db. But this change cause "invalidate metadata" hanging, as "invalidate metadata" also triggers method addDb, to replace current Db to incomplete one. And it has to remove old table & function version to let min catalog version increase to catalog's latest update version [https://github.com/apache/impala/blob/master/be/src/service/impala-server.cc#L1691]
+
+So the best way maybe add table& function only for alterDb command, but from the passing info, I can't find any parameter can be used as alterDb type identification. Any help?
+
+ 
+
+[~Xiaomeng Zhang], I think your solution make sense but I can't reproduce the hanging of "invalidate metadata" at first. Finally, I figured out that if you remove the codes for removing all versions of the tables and functions, the "invalidate metadata" command do hang. So I guest your changes may be something like this:
+{code:java}
+diff --git a/fe/src/main/java/org/apache/impala/catalog/ImpaladCatalog.java b/fe/src/main/java/org/apache/impala/catalog/ImpaladCatalog.java
+index 13cb620..9ddb888 100644
+--- a/fe/src/main/java/org/apache/impala/catalog/ImpaladCatalog.java
++++ b/fe/src/main/java/org/apache/impala/catalog/ImpaladCatalog.java
+@@ -19,6 +19,7 @@ package org.apache.impala.catalog;
+ 
+ import java.nio.ByteBuffer;
+ import java.util.ArrayDeque;
++import java.util.List;
+ import java.util.Set;
+ import java.util.concurrent.atomic.AtomicLong;
+ import java.util.concurrent.atomic.AtomicReference;
+@@ -390,11 +391,16 @@ public class ImpaladCatalog extends Catalog implements FeCatalog {
+       newDb.setCatalogVersion(catalogVersion);
+       addDb(newDb);
+       if (existingDb != null) {
++        for (Table tbl : existingDb.getTables()) {
++          newDb.addTable(tbl);
++        }
++        for (List<Function> functionList : existingDb.getAllFunctions().values()) {
++          for (Function func : functionList) {
++            newDb.addFunction(func);
++          }
++        }
+         CatalogObjectVersionSet.INSTANCE.updateVersions(
+             existingDb.getCatalogVersion(), catalogVersion);
+-        CatalogObjectVersionSet.INSTANCE.removeAll(existingDb.getTables());
+-        CatalogObjectVersionSet.INSTANCE.removeAll(
+-            existingDb.getFunctions(null, new PatternMatcher()));
+       } else {
+         CatalogObjectVersionSet.INSTANCE.addVersion(catalogVersion);
+       }
+{code}
+Actually, we shouldn't remove the codes calling "CatalogObjectVersionSet.INSTANCE.removeAll". Because "newDb.addTable" and "newDb.addFunction" will also add versions into the CatalogObjectVersionSet which is a *multi-set*. Removing those three lines causes the old table versions being double counted. So the minVersion_ of CatalogObjectVersionSet won't be updated since their counters can't decrease to 0.
+
+For "invalidate metadata", in the coordinator side, database updates are processed prior to the table/function updates: [https://github.com/apache/impala/blob/eb97c746d2309fcf78ff3b50751cd5e27101539a/fe/src/main/java/org/apache/impala/catalog/ImpaladCatalog.java#L124-L129]. So even if we retain the old tables/functions of a db, they'll be updated later in processing the table/function updates of this db. So I think it's no problems for "invalidate metadata".
+
+Just uploaded a patch for this: [https://gerrit.cloudera.org/c/13904/]
+
+Commit c501b34fb2ea7378ae0b1b615d9610e93a2e5af0 in impala's branch refs/heads/master from stiga-huang
+[ https://gitbox.apache.org/repos/asf?p=impala.git;h=c501b34 ]
+
+IMPALA-8434: retain tables and functions in altering database
+
+In the legacy catalog implementation (ImpaladCatalog), when altering a
+database, the tables and functions in it will disappear until we run
+INVALIDATE METADATA to reset the cache. The cause is that we just
+replace the old Db object with the new one deserialized from the
+TDatabase. We should migrate the existing tables and functions to the
+new Db object.
+
+Tests:
+ - Add test_metadata_after_alter_database for the bug.
+ - Run Core tests
+
+Change-Id: Ia3dc9857fd2733e20cf10fbe17bb1a4670d7d015
+Reviewed-on: http://gerrit.cloudera.org:8080/13904
+Reviewed-by: Vihang Karajgaonkar <vihang@cloudera.com>
+Tested-by: Impala Public Jenkins <impala-public-jenkins@cloudera.com>
+
+

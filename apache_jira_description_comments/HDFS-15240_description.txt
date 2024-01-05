@@ -1,0 +1,50 @@
+# When read some lzo files we found some blocks were broken.
+
+I read back all internal blocks(b0-b8) of the block group(RS-6-3-1024k) from DN directly, and choose 6(b0-b5) blocks to decode other 3(b6', b7', b8') blocks. And find the longest common sequenece(LCS) between b6'(decoded) and b6(read from DN)(b7'/b7 and b8'/b8).
+
+After selecting 6 blocks of the block group in combinations one time and iterating through all cases, I find one case that the length of LCS is the block length - 64KB, 64KB is just the length of ByteBuffer used by StripedBlockReader. So the corrupt reconstruction block is made by a dirty buffer.
+
+The following log snippet(only show 2 of 28 cases) is my check program output. In my case, I known the 3th block is corrupt, so need other 5 blocks to decode another 3 blocks, then find the 1th block's LCS substring is block length - 64kb.
+
+It means (0,1,2,4,5,6)th blocks were used to reconstruct 3th block, and the dirty buffer was used before read the 1th block.
+
+Must be noted that StripedBlockReader read from the offset 0 of the 1th block after used the dirty buffer.
+
+EDITED for readability.
+{code:java}
+decode from block[0, 2, 3, 4, 5, 7] to generate block[1', 6', 8']
+Check the first 131072 bytes between block[1] and block[1'], the longest common substring length is 4
+Check the first 131072 bytes between block[6] and block[6'], the longest common substring length is 4
+Check the first 131072 bytes between block[8] and block[8'], the longest common substring length is 4
+decode from block[0, 2, 3, 4, 5, 6] to generate block[1', 7', 8']
+Check the first 131072 bytes between block[1] and block[1'], the longest common substring length is 65536
+CHECK AGAIN: all 27262976 bytes between block[1] and block[1'], the longest common substring length is 27197440  # this one
+Check the first 131072 bytes between block[7] and block[7'], the longest common substring length is 4
+Check the first 131072 bytes between block[8] and block[8'], the longest common substring length is 4{code}
+Now I know the dirty buffer causes reconstruction block error, but how does the dirty buffer come about?
+
+After digging into the code and DN log, I found this following DN log is the root reason.
+{code:java}
+[INFO] [stripedRead-1017] : Interrupted while waiting for IO on channel java.nio.channels.SocketChannel[connected local=/xxxxxxxx:52586 remote=/xxxxxxxx:50010]. 180000 millis timeout left.
+[WARN] [StripedBlockReconstruction-199] : Failed to reconstruct striped block: BP-714356632-xxxxxxxx-1519726836856:blk_-YYYYYYYYYYYYYY_3472979393
+java.lang.NullPointerException
+    at org.apache.hadoop.hdfs.util.StripedBlockUtil.getNextCompletedStripedRead(StripedBlockUtil.java:314)
+    at org.apache.hadoop.hdfs.server.datanode.erasurecode.StripedReader.doReadMinimumSources(StripedReader.java:308)
+    at org.apache.hadoop.hdfs.server.datanode.erasurecode.StripedReader.readMinimumSources(StripedReader.java:269)
+    at org.apache.hadoop.hdfs.server.datanode.erasurecode.StripedBlockReconstructor.reconstruct(StripedBlockReconstructor.java:94)
+    at org.apache.hadoop.hdfs.server.datanode.erasurecode.StripedBlockReconstructor.run(StripedBlockReconstructor.java:60)
+    at java.base/java.util.concurrent.Executors$RunnableAdapter.call(Executors.java:515)
+    at java.base/java.util.concurrent.FutureTask.run(FutureTask.java:264)
+    at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1128)
+    at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:628)
+    at java.base/java.lang.Thread.run(Thread.java:834) {code}
+Reading from DN may timeout(hold by a future(F)) and output the INFO log, but the futures that contains the future(F)  is cleared, 
+{code:java}
+return new StripingChunkReadResult(futures.remove(future),
+    StripingChunkReadResult.CANCELLED); {code}
+futures.remove(future) cause NPE. So the EC reconstruction is failed. In the finally phase, the code snippet in *getStripedReader().close()* 
+{code:java}
+reconstructor.freeBuffer(reader.getReadBuffer());
+reader.freeReadBuffer();
+reader.closeBlockReader(); {code}
+free buffer firstly, but the StripedBlockReader still holds the buffer and write it, that pollute the buffer of BufferPool.

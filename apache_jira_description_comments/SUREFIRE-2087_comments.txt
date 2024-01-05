@@ -1,0 +1,399 @@
+Note that this bug even affects JUnit 4 based parameterized tests as long as they are executed with JUnit 5 Vintage rather than JUnit 4. Minimal reproducible example here: https://github.com/basil/SUREFIRE-2087-mre
+
+"If 1st iteration of the test passes and the 2nd one fails, it still marks the test as flaky passed."
+
+That sounds correct. If there's something I'm missing about this and you can point to docs that say otherwise, please reopen. A reproducible example might also help. 
+
+{quote}A reproducible example might also help.
+{quote}
+[~elharo] Have you read the second half of SUREFIRE-2087 (comment)?
+
+I have read it and I still think this is all working as intended. perhaps I'm missing something, but so far I don't see it. 
+
+OK, maybe I see it. The issue is specifically with parameterized tests. Note that "Instead of failing TestA, it's marked as flaky giving an overall pass for the test suite." is still WAI. That is, Test A should be marked as a pass, not failed. 
+
+The difference in behavior between the {{expected}} and {{actual}} modules of [https://github.com/basil/SUREFIRE-2087-mre] says it all. We have been impacted by this in the Jenkins project: after switching from {{org.apache.maven.surefire.junit4.JUnit4Provider}} to {{org.apache.maven.surefire.junitplatform.JUnitPlatformProvider}} for our (predominantly JUnit 4 based) test suite, someone made a change that broke a test. But Maven erroneously classified it as a flaky test and marked the overall run as successful, which caused the bug to go unnoticed. Later on, that bug resulted in a security vulnerability which required an emergency release to correct. So this is a very real problem that has affected us. We worked around the issue first by removing parameterization from the test in question, then by disabling {{rerunFailingTestsCount}} entirely, the latter of which forced us to spend months making our test suite less flaky.
+
+So this works as you expect in JUnit 4 but not JUnit 5? That is surprising and might be a bug in JUnit.
+
+rerunFailingTests is something of a hack, and making tests less flaky is an appropriate response. 
+
+
+bq. So this works as you expect in JUnit 4 but not JUnit 5?
+
+Yes, as I noted in the very first comment:
+
+bq. Note that this bug even affects JUnit 4 based parameterized tests as long as they are executed with JUnit 5 Vintage rather than JUnit 4.
+
+bq. {{rerunFailingTests}} is something of a hack, and making tests less flaky is an appropriate response.
+
+It is not deprecated in the documentation, and certainly worked fine in the past with {{org.apache.maven.surefire.junit4.JUnit4Provider}}. Putting the Jenkins core development team under unexpected pressure to make its test suite less flaky (or revert back to {{org.apache.maven.surefire.junit4.JUnit4Provider}}) was certainly not viewed favorably.
+
+I came across a very weird problem that seems related to this issue. I'm not sure if root cause is the same than described above, but it likewise concerns inconsistent surefire handling of JUnit5 tests with _@ParameterizedTest_ or {_}@RepeatedTest{_}, in a fairly specific case. We noticed that certain tests of ours (as in: specific instances of one {_}@ParameterizedTest-{_}method) were (consistently) failing / broken, but this got handled as a Flake by surefire, and in turn it would (in combination with {_}rerunFailingTestsCount{_}) +not+ break the build as it should have.
+
+The symptom is similar than described above, in that surefire sometimes handles all instances of such templated tests as "one bag", and deems them to be flakes - even if it is always the very same instance (e.g. always the 2nd one) that fails - i.e. anything but a flaky case.
+
+For some reason, I only have this problem for tests annotated with one specific custom {_}name{_}-value of the template-annotation, but that inconsistent handling is fully reproducible. Namely, with test-methods annotated with one of the two samples below, surefire is somehow not able to separate the different templated instances of the method from each other properly:
+
+ 
+{code:java}
+@ParameterizedTest(name = "[{index}]")
+
+@RepeatedTest(value = 5, name = "[{currentRepetition}]"){code}
+ 
+
+The problem seems limited to this very name-pattern - as soon as I change anything in that pattern (e.g. remove the square brackets, or add anything else to it), it works fine.  It seems quite counter-intuitive, but I could reproduce it consistently with 3.0.0-M8 (and also the same on all earlier 3.0.0 versions with JUnit5-support). I was not able to pinpoint anything myself, after having a quick look at the surefire source code. A workaround is simple -> just avoid / replace usages of this "problematic" name-pattern.
+
+ 
+
+Repo with a minimal project to reproduce - just running _mvn test_ on it should show the discrepancies, i.e. Flakes that clearly aren't flakes:
+ * [https://github.com/s-rwe/SUREFIRE-2087-mishandled-templated-tests]
+
+ 
+
+Maybe this also helps in relation to the issues described in the comments above.
+
+While a full fix would of course be to rerun parameterized tests as expected, I think it would suffice in the interim to just disable the rerun feature on parameterized tests, if that is easier to implement. It would certainly be better than pretending your test suite passes when in fact you have introduced a regression, which for a test runner is a critical defect.
+
+I have managed to find a workaround for this locally, where I managed to debug that [https://github.com/apache/maven-surefire/blob/master/maven-surefire-common/src/main/java/org/apache/maven/plugin/surefire/report/DefaultReporterFactory.java#L302] merges the passes and failures from different parameterised runs into one, as it only uses the test name, not the parameterised name.
+
+The workaround below _fixes_ the reporting problem (the tests reliably fail), but unsure if this is the most appropriate code change. If yes, I'm happy to open a PR, or discuss alternatives.
+
+ 
+{code:java}
+> git diff maven-surefire-common/src/main/java/org/apache/maven/plugin/surefire/report/WrappedReportEntry.java
+diff --git a/maven-surefire-common/src/main/java/org/apache/maven/plugin/surefire/report/WrappedReportEntry.java b/maven-surefire-common/src/main/java/org/apache/maven/plugin/surefire/report/WrappedReportEntry.java
+index 75e845e59..e137d9dee 100644
+--- a/maven-surefire-common/src/main/java/org/apache/maven/plugin/surefire/report/WrappedReportEntry.java
++++ b/maven-surefire-common/src/main/java/org/apache/maven/plugin/surefire/report/WrappedReportEntry.java
+@@ -27,6 +27,7 @@
+ import javax.annotation.Nonnull;
+ import java.util.Collections;
+ import java.util.Map;
++import java.util.Optional;
+ 
+ import static java.util.Collections.unmodifiableMap;
+ import static org.apache.maven.plugin.surefire.report.ReporterUtils.formatElapsedTime;
+@@ -124,7 +125,8 @@ public String getNameText()
+ 
+     public String getClassMethodName()
+     {
+-        return original.getSourceName() + "." + original.getName();
++        String name = Optional.ofNullable(original.getNameText()).orElse(original.getName());
++        return original.getSourceName() + "." + name;
+     }
+ 
+     @Override {code}
+
+FTR - I think this issue has been addressed with SUREFIRE-2065.
+
+Not totally sure if that indeed covers everything of this ticket - but I can confirm that the corner-case I described in my earlier comment above is resolved on latest version 3.0.0-M9, which includes the patch of SUREFIRE-2065.
+
+The test case provided in https://github.com/basil/SUREFIRE-2087-mre passes with 3.0.0-M9, so this ticket can be closed as a duplicate of SUREFIRE-2065.
+
+[~basil] issue linked and closed.
+
+Can we please reopen this ticket to also address issues with other repeated runs? (in our case `@TestTemplate`).
+
+We've put together a test case like this:
+{code:java}
+package demo.surefire2087;
+
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestTemplate;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+@ExtendWith(DemoTestTemplateInvocationContextProvider.class)
+public class TestSurefire2087 {
+
+    private static boolean flake = true;
+    private int demoValue = 1;
+
+    @ParameterizedTest
+    @ValueSource(ints = {0, 1})
+    public void testParameterised(int i) {
+        assertTrue(i == 1);
+    }
+
+    @TestTemplate
+    public void testDemoTemplate() {
+        assertEquals(demoValue, 1);
+    }
+
+    @Test
+    public void testPlain() {
+        assertTrue(false);
+    }
+
+    @Test
+    public void testFlakey() {
+        if (flake) {
+            flake = false;
+            assertTrue(false);
+        }
+
+        assertTrue(true);
+    }
+
+} {code}
+This uses the test template context provider:
+{code:java}
+package demo.surefire2087;
+
+import org.junit.jupiter.api.extension.BeforeEachCallback;
+import org.junit.jupiter.api.extension.Extension;
+import org.junit.jupiter.api.extension.ExtensionContext;
+import org.junit.jupiter.api.extension.TestTemplateInvocationContext;
+import org.junit.jupiter.api.extension.TestTemplateInvocationContextProvider;
+
+import java.lang.reflect.Field;
+import java.util.Collections;
+import java.util.List;
+import java.util.stream.Stream;
+
+public class DemoTestTemplateInvocationContextProvider implements TestTemplateInvocationContextProvider {
+    @Override
+    public boolean supportsTestTemplate(ExtensionContext extensionContext) {
+        return extensionContext.getRequiredTestMethod().getName().toLowerCase().contains("demotemplate");
+    }
+
+    @Override
+    public Stream<TestTemplateInvocationContext> provideTestTemplateInvocationContexts(ExtensionContext extensionContext) {
+        return Stream.of(
+                new TestTemplateInvocationContext() {
+                    @Override
+                    public String getDisplayName(int invocationIndex) {
+                        return "demo1--" + TestTemplateInvocationContext.super.getDisplayName(invocationIndex);
+                    }
+                },
+                new TestTemplateInvocationContext() {
+                    @Override
+                    public String getDisplayName(int invocationIndex) {
+                        return "demo2--" + TestTemplateInvocationContext.super.getDisplayName(invocationIndex);
+                    }
+
+                    @Override
+                    public List<Extension> getAdditionalExtensions() {
+                        return Collections.singletonList(new BeforeEachCallback() {
+                            @Override
+                            public void beforeEach(ExtensionContext extensionContext) throws Exception {
+                                final Object testInstance = extensionContext.getRequiredTestInstance();
+                                final Field field = extensionContext.getRequiredTestClass().getDeclaredField("demoValue");
+                                field.setAccessible(true);
+                                field.set(testInstance, 2);
+                            }
+                        });
+                    }
+                }
+        );
+    }
+} {code}
+ 
+
+Executing this with `mvn verify -Dsurefire.rerunFailingTestsCount=2 -Dtest=TestSurefire2087#<testMethod>` yields the following results on 3.0.0-M9:
+
+ 
+
+1. `testParameterised` (fails as expected)
+{code:java}
+[main] [INFO] --- surefire:3.0.0-M9:test (default-test) @ test-module ---
+[main] [INFO] Using auto detected provider org.apache.maven.surefire.junitplatform.JUnitPlatformProvider
+[main] [INFO] 
+[main] [INFO] -------------------------------------------------------
+[main] [INFO]  T E S T S
+[main] [INFO] -------------------------------------------------------
+[ThreadedStreamConsumer] [INFO] Running demo.surefire2087.TestSurefire2087
+[ThreadedStreamConsumer] [ERROR] Tests run: 2, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.069 s <<< FAILURE! - in demo.surefire2087.TestSurefire2087
+[ThreadedStreamConsumer] [ERROR] demo.surefire2087.TestSurefire2087.testParameterised(int)[1]  Time elapsed: 0.034 s  <<< FAILURE!
+...
+[main] [INFO] 
+[main] [INFO] Results:
+[main] [INFO] 
+[main] [ERROR] Failures: 
+[main] [ERROR] com.atlassian.jira.TestSurefire2087.testParameterised(int)[1]
+[main] [ERROR]   Run 1: TestSurefire2087.testParameterised:21 expected: <true> but was: <false>
+[main] [ERROR]   Run 2: TestSurefire2087.testParameterised:21 expected: <true> but was: <false>
+[main] [ERROR]   Run 3: TestSurefire2087.testParameterised:21 expected: <true> but was: <false>
+[main] [INFO] 
+[main] [ERROR] demo.surefire2087.TestSurefire2087.testParameterised(int)[1]
+[main] [ERROR]   Run 1: TestSurefire2087.testParameterised:21 expected: <true> but was: <false>
+[main] [ERROR]   Run 2: TestSurefire2087.testParameterised:21 expected: <true> but was: <false>
+[main] [ERROR]   Run 3: TestSurefire2087.testParameterised:21 expected: <true> but was: <false>
+[main] [INFO] 
+[main] [INFO] 
+[main] [ERROR] Tests run: 4, Failures: 2, Errors: 0, Skipped: 0
+[main] [INFO] 
+[main] [INFO] ------------------------------------------------------------------------
+[main] [INFO] BUILD FAILURE
+[main] [INFO] ------------------------------------------------------------------------{code}
+ 
+
+2. `testPlain` (fails as expected)
+{code:java}
+[main] [INFO] --- surefire:3.0.0-M9:test (default-test) @ test-module ---
+[main] [WARNING] Parameter 'systemProperties' is deprecated: Use systemPropertyVariables instead.
+[main] [INFO] Using auto detected provider org.apache.maven.surefire.junitplatform.JUnitPlatformProvider
+[main] [INFO] 
+[main] [INFO] -------------------------------------------------------
+[main] [INFO]  T E S T S
+[main] [INFO] -------------------------------------------------------
+[ThreadedStreamConsumer] [INFO] Running demo.surefire2087.TestSurefire2087
+[ThreadedStreamConsumer] [ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.034 s <<< FAILURE! - in demo.surefire2087.TestSurefire2087
+[ThreadedStreamConsumer] [ERROR] demo.surefire2087.TestSurefire2087.testPlain  Time elapsed: 0.018 s  <<< FAILURE!
+...
+[main] [INFO] 
+[main] [INFO] Results:
+[main] [INFO] 
+[main] [ERROR] Failures: 
+[main] [ERROR] com.atlassian.jira.TestSurefire2087.testPlain
+[main] [ERROR]   Run 1: TestSurefire2087.testPlain:31 expected: <true> but was: <false>
+[main] [ERROR]   Run 2: TestSurefire2087.testPlain:31 expected: <true> but was: <false>
+[main] [ERROR]   Run 3: TestSurefire2087.testPlain:31 expected: <true> but was: <false>
+[main] [INFO] 
+[main] [ERROR] demo.surefire2087.TestSurefire2087.testPlain
+[main] [ERROR]   Run 1: TestSurefire2087.testPlain:31 expected: <true> but was: <false>
+[main] [ERROR]   Run 2: TestSurefire2087.testPlain:31 expected: <true> but was: <false>
+[main] [ERROR]   Run 3: TestSurefire2087.testPlain:31 expected: <true> but was: <false>
+[main] [INFO] 
+[main] [INFO] 
+[main] [ERROR] Tests run: 2, Failures: 2, Errors: 0, Skipped: 0
+[main] [INFO] 
+[main] [INFO] ------------------------------------------------------------------------
+[main] [INFO] BUILD FAILURE
+[main] [INFO] ------------------------------------------------------------------------{code}
+ 
+
+3. `testFlakey` (marked as flake, does NOT mark the build failed, but this is expected and is OK)
+{code:java}
+[main] [INFO] --- surefire:3.0.0-M9:test (default-test) @ test-module ---
+[main] [WARNING] Parameter 'systemProperties' is deprecated: Use systemPropertyVariables instead.
+[main] [INFO] Using auto detected provider org.apache.maven.surefire.junitplatform.JUnitPlatformProvider
+[main] [INFO] 
+[main] [INFO] -------------------------------------------------------
+[main] [INFO]  T E S T S
+[main] [INFO] -------------------------------------------------------
+[ThreadedStreamConsumer] [INFO] Running demo.surefire2087.TestSurefire2087
+[ThreadedStreamConsumer] [ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.031 s <<< FAILURE! - in demo.surefire2087.TestSurefire2087
+[ThreadedStreamConsumer] [ERROR] demo.surefire2087.TestSurefire2087.testFlakey  Time elapsed: 0.016 s  <<< FAILURE!
+...
+[ThreadedStreamConsumer] [INFO] Running com.atlassian.jira.TestSurefire2087
+[ThreadedStreamConsumer] [INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.001 s - in com.atlassian.jira.TestSurefire2087
+[ThreadedStreamConsumer] [INFO] Running demo.surefire2087.TestSurefire2087
+[ThreadedStreamConsumer] [INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.001 s - in demo.surefire2087.TestSurefire2087
+[main] [INFO] 
+[main] [INFO] Results:
+[main] [INFO] 
+[main] [WARNING] Flakes: 
+[main] [WARNING] com.atlassian.jira.TestSurefire2087.testFlakey
+[main] [ERROR]   Run 1: TestSurefire2087.testFlakey:38 expected: <true> but was: <false>
+[main] [INFO]   Run 2: PASS
+[main] [INFO] 
+[main] [WARNING] demo.surefire2087.TestSurefire2087.testFlakey
+[main] [ERROR]   Run 1: TestSurefire2087.testFlakey:38 expected: <true> but was: <false>
+[main] [INFO]   Run 2: PASS
+[main] [INFO] 
+[main] [INFO] 
+[main] [WARNING] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Flakes: 2
+...
+[main] [INFO] ------------------------------------------------------------------------
+[main] [INFO] BUILD SUCCESS
+[main] [INFO] ------------------------------------------------------------------------{code}
+ 
+
+4. `testDemoTemplate` (should fail but does NOT, marked as flake but one parameterized execution always fails)
+{code:java}
+[main] [INFO] --- surefire:3.0.0-M9:test (default-test) @ test-module ---
+...
+[main] [INFO] -------------------------------------------------------
+[main] [INFO]  T E S T S
+[main] [INFO] -------------------------------------------------------
+[ThreadedStreamConsumer] [INFO] Running demo.surefire2087.TestSurefire2087
+[ThreadedStreamConsumer] [ERROR] Tests run: 2, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.048 s <<< FAILURE! - in demo.surefire2087.TestSurefire2087
+[ThreadedStreamConsumer] [ERROR] demo.surefire2087.TestSurefire2087.testDemoTemplate  Time elapsed: 0.003 s  <<< FAILURE!
+...
+[main] [INFO] 
+[main] [INFO] Results:
+[main] [INFO] 
+[main] [WARNING] Flakes: 
+[main] [WARNING] com.atlassian.jira.TestSurefire2087.testDemoTemplate
+[main] [INFO]   Run 1: PASS
+[main] [ERROR]   Run 2: TestSurefire2087.testDemoTemplate:26 expected: <2> but was: <1>
+[main] [ERROR]   Run 3: TestSurefire2087.testDemoTemplate:26 expected: <2> but was: <1>
+[main] [ERROR]   Run 4: TestSurefire2087.testDemoTemplate:26 expected: <2> but was: <1>
+[main] [INFO] 
+[main] [WARNING] demo.surefire2087.TestSurefire2087.testDemoTemplate
+[main] [INFO]   Run 1: PASS
+[main] [ERROR]   Run 2: TestSurefire2087.testDemoTemplate:26 expected: <2> but was: <1>
+[main] [ERROR]   Run 3: TestSurefire2087.testDemoTemplate:26 expected: <2> but was: <1>
+[main] [ERROR]   Run 4: TestSurefire2087.testDemoTemplate:26 expected: <2> but was: <1>
+[main] [INFO] 
+[main] [INFO] 
+[main] [WARNING] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Flakes: 2
+...
+[main] [INFO] ------------------------------------------------------------------------
+[main] [INFO] BUILD SUCCESS
+[main] [INFO] ------------------------------------------------------------------------{code}
+ 
+
+If I apply the patch from my previous comment to tell apart different parameterized runs of the same test, then it fails as expected:
+{code:java}
+[main] [INFO] --- surefire:3.0.0-M10-patch-vadam:test (default-test) @ test-module ---
+[main] [WARNING] Parameter 'systemProperties' is deprecated: Use systemPropertyVariables instead.
+[main] [INFO] Using auto detected provider org.apache.maven.surefire.junitplatform.JUnitPlatformProvider
+[main] [INFO] 
+[main] [INFO] -------------------------------------------------------
+[main] [INFO]  T E S T S
+[main] [INFO] -------------------------------------------------------
+[ThreadedStreamConsumer] [INFO] Running demo.surefire2087.TestSurefire2087
+[ThreadedStreamConsumer] [ERROR] Tests run: 2, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.046 s <<< FAILURE! - in demo.surefire2087.TestSurefire2087
+[ThreadedStreamConsumer] [ERROR] demo.surefire2087.TestSurefire2087.testDemoTemplate() demo2--[2]  Time elapsed: 0.003 s  <<< FAILURE!
+...
+[main] [INFO] 
+[main] [INFO] Results:
+[main] [INFO] 
+[main] [ERROR] Failures: 
+[main] [ERROR] com.atlassian.jira.TestSurefire2087.testDemoTemplate() demo2--[2]
+[main] [ERROR]   Run 1: TestSurefire2087.testDemoTemplate:26 expected: <2> but was: <1>
+[main] [ERROR]   Run 2: TestSurefire2087.testDemoTemplate:26 expected: <2> but was: <1>
+[main] [ERROR]   Run 3: TestSurefire2087.testDemoTemplate:26 expected: <2> but was: <1>
+[main] [INFO] 
+[main] [ERROR] demo.surefire2087.TestSurefire2087.testDemoTemplate() demo2--[2]
+[main] [ERROR]   Run 1: TestSurefire2087.testDemoTemplate:26 expected: <2> but was: <1>
+[main] [ERROR]   Run 2: TestSurefire2087.testDemoTemplate:26 expected: <2> but was: <1>
+[main] [ERROR]   Run 3: TestSurefire2087.testDemoTemplate:26 expected: <2> but was: <1>
+[main] [INFO] 
+[main] [INFO] 
+[main] [ERROR] Tests run: 4, Failures: 2, Errors: 0, Skipped: 0
+[main] [INFO] 
+[main] [INFO] ------------------------------------------------------------------------
+[main] [INFO] BUILD FAILURE
+[main] [INFO] ------------------------------------------------------------------------{code}
+ 
+
+Can you please suggest a way forward here for fixing that? Would you prefer reopening this issue, or opening a new one for TestTemplate specifically? (unsure if there are more/other cases like that)
+
+Indeed use of JUnit5 _@TestTemplate_ has the same issue once more, verified the issue of [~vadam] above in my own test-repo.
+
+ 
+
+The cleaner fix for this should happen in _RunListenerAdapter_ though AFAICS, around where the patch for SUREFIRE-2065 has also mainly been done  (specifically, in _#toClassMethodName_ of that class - which is not quite trivial to fully understand TBH).
+
+ 
+
+IMHO - it would we better to check explicitly for any sort of JUnit5 templated-tests at that place in the code. In fact, the _TestIdentifier_ can be analyzed to clearly check for (and handle) templated tests fully on their own (namely, checking if their _UniqueId_ includes a segment like {_}[test-template-invocation:#<id>]{_}, which is true for all templated invocations).
+
+ 
+
+This also relates to SUREFIRE-2152 which I opened a few days ago. As I mentioned over there, I do have an own patch we have in use to take care of this - which ensures to always include the invocation-id to create the surefire test-ID. This would likewise also cover the issue reported here now (just verified that it would cover it). As I mentioned in that ticket, happy to create a PR for it if that makes sense.
+
+Thanks for the pointers [~rweires] !
+
+I'd be interested in your patch, my changes above seem to break things like Bamboo JUnit report parsing for example, so I agree it should be done elsewhere.
+
+[~vadam] - I cleaned my patch up a bit, to create a PR linked to SUREFIRE-2152: https://github.com/apache/maven-surefire/pull/615
+

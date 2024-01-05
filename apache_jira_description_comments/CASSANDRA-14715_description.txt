@@ -1,0 +1,75 @@
+In RepairMergeListener:close() it does the following:
+
+ 
+{code:java}
+try
+{
+    FBUtilities.waitOnFutures(repairResults, DatabaseDescriptor.getWriteRpcTimeout());
+}
+catch (TimeoutException ex)
+{
+    // We got all responses, but timed out while repairing
+    int blockFor = consistency.blockFor(keyspace);
+    if (Tracing.isTracing())
+        Tracing.trace("Timed out while read-repairing after receiving all {} data and digest responses", blockFor);
+    else
+        logger.debug("Timeout while read-repairing after receiving all {} data and digest responses", blockFor);
+
+    throw new ReadTimeoutException(consistency, blockFor-1, blockFor, true);
+}
+{code}
+This propagates up and gets sent to the client and we have customers get confused cause they see timeouts for CL ALL requiring ALL replicas even though they have read_repair_chance = 0 and using a LOCAL_* CL.
+
+At minimum I suggest instead of using the consistency level of DataResolver (which is always ALL with read repairs) for the timeout it instead use repairResults.size(). That is blockFor = repairResults.size() . But saying it received _blockFor - 1_ is bogus still. Fixing that would require more changes. I was thinking maybe like so:
+
+ 
+{code:java}
+public static void waitOnFutures(List<AsyncOneResponse> results, long ms, MutableInt counter) throws TimeoutException
+{
+    for (AsyncOneResponse result : results)
+    {
+        result.get(ms, TimeUnit.MILLISECONDS);
+        counter.increment();
+    }
+}
+{code}
+ 
+
+ 
+
+ 
+
+Likewise in SinglePartitionReadLifecycle:maybeAwaitFullDataRead() it says _blockFor - 1_ for how many were received, which is also bogus.
+
+ 
+
+Steps used to reproduce was modify RepairMergeListener:close() to always throw timeout exception.  With schema:
+{noformat}
+CREATE KEYSPACE weather WITH replication = {'class': 'NetworkTopologyStrategy', 'dc1': '3', 'dc2': '3'}  AND durable_writes = true;
+
+CREATE TABLE weather.city (
+cityid int PRIMARY KEY,
+name text
+) WITH bloom_filter_fp_chance = 0.01
+AND dclocal_read_repair_chance = 0.0
+AND read_repair_chance = 0.0
+AND speculative_retry = 'NONE';
+{noformat}
+Then using the following steps:
+ # ccm node1 cqlsh
+ # INSERT INTO weather.city(cityid, name) VALUES (1, 'Canberra');
+ # exit;
+ # ccm node1 flush
+ # ccm node1 stop
+ # rm -rf ~/.ccm/test_repair/node1/data0/weather/city-ff2fade0b18d11e8b1cd097acbab1e3d/mc-1-big-* # remove the sstable with the insert
+ # ccm node1 start
+ # ccm node1 cqlsh
+ # CONSISTENCY LOCAL_QUORUM;
+ # select * from weather.city where cityid = 1;
+
+You get result of:
+{noformat}
+ReadTimeout: Error from server: code=1200 [Coordinator node timed out waiting for replica nodes' responses] message="Operation timed out - received only 5 responses." info={'received_responses': 5, 'required_responses': 6, 'consistency': 'ALL'}{noformat}
+But was expecting:
+{noformat}
+ReadTimeout: Error from server: code=1200 [Coordinator node timed out waiting for replica nodes' responses] message="Operation timed out - received only 1 responses." info={'received_responses': 1, 'required_responses': 2, 'consistency': 'LOCAL_QUORUM'}{noformat}

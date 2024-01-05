@@ -1,0 +1,191 @@
+Just hit an error on {{CQLConnectionTest#handleCorruptionOfLargeMessageFrame}} on CircleCI for trunk:
+
+[https://app.circleci.com/pipelines/github/adelapena/cassandra/2504/workflows/431c2a2d-0311-4b98-94d1-bebdb841b362/jobs/24586/tests]
+{code:java}
+junit.framework.AssertionFailedError
+	at org.apache.cassandra.transport.CQLConnectionTest.testFrameCorruption(CQLConnectionTest.java:488)
+	at org.apache.cassandra.transport.CQLConnectionTest.testFrameCorruption(CQLConnectionTest.java:450)
+	at org.apache.cassandra.transport.CQLConnectionTest.testUnrecoverableEnvelopeDecodingErrors(CQLConnectionTest.java:315)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:62)
+	at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+{code}
+It can easily be reproduced on trunk with the multiplexer:
+{code:java}
+.circleci/generate.sh -m -e REPEATED_UTESTS=org.apache.cassandra.transport.CQLConnectionTest
+{code}
+[https://app.circleci.com/pipelines/github/adelapena/cassandra/2505/workflows/e67dd2a9-87a0-4a2b-92e9-db204c5703a6]
+
+This ticket has been closed as a duplicate of CASSANDRA-16677, but it seems that ticket is for {{o.a.c.net.ConnectionTest}}, whereas the failures here are for {{o.a.c.transport.CQLConnectionTest}}. 
+
+This test is weird. 
+
+Looking at the script:
+{code:java}
+            client.connect(address, port);
+            assertTrue(client.isConnected());
+
+            // Only install the transform after protocol negotiation is complete
+            controller.withPayloadTransform(transform);
+
+            for (int i = 0; i < messageCount; i++)
+                client.send(envelopeProvider.apply(i));
+
+            client.awaitResponses();
+            // Client has disconnected
+            assertFalse(client.isConnected());
+            // But before it did, it sent an error response
+            Envelope received = client.inboundMessages.poll();
+            assertNotNull(received); // <----------------------- ERROR
+            Message.Response response = Message.responseDecoder().decode(client.channel, received);
+{code}
+
+We can see that we first wait for the error message, then expect the connection to be closed, and eventually, we read the message asserting its content. 
+
+So, the first thing is that {{client.awaitResponses()}} awaits two messages and returns regardless of whether it is successful. Only one message is being sent - the error message, so the statement always times out. Irrespective of whether the server completes its job or not, we expect the client to be disconnected - it is enough to add a small sleep in the {{ExceptionHandlers}} before the connection should be closed and the test starts to fail at {{assertFalse(client.isConnected())}}. Eventually - we test it with networking, and since we only make sure that the error message is sent before the connection is closed, we cannot guarantee the order of events will be retained on the client side. It is even more apparent in real deployments. 
+
+So, if I'm not wrong, the expectation that the client receives and processes the error message before closing the connection without expecting any ack from the client does not make sense. If we want to verify that such a message is sent before closing the connection on the server side, we should implement the test differently - assert that the message was sent rather than received. Otherwise, if we expect the client to process the error message before closing the connection, we should expect some ack from the client before the server closes the connection.
+
+[~dcapwell] wdyt ?
+
+{quote}So, the first thing is that client.awaitResponses() awaits two messages and returns regardless of whether it is successful. Only one message is being sent - the error message, so the statement always times out. Irrespective of whether the server completes its job or not, we expect the client to be disconnected
+{quote}
+{noformat}
+// Client needs to expect multiple responses or else awaitResponses returns
+// after the error is first received and we race between handling the exception
+// caused by remote disconnection and checking the connection status.{noformat}
+i.e. if we don't coerce the client into additional waiting, the client may not have finished reacting to the server closing the connection before we check. An alternative would be to add a sleep between the two:
+
+ 
+{code:java}
+client.awaitResponses();
+TimeUnit.SECONDS.sleep(1);
+// Client has disconnected
+assertFalse(client.isConnected());
+{code}
+{quote}we cannot guarantee the order of events will be retained on the client side. It is even more apparent in real deployments.
+{quote}
+I don't quite understand this. For sure we in a real deployment we cannot guarantee the order of events on the client side as we don't control the client, but we do in a test like this.
+{quote}we should implement the test differently - assert that the message was sent rather than received
+{quote}
+If I remember right (but it's been a while, sorry), then the reasoning for doing it this way was mostly that it was easier/cleaner/less invasive to have a custom test client that we could inspect than to modify the server side in a way that is only really useful for testing.
+{quote}we should expect some ack from the client before the server closes the connection
+{quote}
+Not really, the sending of the error response is really just an optimisation to try and avoid client side timeouts. It's especially optimistic given we have so little control over how disparate client implementations deal with errors/timeouts (and even stream tracking). The server doesn't need to wait for an ack before closing.
+
+I saw that comment, but I don't get it - is that {{await}} deliberately used as a sleep? We get a single message - can we just await even longer for a single message to arrive, then check what that message is (assert it is an error), and finally assert that the connection is closed in a {{Awaitlily}} loop?
+
+
+
+Yep, I think that would probably work just as welI (I don't think we had started using {{Awaitility}} when the test was first written, or maybe I just wasn't aware of it then).  
+
+Let's try that then, maybe it will help getting rid of this flakiness. Thanks for explanation [~samt]
+
+https://app.circleci.com/pipelines/github/jacek-lewandowski/cassandra/903/workflows/0dceaede-a0ee-4bbf-af12-d97ad99e6bd1/jobs/30926/tests
+
+Comparing to the successful run, there are two message missing in the failing run:
+
+{noformat}
+DEBUG [epollEventLoopGroup-20-2] Discarded inbound message BufferPoolAllocator$Wrapped(ridx: 0, widx: 65528, cap: 65536) that reached at the tail of the pipeline. Please check your pipeline configuration.
+DEBUG [epollEventLoopGroup-20-2] Discarded message pipeline : [DefaultChannelPipeline$TailContext#0]. Channel : [id: 0xa5a32134, L:/127.0.0.1:33245 ! R:/127.0.0.1:37322].
+{noformat}
+
+
+Ha! I've managed to reproduce it quite reliably! Just added a short sleep in the {{SimpleClient#maybeWrite}} loop.
+
+[~samt], I admit that my previous explanation was wrong.
+
+When the messages are being sent, they are split into frames. The corrupted frame is not the last one the test tries to send. Also, those messages are sent asynchronously.
+
+The test expects the connection to be closed by the server, and the client can no longer read from the channel. As a result, we get an exception, which marks the connection as closed. In such a case, we can expect the custom error message to appear in the buffer. 
+
+However, there is a race - the client may fail due to the inability to send some remaining frames. This can be clearly seen when we log the error message from the exception handling code:
+
+expected behaviour:
+{noformat}
+ERROR [TEST-CLIENT:1] 2023-09-27 15:25:31,673 CQLConnectionTest.java:1059 - Connection exception: 
+java.io.IOException: Connection reset by peer
+	at java.base/sun.nio.ch.FileDispatcherImpl.read0(Native Method)
+	at java.base/sun.nio.ch.SocketDispatcher.read(SocketDispatcher.java:39)
+	at java.base/sun.nio.ch.IOUtil.readIntoNativeBuffer(IOUtil.java:276)
+	at java.base/sun.nio.ch.IOUtil.read(IOUtil.java:233)
+	at java.base/sun.nio.ch.IOUtil.read(IOUtil.java:223)
+	at java.base/sun.nio.ch.SocketChannelImpl.read(SocketChannelImpl.java:356)
+	at io.netty.buffer.UnpooledDirectByteBuf.setBytes(UnpooledDirectByteBuf.java:570)
+	at io.netty.buffer.AbstractByteBuf.writeBytes(AbstractByteBuf.java:1132)
+	at io.netty.channel.socket.nio.NioSocketChannel.doReadBytes(NioSocketChannel.java:357)
+	at io.netty.channel.nio.AbstractNioByteChannel$NioByteUnsafe.read(AbstractNioByteChannel.java:151)
+	at io.netty.channel.nio.NioEventLoop.processSelectedKey(NioEventLoop.java:788)
+	at io.netty.channel.nio.NioEventLoop.processSelectedKeysOptimized(NioEventLoop.java:724)
+	at io.netty.channel.nio.NioEventLoop.processSelectedKeys(NioEventLoop.java:650)
+	at io.netty.channel.nio.NioEventLoop.run(NioEventLoop.java:562)
+	at io.netty.util.concurrent.SingleThreadEventExecutor$4.run(SingleThreadEventExecutor.java:997)
+	at io.netty.util.internal.ThreadExecutorMap$2.run(ThreadExecutorMap.java:74)
+	at io.netty.util.concurrent.FastThreadLocalRunnable.run(FastThreadLocalRunnable.java:30)
+	at java.base/java.lang.Thread.run(Thread.java:829)
+{noformat}
+
+unexpected behaviour (with sleep in flush loop on the client side):
+{noformat}
+ERROR [TEST-CLIENT:1] 2023-09-27 15:31:01,896 CQLConnectionTest.java:1059 - Connection exception: 
+java.io.IOException: Connection reset by peer
+	at java.base/sun.nio.ch.FileDispatcherImpl.write0(Native Method)
+	at java.base/sun.nio.ch.SocketDispatcher.write(SocketDispatcher.java:47)
+	at java.base/sun.nio.ch.IOUtil.writeFromNativeBuffer(IOUtil.java:113)
+	at java.base/sun.nio.ch.IOUtil.write(IOUtil.java:58)
+	at java.base/sun.nio.ch.IOUtil.write(IOUtil.java:50)
+	at java.base/sun.nio.ch.SocketChannelImpl.write(SocketChannelImpl.java:462)
+	at io.netty.channel.socket.nio.NioSocketChannel.doWrite(NioSocketChannel.java:415)
+	at io.netty.channel.AbstractChannel$AbstractUnsafe.flush0(AbstractChannel.java:931)
+	at io.netty.channel.nio.AbstractNioChannel$AbstractNioUnsafe.flush0(AbstractNioChannel.java:354)
+	at io.netty.channel.AbstractChannel$AbstractUnsafe.flush(AbstractChannel.java:895)
+	at io.netty.channel.DefaultChannelPipeline$HeadContext.flush(DefaultChannelPipeline.java:1372)
+	at io.netty.channel.AbstractChannelHandlerContext.invokeFlush0(AbstractChannelHandlerContext.java:921)
+	at io.netty.channel.AbstractChannelHandlerContext.invokeFlush(AbstractChannelHandlerContext.java:907)
+	at io.netty.channel.AbstractChannelHandlerContext.flush(AbstractChannelHandlerContext.java:893)
+	at io.netty.channel.ChannelOutboundHandlerAdapter.flush(ChannelOutboundHandlerAdapter.java:125)
+	at io.netty.channel.AbstractChannelHandlerContext.invokeFlush0(AbstractChannelHandlerContext.java:925)
+	at io.netty.channel.AbstractChannelHandlerContext.invokeWriteAndFlush(AbstractChannelHandlerContext.java:941)
+	at io.netty.channel.AbstractChannelHandlerContext.write(AbstractChannelHandlerContext.java:966)
+	at io.netty.channel.AbstractChannelHandlerContext.writeAndFlush(AbstractChannelHandlerContext.java:934)
+	at org.apache.cassandra.transport.SimpleClient$SimpleFlusher.writeLargeMessage(SimpleClient.java:820)
+	at org.apache.cassandra.transport.SimpleClient$SimpleFlusher.maybeWrite(SimpleClient.java:744)
+	at org.apache.cassandra.transport.SimpleClient$SimpleFlusher.lambda$schedule$0(SimpleClient.java:722)
+	at io.netty.util.concurrent.PromiseTask.runTask(PromiseTask.java:98)
+	at io.netty.util.concurrent.ScheduledFutureTask.run(ScheduledFutureTask.java:159)
+	at io.netty.util.concurrent.AbstractEventExecutor.runTask(AbstractEventExecutor.java:174)
+	at io.netty.util.concurrent.AbstractEventExecutor.safeExecute(AbstractEventExecutor.java:167)
+	at io.netty.util.concurrent.SingleThreadEventExecutor.runAllTasks(SingleThreadEventExecutor.java:470)
+	at io.netty.channel.nio.NioEventLoop.run(NioEventLoop.java:569)
+	at io.netty.util.concurrent.SingleThreadEventExecutor$4.run(SingleThreadEventExecutor.java:997)
+	at io.netty.util.internal.ThreadExecutorMap$2.run(ThreadExecutorMap.java:74)
+	at io.netty.util.concurrent.FastThreadLocalRunnable.run(FastThreadLocalRunnable.java:30)
+	at java.base/java.lang.Thread.run(Thread.java:829)
+{noformat}
+ 
+In particular, I presume that the failure scenario is as follows:
+1. C sends the correct frames
+2. C sends the corrupted frame
+3. S receives the corrupted frame, sends the error message, and closes the connection
+4. C sends the correct frames
+5. OS responds with RST as the socket is already closed
+6. C receives RST before anything else (before the error message and legitimate connection close request from the S)
+7. C closes the connection
+
+
+I think that to fix this flakiness we have to make sure that the test corrupts the last frame. Perhaps it would be better to corrupt the frame on the client side so that it is certain that no more frames are tried to be sent after the corrupted frame?
+
+ 
+
+That doesn't sound unreasonable. I think it's a nice property of the test to _not_ rely on it being the last sent frame that's corrupt, but obviously that's invalidated if it makes the test unreliable. 
+
+alternatively, if we want to reliably verify the error message is sent, we can use byteman and not rely the client receiving it - this is probably a simpler approach and we verify exactly what we want to verify.
+
++1 LGTM
+
+We may as well commit this to 4.0/4.1/5.0 as this is essentially a test-only fix (SimpleClient is only used in tests / stress and the changes there only really amount to additional TRACE logging anyway). WDYT?
+
+bq. We may as well commit this to 4.0/4.1/5.0 as this is essentially a test-only fix (SimpleClient is only used in tests / stress and the changes there only really amount to additional TRACE logging anyway). WDYT?
+
+sure
+

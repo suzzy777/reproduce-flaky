@@ -1,0 +1,76 @@
+Please raise this kind of issue on the user's list first, then if it turns out not to be
+pilot error raise a JIRA.
+
+Nothing substantive, I have no clue about this particular issue though.
+
+
+Does it work with createNodeSet when using plain SolrCloud without SSL?
+
+Please provide the exact CollectionApi request you used when it failed, so we can see if the syntax is correct. Also, is 443 your secure port number in Jetty/Tomcat?
+
+Yes, running SolrCloud without SSL it works fine with the createNodeSet param. I run this with Tomcat application server and 443 enabled.
+
+Although I receive this error message the collection and the shards gets created and the clusterstate.json updated, but the cores are missing. I manual add them one by one in the admin console so I get my cloud up running and the solr-nodes are able to talk to each other - no certificate issues or SSL handshake error between the nodes.
+
+curl -E solr-ssl.pem:secret12 -k 'https://vt-searchln03:443/solr/admin/collections?action=CREATE&numShards=3&replicationFactor=2&name=multisharding&createNodeSet=vt-searchln03:443_solr,vt-searchln04:443_solr,vt-searchln01:443_solr,vt-searchln02:443_solr,vt-searchln05:443_solr,vt-searchln06:443_solr'
+ 
+
+<?xml version="1.0" encoding="UTF-8"?>
+<response>
+<lst name="responseHeader"><int name="status">0</int><int name="QTime">206</int></lst><lst name="failure"><str>org.apache.solr.client.solrj.SolrServerException:IOException occured when talking to server at: https://vt-searchln03:443/solr</str><str>org.apache.solr.client.solrj.SolrServerException:IOException occured when talking to server at: https://vt-searchln04:443/solr</str><str>org.apache.solr.client.solrj.SolrServerException:IOException occured when talking to server at: https://vt-searchln06:443/solr</str><str>org.apache.solr.client.solrj.SolrServerException:IOException occured when talking to server at: https://vt-searchln05:443/solr</str><str>org.apache.solr.client.solrj.SolrServerException:IOException occured when talking to server at: https://vt-searchln01:443/solr</str><str>org.apache.solr.client.solrj.SolrServerException:IOException occured when talking to server at: https://vt-searchln02:443/solr</str></lst>
+</response>
+
+The reason for the IOException was that the Overseer node did not have the correct SSL certificate required for authenticating with all the other Solr nodes. Uploading the correct certificate to all nodes solved the issue.
+
+However, will re-purpose this issue to improving error response on failed distributed collection actions.
+
+Comment to the three listed problems in the updated problem description:
+# What error code to return? Anything is better than 0. In this case it's a server configuration error, so 5xx? But where to modify the status code? Perhaps {{OverseerCollectionProcessor#processResponse()}}?
+# How about printing the Exception-class names of all intermediate exceptions in the chain and then the message from the original one?
+# Rollback of partially successful collection create would be interesting, but deserves its own JIRA perhaps :-)
+
+Appreciate feedback and discussion on how to solve this...
+
+above conversation nobody tell clearly how to solve it,
+I am getting same error in solr-5.3.
+Provide the exact command for creating create colllection/core.
+
+I wonder if the error reporting might be solved during a lot of refactoring of the overseer, async operations etc? Anyone?
+
+Wanted to check in on this and see which of the original concerns are still issues:
+
+bq. Status=0 when the cmd did not succeed
+Still a problem, though it will soon be fixed for CREATE, the reporter's original example here.
+
+bq. The error printed does not tell which action failed
+Still a problem, but a hard one: it's tough to guess which bits in the exception chain are the helpful bits.  The top and root of the chain are the most likely entries to be interesting, but not always.  Any truncation of the exception chain is going to reduce the chance we're conveying the important part.
+
+bq. State of collection is not clean since it exists as far as ZK is concerned but cores not created
+This _should_ have already been fixed in SOLR-8983.
+
+So I'd argue that fixing the {{status}} property should be our main goal.  To that end, I've attached a patch fixing this problem for CREATE on SOLR-5970.  I don't like the narrowness of that fix though will spend some time seeing if there's a way it can be generalized at a different level of our collection API processing.  Going to assign this to myself.
+
+I've attached a patch here which ensures that any collection-api response with a non-empty "failure" property also has its status set to 500.  This has the advantage of covering things more generically and save us from constantly finding new cases where the status property (and HTTP status code) is incorrect.  (There's a few different JIRAs open at the moment for similar issues with various collection APIs.).
+
+Reviewers might notice that I change the status to 500 not by throwing a SolrException as is common, but my introducing a field in SolrQueryResponse as a "status-override".  I didn't like deviating from the normal way of doing things, and I don't love introducing yet-another way to set the API status, but I had trouble finding a good way to flatten the often-nested structure of the "failure" map into a message for a SolrException without losing tons of information that could help the user out.  If anyone sees a better way here, I'd love some review/feedback.
+
+This change triggers a few additional test failures- the API calls in these tests have apparently been failing for some time before this change but we never noticed since the incorrect statuses obscured the problem.  So this patch includes fixes for a number of these tests.  I'm still building confidence that I've caught all of these cases, hoping to flush out more status-related test failures through the week.  If my runs stop finding issues by the end of the week, I'll be looking to commit.
+
+Thinking aloud here, and I guess also soliciting feedback.
+
+The current patch sets 500 as the value for the "status' property, as well as the HTTP status code on the response.  The expectation in most other places seems to be that the "status" property matches the HTTP status code.  So this seems like the technically correct thing to do from an API perspective.
+
+There's is a downside to this though- SolrJ converts non-200 responses into exceptions.  So while the failure information is still in the response, SolrJ users can't get at it.  (This isn't strictly true...SolrJ tries its best to come up with a good exception message by looking for properties like "error" and "failure".  But that's a pale substitute to giving users access to the response itself if they want it).
+
+It'd be cool if SolrJ users could access the original response in exceptional cases.  Maybe we should attach the parsed NamedList to RemoteSolrExceptions that get thrown by SolrJ.  That seems like a separate JIRA, but wanted to raise it here since it bears on these response changes indirectly.
+
+I'm not going to have much time in the immediate future to finish this up, so I wanted to summarize the progress so far:
+
+- the latest patch sets the "status" property to 500 when the "failure" list is present and non-empty
+- because of this, SolrJ will now throw exceptions in failure cases where it previously allowed the request to fail silently.  This causes some tests to fail that were passing (incorrectly) before.  I investigated a few examples of this, and most were in test setup/cleanup when the expectations were a bit off.  There weren't a ton of these failures though and they should be simpler to debug thanks to other recent test flakiness improvements.
+- I investigated making changes to SolrJ that would attach a NamedList to SolrExceptions thrown because of a 500, but didn't pursue that too far.  It's probably a separate JIRA anyways. 
+
+Started investigating how we could return JSON error responses from Solr instead of the default Jetty HTML error response. Then I bumped over this issue again.
+
+To me the proposed action sounds a whole lot better than sneaky OK responses..
+

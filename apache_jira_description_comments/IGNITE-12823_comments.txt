@@ -1,0 +1,156 @@
+Hello [~ptupitsyn].
+
+Are you working on this issue?
+One of my customers wants to have this issue ASAP so I'm offering my help with resolving one of the issue (IGNITE-10100, IGNITE-12823).
+
+[~nizhikov] feel free to take over both tickets.
+
+PR: https://github.com/apache/ignite/pull/7788
+
+{panel:title=Branch: [pull/7788/head] Base: [master] : No blockers found!|borderStyle=dashed|borderColor=#ccc|titleBGColor=#D6F7C1}{panel}
+[TeamCity *--&gt; Run :: All* Results|https://ci.ignite.apache.org/viewLog.html?buildId=5327287&amp;buildTypeId=IgniteTests24Java8_RunAll]
+
+[~ptupitsyn], please, review my change.
+
+[~zzzadruga] can you please describe the rationale behind this change? Why exactly are the changes in BinaryMarshaller needed to fix platform interoperability?
+Is this change backward-compatible (for example, if a user persists marshalled data in a 3-rd party database, will they be able to deserialize the old data after the fix is released?)
+
+[~zzzadruga] In my understanding, we don't need to change сore serialization logic to fix this issue.
+The problem boils down to this: in PlatformServices.invoke all arrays are Object[], but service method may have a different array type T[]. All we have to do is convert the array on the go. 
+
+I've made a quick POC that makes the tests pass, replace org.apache.ignite.internal.processors.platform.services.PlatformServices.ServiceProxyHolder#invoke with the following:
+
+{code}
+        public Object invoke(String mthdName, boolean srvKeepBinary, Object[] args)
+            throws IgniteCheckedException, NoSuchMethodException {
+            if (proxy instanceof PlatformService)
+                return ((PlatformService)proxy).invokeMethod(mthdName, srvKeepBinary, args);
+            else {
+                assert proxy instanceof GridServiceProxy;
+
+                // Deserialize arguments for Java service when not in binary mode
+                if (!srvKeepBinary)
+                    args = PlatformUtils.unwrapBinariesInArray(args);
+
+                Method mtd = getMethod(serviceClass, mthdName, args);
+
+                for (int i = 0; i < args.length; i++) {
+                    Object arg = args[i];
+
+                    if (arg instanceof Object[]) {
+                        Class<?> parameterType = mtd.getParameterTypes()[i];
+
+                        if (parameterType.isArray() && parameterType != Object[].class) {
+                            Object[] arr = (Object[])arg;
+                            Object newArg = Array.newInstance(parameterType.getComponentType(), arr.length);
+
+                            for (int j = 0; j < arr.length; j++)
+                                Array.set(newArg, j, arr[j]);
+
+                            args[i] = newArg;
+                        }
+                    }
+                }
+
+                try {
+                    return ((GridServiceProxy)proxy).invokeMethod(mtd, args);
+                }
+                catch (Throwable t) {
+                    throw IgniteUtils.cast(t);
+                }
+            }
+        }
+{code}
+
+[~ptupitsyn], yes, but we have a problem when we start .NET services from .NET on the remote node with method parameters that have an array of user types. Local node send an array to remote node, and we cannot deserialize it, because it don't have this class on Java. But if it only unmarshal the array in Object[], we lose .NET user type. 
+
+Run your POC on this test [1].
+
+[1] https://github.com/apache/ignite/pull/7788/commits/c654e66caf130bdf9df3a99979b363ba6b80ff37#diff-c0ec0308d69151e8b10db00c15158d29R420
+
+[~zzzadruga] the fix for .NET -> .NET call is similar. Here is the full POC, I've used your tests as is:
+
+https://github.com/apache/ignite/pull/7844
+
+[~ptupitsyn], Yes, your decision is better. Unfortunately, I did not think of this. But I came up with one crazy case (maybe he is not alone) in which your decision needs to be fixed.
+
+As I understand it, do you take a ticket to yourself?
+{code:java}
+Assert.AreEqual("PlatformComputeBinarizable2", prx.TestBinarizableArray(new[] {10, 11, 12}.Select(x => new PlatformComputeBinarizable2 {Field = x}).ToArray()));
+
+....
+
+            public string TestBinarizableArray(object[] x)
+            {
+                if (x.GetType() == typeof(PlatformComputeBinarizable[]))
+                    return "PlatformComputeBinarizable";
+                if (x.GetType() == typeof(PlatformComputeBinarizable2[]))
+                    return "PlatformComputeBinarizable2";
+                    
+                return "object";
+            }
+...
+
+Expected string length 27 but was 6. Strings differ at index 0.
+  Expected: "PlatformComputeBinarizable2"
+  But was:  "object"
+{code}
+ 
+
+[~zzzadruga] I can take the ticket and finalize the solution if you have no objections.
+
+[~zzzadruga] regarding the code snippet - yes, that is the limitation of Ignite binary serializer. We have array element type id encoded as part of the array, but this information is lost when deserializing in binary mode and back. 
+
+The fix from you and Alexey is closer to a proper solution, but it is still a workaround for a specific case. Ideally we should allow reading arrays as BinaryObject, so that type information is preserved. But this would be hard to do while maintaining compatibility.
+
+[~ptupitsyn], reading arrays as BinaryObject can be done in Ignite 3.0. 
+
+[~zzzadruga], [~kukushal], [~nizhikov] my PR is ready for the review:
+https://github.com/apache/ignite/pull/7844
+
+In particular, please check Java-side array conversion: can it be improved?
+In C# we pre-compile the conversion code, but in Java I had to use reflection.
+
+{panel:title=Branch: [pull/7844/head] Base: [master] : Possible Blockers (3)|borderStyle=dashed|borderColor=#ccc|titleBGColor=#F7D6C1}
+{color:#d04437}Cache 2{color} [[tests 0 TIMEOUT , Exit Code |https://ci.ignite.apache.org/viewLog.html?buildId=5340825]]
+
+{color:#d04437}Cache 8{color} [[tests 1|https://ci.ignite.apache.org/viewLog.html?buildId=5340831]]
+* IgniteCacheTestSuite8: GridCacheNearMetricsSelfTest.testNearRead - Test has low fail rate in base branch 0,0% and is not flaky
+
+{color:#d04437}MVCC Cache 2{color} [[tests 1|https://ci.ignite.apache.org/viewLog.html?buildId=5340860]]
+* IgniteCacheMvccTestSuite2: IgniteCachePartitionMapUpdateSafeLossPolicyTest.testRandom - Test has low fail rate in base branch 0,0% and is not flaky
+
+{panel}
+[TeamCity *--&gt; Run :: All* Results|https://ci.ignite.apache.org/viewLog.html?buildId=5340876&amp;buildTypeId=IgniteTests24Java8_RunAll]
+
+[~ptupitsyn], the fix looks almost OK, just need to take care about "keep binary" mode for both the Java and .NET services. I added comments in the pull request.
+
+[~kukushal] keepBinary mode requires the same treatment - service may take BinaryObject[], so array conversion is necessary. I've added tests for both .NET->.NET and .NET->Java calls to demonstrate this.
+
+[~ptupitsyn], thank you, I approved the pull request!
+
+LGTM
+
+{panel:title=Branch: [pull/7844/head] Base: [master] : Possible Blockers (6)|borderStyle=dashed|borderColor=#ccc|titleBGColor=#F7D6C1}
+{color:#d04437}MVCC Cache 7{color} [[tests 0 TIMEOUT , Out Of Memory Error , Exit Code |https://ci.ignite.apache.org/viewLog.html?buildId=5348673]]
+
+{color:#d04437}SPI{color} [[tests 1|https://ci.ignite.apache.org/viewLog.html?buildId=5348599]]
+* IgniteSpiTestSuite: GridTcpCommunicationSpiTcpNoDelayOffSelfTest.testSendToManyNodes - Test has low fail rate in base branch 0,0% and is not flaky
+
+{color:#d04437}Queries 1{color} [[tests 2|https://ci.ignite.apache.org/viewLog.html?buildId=5348659]]
+* IgniteBinaryCacheQueryTestSuite: KillCommandsMXBeanTest.testCancelSnapshot - Test has low fail rate in base branch 0,0% and is not flaky
+* IgniteBinaryCacheQueryTestSuite: IndexingCachePartitionLossPolicySelfTest.checkLostPartition[ATOMIC READ_ONLY_SAFE 2 true 5 false] - Test has low fail rate in base branch 0,0% and is not flaky
+
+{color:#d04437}Thin Client: Java{color} [[tests 0 Exit Code |https://ci.ignite.apache.org/viewLog.html?buildId=5348590]]
+
+{color:#d04437}Security{color} [[tests 0 TIMEOUT , Out Of Memory Error , Exit Code |https://ci.ignite.apache.org/viewLog.html?buildId=5348681]]
+
+{panel}
+[TeamCity *--&gt; Run :: All* Results|https://ci.ignite.apache.org/viewLog.html?buildId=5348684&amp;buildTypeId=IgniteTests24Java8_RunAll]
+
+Merged to master: b0c5a15e91a64bf02c9ded5ae4eb051ff6a3215a
+
+Dear [~ptupitsyn], what is the Fix Version for this bug? Is it 2.9?
+
+[~dfrolov] yes, updated it. Thanks for noticing!
+

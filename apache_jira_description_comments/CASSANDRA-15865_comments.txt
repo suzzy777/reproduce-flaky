@@ -1,0 +1,194 @@
+I haven't dug into it, but at first glance it looks like there could be a problem with the dtest:
+
+{code:python}
+        for node in node1, node2:
+            res = self._launch_nodetool_cmd(node, 'statushandoff')
+            assert 'Hinted handoff is running' == res.rstrip()
+
+        res = self._launch_nodetool_cmd(node, 'getmaxhintwindow')
+        assert 'Current max hint window: 300000 ms' == res.rstrip()
+        self._do_hinted_handoff(node1, node2, True)
+        node1.start(wait_other_notice=True)
+        self._launch_nodetool_cmd(node, 'setmaxhintwindow 1')
+        assert 'Current max hint window: 1 ms' == res.rstrip()
+        self._do_hinted_handoff(node1, node2, False, keyspace='ks2')
+{code}
+
+The call to {{setmaxhintwindow}} to 1ms uses {{node}}, not {{node1}} which could be affected by the ordering of the output from {{nodetool statushandoff}}. {{_do_hinted_handoff}} writes to {{node1}} when {{node2}} is shutdown, so if the max window is set on {{node2}} by mistake, the test will fail as per the reported error:
+
+{code}
+self = <hintedhandoff_test.TestHintedHandoffConfig object at 0x7fd143d926a0>
+
+    @since('4.0')
+    def test_hintedhandoff_setmaxwindow(self):
+        """
+            Test global hinted handoff against max_hint_window_in_ms update via nodetool
+            """
+        node1, node2 = self._start_two_node_cluster({'hinted_handoff_enabled': True, "max_hint_window_in_ms": 300000})
+    
+        for node in node1, node2:
+            res = self._launch_nodetool_cmd(node, 'statushandoff')
+            assert 'Hinted handoff is running' == res.rstrip()
+    
+        res = self._launch_nodetool_cmd(node, 'getmaxhintwindow')
+        assert 'Current max hint window: 300000 ms' == res.rstrip()
+        self._do_hinted_handoff(node1, node2, True)
+        node1.start(wait_other_notice=True)
+        self._launch_nodetool_cmd(node, 'setmaxhintwindow 1')
+        res = self._launch_nodetool_cmd(node, 'getmaxhintwindow')
+        assert 'Current max hint window: 1 ms' == res.rstrip()
+>       self._do_hinted_handoff(node1, node2, False, keyspace='ks2')
+
+hintedhandoff_test.py:146: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+hintedhandoff_test.py:76: in _do_hinted_handoff
+    query_c1c2(session, n, ConsistencyLevel.ONE, tolerate_missing=True, must_be_missing=True)
+tools/data.py:40: in query_c1c2
+    assertions.assert_length_equal(rows, 0)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+object_with_length = [Row(c1='value1', c2='value2')], expected_length = 0
+
+    def assert_length_equal(object_with_length, expected_length):
+        """
+        Assert an object has a specific length.
+        @param object_with_length The object whose length will be checked
+        @param expected_length The expected length of the object
+    
+        Examples:
+        assert_length_equal(res, nb_counter)
+        """
+        assert len(object_with_length) == expected_length, \
+            "Expected {} to have length {}, but instead is of length {}"\
+>           .format(object_with_length, expected_length, len(object_with_length))
+E       AssertionError: Expected [Row(c1='value1', c2='value2')] to have length 0, but instead is of length 1
+
+tools/assertions.py:269: AssertionError
+{code}
+
+Moving to beta as it's a) test only (i.e. not product), b) flaky, and c) looks like it's JDK11 related.
+
+[~Ottermad] are you still looking at this?
+
+[~aholmber] I'm afraid I'm not I'll move it out of in progress
+
+{code}
+test_hintedhandoff_setmaxwindow failed and was not selected for rerun.
+        <class 'AssertionError'>
+        Expected [Row(c1='value1', c2='value2')] to have length 0, but instead is of length 1
+        [<TracebackEntry /home/ubuntu/cassandra-dtest/hintedhandoff_test.py:146>, <TracebackEntry /home/ubuntu/cassandra-dtest/hintedhandoff_test.py:76>, <TracebackEntry /home/ubuntu/cassandra-dtest/tools/data.py:40>, <TracebackEntry /home/ubuntu/cassandra-dtest/tools/assertions.py:269>]
+
+{code}
+
+Stealing this one from [~brandon.williams] I hope you don't mid :-)
+
+I would argue {{statushandoff}}'s output is not being used as per the test's code unless I am missing sthg. In fact looking at the loop {{node}} stays set to {{node2}} as this is the last value the initial loop leaves it to. So the HH setting, along the rest of operations, are being sent to {{node2}} imo.
+
+I couldn't repro as much as I tried but I am putting a PR up. It only makes sure the HH of 1m is effective on all nodes before proceding.
+
+Go for it. :)
+
+bq. So the HH setting, along the rest of operations, are being sent to node2 imo.
+
+Sam's comment was similar, and I posted the trace above with a patch like the PR applied, since that was clearly wrong.  When I dug in it looked like node2 flapped once after shutdown which was causing this.  I can usually repro in a few hundred runs on j11, I'll see what happens.
+
+I'm afraid as I suspected, that's a swing and a miss, [~Bereng].  It still fails as before, even though this part was obviously wrong.
+
+I'll try to repro by leaving it running overnight on my laptop. Let's see if between the 2 of us we get somewhere... I'd hate to bounce it back to you but if it doesn't I can only stare at the code a bit longer but not much more I'm afraid.
+
+So I managed to repro once laving it overnight 2 days ago. Staring at the code I added some debug in {{StorageProxy.shouldHint()}} which made it not repro anymore. So I guess I am in the right area of the code but can't repro anymore. I'll look into it a bit more. #collaborating
+
+Some progress. The only failure's logs look like 
+
+{noformat}
+grep -ri "is now" node1_debug.log
+INFO  [GossipStage:1] 2020-10-19 15:34:07,204 Gossiper.java:1235 - Node /127.0.0.2:7000 is now part of the cluster
+INFO  [GossipStage:1] 2020-10-19 15:34:07,264 Gossiper.java:1193 - InetAddress /127.0.0.2:7000 is now UP
+INFO  [GossipStage:1] 2020-10-19 15:34:19,054 Gossiper.java:1211 - InetAddress /127.0.0.2:7000 is now DOWN
+INFO  [GossipStage:1] 2020-10-19 15:34:31,968 Gossiper.java:1193 - InetAddress /127.0.0.2:7000 is now UP
+INFO  [GossipStage:1] 2020-10-19 15:35:04,652 Gossiper.java:1193 - InetAddress /127.0.0.2:7000 is now UP
+INFO  [GossipStage:1] 2020-10-19 15:35:04,653 Gossiper.java:1193 - InetAddress /127.0.0.2:7000 is now UP
+INFO  [GossipStage:1] 2020-10-19 15:35:11,715 Gossiper.java:1211 - InetAddress /127.0.0.2:7000 is now DOWN
+INFO  [GossipStage:1] 2020-10-19 15:35:11,719 Gossiper.java:1193 - InetAddress /127.0.0.2:7000 is now UP
+INFO  [GossipStage:1] 2020-10-19 15:35:24,727 Gossiper.java:1211 - InetAddress /127.0.0.2:7000 is now DOWN
+INFO  [GossipStage:1] 2020-10-19 15:35:24,762 Gossiper.java:1193 - InetAddress /127.0.0.2:7000 is now UP
+
+grep -ri "is now" node2_debug.log
+INFO  [GossipStage:1] 2020-10-19 15:34:07,930 Gossiper.java:1235 - Node /127.0.0.1:7000 is now part of the cluster
+INFO  [GossipStage:1] 2020-10-19 15:34:07,950 Gossiper.java:1193 - InetAddress /127.0.0.1:7000 is now UP
+INFO  [GossipStage:1] 2020-10-19 15:34:31,988 Gossiper.java:1193 - InetAddress /127.0.0.1:7000 is now UP
+INFO  [GossipStage:1] 2020-10-19 15:34:45,688 Gossiper.java:1211 - InetAddress /127.0.0.1:7000 is now DOWN
+INFO  [GossipStage:1] 2020-10-19 15:35:04,633 Gossiper.java:1193 - InetAddress /127.0.0.1:7000 is now UP
+INFO  [GossipStage:1] 2020-10-19 15:35:04,652 Gossiper.java:1193 - InetAddress /127.0.0.1:7000 is now UP
+INFO  [GossipStage:1] 2020-10-19 15:35:24,791 Gossiper.java:1193 - InetAddress /127.0.0.1:7000 is now UP
+INFO  [GossipStage:1] 2020-10-19 15:35:25,316 Gossiper.java:1211 - InetAddress /127.0.0.1:7000 is now DOWN
+{noformat}
+
+whereas all the other million non-failing runs diplay
+{noformat}
+grep -ri "is now" node1_debug.log
+INFO  [GossipStage:1] 2020-10-19 15:35:40,341 Gossiper.java:1235 - Node /127.0.0.2:7000 is now part of the cluster
+INFO  [GossipStage:1] 2020-10-19 15:35:40,391 Gossiper.java:1193 - InetAddress /127.0.0.2:7000 is now UP
+INFO  [GossipStage:1] 2020-10-19 15:35:52,169 Gossiper.java:1211 - InetAddress /127.0.0.2:7000 is now DOWN
+INFO  [GossipStage:1] 2020-10-19 15:36:05,123 Gossiper.java:1193 - InetAddress /127.0.0.2:7000 is now UP
+INFO  [GossipStage:1] 2020-10-19 15:36:37,729 Gossiper.java:1193 - InetAddress /127.0.0.2:7000 is now UP
+INFO  [GossipStage:1] 2020-10-19 15:36:37,729 Gossiper.java:1193 - InetAddress /127.0.0.2:7000 is now UP
+INFO  [GossipStage:1] 2020-10-19 15:36:37,729 Gossiper.java:1193 - InetAddress /127.0.0.2:7000 is now UP
+INFO  [GossipStage:1] 2020-10-19 15:36:44,959 Gossiper.java:1211 - InetAddress /127.0.0.2:7000 is now DOWN
+INFO  [GossipStage:1] 2020-10-19 15:36:57,732 Gossiper.java:1193 - InetAddress /127.0.0.2:7000 is now UP
+
+grep -ri "is now" node2_debug.log
+INFO  [GossipStage:1] 2020-10-19 15:35:41,061 Gossiper.java:1235 - Node /127.0.0.1:7000 is now part of the cluster
+INFO  [GossipStage:1] 2020-10-19 15:35:41,094 Gossiper.java:1193 - InetAddress /127.0.0.1:7000 is now UP
+INFO  [GossipStage:1] 2020-10-19 15:36:05,150 Gossiper.java:1193 - InetAddress /127.0.0.1:7000 is now UP
+INFO  [GossipStage:1] 2020-10-19 15:36:18,807 Gossiper.java:1211 - InetAddress /127.0.0.1:7000 is now DOWN
+INFO  [GossipStage:1] 2020-10-19 15:36:37,710 Gossiper.java:1193 - InetAddress /127.0.0.1:7000 is now UP
+INFO  [GossipStage:1] 2020-10-19 15:36:37,728 Gossiper.java:1193 - InetAddress /127.0.0.1:7000 is now UP
+INFO  [GossipStage:1] 2020-10-19 15:36:57,756 Gossiper.java:1193 - InetAddress /127.0.0.1:7000 is now UP
+INFO  [GossipStage:1] 2020-10-19 15:36:58,660 Gossiper.java:1211 - InetAddress /127.0.0.1:7000 is now DOWN
+{noformat}
+
+We can see node2 behaves exactly the same whereas node1 displays an extra 'DOWN'. Matching timestamps this is what's going on in the logs for a bad run
+{noformat}
+DEBUG [GossipStage:1] 2020-10-19 15:35:11,626 MigrationManager.java:89 - Not pulling schema from /127.0.0.2:7000, because schema versions match (7e1669d0-936a-331b-8aca-b6a47709bc60)
+INFO  [GossipStage:1] 2020-10-19 15:35:11,715 Gossiper.java:1211 - InetAddress /127.0.0.2:7000 is now DOWN
+DEBUG [GossipStage:1] 2020-10-19 15:35:11,716 FailureDetector.java:354 - Forcing conviction of /127.0.0.2:7000
+DEBUG [GossipStage:1] 2020-10-19 15:35:11,719 Gossiper.java:1192 - removing expire time for endpoint : /127.0.0.2:7000
+INFO  [GossipStage:1] 2020-10-19 15:35:11,719 Gossiper.java:1193 - InetAddress /127.0.0.2:7000 is now UP
+DEBUG [GossipStage:1] 2020-10-19 15:35:11,719 MigrationManager.java:89 - Not pulling schema from /127.0.0.2:7000, because schema versions match (7e1669d0-936a-331b-8aca-b6a47709bc60)
+
+DEBUG [GossipStage:1] 2020-10-19 15:35:23,368 Gossiper.java:1480 - Shadow request received, adding all states
+DEBUG [GossipStage:1] 2020-10-19 15:35:24,727 Gossiper.java:471 - Convicting /127.0.0.2:7000 with status shutdown - alive true
+INFO  [GossipStage:1] 2020-10-19 15:35:24,727 Gossiper.java:1211 - InetAddress /127.0.0.2:7000 is now DOWN
+DEBUG [GossipStage:1] 2020-10-19 15:35:24,728 FailureDetector.java:354 - Forcing conviction of /127.0.0.2:7000
+DEBUG [GossipStage:1] 2020-10-19 15:35:24,729 Gossiper.java:1142 - Clearing interval times for /127.0.0.2:7000 due to generation change
+INFO  [GossipStage:1] 2020-10-19 15:35:24,729 Gossiper.java:1233 - Node /127.0.0.2:7000 has restarted, now UP
+{noformat}
+
+and this is what happens for a good run:
+{noformat}
+DEBUG [GossipStage:1] 2020-10-19 15:36:44,713 MigrationManager.java:89 - Not pulling schema from /127.0.0.2:7000, because schema versions match (4f3d62af-22c5-3886-8c0b-c5f1b95fc403)
+INFO  [GossipStage:1] 2020-10-19 15:36:44,959 Gossiper.java:1211 - InetAddress /127.0.0.2:7000 is now DOWN
+DEBUG [GossipStage:1] 2020-10-19 15:36:44,960 FailureDetector.java:354 - Forcing conviction of /127.0.0.2:7000
+
+DEBUG [GossipStage:1] 2020-10-19 15:36:56,647 Gossiper.java:1480 - Shadow request received, adding all states
+DEBUG [GossipStage:1] 2020-10-19 15:36:57,725 Gossiper.java:1142 - Clearing interval times for /127.0.0.2:7000 due to generation change
+INFO  [GossipStage:1] 2020-10-19 15:36:57,725 Gossiper.java:1233 - Node /127.0.0.2:7000 has restarted, now UP
+{noformat}
+
+Looking at {{Gossiper}} code and trying infer what's going on looks like node2 is reported UP/DOWN an extra time but I can't infer what's happening from only looking at the logs. I have added tracing level to the test and hope to repro overnight.
+
+I am attaching a  zip [^logsGoodNBad.zip]  for the good and bad runs for the record.
+
+Managed to repro again with TRACE enabled. {{FailureDetector}} seems to toggle the node down/up in a rapid succession and that might play into the picture. I haven't been able to pinf it down yet how does data reach node2. Attaching  [^nodeGoodNBadTrace.zip] for the record.
+
+[~Bereng] I only had a very quick look, but it seems this could be CASSANDRA-16094 ?
+
+I bet it is. I have been seeing the node marked down, ECHO requests going there after the fact, listeners on the ECHO reacting to that reply etc 
+
+I went ahead and committed Berenguer's dtest patch, since that part was obviously wrong.
+
+[~marcuse] I have been looking into this a bit more as I haven't looked into Gossip code before and I think this is it.
+
+For the record: [Here|https://github.com/krummas/cassandra/blob/890840d40c5c5eb0a37c14dbef09e2ba32e366d0/src/java/org/apache/cassandra/gms/Gossiper.java#L1186] is where the ECHO sets the node UP again on the callback. That makes the downtime for that node be 0 and  {{shouldHint()}} logic in {{SotrageProxy}} send hints to it.
+

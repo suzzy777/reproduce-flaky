@@ -1,0 +1,116 @@
+I was just looking into `suppress()` implementation, that obviously does not know anything about semantics of upstream window definitions. It computes the "expiry-time" based on window-end time. Thus, I believe that the right fix for session windows would be to enforce that gracePeriod > gap. \cc [~ableegoldman] as you proposed to address this inside the session window processor (I think this approach won't work).
+
+{quote}I was just looking into `suppress()` implementation, that obviously does not know anything about semantics of upstream window definitions{quote}
+[~mjsax] can you elaborate? Suppression does in fact search the processor graph to find the grace period of the windowed operator which is upstream of the suppression. It's called GraphGraceSearchUtil or something
+
+Well, `gracePeriod` is a generic concept that applies to all windows. However, windows may have quite different semantics, and thus I don't think we should leak actual semantics into `suppress()`? It does not seem desirable to let `suppress()` inspect the actual window type, and do different things based on it? Especially, because it is possible that users implement custom windows.
+
+Thus, my take it that we should stick with `closeTime = windowEnd + grace`. If we would accept to "leak" the semantics into `suppress()` we would need to compute `closeTime = windowEnd + gap + grace` (or add `gap` to the user specified `grace` to avoid branching base on window type in suppress() – or maybe set `gap=0` for non-session windows). I guess I could be convinced _if_ there is a good argument that we don't open Pandoras box this way?
+
+If we stick with `closeTime = windowEnd + grace` and keep window semantics out of suppress and session windows semantics stay encapsulated with `SessionWindows` – and `SessionWindows` understand that it should enforce `grace > gap` to work properly.
+
+Thoughts?
+
+[~byusti] Thanks for your interest. Happy to guide you. I guess, we will first need to agree how we want to address this issue though :)
+
+Couple of pointer so you can follow the discussion:
+ * suppress() implementation: [https://github.com/apache/kafka/blob/trunk/streams/src/main/java/org/apache/kafka/streams/kstream/internals/suppress/KTableSuppressProcessorSupplier.java] 
+ * test that "reveals" the issue: [https://github.com/apache/kafka/blob/trunk/streams/src/test/java/org/apache/kafka/streams/kstream/internals/KStreamSessionWindowAggregateProcessorTest.java#L446-L455] 
+ * session-windows: [https://github.com/apache/kafka/blob/trunk/streams/src/main/java/org/apache/kafka/streams/kstream/SessionWindows.java] 
+
+Thanks for reporting this, [~mjsax] !
+
+What [~ableegoldman] said is correct. The grace period is defined at the windowing operation and inherited downstream by the suppression operator. Which means that when you add a suppression to the topology it has to search up the graph to learn the grace period it should use. This logic is defined in GraphGraceSearchUtil.
+
+In addition to traversing the graph, this logic actually does inspect the type of window definition. IIRC, this was required at the time because of the awkward definition of Windows, but that has just recently been cleaned up, so maybe this logic can now be cleaned up as well.
+
+The relevant snippet is:
+{code:java}
+private static Long extractGracePeriod(final GraphNode node) {
+    if (node instanceof StatefulProcessorNode) {
+        final ProcessorSupplier processorSupplier = ((StatefulProcessorNode) node).processorParameters().oldProcessorSupplier();
+        if (processorSupplier instanceof KStreamWindowAggregate) {
+            final KStreamWindowAggregate kStreamWindowAggregate = (KStreamWindowAggregate) processorSupplier;
+            final Windows windows = kStreamWindowAggregate.windows();
+            return windows.gracePeriodMs();
+        } else if (processorSupplier instanceof KStreamSessionWindowAggregate) {
+            final KStreamSessionWindowAggregate kStreamSessionWindowAggregate = (KStreamSessionWindowAggregate) processorSupplier;
+            final SessionWindows windows = kStreamSessionWindowAggregate.windows();
+            return windows.gracePeriodMs() + windows.inactivityGap();
+        } else if (processorSupplier instanceof KStreamSlidingWindowAggregate) {
+            final KStreamSlidingWindowAggregate kStreamSlidingWindowAggregate = (KStreamSlidingWindowAggregate) processorSupplier;
+            final SlidingWindows windows = kStreamSlidingWindowAggregate.windows();
+            return windows.gracePeriodMs();
+        } else {
+            return null;
+        }
+    } else {
+        return null;
+    }
+} {code}
+Actually, it seems like your concern is actually resolved by this code block, since the effective grace period for sliding windows is actually "gap + declared grace".
+
+However, I'm not happy with how difficult it was to track this down. It should have been easy for any reader to verify the correctness of the implementation. It might be good to consider ways to generalize the grace period logic so that it's defined explicitly in the window definition.
+
+I just realized that the issue is actually not within `suppress()` but within `KStreamSessionWindowAggregateProcessor` – note that the test is question test the processor, not suppress().
+
+It seem we would prefer to not to enforce `grace > gap` and thus, we should fix how we compute `closeTime` inside the processor and add the currently missing `gap` parameter.
+
+[~byusti] feel free to start working on a PR. Let us know if you have any further questions. I added you to the list of contributors and assigned the ticket. You can know also self-assign tickets.
+
+Hello Mr. Sax, I see someone else already attempted this issue but left prior to finishing it. Would it be alright if I tried looking over your comments and attempted a fix myself?
+
+[~gonzur] it seems [~byusti] lost interest to work on this ticket. Feel free to pick it up.
+
+Thank you for assigning me. I will begin work on it tomorrow morning. :D
+
+Hello [~mjsax]. Sorry for this late follow up but I've mostly fixed the issue. I've corrected the two test cases that were giving issues due to being tuned to accept erroneous results wherein the gap time was previously absent. Them being located in org.apache.kafka.streams.kstream.internals.KStreamSessionWindowAggregateProcessorTest. But now I have an issue with shouldSupportFinalResultsForSessionWindows in org.apache.kafka.streams.kstream.internals.SuppressScenarioTest that I am unsure of how to fix. I do not understand why the test case has been modeled that way. The error result given is as follows:
+
+
+{code:java}
+java.lang.AssertionError: [
+ TestRecord[key=[k1@0/0], value=1, headers=RecordHeaders(headers = [], isReadOnly = false), recordTime=1970-01-01T00:00:00Z]
+ TestRecord[key=[k1@0/0], value=null, headers=RecordHeaders(headers = [], isReadOnly = false), recordTime=1970-01-01T00:00:00Z]
+ TestRecord[key=[k1@0/5], value=2, headers=RecordHeaders(headers = [], isReadOnly = false), recordTime=1970-01-01T00:00:00.005Z]
+ TestRecord[key=[k1@0/5], value=null, headers=RecordHeaders(headers = [], isReadOnly = false), recordTime=1970-01-01T00:00:00.005Z]
+ TestRecord[key=[k1@0/5], value=3, headers=RecordHeaders(headers = [], isReadOnly = false), recordTime=1970-01-01T00:00:00.005Z]
+ TestRecord[key=[k2@6/6], value=1, headers=RecordHeaders(headers = [], isReadOnly = false), recordTime=1970-01-01T00:00:00.006Z]
+ TestRecord[key=[k1@0/5], value=null, headers=RecordHeaders(headers = [], isReadOnly = false), recordTime=1970-01-01T00:00:00.005Z]
+ TestRecord[key=[k1@0/5], value=4, headers=RecordHeaders(headers = [], isReadOnly = false), recordTime=1970-01-01T00:00:00.005Z]
+ TestRecord[key=[k1@30/30], value=1, headers=RecordHeaders(headers = [], isReadOnly = false), recordTime=1970-01-01T00:00:00.030Z]
+ ] != [KeyValueTimestamp{key=[k1@0/0], value=1, timestamp=0}, KeyValueTimestamp{key=[k1@0/0], value=null, timestamp=0}, KeyValueTimestamp{key=[k1@0/5], value=2, timestamp=5}, KeyValueTimestamp{key=[k1@0/5], value=null, timestamp=5}, KeyValueTimestamp{key=[k1@0/5], value=3, timestamp=5}, KeyValueTimestamp{key=[k2@6/6], value=1, timestamp=6}, KeyValueTimestamp{key=[k1@30/30], value=1, timestamp=30}]
+{code}
+I can't seem to make sense of what k1@0/5 means or where value is derived from as the original only shows "v1" in its value argument to pipeInput or why the original has 6 values but output-raw has 7. If you could offer some assistance it would be greatly appreciated. I will be back tomorrow sometime in the afternoon to check back on this again. In the meantime, if you need me to upload my work so far or require anything else to make it easier on you to help simply suggest it.
+
+`key=[k1@0/5]` is the key of a session, with data key `k1` and session start time of 0 and session end time of 5. The format is `[dataKey@windowStart/windowEnd]`.
+
+Given the input data we observe and expected the following: The first record creates a new session `k1@0/0` – the second record extend the existing session (gap is set to 5) – for this case, we get a tombstone for the existing sessions and a second record for the new sessions. Thus after processing the first two input records, we have 3 output records.
+
+Seems the first 6 output records are actually the same as in the expected result, but output records 7 and 8 are not expected in the result. Given that grace-period is zero, the fourth input record `k2` with ts=6 actually closes the session `k1@0/5` (before your fix) and thus the 5th input record was not expected to produce any output – however, with the fix, `k2` does not close the window any longer, and thus we get more result records.
+
+I guess the goal of the test was to verify that the first session gets closed, so I think the right fix is to change the input data, ie, the timestamp of input record key=k2 should be changes from 6 to 11 to bump the time beyond session-end plus gap?
+
+Hi folks, I'm bumping up the priority of this ticket for 3.0 for now (note that we still have plenty of time towards the code freeze: https://cwiki.apache.org/confluence/pages/viewpage.action?pageId=177046466 but still would be good to get this easy fix asap).
+
+Thanks [~guozhang] – given the last message from [~gonzur], I expect that we get a PR for it soon.
+
+Btw: I also think that getting https://issues.apache.org/jira/browse/KAFKA-12317 into 3.0 might be worth it? Thoughts [~guozhang]? [~gonzur] would be be interested to pick this ticket up, too?
+
+I will try to get this PR tonight or tomorrow night depending on circumstances. This test case is the last I need to update in order to agree with the gap changes within the streams test. As to the new ticket itself I would love to pick it up but I've not investigated it with enough depth to be certain whether or not I could beat the 14th deadline for it. I would be happy to try, though :) [~mjsax].
+
+ 
+
+Edit: I thought it was June 14th but it's really July. Yes I'll add myself rn
+
+Pull request: https://github.com/apache/kafka/pull/10824
+
+Attempting to fix the conflict at the moment. I find it odd that some of the compile step fails here as my local branch is having no issues whatsoever. The test cases for streams all succeeded. Since I don't know how to access the profiling report from the crashes in Jenkins I'm not sure what to do. Any advice? [~mjsax]
+
+Not sure what you mean. Just looked at your PR (and left a few nit comments), and it seems there are no conflict and that Jenkins passed? (One build failed with a know flaky test, so we can ignore it) – We are only interested in the "test" builds, not the "stags" builds.
+
+I see. But yes that was what I meant. Thanks for looking at the issue and explaining what you're concerned about as it relates to builds. I'd heard about flake tests from the contribution instructions but didn't know which were flakes and which weren't. Does the project have a compiled list of them or is the stages and test build that division itself? 
+
+I'll fix the nits rn
+
+For flaky tests that fail more recently, we create Jira tickets. But in general, you don't need to worry about it and the reviewer will guide you. – As long as it's not a compile or checkstyle error, or a test that fails reproducible in your local env, it's most likely a flaky test. In the end, the committer who merges the PR is responsible to ensure we don't merge bad PRs.
+

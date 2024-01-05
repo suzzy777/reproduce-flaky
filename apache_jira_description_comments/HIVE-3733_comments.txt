@@ -1,0 +1,106 @@
+Attaching patch to fix the issue (used git diff --no-prefix ...). I tried using "arc diff --jira HIVE-3733"
+Got :
+PHP Fatal error:  Call to undefined method ArcanistGitAPI::amendGitHeadCommit() in /Users/pradeepk/opensource-hive/.arc_jira_lib/arcanist/ArcJIRAConfiguration.php on line 173
+
+I saw some other references to this error in different JIRAs but no solution suggested - is there a fix for this issue?
+
+So I manually uploaded a diff (used git diff ..) to create the review - https://reviews.facebook.net/D6969
+
+Also on my Mac, a few tests fails
+		testCliDriver_escape1
+		testCliDriver_escape2
+		testCliDriver_join29
+		testCliDriver_join35
+		testCliDriver_lineage1
+		testCliDriver_load_dyn_part14
+		testCliDriver_union10
+		testCliDriver_union12
+		testCliDriver_union18
+		testCliDriver_union30
+		testCliDriver_union4
+		testCliDriver_union6 
+
+I spot checked a few of them (union4, union6) and they are due to differences in plan output - the new output seems to have more operators including the conditional operator - I will look more into it - any guidance to help me would be greatly appreciated.
+
+I noticed the following in HiveConf.java:
+{code}
+HIVEMERGEMAPFILES("hive.merge.mapfiles", true)
+{code}
+
+I suspect that with my new changes and the above setting, we are now merging files for map only tasks where we previously were not - I am very new to the hive code base  - would request some committer to take a look to see if in fact the new behavior is the expected one given that the default for merge map files is true.
+
+Comments on phabricator.
+
+testCliDriver_escape1
+testCliDriver_escape2
+
+always fail on mac.
+
+For plan output changes, can you check the test and verify if the new plan is correct ?
+If you think the new plan is correct, modify the output file.
+
+This is the most recent patch file - please review - I have also uploaded this to the review at https://reviews.facebook.net/D6969
+
+A couple of unit tests fail:
+1) testCliDriver_groupby_multi_single_reducer
+This fails for me locally on trunk as well with a ClassNotFoundException for JSONFactory.
+2) testNegativeCliDriver_stats_aggregator_error_1 
+Apparently this one is known to be flakey.
+
+Note that I needed to update union19.q.out to include the extra merge.
+
+Please review - Thanks!
+
+Re-running testCliDriver_groupby_multi_single_reducer locally I noticed it is failing because the new code is adding an additional conditional merge. The query is a multi insert one but all with map-reduce phases - so it appears like this is a regression.
+
+In the debugger I noticed:
+currWork.getReducer() is org.apache.hadoop.hive.ql.exec.ExtractOperator@66bb4c22
+		
+However stack does not contain it causing the merge operation to be added!
+Stack has:
+[org.apache.hadoop.hive.ql.exec.TableScanOperator@476acffa, org.apache.hadoop.hive.ql.exec.SelectOperator@3de76262, org.apache.hadoop.hive.ql.exec.ReduceSinkOperator@61607dda, org.apache.hadoop.hive.ql.exec.ForwardOperator@5e6a528, org.apache.hadoop.hive.ql.exec.FilterOperator@1b97680c, org.apache.hadoop.hive.ql.exec.GroupByOperator@712ff9fa, org.apache.hadoop.hive.ql.exec.SelectOperator@433d44fc, org.apache.hadoop.hive.ql.exec.SelectOperator@2c3b39be, org.apache.hadoop.hive.ql.exec.FileSinkOperator@397bd678]
+
+Any ideas why this is happening?
+
+Changed the code which looks in the Operator Stack to look for ReduceSinkOperator instead of the exact CurrWork.getReducer() instance.
+
+union19 no longer performs a conditional merge with this change. My hypothesis for this follows:
+
+The union19 query is:
+FROM (select 'tst1' as key, cast(count(1) as string) as value from src s1
+UNION ALL
+select s2.key as key, s2.value as value from src s2) unionsrc
+INSERT OVERWRITE TABLE DEST1 SELECT unionsrc.key, count(unionsrc.value) group by unionsrc.key
+INSERT OVERWRITE TABLE DEST2 SELECT unionsrc.key, unionsrc.value, unionsrc.value;
+
+The from subquery has an implicit group by/ReduceSink due to the count. So though the second insert in the multi insert by itself does not have a groupby/ReduceSink, the subquery in the from clause causes the groupby/ReduceSink to appear in the stack and hence we decide not to do the conditional merge since the FileSink will be in the reduce.
+
+[~pkamath], can you load the complete patch ?
+
+Ideally, the sub-query should not matter. By the time you are looking at the FileSinkDesc for insert, the union should have been processed.
+You should not look at the complete stack, but the first operator which would break the tree, which is union in this case.
+
+Thinking more about it, this approach is fairly difficult to get right. The more I think about it, the more I like the earlier idea, of moving
+the merge to a physical optimizer. The tasks have already been broken up, and the stack would be well defined. We dont have to hack this up.
+[~kevinwilfong], what do you think ? 
+
+Hi Namit - HIVE-3733.4.patch.txt has the most recent full patch.
+
+Thanks, what do you think of moving this logic once the tasks have been finalized - PhysicalOptimizer.java
+
+Uploading a new version (attached as HIVE-3733.optimizer.patch.txt, I have also updated the phabricator review with this new code) based on new logic to work at the physical optimizer level.
+
+ - I am still running the tests - this is an early preview so I know that I am on the right track
+- I feel like the wiring between stages is not quite right though I couldn't figure out enough to know - the creation of the ConditionalTask is pretty deep into the guts of task/operator code which I am not very familiar. For example, in the new union19.q.out, one of the stages (stage-6) is missing
+
+There maybe room for improving the code - I wanted early feedback - so please do review the code carefully.
+
+I have attached HIVE-3733.5.patch.txt for review (also added it to differential at https://reviews.facebook.net/D6969) with some changes but essentially implementing the fix for this issue at the physical optimizer level. The code checks if a non reduce FileSinkOperator in a MapRedTask (which is not child of a ConditionTask so we don't go after merge Tasks) can be conditionally merged and uses the code from GenMRFileSink1 to actually introduce the conditional merge.
+
+All tests pass besides the two below:
+testCliDriver_stats19 - This succeeds on my Mac but fails on a linux machine - not quite sure what to make of it. 
+testNegativeCliDriver_stats_aggregator_error_1 produces an error during execution - I am assuming this testcase has been known to be flaky and the error is not due to the current changes
+
+Committers, please review carefully to make sure I haven't missed any corner cases and I have left the tasks/plan in a valid state.
+
+

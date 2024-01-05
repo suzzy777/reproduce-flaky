@@ -1,0 +1,1250 @@
+Approach depends on why we are sending credentials for all apps which i am not completely clear. IMO it should be sufficient to send the tokens for the apps (containers) active on the node.
+Possible solutions :
+# Send only app credentials related to the node on each heartbeat
+# Send only app credentials related to the node on each heartbeat and also delta modifications for the node since the last heartbeat.
+# Cache SystemCredentialsForAppsProto objects itself and reuse them rather than recreating for each node's heartbeat.(if require to send all the apps token to the node)
+
+P.S. credit goes to [~gu chi] for analysis of this issue.
+
+
++1 for the issue.  I am not sure why all the apps tokens are sent to NM rather than sending only of applications which are running on that node. In 2nd and 3rd approaches has to deal with renewal of credentials. It never be known that does credentials are renewed. But in 1st approach, performance need to be compromised for node heartbeat response time. 
+
+How about keeping app credentials in RMNodeImpl i.e proposal is let RMnodeImpl maintains copy of credentials and these are sent in heartbeat response. By this way, RMnodeImpl maintains app credential for running applications on node. In case of credential renewal, an event triggered to RMnodeImpl to change its credentials. But, there would be corner cases, updated credentials will misses for couple of heartbeats. cc:/ [~jlowe]
+
+Yes. Its ideal to keep a copy of apps tokens on each RMNodeImpl itself. I think RMNodeImpl could pull renewed tokens from {{DelegationTokenRenewer}} at regular intervals if there is a concern over increased number of events to be fired to RMNodeImpl regarding token renewal. I still feel an event publishing model will be more concrete.
+
+I don't know the full story behind the SystemCredentialsForApps thing.  Looks like something that was put in for Slider and other long-running services where the initial tokens can expire.  It would be good to get input from [~vinodkv] and [~jianhe] since they were more involved in this.
+
+I agree it seems silly for every node in the cluster to get _all_ apps HDFS credentials on _every heartbeat_.  I suspect this was the simplest thing to implement, but it's far from efficient.  Going to the other extreme of just sending the app credentials only once for just the apps that could be active on the node is a lot more complicated.  It's true that RMNodeImpl is tracking what applications are on the node, but this is _reactive_ tracking to what the node is already doing.  There are some scenarios where the updated tokens need to be on the node _before_ the container launch request arrives at the node and therefore the app becomes active in the node's RMNodeImpl.  For example, a Slider app runs for months.  The initial tokens at app submit time have long expired, so the RM has had to re-fetch the tokens.  Then suddenly the Slider app wants to launch a container on a node it's never touched before.  The node's RMNodeImpl doesn't know the app is active until a container starts running on it, but the container can't localize without the updated tokens that the node has never received yet.  So we'd need to send the credentials when the scheduler allocates an app's container on the node for the first time and then also when any of the app's credentials are updated (e.g.: when a token is replaced with a refreshed version).  And then there's handling lost heartbeats, node reconnect, etc.  In short, efficient delta is a lot more complicated.
+
+Rather than going straight to the complicated, fully optimal implementation we could do something in-between.  For example, we could have a sequence number associated with the system credentials.  Nodes would send the last sequence number that they have received, and if it matches the current sequence number then the RM does _not_ send them in the heartbeat response.  If the sequence numbers don't match then the RM sends the current sequence number along with the system credentials.  It's still sending all the credentials instead of optimal deltas, but at least they're only being sent when the node needs the updated version.  And yes, we should precompute the SystemCredentialsForAppsProto once when the credentials change and re-send the same object to any node that needs the updated credentials rather than recreate the same object over and over and over.  That should drastically cut down on the number of objects related to system credentials in heartbeats and how often we're sending them.
+
+
+Sorry for the delay in response [~jlowe],
+Thanks for the very detailed response. Agree that the delta approaches initially mentioned can introduce certain amount of complexity in the cases mentioned by you.
+Though initially the approach mentioned by you was appealing and less complicated, i was thinking of following scenarios :
+# When there are large number of small jobs in a large clsuter we almost send all the tokens all the time as the sequence keeps increasing when more and more jobs get submitted.
+# Well we are doing interface modification, so it would be better to go for complete solution so that its not revisited again for deprecation.
+
+One other approach which i can think of is : Send all the tokens during node registration ( This will avoid most of the corner cases) and as part of heartbeat send the app tokens(all) which have been renewed (which can be done in event based model). Further we can have the cache(pre-computed) of SystemCredentialsForAppsProto which are sent as part of Heart Beat so that we reduce memory foot print. thus this approach would solve large number of small jobs too without interface change. thoughts ?
+
+Sending the full list at registration time makes a lot of sense to me, and I also think we can get the delta to work with some effort.  Note however that the delta is _per node_ not some global delta, because nodes may be heartbeating at drastically different times.  Therefore there isn't going to be a good way to build a single, pre-computed SystemCredentialsForAppsProto for deltas.  Each node will have to receive the app tokens that have been renewed since their last heartbeat, and that will be a different list than for other nodes in the cluster.  There will be many that will share the same delta, but it won't be the same for all of them.
+
+Also note that there is going to be an interface change even with your proposal.  The current code assumes that the system credentials received in a heartbeat _replace_ the previous set of credentials.  If we suddenly start sending a delta in heartbeats instead of the full set then that's an incompatible semantic change even though the technical signature of the interface did not change.  Old nodemanagers during a rolling upgrade will not do the correct thing and apps could fail.  So minimally the RM would need to check the NM version and always send the full system credentials in each heartbeat if the NM version is "old" and only use the delta when the NM is beyond a certain version.
+
+Thanks for the quick reply [~jlowe],
+bq. I also think we can get the delta to work with some effort. Note however that the delta is per node not some global delta, because nodes may be heart beating at drastically different times. Therefore there isn't going to be a good way to build a single, pre-computed 
+well actually i was trying to say here was not a delta, but send the tokens for all apps for which atleast one of the tokens gets renewed (assuming that there will be less #apps for which renewal happens).
+Based on what you mentioned and what i could understand from the code: if the tokens are not expired then usually tokens are available in ContainerLaunchContext for NM to localize the resources. So we need tokens from RM to be sent to NM only for the renewed ones only. And as you were mentioning earlier there were two issues to be addressed
+# Long running job with renewed token can get an allocation to a node which has not launched any container for this app.
+# tokens are renewed for app and either Node is down or having connectivity issues.
+
+Sending all tokens during registration might solve the later issue. But having delta per node does not solve the first issue. Hence i was suggesting we will send the tokens for all apps for which atleast one of the tokens gets renewed.
+
+bq. If we suddenly start sending a delta in heartbeats instead of the full set then that's an incompatible semantic change even though the technical signature of the interface did not change. Old nodemanagers during a rolling upgrade will not do the correct thing and apps could fail. 
+Ohh i missed this scenario, thanks for pointing it out and also helping with the solution. IIUC there is no version concept as of now between RM and NM and we need to bring in now right ?
+
+bq. well actually i was trying to say here was not a delta, but send the tokens for all apps for which atleast one of the tokens gets renewed (assuming that there will be less #apps for which renewal happens).
+
+When I last looked at the code, I thought the system credentials map only had the tokens that the RM had to go get on behalf of the app?  If that's indeed the case, then the credentials being sent to each node on every heartbeat already is the subset you are proposing.  Looking at the code again, I only see the system credentials being added by DelegationTokenRenewer#requestNewHdfsDelegationTokenAsProxyUser, and that is only called if the HDFS token is missing or bad for the app.  In addition it is only adding the token that was retrieved and not the entire app credentials.  That already seems to be the minimum set of credentials that the RM needs to send to all nodes if we're not doing a per-node delta approach.
+
+Given this is really bad on your cluster, it'd be good to understand why the RM has put so many tokens in there since it should only be putting in ones where the app was either missing the HDFS token or the token couldn't be renewed for some reason (e.g.: already expired).  Maybe I'm missing something in the code.
+
+bq. But having delta per node does not solve the first issue. 
+
+It does solve the issue if we're tracking the delta for all nodes in the cluster, not just nodes that have run the app's containers in the past.  I hope we're all in agreement now that we cannot make this work if we're only sending the system credentials for an app to a subset of the nodes.  An optimal,  minimal data transfer approach is where we only send the changed credentials for an app since the last time a node heartbeats.  That credential delta will be different for some nodes vs. others since their heartbeats can occur before or after an app credential update.  A bit complicated to implement in practice, but it is doable.
+
+bq. IIUC there is no version concept as of now between RM and NM
+
+There is a version that is sent between the NM and RM when the NM registers.  That's how the yarn.nodemanager.resourcemanager.minimum.version functionality works, check ResourceTrackerService#registerNodeManager.  It is true that the version the NM reports is discarded once it passes the minimum version check, and we'd need to store the NM version (or a feature bit derived from the version) somewhere like the RMNodeImpl to handle the heartbeat semantic change properly.
+
+Thanks [~jlowe] for supporting in analysis for this issue. And sorry to inform that due to one of the private fix in our code base we were facing this issue (spark JDBCserver sending different token when starting the AM and launching of executors later on). Did not realize it that it was only in our code we were sending out tokens for each app when app was getting submitted.  We are trying to analyze further on this issue. 
+Thanks for helping out with it, but given that in Opensource we are already sending tokens only which is newly created as part of NM - RM communication, I think we do not require much further optimization right ? As Token renew which happens once in a day doesn't need to be updated to others and only on request of new token from RM(after token expires after 7 days) we need to inform other containers using it ?
+
+[~jlowe], In our offline discussion you had mentioned as 
+bq.  believe there's still some optimization that can be done given that once a token is retrieved by the RM on behalf of an application that token is sent for every heartbeat to every node in the cluster until that application completes.  That's very wasteful.  Doing a sequence number version thing as I suggested earlier with a precomputed system credentials would drastically cut down on the traffic and garbage created for every heartbeat.  However I agree in light of the custom release findings that the priority of fixing this is far lower than before.
+
+Agree for the long running app unnecessary tokens will be exchanged after 7 days, which is unnecessary traffic and memory reclaiming. {{sequence number version thing}} seems to be a good fit approach will try work on it further.
+
+Looks like there hasn't been much movement on this recently.  [~Naganarasimha], we're about a month away from beta1.  In case there isn't a second beta, what is the likelihood we can get this one done?
+
+Thanks [~rchiang], for having a look into this, as per the discussion above this is like good to have improvement rather than bug, and also its not of high priority hence planning to get it in next version. So have removed the target version and changed type to improvement.
+
+[~Naganarasimha]
+
+I made an attempt to understand the discussion in this JIRA and come up with below steps to address this. Please review and share your thoughts. Can I work on this?
+
+A) Sequence No flow:
+
+1. Introduce a atomic long variable in RMContextImpl to hold this sequence no
+2. Make sure the above sequence no current value passed to Nodes as part of node registration process through response
+3. Increment above sequence no as and when there is any update in delegation tokens, specifically in DelegationTokenRenewer#requestNewHdfsDelegationTokenAsProxyUser
+4. ResourceTrackerService#nodeHeartbeat would use the above sequence number to decide whether to update SystemCredentialsForApps in NodeHeartbeatResponse or not by comparing it with the number received as part of NodeHeartbeatRequest.
+5. NodeHeartbeatRequest will start having sequence no as part of the request. This requires a change in corresponding proto class.
+6. NodeHeartbeatResponse will start having sequence no as part of the  response. This requires a change in corresponding proto class.
+
+B) Caching system credentials objects
+
+Will go through the code and share my proposal to achieve the same.
+
+Thanks [~manirajv06@gmail.com], for reworking on the comments and providing the approach as discussed offline. Steps seems to be fine to start of with. Will give additional comments once you upload the initial patch. Assigning the jira to you.
+
+Thanks [~manirajv06@gmail.com], [~Naganarasimha], [~jlowe] for working on this. This looks to be a serious performance bottleneck especially considering that Federation (YARN-2915) is now part of 2.9.0. Can we accelerate this and get it resolved by 27th October?
+
+[~Naganarasimha] is this issue still Critical after the revelations from [this comment|https://issues.apache.org/jira/browse/YARN-6523?focusedCommentId=16000998&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-16000998]?  I got the impression this is not a problem for most deployments in practice because it is rare for a job to be submitted without the HDFS token needed for logging.
+
+Thanks for looking into this [~subru] and [~jlowe] for the comment, Sorry to have missed to update the priority. Agree that this is not critical but will impact clusters with multiple long running jobs. 
+
+Attached patch based on our earlier discussions. Thanks [~Naganarasimha] for taking a quick glance on the patch. I will try to cover the RM restarts, NM restarts case also in live pseudo cluster setup.
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 25s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 3 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 10s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 15m 13s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  2m  9s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 37s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 36s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 10m 52s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:red}-1{color} | {color:red} findbugs {color} | {color:red}  1m  1s{color} | {color:red} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager in trunk has 1 extant Findbugs warnings. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 57s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m  8s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m 33s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  2m  3s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} cc {color} | {color:green}  2m  3s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  2m  3s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 36s{color} | {color:orange} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server: The patch generated 9 new + 224 unchanged - 0 fixed = 233 total (was 224) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 30s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 10m  9s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 58s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m  1s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  1m 56s{color} | {color:green} hadoop-yarn-server-common in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 24m 17s{color} | {color:red} hadoop-yarn-server-nodemanager in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 45m  3s{color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 22s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}125m  8s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.yarn.server.nodemanager.TestLocalDirsHandlerService |
+|   | hadoop.yarn.server.nodemanager.TestLinuxContainerExecutorWithMocks |
+|   | hadoop.yarn.server.nodemanager.TestNodeManagerReboot |
+|   | hadoop.yarn.server.nodemanager.containermanager.monitor.TestContainersMonitor |
+|   | hadoop.yarn.server.nodemanager.TestNodeHealthService |
+|   | hadoop.yarn.server.nodemanager.containermanager.logaggregation.TestLogAggregationService |
+|   | hadoop.yarn.server.nodemanager.containermanager.scheduler.TestContainerSchedulerQueuing |
+|   | hadoop.yarn.server.nodemanager.webapp.TestNMWebServices |
+|   | hadoop.yarn.server.nodemanager.containermanager.TestContainerManager |
+|   | hadoop.yarn.server.nodemanager.containermanager.localizer.TestResourceLocalizationService |
+|   | hadoop.yarn.server.nodemanager.TestNodeManagerResync |
+|   | hadoop.yarn.server.nodemanager.TestNodeManagerShutdown |
+|   | hadoop.yarn.server.nodemanager.containermanager.launcher.TestContainerLaunch |
+|   | hadoop.yarn.server.resourcemanager.scheduler.capacity.TestNodeLabelContainerAllocation |
+| Timed out junit tests | org.apache.hadoop.yarn.server.nodemanager.containermanager.TestContainerManagerRecovery |
+|   | org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.conf.TestZKConfigurationStore |
+|   | org.apache.hadoop.yarn.server.resourcemanager.TestRMStoreCommands |
+|   | org.apache.hadoop.yarn.server.resourcemanager.TestSubmitApplicationWithRMHA |
+|   | org.apache.hadoop.yarn.server.resourcemanager.TestRMHAForNodeLabels |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:5b98639 |
+| JIRA Issue | YARN-6523 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12898130/YARN-6523.001.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  cc  |
+| uname | Linux 69eecc6d999c 4.4.0-89-generic #112-Ubuntu SMP Mon Jul 31 19:38:41 UTC 2017 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 5f0b238 |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_151 |
+| findbugs | v3.1.0-RC1 |
+| findbugs | https://builds.apache.org/job/PreCommit-YARN-Build/18552/artifact/out/branch-findbugs-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager-warnings.html |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/18552/artifact/out/diff-checkstyle-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/18552/artifact/out/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-nodemanager.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/18552/artifact/out/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/18552/testReport/ |
+| Max. process+thread count | 553 (vs. ulimit of 5000) |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/18552/console |
+| Powered by | Apache Yetus 0.7.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Fixed checkstyle issues. Junit failures are not related to this patch, verified in my setup as well.
+
+Thank you [~rohithsharma] for helping me in setting up a secure cluster. Huh ! :)  Thank you [~bibinchundatt] for inputs.
+
+[~Naganarasimha] / [~jlowe]
+
+Was able to test the patch in live pseudo cluster and able to see token sequence no getting incremented as and when any new token fetches from HDFS. Can you please review the patch?
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m  0s{color} | {color:blue} Docker mode activated. {color} |
+| {color:red}-1{color} | {color:red} patch {color} | {color:red}  0m  5s{color} | {color:red} YARN-6523 does not apply to trunk. Rebase required? Wrong Branch? See https://wiki.apache.org/hadoop/HowToContribute for help. {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| JIRA Issue | YARN-6523 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12898470/YARN-6523.002.patch |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/19724/console |
+| Powered by | Apache Yetus 0.8.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Rebasing patch.
+
+| (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 16m 23s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 3 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 12s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 18m  5s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  2m 31s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 47s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 54s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 12m 42s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  3m  4s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m  7s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m  9s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m 53s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  2m 34s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} cc {color} | {color:green}  2m 34s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  2m 34s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 42s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 49s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 11m 24s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  3m 26s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m  7s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  2m 11s{color} | {color:green} hadoop-yarn-server-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 19m 53s{color} | {color:green} hadoop-yarn-server-nodemanager in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 68m 25s{color} | {color:green} hadoop-yarn-server-resourcemanager in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 23s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}169m 20s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:5b98639 |
+| JIRA Issue | YARN-6523 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12910944/YARN-6523.003.patch |
+| Optional Tests |  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  cc  |
+| uname | Linux f266db04ae2e 3.13.0-135-generic #184-Ubuntu SMP Wed Oct 18 11:55:51 UTC 2017 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 82f029f |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_151 |
+| findbugs | v3.1.0-RC1 |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/19727/testReport/ |
+| Max. process+thread count | 886 (vs. ulimit of 5500) |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/19727/console |
+| Powered by | Apache Yetus 0.8.0-SNAPSHOT   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+[~jlowe] Rebasing the patch..
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m  0s{color} | {color:blue} Docker mode activated. {color} |
+| {color:red}-1{color} | {color:red} patch {color} | {color:red}  0m  5s{color} | {color:red} YARN-6523 does not apply to trunk. Rebase required? Wrong Branch? See https://wiki.apache.org/hadoop/HowToContribute for help. {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| JIRA Issue | YARN-6523 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12945524/YARN-6523.004.patch |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/22331/console |
+| Powered by | Apache Yetus 0.8.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Rebasing..
+
+Thanks for updating the patch!
+
+All PBImpl set methods must call maybeInitBuilder before , otherwise the set method risks an NPE or the get methods could still think the value is coming from a protocol buffer rather than the builder.
+
+Does the registration request and response really need a token sequence number field?  I think the sequence number only needs to be associated with the heartbeat request to let the RM know where the NM is with respect to the credentials timeline and in the node heartbeat response so the NM knows how to update its own concept of the credentials "timestamp."  I'm not seeing how it helps for the NM to report this in the registration request, and it seems actively harmful in the registration response since the token sequence number could be updated on the NM side without actually receiving the updated tokens.
+
+Has the RM failover scenario been considered?
+
+Arbitrary thread sleeps are a pet peeve of mine and lead to flaky an/or unnecessarily slow unit tests.  It would be good to remove the sleeps from the unit tests making them either directly event driven rather than polled (e.g.: through use of CountdownLatch/CyclicBarrier/etc) or use GenericTestUtils.waitFor() with a small poll interval to wait for the necessary condition if it has to be polled.  I haven't personally run the unit test in this patch yet, but just looking at it I counted at least 90 seconds of sleeping which makes for a long, single test.
+
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 19s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 3 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 59s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 22m 45s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  2m 52s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m  5s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m  5s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 14m 51s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  3m 44s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 38s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 15s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  2m 23s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  3m 10s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} cc {color} | {color:green}  3m 10s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  3m 10s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m  9s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m 16s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 14m  6s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  3m 39s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 12s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  2m 20s{color} | {color:green} hadoop-yarn-server-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 18m 53s{color} | {color:green} hadoop-yarn-server-nodemanager in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}110m 40s{color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 33s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}209m 32s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.yarn.server.resourcemanager.scheduler.capacity.TestContainerAllocation |
+|   | hadoop.yarn.server.resourcemanager.rmapp.TestRMAppTransitions |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:8f97d6f |
+| JIRA Issue | YARN-6523 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12945612/YARN-6523.005.patch |
+| Optional Tests |  dupname  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  cc  |
+| uname | Linux 543ecaf0c6b2 3.13.0-143-generic #192-Ubuntu SMP Tue Feb 27 10:45:36 UTC 2018 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / fb2b72e |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_181 |
+| findbugs | v3.1.0-RC1 |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/22336/artifact/out/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/22336/testReport/ |
+| Max. process+thread count | 909 (vs. ulimit of 10000) |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/22336/console |
+| Powered by | Apache Yetus 0.8.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+{quote}Does the registration request and response really need a token sequence number field? {quote}
+
+Added token sequence no only in Registration response. Thought it would be more cleaner approach to have the sequence no upfront and pass as part of first node heartbeat itself. Anyways, removed now so that NM's StatusUpdaterImpl pass 0 in first heartbeat request and from then it would get set based on value received as part of node heartbeat response from RM.
+
+{quote}Has the RM failover scenario been considered?{quote}
+
+Since RMContext has tokenSeqeunceNo and initialised to 1 during the start, in cases of any restart it would again initialised to 1 and after all NM's re-registration process, each NM's first node heartbeat response would be having credentials for sure as there would be difference in value.
+
+Taken care of all other comments. Attaching patch for review.
+
+
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 21s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 12s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 21m 48s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  2m 44s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m  3s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 59s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 15m  7s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  3m  2s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 18s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 12s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m 56s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  2m 36s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} cc {color} | {color:green}  2m 36s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  2m 36s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 57s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 51s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 13m 42s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  3m 48s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 15s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  2m 25s{color} | {color:green} hadoop-yarn-server-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 19m  0s{color} | {color:green} hadoop-yarn-server-nodemanager in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}110m 23s{color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 25s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}204m 34s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:8f97d6f |
+| JIRA Issue | YARN-6523 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12947859/YARN-6523.006.patch |
+| Optional Tests |  dupname  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  cc  |
+| uname | Linux ab2f290be120 3.13.0-153-generic #203-Ubuntu SMP Thu Jun 14 08:52:28 UTC 2018 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 42f3a70 |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_181 |
+| findbugs | v3.1.0-RC1 |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/22509/artifact/out/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/22509/testReport/ |
+| Max. process+thread count | 862 (vs. ulimit of 10000) |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/22509/console |
+| Powered by | Apache Yetus 0.8.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Crash error. Not related to this patch. Re-run should help.
+
+Thanks for updating the patch!  The unit test failure is unrelated and tracked by YARN-8937.
+
+Changes are looking much better, although it would be good to implement one suggestion I made early on:
+bq. we should precompute the SystemCredentialsForAppsProto once when the credentials change and re-send the same object to any node that needs the updated credentials rather than recreate the same object over and over and over.
+The NodeHeartbeatResponseProto.Builder already has a setSystemCredentialsForApps method that takes a SystemCredentialsForAppsProto, but that would need to be exposed in the PBImpl wrapper so every time the system credentials change we can precompute the protobuf object that will be sent to every NM on their next heartbeat.  It's pretty expensive in terms of generated garbage to compute this, and it would be nice not to compute it on the next heartbeat from every node in the cluster when the token sequence number changes.
+
+Nit: Checking for hasTokenSequenceNo and returning zero if not present is redundant.  getTokenSequenceNo already does this if the field is not present, since 0 is the default value for longs in a protobuf (can be changed in the protobuf definition if desired).
+
+My concerns about the unit test duration have not been addressed.  This single unit test takes almost _two minutes_ to execute.  The unit testing could be done much faster if the tests were more like unit tests than integration tests.  One approach is to split the testing into two, separate unit tests for the two prime units requiring testing as part of this feature.  One test can verify the DelegationTokenRenewer updates the sequence number when new delegation tokens are requested, and another test can verify that ResourceTrackerService sends system credentials in the heartbeat response only when the sequence numbers mismatch.  Both of those unit tests can be implemented in a way that does not require waiting around for internal machinery timers to expire.
+
+
+Bulk update: moved all 3.2.0 non-blocker issues, please move back if it is a blocker.
+
+[~jlowe] Thanks for your detailed explanation.
+
+I've made changes to compute SystemCredentialsForAppsProto in case of any changes in credentials only once in NodeHeartbeatResponsePBImpl.setSystemCredentialsForApps itself so that SystemCredentialsForAppsProto computation can be avoided when every time NodeHeartbeatResponsePBImpl.getProto() call happens. Thoughts?
+
+{quote}Checking for hasTokenSequenceNo and returning zero if not present is redundant.{quote}
+Taken care
+
+{quote}My concerns about the unit test duration have not been addressed. This single unit test takes almost two minutes to execute{quote}
+
+Sorry, thought of configuring appropriate token expiry time but missed this in earlier patch. Taken care now. It has reduced overall unit tests duration significantly.
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 14s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  1m  2s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 21m 53s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  8m 53s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 34s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  3m 11s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 17m 20s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  4m 52s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  2m 28s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 13s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  2m 36s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  7m 42s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} cc {color} | {color:green}  7m 42s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  7m 42s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  1m 29s{color} | {color:orange} hadoop-yarn-project/hadoop-yarn: The patch generated 12 new + 171 unchanged - 4 fixed = 183 total (was 175) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  3m  1s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} whitespace {color} | {color:red}  0m  0s{color} | {color:red} The patch has 3 line(s) that end in whitespace. Use git apply --whitespace=fix <<patch_file>>. Refer https://git-scm.com/docs/git-apply {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 13m  8s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  5m 22s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  2m 21s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  3m 20s{color} | {color:green} hadoop-yarn-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  2m 24s{color} | {color:green} hadoop-yarn-server-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 18m 35s{color} | {color:green} hadoop-yarn-server-nodemanager in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}102m 17s{color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} asflicense {color} | {color:red}  0m 51s{color} | {color:red} The patch generated 2 ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}222m 24s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:8f97d6f |
+| JIRA Issue | YARN-6523 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12949085/YARN-6523.007.patch |
+| Optional Tests |  dupname  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  cc  |
+| uname | Linux bbd5bbb52f6d 3.13.0-143-generic #192-Ubuntu SMP Tue Feb 27 10:45:36 UTC 2018 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 34b6fa7 |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_181 |
+| findbugs | v3.1.0-RC1 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/22669/artifact/out/diff-checkstyle-hadoop-yarn-project_hadoop-yarn.txt |
+| whitespace | https://builds.apache.org/job/PreCommit-YARN-Build/22669/artifact/out/whitespace-eol.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/22669/artifact/out/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/22669/testReport/ |
+| asflicense | https://builds.apache.org/job/PreCommit-YARN-Build/22669/artifact/out/patch-asflicense-problems.txt |
+| Max. process+thread count | 894 (vs. ulimit of 10000) |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/22669/console |
+| Powered by | Apache Yetus 0.8.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Thanks for updating the patch!  The whitespace and ASF warnings are related to the patch.  There are a lot of checkstyle warnings that should also be addressed like unused imports, lacking braces on {{if}} statements, etc.  The unit test failure appears to be unrelated and tracked by YARN-8937.
+
+I'm not sure all this PBImpl stuff is worth the boilerplate, especially in this instance, and especially because it is not exposed to user code -- this is an internal API between the RM and the NM.  All we need to do here is cache the list of SystemCredentialsForAppsProto values and have NodeHearbeatResponse take that list of protos rather than a Map<String,ByteBuffer> for the system credentials.  NodeHeartbeatResponsePBImpl can then call addAllSystemCredentialsForApps on the builder when it builds its protocol buffer.  IMHO adding more abstract classes and PBImpls here just adds boilerplate for no real benefit and just adds room for errors.  It's not like we support anything other than protocol buffers -- there's blind downcasting to PBImpl all over the place, including in this patch.  I say ditch all that and just cache the list of SystemCredentialsForAppsProto directly.  No new interfaces or classes needed, especially because we're not sending anything we weren't already sending before.
+
+TestYarnServerApiClasses has a commented import.
+
+TestYarnServerApiClasses#testNodeHeartbeatResponsePBImpl has two "// create token2" comments, and I'm assuming only one of them is accurate.
+
+ResourceTrackerService#populateTokenSequenceNo has a few debug statement that build log strings before calling the logger.  These either need to be protected by log debug enabled checks or use the SLF4J positional argument brace syntax to avoid constructing the log string for no benefit when debug logging is not enabled (i.e.: the common case).
+
+The very long unit test was removed but equivalent tests were not added.  The only tests that now exist are simple ones that verify NodeHeartbeatReponsePBImpl properly preserves the system credentials for apps payload.  There should be two additional tests as I described earlier:
+bq. One approach is to split the testing into two, separate unit tests for the two prime units requiring testing as part of this feature. One test can verify the DelegationTokenRenewer updates the sequence number when new delegation tokens are requested, and another test can verify that ResourceTrackerService sends system credentials in the heartbeat response only when the sequence numbers mismatch.
+
+Thanks for very informative comments.
+
+{quote}All we need to do here is cache the list of SystemCredentialsForAppsProto values and have NodeHearbeatResponse take that list of protos rather than a Map<String,ByteBuffer> for the system credentials. NodeHeartbeatResponsePBImpl can then call addAllSystemCredentialsForApps on the builder when it builds its protocol buffer{quote}
+
+Taken care and modified related unit test cases as well.
+
+{quote}TestYarnServerApiClasses#testNodeHeartbeatResponsePBImpl has two "// create token2" comments, and I'm assuming only one of them is accurate.{quote}
+
+Correct. Cleaned it up.
+
+{quote}The very long unit test was removed but equivalent tests were not added.{quote}
+
+Sorry, I missed to include this change in earlier patch. As I said earlier, configuring appropriate token expiry time reduce overall test case execution time. Now it is between 10-13 secs and hope it is fine. However, I am open to changes.
+
+Also taken care of other minor nits - checkstyle warnings, whitespace issues, debug stmts etc.
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 18s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 5 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 17s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 21m  7s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  8m 25s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 32s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  3m 10s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 17m 13s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  4m 55s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  2m 27s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 14s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  3m  0s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 11m 13s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} cc {color} | {color:green} 11m 13s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 11m 13s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  1m 34s{color} | {color:orange} hadoop-yarn-project/hadoop-yarn: The patch generated 12 new + 340 unchanged - 14 fixed = 352 total (was 354) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m 59s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 13m 16s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  5m 25s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  2m 23s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  3m 28s{color} | {color:green} hadoop-yarn-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  2m 39s{color} | {color:green} hadoop-yarn-server-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 19m 23s{color} | {color:green} hadoop-yarn-server-nodemanager in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}109m 12s{color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 36s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}232m 26s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.yarn.server.resourcemanager.scheduler.capacity.TestContainerResizing |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:8f97d6f |
+| JIRA Issue | YARN-6523 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12949883/YARN-6523.008.patch |
+| Optional Tests |  dupname  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  cc  |
+| uname | Linux 1896724ee182 4.4.0-138-generic #164~14.04.1-Ubuntu SMP Fri Oct 5 08:56:16 UTC 2018 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 085f10e |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_181 |
+| findbugs | v3.1.0-RC1 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/22739/artifact/out/diff-checkstyle-hadoop-yarn-project_hadoop-yarn.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/22739/artifact/out/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/22739/testReport/ |
+| Max. process+thread count | 869 (vs. ulimit of 10000) |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/22739/console |
+| Powered by | Apache Yetus 0.8.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Thanks for updating the patch!
+
+NodeHeartbeatResponse should not take a map of AppId to SystemCredentialsForAppsProto.  It can take a map of AppId to ByteBuffer and/or a collection of SystemCredentialsForAppsProto.  If it gets a map of appId to the creds proto, it just ignores the apps so the map is overkill.
+
+NodeHeartbeatResponsePBImpl has two fields that represent the same thing: systemCredentials and systemCredentialsForAppsProto.  It should only have one, otherwise they are bound to conflict and cause bugs.  Since we want to cache the raw protobuffers for multiple heartbeat responses, IMHO the interface should have a getter/setter for a Collection of SystemCredentialsForAppsProto.  ProtoUtils or some other utility class can be used to convert a Map<ApplicationId,ByteBuffer> to/from this collection outside of the PBImpl.
+
+NodeHeartbeatResponsePBImpl should call clearSystemCredentialsForApps on the builder before earlying-out or setting it to implement the semantics of a set rather than an append.  It should also use addAllSystemCredentialsForApps on the builder rather than iterating itself.  That allows the underlying protobuf to do the add more efficiently since it can know up front how many are being added.
+
+I'd really rather see the two separate tests that involve no sleeping/waiting rather than a single test that does.  The risk of using these arbitrary time intervals is things can fall apart if the test runs on a slow VM that gets paused for a few seconds for some reason due to load and/or long GC.  If that's not going to be an issue somehow then lower all the timeouts to as small as possible (i.e.: tokens expiring in 1 second and waitFor polling every 10 msec rather than every 2 seconds).  It will run even faster, but I suspect this, along with the original test, will ultimately be a flaky test in practice.
+
+Thanks for your guidance.
+
+Made the changes in NodeHeartbeatResponsePBImpl class to contain only systemCredentialsForAppsProto list and introduced methods in utility class for "Map<ApplicationId,ByteBuffer> to/from collection" conversions. With this approach, I can see a minor issue: ApplicationId proto and ByteBuffer conversion happens at the collar side and can repeat for the same heart beat response. Whereas, before, thats not the case. Hope this is not an critical issue. 
+
+Also created 2 seperate test cases to test token renewal -> sequence no increment flow and sequence no change -> response contains credentials flow.
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 22s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 5 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 14s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 20m 39s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  8m 24s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 36s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  3m  9s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 17m 14s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  4m 53s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  2m 27s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 13s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  2m 38s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  7m 44s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} cc {color} | {color:green}  7m 44s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  7m 44s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  1m 32s{color} | {color:orange} hadoop-yarn-project/hadoop-yarn: The patch generated 14 new + 338 unchanged - 16 fixed = 352 total (was 354) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  3m  1s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 13m 13s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  5m 30s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  2m 27s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  3m 45s{color} | {color:green} hadoop-yarn-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  2m 45s{color} | {color:green} hadoop-yarn-server-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 19m 31s{color} | {color:green} hadoop-yarn-server-nodemanager in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}110m 28s{color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 37s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}229m 59s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.yarn.server.resourcemanager.security.TestDelegationTokenRenewer |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:8f97d6f |
+| JIRA Issue | YARN-6523 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12950318/YARN-6523.009.patch |
+| Optional Tests |  dupname  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  cc  |
+| uname | Linux 3a78ae8e4f4f 4.4.0-138-generic #164~14.04.1-Ubuntu SMP Fri Oct 5 08:56:16 UTC 2018 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 042c8ef |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_181 |
+| findbugs | v3.1.0-RC1 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/22768/artifact/out/diff-checkstyle-hadoop-yarn-project_hadoop-yarn.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/22768/artifact/out/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/22768/testReport/ |
+| Max. process+thread count | 893 (vs. ulimit of 10000) |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/22768/console |
+| Powered by | Apache Yetus 0.8.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Unit test failure is related, but there is something wrong in basic flow itself. For example, I don't see node manager registration related logs in full stack trace of that corresponding test case execution. May be re run help in this context. I can able to run this test case in my local setup multiple times successfully.
+
+Thanks for updating the patch!   If a unit test just added in a patch fails in the precommit build then there's usually something wrong with the test even if it passes locally.  It's likely to be a racy test, as the precommit builds are notorious for running unit tests with a different timing than seen locally.
+
+The problem with these tests is they still aren't really unit tests but rather integration tests where it is spinning up an RM and an NM.  The first test should only create a DelegationTokenRenewer with a mock RMContext and verify that RMContext#incrTokenSequenceNo is called when the appropriate token is created and when it is renewed.  No server start ups, heartbeats, etc.  All of that tends to be racy as async dispatchers are usually involved making it hard to know when something is done processing and therefore safe to examine for assertions.  DelegationTokenRenewer#addApplicationSync can be used to test the case where a token is created, and we can make DelegationTokenRenewer#requestNewHdfsDelegationTokenIfNeeded package-private so we can call it from a test with a token that needs to be renewed to test the renewal case.
+
+The second test is designed to test the ResourceTrackerService is properly handling the token sequence number, so there should be a unit test that verifies that the system credentials are sent when the token sequence number mismatches and not sent when they match.  That test should be in TestResourceTrackerService, since that's what we're testing.  If we pass a mock RMContext to the ResourceTrackerService when we construct it for the test, it makes it easy to manipulate it, along with the credentials payload, to verify in the test that the credentials are only sent when expected. 
+
+NodeHeartbeatResponse should get/set a Collection rather than a List.  That allows ResourceTrackerService to pass the values of its tracking map directly rather than needing to convert it into a list first.
+
+Typo in NodeHeartbeatResponse comment: "logAggreations"
+
+NodeHeartbeatResponsePBImpl#setSystemCredentialsForApps should pass the collection directly to the ArrayList constructor so it doesn't have to guess at the initial size of the array then immediately discard it to reallocate a new one when the collection is larger than the initial guess.  Passing directly to the constructor allows ArrayList to allocate the correct array size the first time and reduces unnecessary garbage.
+
+Nit: The name "systemCredentialsForAppsProto" in NodeHeartbeatResponsePBImpl implies it is a single proto rather than a collection of multiple.  Maybe just "systemCredentials"?
+
+YarnServerBuilderUtils should pass the desired capacity to the ArrayList or HashMap constructor since it's trivial to compute and eliminates the possibility of needing to resize the collection due to a poor initial guess in the default constructor.
+
+
+Thanks. Reviews are very educative. Addressed all points in attached patch. Please review.
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 21s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 7 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 43s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 20m 32s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  8m 21s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 34s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  3m 10s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 17m 41s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  5m 27s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  2m 29s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 14s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  2m 43s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  7m 54s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} cc {color} | {color:green}  7m 54s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  7m 54s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  1m 33s{color} | {color:orange} hadoop-yarn-project/hadoop-yarn: The patch generated 18 new + 393 unchanged - 16 fixed = 411 total (was 409) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  3m  5s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 13m 17s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  5m 37s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} javadoc {color} | {color:red}  0m 30s{color} | {color:red} hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-common generated 2 new + 0 unchanged - 0 fixed = 2 total (was 0) {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  3m 27s{color} | {color:green} hadoop-yarn-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  2m 33s{color} | {color:green} hadoop-yarn-server-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 19m 29s{color} | {color:green} hadoop-yarn-server-nodemanager in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 93m 48s{color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 39s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}214m 40s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:8f97d6f |
+| JIRA Issue | YARN-6523 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12951016/YARN-6523.010.patch |
+| Optional Tests |  dupname  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  cc  |
+| uname | Linux 4774044e3200 4.4.0-138-generic #164~14.04.1-Ubuntu SMP Fri Oct 5 08:56:16 UTC 2018 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 6c852f2 |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_181 |
+| findbugs | v3.1.0-RC1 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/22799/artifact/out/diff-checkstyle-hadoop-yarn-project_hadoop-yarn.txt |
+| javadoc | https://builds.apache.org/job/PreCommit-YARN-Build/22799/artifact/out/diff-javadoc-javadoc-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-common.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/22799/artifact/out/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/22799/testReport/ |
+| Max. process+thread count | 932 (vs. ulimit of 10000) |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/22799/console |
+| Powered by | Apache Yetus 0.8.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Addressed checkstyle and javadoc issues except 1 issue. Couldn't find a way to fix "Line is longer than 80 characters" warnings for field declarations. For ex, {{private final ConcurrentMap<ApplicationId, SystemCredentialsForAppsProto> systemCredentials}} is exceeding max length. I am using Neon.3 Release (4.6.3). 
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 20s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 7 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 14s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 20m 32s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  8m 48s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 33s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  3m 13s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 17m 54s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  5m 35s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  2m 53s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 16s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  3m 20s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 10m 12s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} cc {color} | {color:green} 10m 12s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 10m 12s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  1m 37s{color} | {color:orange} hadoop-yarn-project/hadoop-yarn: The patch generated 8 new + 393 unchanged - 16 fixed = 401 total (was 409) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  3m 21s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 14m  9s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  6m 20s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  2m 36s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  3m 43s{color} | {color:green} hadoop-yarn-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  2m 44s{color} | {color:green} hadoop-yarn-server-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 20m  7s{color} | {color:green} hadoop-yarn-server-nodemanager in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 93m 58s{color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 36s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}221m 51s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:8f97d6f |
+| JIRA Issue | YARN-6523 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12951228/YARN-6523.011.patch |
+| Optional Tests |  dupname  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  cc  |
+| uname | Linux 01a243307700 4.4.0-138-generic #164~14.04.1-Ubuntu SMP Fri Oct 5 08:56:16 UTC 2018 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 17a8708 |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_181 |
+| findbugs | v3.1.0-RC1 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/22825/artifact/out/diff-checkstyle-hadoop-yarn-project_hadoop-yarn.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/22825/artifact/out/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/22825/testReport/ |
+| Max. process+thread count | 884 (vs. ulimit of 10000) |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/22825/console |
+| Powered by | Apache Yetus 0.8.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Thanks for updating the patch!  I think it is really close now.
+
+NodeHeartbeatResponsePBImpl can be more efficient on the handling of the system credentials for apps collection.  Rather than making a copy of it and delay until mergeLocalToBuilder is called to set it on the builder (which will also make a copy), it can be handled more like the token sequence number where we just get it and set it on the proto/builder when it is get/set on the PBImpl.  For example:
+{code}
+  @Override
+  public void setSystemCredentialsForApps(
+      Collection<SystemCredentialsForAppsProto> systemCredentialsForAppsProto) {
+    maybeInitBuilder();
+    builder.clearSystemCredentialsForApps();
+    if (systemCredentialsForAppsProto != null) {
+      builder.addAllSystemCredentialsForApps(systemCredentialsForAppsProto);
+    }
+  }
+
+  @Override
+  public Collection<SystemCredentialsForAppsProto>
+      getSystemCredentialsForApps() {
+    NodeHeartbeatResponseProtoOrBuilder p = viaProto ? proto : builder;
+    return p.getSystemCredentialsForAppsList();
+  }
+{code}
+
+Other than that the patch looks good to me.
+
+Sorry for the delay. 
+
+Addressed comments in attached patch.
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m  0s{color} | {color:blue} Docker mode activated. {color} |
+| {color:red}-1{color} | {color:red} patch {color} | {color:red}  0m  6s{color} | {color:red} YARN-6523 does not apply to trunk. Rebase required? Wrong Branch? See https://wiki.apache.org/hadoop/HowToContribute for help. {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| JIRA Issue | YARN-6523 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12953775/YARN-6523.012.patch |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/22985/console |
+| Powered by | Apache Yetus 0.8.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m  0s{color} | {color:blue} Docker mode activated. {color} |
+| {color:red}-1{color} | {color:red} patch {color} | {color:red}  0m  6s{color} | {color:red} YARN-6523 does not apply to trunk. Rebase required? Wrong Branch? See https://wiki.apache.org/hadoop/HowToContribute for help. {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| JIRA Issue | YARN-6523 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12953776/YARN-6523.012.patch |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/22986/console |
+| Powered by | Apache Yetus 0.8.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+The most recently posted patch is identical to patch version 11 which is the last version I reviewed and no longer applies to trunk.  Maybe the wrong patch file was uploaded?
+
+Attached wrong patch earlier. Corrected now.
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 24s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 7 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 15s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 20m 38s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  8m 14s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 36s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  3m 11s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 17m 23s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  4m 59s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  2m 29s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 14s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  2m 36s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  7m 34s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} cc {color} | {color:green}  7m 34s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  7m 34s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  1m 32s{color} | {color:orange} hadoop-yarn-project/hadoop-yarn: The patch generated 8 new + 397 unchanged - 16 fixed = 405 total (was 413) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m 59s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 13m 10s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:red}-1{color} | {color:red} findbugs {color} | {color:red}  1m 11s{color} | {color:red} hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-common generated 1 new + 0 unchanged - 0 fixed = 1 total (was 0) {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  2m 22s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  3m 26s{color} | {color:green} hadoop-yarn-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  2m 32s{color} | {color:green} hadoop-yarn-server-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 19m 30s{color} | {color:green} hadoop-yarn-server-nodemanager in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 93m 24s{color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 43s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}212m 16s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| FindBugs | module:hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-common |
+|  |  Unread field:NodeHeartbeatResponsePBImpl.java:[line 73] |
+| Failed junit tests | hadoop.yarn.server.resourcemanager.security.TestAMRMTokens |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:8f97d6f |
+| JIRA Issue | YARN-6523 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12953862/YARN-6523.013.patch |
+| Optional Tests |  dupname  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  cc  |
+| uname | Linux 5647e9e294a9 4.4.0-138-generic #164~14.04.1-Ubuntu SMP Fri Oct 5 08:56:16 UTC 2018 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 1f42527 |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_191 |
+| findbugs | v3.1.0-RC1 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/22994/artifact/out/diff-checkstyle-hadoop-yarn-project_hadoop-yarn.txt |
+| findbugs | https://builds.apache.org/job/PreCommit-YARN-Build/22994/artifact/out/new-findbugs-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-common.html |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/22994/artifact/out/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/22994/testReport/ |
+| Max. process+thread count | 858 (vs. ulimit of 10000) |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/22994/console |
+| Powered by | Apache Yetus 0.8.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Fixed checkstyle issues and findbugs warning. Unit test failure is not related.
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 15s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 7 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 17s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 18m 51s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  7m 44s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 17s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m 47s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 14m 50s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  4m 27s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  2m  4s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 12s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  2m 25s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  7m  1s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} cc {color} | {color:green}  7m  1s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  7m  1s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  1m 13s{color} | {color:orange} hadoop-yarn-project/hadoop-yarn: The patch generated 8 new + 398 unchanged - 17 fixed = 406 total (was 415) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  2m 37s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 11m 56s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  5m 11s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  2m  9s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  3m 27s{color} | {color:green} hadoop-yarn-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  2m 26s{color} | {color:green} hadoop-yarn-server-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 19m 17s{color} | {color:green} hadoop-yarn-server-nodemanager in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 88m 54s{color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 41s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}198m  6s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.yarn.server.resourcemanager.security.TestAMRMTokens |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:8f97d6f |
+| JIRA Issue | YARN-6523 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12954019/YARN-6523.014.patch |
+| Optional Tests |  dupname  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  cc  |
+| uname | Linux 3da06a535d7d 4.4.0-139-generic #165-Ubuntu SMP Wed Oct 24 10:58:50 UTC 2018 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / d715233 |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_191 |
+| findbugs | v3.1.0-RC1 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/23007/artifact/out/diff-checkstyle-hadoop-yarn-project_hadoop-yarn.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/23007/artifact/out/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/23007/testReport/ |
+| Max. process+thread count | 894 (vs. ulimit of 10000) |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/23007/console |
+| Powered by | Apache Yetus 0.8.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Fixed imports issue.
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 16s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 7 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 14s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 18m 40s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  7m 33s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 27s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  3m  4s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 15m 27s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  4m 54s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  2m 34s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 13s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  2m 28s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  7m 14s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} cc {color} | {color:green}  7m 14s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  7m 14s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  1m 20s{color} | {color:orange} hadoop-yarn-project/hadoop-yarn: The patch generated 5 new + 398 unchanged - 17 fixed = 403 total (was 415) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  3m  6s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 12m 27s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  5m 33s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  2m 33s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}  3m 42s{color} | {color:red} hadoop-yarn-common in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  2m 43s{color} | {color:green} hadoop-yarn-server-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 20m  4s{color} | {color:green} hadoop-yarn-server-nodemanager in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 91m  8s{color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 41s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}205m 30s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.yarn.client.api.impl.TestTimelineClientV2Impl |
+|   | hadoop.yarn.server.resourcemanager.security.TestAMRMTokens |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:8f97d6f |
+| JIRA Issue | YARN-6523 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12954127/YARN-6523.015.patch |
+| Optional Tests |  dupname  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  cc  |
+| uname | Linux 266dc416b0a3 4.4.0-139-generic #165-Ubuntu SMP Wed Oct 24 10:58:50 UTC 2018 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 0921b70 |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_191 |
+| findbugs | v3.1.0-RC1 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/23027/artifact/out/diff-checkstyle-hadoop-yarn-project_hadoop-yarn.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/23027/artifact/out/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-common.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/23027/artifact/out/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/23027/testReport/ |
+| Max. process+thread count | 945 (vs. ulimit of 10000) |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/23027/console |
+| Powered by | Apache Yetus 0.8.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 23s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 7 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 39s{color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 21m  8s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  8m 29s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 35s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  3m 11s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 17m 26s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  5m  0s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  2m 28s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue}  0m 13s{color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  2m 37s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  7m 43s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} cc {color} | {color:green}  7m 43s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  7m 43s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  1m 32s{color} | {color:orange} hadoop-yarn-project/hadoop-yarn: The patch generated 5 new + 396 unchanged - 17 fixed = 401 total (was 413) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  3m  0s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 13m  9s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  5m 25s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  2m 23s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  3m 26s{color} | {color:green} hadoop-yarn-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}  2m 32s{color} | {color:green} hadoop-yarn-server-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 19m 31s{color} | {color:green} hadoop-yarn-server-nodemanager in the patch passed. {color} |
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 94m 15s{color} | {color:red} hadoop-yarn-server-resourcemanager in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 39s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}214m 26s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.yarn.server.resourcemanager.security.TestAMRMTokens |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hadoop:8f97d6f |
+| JIRA Issue | YARN-6523 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12954127/YARN-6523.015.patch |
+| Optional Tests |  dupname  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  cc  |
+| uname | Linux a86009b92d39 4.4.0-138-generic #164~14.04.1-Ubuntu SMP Fri Oct 5 08:56:16 UTC 2018 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 999f31f |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_191 |
+| findbugs | v3.1.0-RC1 |
+| checkstyle | https://builds.apache.org/job/PreCommit-YARN-Build/23029/artifact/out/diff-checkstyle-hadoop-yarn-project_hadoop-yarn.txt |
+| unit | https://builds.apache.org/job/PreCommit-YARN-Build/23029/artifact/out/patch-unit-hadoop-yarn-project_hadoop-yarn_hadoop-yarn-server_hadoop-yarn-server-resourcemanager.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-YARN-Build/23029/testReport/ |
+| Max. process+thread count | 956 (vs. ulimit of 10000) |
+| modules | C: hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-common hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager U: hadoop-yarn-project/hadoop-yarn |
+| Console output | https://builds.apache.org/job/PreCommit-YARN-Build/23029/console |
+| Powered by | Apache Yetus 0.8.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Thanks for updating the patch!  The unit test failure is unrelated and tracked by YARN-9183.
+
++1 lgtm.  Committing this.
+
+Thanks, [~manirajv06@gmail.com]!  I committed this to trunk.
+
+SUCCESS: Integrated in Jenkins build Hadoop-trunk-Commit #15748 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/15748/])
+YARN-6523. Optimize system credentials sent in node heartbeat responses. (jlowe: rev 6a923464afa6b635f505be5d5b2414d47d570f99)
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-common/src/test/java/org/apache/hadoop/yarn/TestYarnServerApiClasses.java
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/test/java/org/apache/hadoop/yarn/server/nodemanager/TestNodeStatusUpdater.java
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/ResourceTrackerService.java
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-common/src/test/java/org/apache/hadoop/yarn/server/api/protocolrecords/TestProtocolRecords.java
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-common/src/main/java/org/apache/hadoop/yarn/server/api/protocolrecords/NodeHeartbeatResponse.java
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMActiveServiceContext.java
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/security/TestDelegationTokenRenewer.java
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/MockNodes.java
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMContextImpl.java
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-common/src/main/java/org/apache/hadoop/yarn/server/api/protocolrecords/impl/pb/NodeHeartbeatResponsePBImpl.java
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/RMContext.java
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-nodemanager/src/main/java/org/apache/hadoop/yarn/server/nodemanager/NodeStatusUpdaterImpl.java
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/main/java/org/apache/hadoop/yarn/server/resourcemanager/security/DelegationTokenRenewer.java
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/MockNM.java
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-resourcemanager/src/test/java/org/apache/hadoop/yarn/server/resourcemanager/TestResourceTrackerService.java
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-common/src/main/java/org/apache/hadoop/yarn/server/api/protocolrecords/NodeHeartbeatRequest.java
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-common/src/main/java/org/apache/hadoop/yarn/api/records/impl/pb/ProtoUtils.java
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-common/src/main/java/org/apache/hadoop/yarn/server/api/protocolrecords/impl/pb/NodeHeartbeatRequestPBImpl.java
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-common/src/main/proto/yarn_server_common_service_protos.proto
+* (edit) hadoop-yarn-project/hadoop-yarn/hadoop-yarn-server/hadoop-yarn-server-common/src/main/java/org/apache/hadoop/yarn/server/utils/YarnServerBuilderUtils.java
+
+
+[~manirajv06@gmail.com] [~Naganarasimha] [~jlowe]
+
+Can we backport this to 3.2.2?
+
+Thanks.
+

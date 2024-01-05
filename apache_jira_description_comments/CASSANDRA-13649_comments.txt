@@ -1,0 +1,131 @@
+It's a netty common practice to include an exception handler at the end of a netty pipeline to handle cases like this. However, I'm reticent to add yet another handler to the pipeline as some of my testing for CASSANDRA-8457 (admittedly, very early-stage testing) showed that we spend extra time in the pipeline just by all the mechanics around invoking another handler (checking the promise, state of the channel, and so on).
+
+That being said, I can probably find some time to reinvestigate as part of finalizing all the netty-related things for 4.0. [~spodxx@gmail.com] feel free to assign to me if you like, but I probably can't get to it for about a month.
+
+I'll note that I've seen those as well and I'm not 100% sure this isn't a "bug" in Netty's epoll implementation in that I don't think we get this if the NIO transport is used. That is, it looks like both the Epoll and NIO Netty implementation don't behave the same way with respect to this. I'll also not we do catch exceptions in the pipeline in {{Message.Dispatcher.exceptionCaught}}, without re-throwing them, and I'm not sure why that wouldn't catch this (in fact, I believe this does catch the exception with the NIO event loop, and that's why I'm suggesting the epoll one may not be doing it's job properly). Haven't investigated much though tbh, so take this with a grain of salt.
+
+Could it be that the read call executed by epoll native happens before handlers have been added by {{Server.Initializer}}?
+
+Looking at this issue again got me a bit suspicious on how our Initializer is [handled by ServerBootstrap|https://github.com/netty/netty/blob/3cc405296310643bccddc8c81998c97f25b3201c/transport/src/main/java/io/netty/bootstrap/ServerBootstrap.java#L169]. It seems that instances added by {{ServerBootstrap.childHandler()}} will not be added immediately to the pipeline (as opposed to {{ServerBootstrap.handler()}}, see code comment for further explanation. This behaviour was changed in netty [4638df2062|https://github.com/netty/netty/commit/4638df20628a8987c8709f0f8e5f3679a914ce1a] ([5566|https://github.com/netty/netty/issues/5566]) and included by upgrading netty in CASSANDRA-13114. Did anyone already noticed this issue before February?
+
+I'm not really sure there's a lot we can do on our side. Maybe add our Initilizer using {{handler()}} instead of {{childHandler()}}? But still, if there's really a race then {{ServerBootstrapAcceptor}} won't get added and the pipeline will not work anyways. [~norman], do you have any suggestions?
+
+
+[~spodxx@gmail.com] sorry I am a bit busy atm but will check over the next days and come back to you.
+
+[~spodxx@gmail.com] yes how handler(...) and childHandler(...) are now handled is more consistent. Can you give me a link to the code where you setup your handlers that this exceptions produce ?
+
+The Initializer implementing ChannelInitializer<Channel> is added by calling ServerBootstrap.childHandler() here:
+https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/transport/Server.java#L153
+
+
+Is it possible that you have an eventExecutor set here?:
+
+https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/transport/Server.java#L329
+
+And if so can you show me the implementation of it ?
+
+It should always be set when not run in a testing context, as instanciated in 
+https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/service/NativeTransportService.java#L65
+and implemented in
+https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/transport/RequestThreadPoolExecutor.java
+
+
+And this only happens with the native epoll transport but not with the nio transport ?
+
+Actually I think it is because of how you do the event dispatching in Cassandra... working on a patch, stay tuned.
+
+To ensure we handle all exceptions in the netty pipeline that are produced by either the Channel itself or the ChannelHandlers in the pipeline we need to ensure the handlers that does so not uses the RequestThreadPoolExecutor as it not enforces strict ordering of the events per Channel.
+
+This patch should fix the problem and should go in all active Cassandra trees.
+
+I'm +1 on the patch, and I'll setup a branch to run the utests/dtests (for sanity sake).
+
+[~spodxx@gmail.com] and [~iamaleksey]: if dtests/utests are happy, I'm thinking 3.0 and up can take this patch. Should we consider 2.2, as well? This is a bug, but not a critical one, so perhaps we should skip 2.2.
+
++1 for 2.2 upwards. If the fix seems to be too risky for 2.2, we should probably not include it in 3.0 as well. On the opposite, if it's not, then let's not diverge our code base without good reason.
+
+Its up to you guys which versions the patch should be applied to, just wanted to mention this fix is very low-risk in terms of Netty itself as it just move logic to an extra ChannelHandler. Thats all. 
+
+3.0 still accepts non-critical bug fixes. Are we treating 2.2 like 2.1 or like 3.0 at this point? I honestly don't remember anymore.
+
+I took the editorial liberty of committing to 2.2 and up. sha is {{e1aa7d32c95ff3f06de97803a186ff432237ecab}}
+
+Thanks for the the patch, [~norman]!
+
+Jason/Norman, we are using cassandra ReleaseVersion: 3.0.11.
+We see the same issue.
+
+INFO  [SharedPool-Worker-1] 2017-08-27 05:35:17,241 Message.java:615 - Unexpected exception during request; channel = [id: 0xcdc01633, L:/XXXXXX:9042 ! R:/XXXXXXXX:58310]
+io.netty.channel.unix.Errors$NativeIoException: syscall:read(...)() failed: Connection reset by peer
+        at io.netty.channel.unix.FileDescriptor.readAddress(...)(Unknown Source) ~[netty-all-4.0.44.Final.jar:4.0.44.Final]
+
+And from the application side we see the below error:
+
+2017-08-27 05:34:05,121 ERROR [mainLog] (nioEventLoopGroup-22-47) [/XXXXXXXX:9042] Timed out waiting for server response; nested exception is com.datastax.driver.core.exceptions.OperationTimedOutException: [/XXXXXXX:9042] Timed out waiting for server response: org.springframework.cassandra.support.exception.CassandraUncategorizedException: [/XXXXXXX:9042] Timed out waiting for server response; nested exception is com.datastax.driver.core.exceptions.OperationTimedOutException: [/XXXXXXX:9042] Timed out waiting for server response
+        at org.springframework.cassandra.support.CassandraExceptionTranslator.translateExceptionIfPossible(CassandraExceptionTranslator.java:129) [spring-cql-1.5.0.RELEASE.jar:]
+        at org.springframework.cassandra.core.CqlTemplate.potentiallyConvertRuntimeException(CqlTemplate.java:946) [spring-cql-1.5.0.RELEASE.jar:]
+
+Has it been fixed int the 3.0.11 version??
+
+Thanks,
+Ajith Shetty
+
+[~ajithshetty28] Please look at the "Fix Version" field above: this was patched in 3.0.15
+
+[~norman] I rolled out this patch to one of our production cluster, I still see syscall:read exception in the logs.
+
+INFO  [epollEventLoopGroup-11-9] 2017-10-11 17:01:10,074 Message.java:641 - Unexpected exception during request; channel = [id: 0x72599f85, L:/X.X.X.X:XXXX - R:/X.X.X.X:XXXX]
+io.netty.channel.unix.Errors$NativeIoException: syscall:read(...)() failed: Connection reset by peer
+
+I also noticed the frequency of this error message increased a lot after upgrading to 3.11.1:
+
+{code:java}
+INFO  [epollEventLoopGroup-2-3] 2017-10-16 10:00:37,592 Message.java:623 - Unexpected exception during request; channel = [id: 0xb253764e, L:/10.40.3.15:9042 - R:/10.30.0.10:58996]
+io.netty.channel.unix.Errors$NativeIoException: syscall:read(...)() failed: Connection reset by peer
+        at io.netty.channel.unix.FileDescriptor.readAddress(...)(Unknown Source) ~[netty-all-4.0.44.Final.jar:4.0.44.Final]
+{code}
+
+
+We have ReleaseVersion: 3.11.1 and there is a lot of errors. Pls help.
+
+INFO [epollEventLoopGroup-2-4] 2018-10-09 19:30:50,113 Message.java:623 - Unexpected exception during request; channel = [id: 0x295ce677, L:/192.168.xx.xxx:9042 - R:/192.168.xx.xxx:58644]
+io.netty.channel.unix.Errors$NativeIoException: syscall:read(...)() failed: Connection reset by peer
+ at io.netty.channel.unix.FileDescriptor.readAddress(...)(Unknown Source) ~[netty-all-4.0.44.Final.jar:4.0.44.Final]
+
+ 
+
+Also sometimes i have error "cluster initialization was aborted after timing out"
+
+Hello,
+
+I am using 3.11.3 version of Cassandra and I still see the exceptions are happening. Can some please take a look? also are these errors harmful? I don't see any errors on my application. just want to make sure I am not ignoring the potential issues.
+
+Also looking at the exception it's not specific to Cassandra version, rather specific to netty version?
+{code:java}
+INFO  [epollEventLoopGroup-2-25] 2020-02-12 19:46:13,867 Message.java:623 - Unexpected exception during request; channel = [id: 0x4cea3872, L:/10.130.8.31:9042 - R:/10.131.85.41:47374]
+io.netty.channel.unix.Errors$NativeIoException: syscall:read(...)() failed: Connection reset by peer
+	at io.netty.channel.unix.FileDescriptor.readAddress(...)(Unknown Source) ~[netty-all-4.0.44.Final.jar:4.0.44.Final]
+{code}
+
+
+Hey [~norman],
+
+Any advice about the status of this ticket?
+
+ 
+
+Jason/Norman, we are using Cassandra ReleaseVersion: 3.11.11
+We see the same issue.
+
+INFO  [IndexSummaryManager:1] 2022-02-24 03:30:21,190 IndexSummaryRedistribution.java:78 - Redistributing index summaries
+WARN  [epollEventLoopGroup-2-7] 2022-02-24 03:44:36,842 Message.java:785 - Unknown exception in client networking
+io.netty.channel.unix.Errors$NativeIoException: syscall:read(...)() failed: Connection reset by peer
+        at io.netty.channel.unix.FileDescriptor.readAddress(...)(Unknown Source) ~[netty-all-4.0.44.Final.jar:4.0.44.Final]
+
+And from the application side we see the below error:
+
+"errorMessage": "NoHostAvailableError: All host(s) tried for query failed. First host tried, 10.200.50.157:9042: DriverError: Connection timeout\n at Socket.connectTimedOut (/var/task/node_modules/cassandra-driver/lib/connection.js:205:19)\n at Object.onceWrapper (events.js:420:28)\n at Socket.emit (events.js:314:20)\n at Socket._onTimeout (net.js:483:8)\n at listOnTimeout (internal/timers.js:554:17)\n at processTimers (internal/timers.js:497:7) \{\n info: 'Cassandra Driver Error'\n}. See innerErrors.",
+
+Has it been fixed in the 3.11.11 version??
+

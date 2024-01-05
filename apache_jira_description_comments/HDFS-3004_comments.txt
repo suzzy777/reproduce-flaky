@@ -1,0 +1,1784 @@
+added design document
+
+add version 2
+
+Thanks for the doc. Makes sense.
+The only addition I'd make is that I think it would make sense to run it interactively, like "fsck" without the "-y" flag. Each question can have "yes/no/yes-all/no-all" type choices (where "all" would answer the same to all following questions of the same type)
+
+Colin, good writeup.
+
+Lets consider two scenarios:
+# The last entry in the editlog is corrupt (most likely because process is not shutdown cleanly).
+# The editlog entry in the middle is corrupt, followed by clean entries (very unlikely).
+
+The first one is easy to handle. The recovery tool prints an error with information about the total size of the editlog and the offset where an error is encountered. If it is close enough to the end of the file, then operator knows only last few records are not valid.
+
+For the second one, one may not be able to continue to read the edits at all, past that point. How can we handle this? We could add periodic markers in the editlog and skip to the next marker on this type of error. Still, it is possible that the namespace is inconsistent that we cannot load the edits.
+
+Typcially Namenode is configured to store edits in multiple directories. The tool should handle this. If one of the copies is corrupt and the other is not, it should indicate the same.
+
+bq. The editlog entry in the middle is corrupt, followed by clean entries (very unlikely).
+
+We should augment the edit-loading process (both for this tool and for the normal NN startup) to handle this case by switching to another copy of the edit log when available. Given we have checksums it's easy enough to detect this - we just don't do anything useful with the error today.
+
+
+bq. Typcially Namenode is configured to store edits in multiple directories. The tool should handle this. If one of the copies is corrupt and the other is not, it should indicate the same.
+
+Yeah, this is definitely something we should do-- and as Todd said, also in the normal NN loading process as well.
+
+bq. [What if] The editlog entry in the middle is corrupt, followed by clean entries (very unlikely).
+
+I think as a first pass solution, we would simply truncate the edit log at the point it becomes unreadable and write out the image in its current form.  (This is assuming that the edit log is corrupt in all copies.)  Later down the road, we could consider various heuristics for this case, but as you said, it's unclear how likely it is that the rest of the log will be readable.
+
+In general, I think the recovery logic that we implement will depend on the patterns of corruption we see in the wild.  A missing or corrupted last entry seems to be a very common one (hopefully this is less common now that we reserve space before writing.)  If there's any other corruptions you guys have seen, it would be really valuable to make a note here.
+
+Other scenarios
+
+# There's an unexplained opcode or something else you can't handle; possibly crept in from using some fork that declared a different use from another: HDFS-1822
+# Weird states involving something like leasing where playback gets confused: HDFS-1149
+
+These could both be handled by allowing for a specific opcode to be turned into a no-op.
+
+
+Hey Colin,
+
+Nice writeup.   Worth mentioning the focus is the edits logs since we've never seen a corrupt image (and it now has an associated checksum). Also worth mentioning common cases we've seen where this happens. Eg NN disk volume fills up (HDFS-1594), multiple 2NNs running (HDFS-2305), buggy fsync, buggy disk firmware.
+
+Per suresh, there are two core cases. I'd start with something simple:
+1. If the last edit is corrupted indicate this and discard it
+2. If an intermediate edit is corrupt (rare, but we've seen this multiple times) then skip it and keep going. Either a bunch (configurable amount) of subsequent edits will fail to apply, in which case we can stop at the offset we skipped (and truncate), or we'll finish loading.
+
+At the end of both of these we'll have a namespace that we can try to load and and admin can poke  around on (to examine the metadata).
+
+Per Todd I'd make it run interactively and by default it just displays info, with Y/N/YA/NA options.
+
+Once this is working we can get fancier on the individual edits (eg try to fixup instead of skip), but seems like we'd get 90% of the value if we just did the above.
+
+Thanks,
+Eli
+
+Add a -recover mode to the NameNode.  This mode will allow the operator get the NameNode working by overcoming on-disk corruption.
+
+Add a unit test for recovery mode.
+
+Currently, recovery mode only gives the choice of truncating the edit log at the site of the problem.
+
+In the future, recovery mode will try to handle cases where only one (or some small number) of edits in the log need to be skipped.
+
+* Add 'a' option to interactive mode (always take first choice)
+
+* More helpful printout when truncating the edit log
+
+* FSImageTransactionalStorageInspector::inspectDirectory: don't need to call NNStorage.readTransactionIdFile twice.
+
+* FSImageTransactionalStorageInspector::inspectDirectory: properly handle I/O error in NNStorage.readTransactionIdFile.
+
+* rewrite the FSEditLogLoader changes to handle the HA merge
+
+One thing that I would like some suggestions about is how to handle the assertion in FSEditLog: "Safety check: we should never start a segment if there are newer txids readable."
+
+As you can see, this is a problem after we have done a successful recovery where we lost some edits.  We will have edit logs in the namenode directory that "seem" to have a higher txid than the current txid.  This would trigger the assert (if I hadn't commented it out.)
+
+I commented out this assert in the latest patch, because I wasn't sure exactly how to handle it.  Here are some ways I thought of to do it:
+1. Bump up the current FSImage txid to be equal to the highest txid the edit logs appear to contain (based on their filenames).  This will have the side effect that there appears to be a hole in the edit log history.  However, there is probably already a hole in the history because of the corrupted file.
+2. Delete the old corrupted edit logs after recovery, so that we can start without encountering this assert
+3. Rename the old corrupted edit logs after recovery, so that we can start without encountering this assert
+
+I'm leaning towards solution #1 right now.
+
+* fixed assertion
+
+Overall approach looks good.
+
+- Wr edit logs in the namenode directory that "seem" to have a higher txid than the current txid, isn't the idea that we have an option to actually truncate the last edit from the log? Ie in this patch you're asking if the user would like to truncate but not actually truncating 
+- Is the move of the re-check of maxSeenTxid cleanup or actually necessary now? I agree the re-check doesn't look necessary though now we bail before adding found images if we can't find the maxSeenTxId in the SD images, not sure that's OK.
+- logTruncateMessage should probably be WARN instead of ERROR since we're doing it intentionally (ie this code path isn't an error case), but we want it to have a high log level so we always see it.
+- In the arg checking loop can just test for one additional argument rather than looping since we only support 1 argument
+- Looks like loadEditRecords used to throw EditLogInputException in cases it now throws IOE. Also, let's pull the recovery code out to a separate method vs implementing inline in the catch block. It may even make sense to have a separate loadEditRecordsWithRecovery method
+- Needs some more test cases, eg w/ and w/o yes to all, and that if you restart the cluster after the recovery the fs state matches the intended state (ie if the last edit created a file check that file is not present, but the rest of the state is in order)
+- Easier if RecoveryContext#ask used var args?
+- New files need the apache license header
+- Testing?  Aside from running the tests would be good to try from a tarball install and start the NN with recovery, check the various options
+
+Style nits:
+- I'd rename "yesToAll" to something like "recoverYesToAll"
+so its clear that its recovery related
+- Method declarations should have an empty line between them
+- would rename EditLogInputStream var "l" "editIn" to be consistent with the rest of the file. And long "e" somethign more descriptive like "txId"
+- Both brackets go on the same line in else and catch clauses (eg "} else {", eg "} catch (..) {"
+- "can't understand" and "e.getMessage()" lines need indentation
+- use postfix increment to be consistent (eg txId++ vs ++txId) when it doesn't matter
+- the opening bracket for a method goes on the same line as the throws clause (eg "throws IOE {")
+
+> Wr edit logs in the namenode directory that "seem" to have a higher txid than
+> the current txid, isn't the idea that we have an option to actually truncate
+> the last edit from the log? Ie in this patch you're asking if the user would
+> like to truncate but not actually truncating
+
+It's a logical truncation-- removing the following content from the state of the system.
+
+I don't want to actually modify the old edit logs.  If I did that, it would be a big hassle for everyone concerned.  For example, what happens if I get an I/O error while writing ot the old edit logs?  Considering we're handling bad on-disk data, there's a higher-than-usual chance of that happening.  Then suddenly all the edits directories are no longer the same-- my changes got applied to some, but not all.  Etc.
+
+Also, the way I intend this being used is that the admin might start up the system, decide that he didn't like the way he resolved the corruption (maybe a crucial file is missing?) and try it again.  With this patch, he can easily do this by deleting the new image, changing the last seen txid,  and simply having another go.  If I start messing with or truncating the old logs, this becomes much harder.
+
+> Is the move of the re-check of maxSeenTxid cleanup or actually necessary now? I
+> agree the re-check doesn't look necessary though now we bail before adding
+> found images if we can't find the maxSeenTxId in the SD images, not sure that's
+> OK.
+
+Yeah, the re-check was never necessary.  It seems to have been a typo.
+
+Also, previously, we didn't catch the exception that might be thrown by readTransactionIdFile, which could lead to aborting the whole NN startup process because one directory was bad.  The current solution is to ignore directories with missing txId files.
+
+I don't know how we would even go about handling an image whose last seen transaction ID was unknown.  If we do decide to handle that case, I would argue we should probably file a separate JIRA, rather than trying to cram it into this patch.
+
+thanks,
+C.
+
+Oops, forgot to post the second half of my commentary.  That's what I get for using an external editor.  Here goes:
+
+> logTruncateMessage should probably be WARN instead of ERROR since we're doing
+> it intentionally (ie this code path isn't an error case), but we want it to
+> have a high log level so we always see it.
+
+Yeah.
+
+> In the arg checking loop can just test for one additional argument rather
+> than looping since we only support 1 argument
+
+The rationale for this is that if we don't do it, someone might pass a command line like: namenode -recover -f -backup
+
+Since the last StartupOption option wins, this would lead to us NOT starting up in recovery mode at all.  I felt that this was confusing and would rather this just be a parse error.
+
+> Looks like loadEditRecords used to throw EditLogInputException in cases it
+> now throws IOE. Also, let's pull the recovery code out to a separate method
+> vs implementing inline in the catch block. It may even make sense to have a
+> separate loadEditRecordsWithRecovery method
+
+EditLogInputException was added to the code very recently, by the HA merge.  I guess I should consult with the original author maybe.  However, by my reading, EditLogInputException doesn't seem to be caught anywhere, but always just treated as an IOE.  I removed it because it didn't seem to be helpful to me.  We're decoding the edit log, so logically everything is an EditLogInputException, right?  Not helpful.
+
+The distinction that I was trying to make is between errors that lead to you trying to skip a few edit log entries (example: bad checksum) and errors that can't be skipped over (example: premature end of file.)  I would rather not worry too much about the exception hierarchy now, but address that in a future patch which adds full support for skipping transactions... if that makes sense.
+
+> Needs some more test cases
+
+Yeah... definitely.  I'll try to expand the test coverage.
+
+C.
+
+* rename "yesToAll" to "takeFirstRecoveryChoice"
+
+* some whitespace fixes
+
+* FSEditLogLoader::logTruncateMessage: LOG.warn, not LOG.error
+
+* use postincrement rather than preincrement in a few places, for consistency's sake
+
+* NameNode::doRecovery: remember to call FSNamesystem::close to clean up after ourselves.
+
+* RecoveryContext.java: add required Apache header
+
+* RecoveryContext::ask: use varargs
+
+* TestNameNodeRecovery: test that we can read from the recovered filesystem.
+
+regenerate patch with diff --no-prefix (d'oh!)
+
+Your comments above make sense, thanks for the explanation.
+
+Comments on latest patch:
+- HDFS-2709 (hash 110b6d0) introduced EditLogInputException and used to have places where it was caught explicitly, that they just catch IOE, so given that you we no longer throw this either you can remove the class entirely
+- In logTruncateMessage we should log something like "stopping edit log load at position X" instead of saying we're truncating it because we're not actually truncating the log (from the user's perspective)
+- Isn't "always select the first choice" effectively "always skip"? Better to call it that as users might think it means use the previously selected option for all future choices (eg if I chose "skip" then chose "try to fix" then "always choose 1st" I might not have meant to "always skip").
+- The conditional on "answer" is probably more readable as a switch, wasn't clear that the else clause was always "a" and therefore that's why we call recovery.setAlwaysChooseFirst()
+- What is the "TODO: attempt to resynchronize stream here" for?
+- Should use "s".equals(answer) instead of answer == "s" etc since if for some reason RecoveryContext doesn't return the exact object it was passed in the future this would break
+- Should RC#ask should log as info instead of error for prompt and automatically choosing log
+- RC#ask javadoc needs to be updated to match the method. Also, "his choice" -> "their choice" =P
+- RecoveryContext could use a high-level javadoc with a sentence or two since the name is pretty generic and the use is very specific
+- Can s/LOG.error/LOG.fatal/ in NN.java for recovery failed case
+- NN#printUsage has two IMPORT lines
+- ++i still used in a couple files
+- brackets on their own line still need fixing eg "} else if {"
+- Why does TestRecoverTruncatedEditLog make the same dir 21 times? Maybe you mean to append "i" to the path? The test should corrupt an operation that mutates the namespace (vs the last op which I believe is an op to finalize the log segment) so you can test that that edit is not present when you reload (eg corrupt the edit to mkdir /foo then assert /foo does not exist in the namespace)
+
+
+bq. Isn't "always select the first choice" effectively "always skip"? Better to call it that as users might think it means use the previously selected option for all future choices (eg if I chose "skip" then chose "try to fix" then "always choose 1st" I might not have meant to "always skip").
+
+The first choice isn't always skip-- sometimes it's "truncate."
+
+Agree with the rest of the points
+
+"cannot switch on a value of type String for source level below 1.7"
+
+Nice idea, but it looks like it's going to have to be if statements.
+
+HDFS-3004.008.patch has a bunch of other stuff in it, probably not the patch you intended. 
+
+diff against correct change
+
+fix diff again, sigh
+
+bq. The first choice isn't always skip-- sometimes it's "truncate."
+
+Why would a user choose "always choose 1st"? The user doesn't know if future errors are skippable or not-skippable so when they select "always choose first" on a skippable prompt they don't know that they're signing up for a future truncate. Seems like we need to make the order consistent if we're going to give people a "Yes to all" option.
+
+- Per above, What is the "TODO: attempt to resynchronize stream here" for?
+- Should the catch of Throwable catch IOException like it used to? We're not trying to catch new types of exceptions in the non-recovery case right?
+- Do we need to sanity check dfs.namenode.num.checkpoints.retained in recovery mode? Ie since we do roll the log is there anyway that we could load an image/log, truncate it in recovery mode, then not retain the old log?
+- TestRecoverTruncatedEditLog still doesn't check that we actually truncated the log, eg even if we didn't truncate the log the test would still pass because the directory would still be there
+- What testing have you done? Would be good to try this on a tarball build with various corrupt and non-corrupt images/logs.
+
+
+
+
+bq. Why would a user choose "always choose 1st"?
+
+A user would choose this option if he was in a hurry and wanted the recovery tool to choose the "normal" or most typical option.  It's similar to fsck -a.
+
+bq. Per above, What is the "TODO: attempt to resynchronize stream here" for?
+
+Basically, this TODO is to remind me to implement skipping.  I was originally hoping to get this patch in first, although I guess the patches could be combined.  Perhaps I will actually implement it in the next rev-- it's simple enough.
+
+bq. Should the catch of Throwable catch IOException like it used to? We're not trying to catch new types of exceptions in the non-recovery case right?
+
+The rationale behind catching throwable is that we don't know exactly what kinds of exceptions dirty data may cause the parsing code to throw.  I think this is explained in a comment:
+{code}
+      // Catch Throwable and not just IOE, since bad edits may generate
+      // NumberFormatExceptions, AssertionErrors, OutOfMemoryErrors, etc.
+{code}
+
+I didn't add this comment-- it was there before to explain why we catch throwable (which we have always done here, as far as I know.)
+
+[command about dfs.namenode.num.checkpoints.retained]
+Yes, I will look into this...
+
+[testing comments]
+
+I'll see if I can add a few more unit tests.  I did run this manually a few times.
+
+implement skipping bad data in the edit log.
+
+TODO: more unit tests for this!
+TODO: mark as many exceptions as possible as skippable
+
+* make more exceptions skippable
+
+* rename StartupOption.ALWAYS_CHOOSE_YES to StartupOption.ALWAYS_CHOOSE_FIRST, to better reflect what it does.
+
+* refactor EditLogInputStream a bit
+
+
+* remove SkippableEditLogException, as it turned out not to be necessary
+
+* test skipping in EditLogInputStream
+
+fix small bug in opcode skipping
+
+* rebase on latest trunk
+
+* make nextOp protected in all subclasses of ELIS
+
+add a section about recovery to hdfs_user_guide.xml
+
+* move to using a per-Reader or per-FSEditLog operation cache, rather than a purely per-thread operation cache.  Now that we are caching a single opcode inside the FSInputStream, we definitely don't want these instances shared between threads.
+
+Feedback on the earlier version:
+
+- Why is the following necessary (instead of mark(1))? Doesn't decode itself still only read 1 byte?
+{code}
+in.mark(in.available());
+{code}
+- Why do we unconditionally skip/read/rewind now in getInputStream now? Isn't this handled lazily?
+- Per above now that we never throw EditLogInputException we can nuke the class and its uses
+- Can we avoid caching opcodes?
+
+Nits:
+- Better flag name than "-f" for always choose first? That sounds like "-force", maybe "-chooseFirst"?
+- Would "skipBrokenEdits" instead of "resync" be a better name for the new param for readOp?
+- Maybe call ELIS#rewind "putOp" instead since we're not necesarily rewinding the stream?
+- skipUntil javadoc should say "to a given transaction ID, or the end of stream is reached"
+
+
+Forgot to mention, JournalStream is removed but there are still references to it, eg "@Override // JournalStream"
+
+bq. Why is the following necessary (instead of mark(1))? Doesn't decode itself still only read 1 byte?  in.mark(in.available());
+
+decodeOp reads however many bytes are necessary to decode the operation.  There is no maximum opcode length.
+
+bq. Per above now that we never throw EditLogInputException we can nuke the class and its uses
+
+Yeah.
+
+bq. Can we avoid caching opcodes?
+
+Not really.  The issue is that in order to seek to at least transaction ID X, you have to read everything up to and possibly including X.
+
+If you read transaction id X, but have no way of putting it back in the input stream, you're screwed.  The earlier code finessed this issue by assuming that there were never any gaps between transactions-- in other words, that transaction ID N+1 always followed N.  So if you want N, just seek to N-1 and then you're set.  For obvious reasons, recovery can't assume this.
+
+I guess there is one alternative-- we could force all of the input streams to implement seek(), but that seems like massive overkill.
+
+For what it's worth, Todd and I discussed the rewind() issue today a little bit and he seems to think the cache should work (although I don't think he's reviewed this patch yet).
+
+[naming change suggestions]
+
+I like these suggestions-- will implement.
+
+* remove obsolete references to JournalStream in comments
+
+* rename resync to skipBrokenEdits
+
+* rename -f to -chooseFirst
+
+* fix EditLogInputStream comments
+
+* ELIS::rewind -> ELIS::putOp
+
+* FSEditLogLoader: fix a case where the numEdits return could be incorrect
+
+* FSEditLogLoader: improve handling of missing transactions
+
+* fix some cases in which we had been assuming that there are no gaps in the transaction log stream.  Try to avoid doing fancy arithmetic by counting the number of edits we've decoded, etc.  Instead, just rely on looking at the transaction ID of the last edit we decoded.
+
+-1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12518778/HDFS-3004.019.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 24 new or modified tests.
+
+    -1 javadoc.  The javadoc tool appears to have generated 1 warning messages.
+
+    -1 javac.  The patch appears to cause tar ant target to fail.
+
+    +1 eclipse:eclipse.  The patch built with eclipse:eclipse.
+
+    -1 findbugs.  The patch appears to cause Findbugs (version 1.3.9) to fail.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed these unit tests:
+                  org.apache.hadoop.hdfs.server.namenode.TestFSEditLogLoader
+                  org.apache.hadoop.hdfs.server.namenode.TestNameNodeRecovery
+                  org.apache.hadoop.hdfs.server.namenode.TestEditLog
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/2035//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/2035//console
+
+This message is automatically generated.
+
+- The docs reference a '-f' flag, but the code seems to be using {{-chooseFirst}}.
+- Regarding above, I think {{alwaysChooseFirst}} in the code is actually hard to understand. I'd prefer {{autoChooseDefault}} - the fact that the default is listed first is sort of ancillary. Similarly, rename {{firstChoice}} to {{defaultChoice}} in the {{ask}} function.
+- I think "q/quit" should probably be an option for all {{ask()}} calls.
+- Rename {{StartupOption.getRecoveryContext}} to {{StartupOption.createRecoveryContext}} since it creates a new one rather than returning a singleton
+- There are a few unrelated changes in FSEditLogLoader that change formatting of code that wasn't touched in the patch
+- You can't remove EditLogInputException. It's important for EditLogTailer to be able to distinguish a transient issue with reading input from the shared directory from an actual invalid operation -- we want to fail fast in the case of the invalid operation, whereas we want to keep retrying in the case of a transient IO error. See HDFS-2709 for details. The fact that you had to change TestFailureToReadEdits is a red flag here.
+- Does RecoveryContext need to be a public class? If so, you need to add an InterfaceAudience annotation to mark it as Private audience
+- Same with OpInstanceCache
+- It seems strange to be passing OpInstanceCache to all of the {{getInstance()}} methods. Instead, can we kill off all the {{getInstance}} methods, and add something like the following to OpInstanceCache:
+
+{code}
+  @SuppressWarnings("unchecked")
+  public <T extends FSEditLogOp> T getInstance(FSEditLogOpCodes code, Class<T> clazz) {
+    return (T)inst.get(code);
+  }
+{code}
+
+this could happen in a separate follow-up JIRA though.
+- Move {{logTruncateMessage}} down lower in the file near the other logging stuff, since it's just a utility method. Also, no need to use StringBuilder here since it's not performance-critical. Easier to read simple string concatenation.
+- In FileJournalManager, please retain the log message when reading from the middle of a stream.
+
+
+- I think the {{skipUntil}} API should actually throw an exception if it could not skip to the requested txid -- we always expect to be able to do that, with the current usage. Then, {{putOp()}} could be made private, which would keep the EditLogInputStream API cleaner (i.e not leak the fact that there's a one-element buffer hiding inside). I'm actually not clear on why this change is part of this patch at all -- how is this change necessary in recovery mode?
+- Rather than adding the new {{skipBrokenEdits}} to {{nextOp()}} and {{readOp()}} I think it's better to add a new API, like {{void skipUntilNextValidEdit()}} or {{void resyncToValidEdit()}}. Then the next call to {{readOp()}} would return that edit. I think this is easier to understand, and parallels the SequenceFile.Reader API we have elsewhere in Hadoop.
+
+- It seems like, in the case that an error is a mismatched transaction ID, we want one of the recovery choices to be "apply the edit anyway" -- eg imagine that for some reason our log just skips from txid 1 to txid 3. When we hit txid 3, we'll see an error that we expected a different one. But we'd like to continue applying from txid 3, ignoring the gap, right?
+
+----
+{code}
+-            if (txId != expectedTxId) {
+-              throw new IOException("Expected transaction ID " +
+-                  expectedTxId + " but got " + txId);
++            if (!skipBrokenEdits) {
++              if (op.txid != expectedTxId) {
+{code}
+Rather than nested ifs, just {{&&}} the two conditions
+
+----
+Formatting nit:
+{code}
++  /** Display a prompt to the user and get his or her choice.
++   *  
+{code}
+The first line of text in the javadoc should be on the line after the {{/**}}
+
+
+Hi Todd,
+
+Thanks for looking at this.  We'll have to chat about EditLogInputException, since there are a few things that are unclear to me about that exception.  It's used almost nowhere in the code.  Pretty much every deserialization error shows up as an IOException.  If the intention was that deserialization errors would be EditLogInputExceptions, we need to make that clear and actually implement it.  It will be quite a large amount of work, though-- probably a patch at least as big as this one, maybe more.
+
+I don't really understand how EditLogTailer is used in practice, so I can't evaluate how reasonable this is.
+
+C.
+
+The EditLogInputExceptions are currently being thrown by this code:
+{code}
+          try {
+            if ((op = in.readOp()) == null) {
+              break;
+            }
+          } catch (IOException ioe) {
+            long badTxId = txId + 1; // because txId hasn't been incremented yet
+            String errorMessage = formatEditLogReplayError(in, recentOpcodeOffsets, badTxId);
+            FSImage.LOG.error(errorMessage);
+            throw new EditLogInputException(errorMessage,
+                ioe, numEdits);
+          }
+{code}
+It indicates that whatever exception happened was due to a deserialization error, which is distinct from an application error.
+
+EditLogTailer is used by the HA StandbyNode to tail the edits out of the edit log and apply them to the SBN's namespace. Since it's reading the same log that the active is writing, it's possible that it can see a partial edit at the end of the file, in which case it will generally see an IOException. The fact that it's being wrapped with EditLogInputException indicates that it was some problem reading the edits and can likely be retried. If the EditLogTailer gets a different type of exception, though, indicating that the _appplication_ of the edit failed, then it will exit, because it may have left the namespace in an inconsistent state and thus is no longer a candidate for failover.
+
+Ok, I think I see what you are trying to express with this exception.  Exceptions reading the edit log, as opposed to exceptions applying the edits.  Since I only looked at what was in trunk, I didn't really see where it was useful, but now I understand.
+
+I do kind of wonder if readOp itself should be doing this, just for consistency's sake.
+
+C.
+
+* remove some unecessary whitespace changes
+
+* re-introduce EditLogInputException
+
+* edit log input stream: change API as we discussed.
+
+* FSEditLogLoader: re-organize this file.  Fix some corner cases relating to out-of-order transaction IDs
+
+* OpInstanceCache needs to be thread-local to work correctly
+
+* update exception text regex in TestFSEditLogLoader
+
+-1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12519152/HDFS-3004.023.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 21 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 eclipse:eclipse.  The patch built with eclipse:eclipse.
+
+    -1 findbugs.  The patch appears to introduce 2 new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed these unit tests:
+                  org.apache.hadoop.hdfs.TestDFSUpgradeFromImage
+                  org.apache.hadoop.hdfs.server.common.TestDistributedUpgrade
+                  org.apache.hadoop.hdfs.TestPersistBlocks
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/2054//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/2054//artifact/trunk/hadoop-hdfs-project/patchprocess/newPatchFindbugsWarningshadoop-hdfs.html
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/2054//console
+
+This message is automatically generated.
+
+-1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12519152/HDFS-3004.023.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 21 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 eclipse:eclipse.  The patch built with eclipse:eclipse.
+
+    -1 findbugs.  The patch appears to introduce 2 new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed these unit tests:
+                  org.apache.hadoop.hdfs.TestDFSUpgradeFromImage
+                  org.apache.hadoop.hdfs.server.common.TestDistributedUpgrade
+                  org.apache.hadoop.hdfs.TestPersistBlocks
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/2057//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/2057//artifact/trunk/hadoop-hdfs-project/patchprocess/newPatchFindbugsWarningshadoop-hdfs.html
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/2057//console
+
+This message is automatically generated.
+
+* HdfsServerConstants: use equals for string equality
+
+* fix bugs with the upgrade process
+
+-1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12519367/HDFS-3004.024.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 21 new or modified tests.
+
+    -1 patch.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/2065//console
+
+This message is automatically generated.
+
+rebase on latest trunk
+
+-1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12519389/HDFS-3004.026.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 21 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 eclipse:eclipse.  The patch built with eclipse:eclipse.
+
+    -1 findbugs.  The patch appears to introduce 1 new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed these unit tests:
+                  org.apache.hadoop.hdfs.server.namenode.TestStartup
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/2067//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/2067//artifact/trunk/hadoop-hdfs-project/patchprocess/newPatchFindbugsWarningshadoop-hdfs.html
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/2067//console
+
+This message is automatically generated.
+
+* fix bug uncovered by jenkins
+
+* add a little more debug in TestNameNodeRecovery
+
+-1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12519489/HDFS-3004.027.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 21 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 eclipse:eclipse.  The patch built with eclipse:eclipse.
+
+    -1 findbugs.  The patch appears to introduce 1 new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed unit tests in .
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/2071//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/2071//artifact/trunk/hadoop-hdfs-project/patchprocess/newPatchFindbugsWarningshadoop-hdfs.html
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/2071//console
+
+This message is automatically generated.
+
+* rebase on trunk
+
+* fix findbugs suppression
+
++1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12519524/HDFS-3004.029.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 21 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 eclipse:eclipse.  The patch built with eclipse:eclipse.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed unit tests in .
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/2075//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/2075//console
+
+This message is automatically generated.
+
+fix bug in prompting
+
+testing done: manually corrupted an edit log, recovered it with recovery mode.
+
+patch update: whitespace tweak for recovery prompt
+
++1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12519553/HDFS-3004.030.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 21 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 eclipse:eclipse.  The patch built with eclipse:eclipse.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed unit tests in .
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/2078//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/2078//console
+
+This message is automatically generated.
+
+-1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12519565/HDFS-3004.031.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 21 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 eclipse:eclipse.  The patch built with eclipse:eclipse.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed these unit tests:
+                  org.apache.hadoop.hdfs.TestFileAppend4
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/2079//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/2079//console
+
+This message is automatically generated.
+
+* hdfs_user_guide.xml: fix paragraph breaks
+
+-1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12519718/HDFS-3004.032.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 21 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 eclipse:eclipse.  The patch built with eclipse:eclipse.
+
+    -1 findbugs.  The patch appears to introduce 1 new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed these unit tests:
+                  org.apache.hadoop.hdfs.server.namenode.TestBackupNode
+                  org.apache.hadoop.cli.TestHDFSCLI
+                  org.apache.hadoop.hdfs.TestGetBlocks
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/2085//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/2085//artifact/trunk/hadoop-hdfs-project/patchprocess/newPatchFindbugsWarningshadoop-hdfs.html
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/2085//console
+
+This message is automatically generated.
+
+It looks like the findbugs warning relates to NameNode::state.  As far as I can see, I haven't changed how the HAState stuff works at all, so I don't think this has anything to do with the patch.
+
+Test failues:
+testCheckpointNode: a port-in-use problem
+testBackupNodeTailsEdits: a port-in-use problem
+testBackupNode: a port-in-use problem
+TestHDFSCLI: a lot of lines similar to this:
+{code}
+Expected output:   [setSpaceQuota: java.io.FileNotFoundException: Directory does not exist: /test1]
+Actual output:   [setSpaceQuota: Directory does not exist: /test1
+{code}
+
+But when I run the test, it passes.  Also, when I run the test manually, I do see the expected exception message:
+{code}
+cmccabe@keter:/opt/hadoop/home4> ./bin/hadoop dfsadmin -setSpaceQuota 1g /test1
+setSpaceQuota: java.io.FileNotFoundException: Directory does not exist: /test1
+{code}
+
+TestGetBlocks.testGetBlocks: test works fine when I run it locally.  Flaky test?
+
+TestHDFSCLI and TestGetBlocks are known to be failing on trunk: see HDFS-3142 and HDFS-3143. If TestGetBlocks is passing for you, it's probably because you have an old snapshot of the source tree.
+
+* rebase on trunk
+
+* fix some resource leaks in TestNameNodeRecovery
+
+* some whitespace and logging cleanups
+
+-1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12520009/HDFS-3004.033.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 21 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 eclipse:eclipse.  The patch built with eclipse:eclipse.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed these unit tests:
+                  org.apache.hadoop.cli.TestHDFSCLI
+                  org.apache.hadoop.hdfs.TestGetBlocks
+                  org.apache.hadoop.hdfs.server.namenode.TestValidateConfigurationSettings
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/2100//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/2100//console
+
+This message is automatically generated.
+
+{code}
++    } catch (IOException e) {
++      return null;
+{code}
+This shows up a few places and makes me nervous. We should always at least LOG.warn an exception.
+
+----
+{code}
++            if (op.getTransactionId() > expectedTxId) { 
++              askOperator("There appears to be a gap in the edit log.  " +
++                  "We expected txid " + expectedTxId + ", but got txid " +
++                  op.getTransactionId() + ".", recovery, "skipping bad edit");
++            } else if (op.getTransactionId() < expectedTxId) { 
++              askOperator("There appears to be an out-of-order edit in " +
++                  "the edit log.  We expected txid " + expectedTxId +
++                  ", but got txid " + op.getTransactionId() + ".", recovery,
++                  "applying edits");
++              continue;
+{code}
+Am I reading this wrong, or is the logic backwards? It seems like the first prompt allows you to say "continue, skipping bad edit", but doesn't call continue (thus applying the bad edit). The second one gives you the choice "continue, applying edits" but *does* skip the bad one.
+
+----
+{code}
++          catch (Throwable e) {
++            askOperator("Failed to apply edit log operation " +
++              op.getTransactionIdStr() + ": error " + e.getMessage(),
++              recovery, "applying edits");
+{code}
+Here we no longer output the stack trace of the exception anywhere. That's often a big problem - we really need the exception trace to understand the root cause and to know whether we might be able to skip it.
+
+- I would also recommend printing the op.toString() itself in all of these cases, not just the txids. That gives the operator something to base their decision on. I think we have a reasonable stringification of all ops nowdays.
+
+----
+{code}
+-          LOG.info(String.format("Log begins at txid %d, but requested start "
+-              + "txid is %d. Skipping %d edits.", elf.getFirstTxId(), fromTxId,
+-              transactionsToSkip));
+-          elfis.skipTransactions(transactionsToSkip);
++        // TODO: add recovery mode override here as part of edit log failover
++        if (elfis.skipUntil(fromTxId) == false) {
+{code}
+Please leave the log message in place here. Also, in the failure log message here, I think you should (a) throw EditLogInputException, and (b) include the file path here
+
+
+----
+{code}
++          /* Now that the operation has been successfully decoded and
++           * applied, update our bookkeeping. */
+{code}
+style: use // comments inline in code, not /* */ generally. There are a couple other places where you should make the same fix.
+
+----
+- There are still a few spurious whitespace changes unrelated to your code here. Not a big deal, but best to remove those hunks from your patch.
+
+----
+
+{code}
++   * Get the next valid operation from the stream storage
++   * 
++   * This is exactly like nextOp, except that we attempt to skip over damaged
++   * parts of the edit log
+{code}
+Please add '.'s at the end of the sentences in the docs. It's annoying, but the way JavaDoc gets formatted, all the sentences will run together without line breaks in many cases, so the punctuation's actually important for readability.
+----
+
+{code}
++   * @return        Returns true if we found a transaction ID greater than
++   *                'txid' in the log.
++   */
++  public boolean skipUntil(long txid) throws IOException {
+{code}
+The javadoc should say "greater than or equal to", right? Also, I think the doc should specify explicitly: "the next call to readOp() will usually return the transaction with the specified txid, unless the log contains a gap, in which case it may return a higher one."
+
+----
+{code}
++  private ThreadLocal <OpInstanceCache> cache = new ThreadLocal<OpInstanceCache>() {
+{code}
+Style: no space between "ThreadLocal" and '<'. Also the line's a bit long (we try to keep to 80 characters unless it's really hard not to)
+
+----
+{code}
++            if (op == null)
+               break;
+{code}
+Style: we use {} braces even for one-line if statements. There are a few other examples of this too.
+
+{code}
++          }
++          catch (Throwable e) {
+{code}
+catch clause goes on same line as '}'
+
+----
+{code}
++    if (txid == HdfsConstants.INVALID_TXID) {
++      throw new RuntimeException("operation has no txid");
+{code}
+Use {{Preconditions.checkState()}} here for better readability
+
+----
+{code}
++        LOG.error("automatically choosing " + firstChoice);
+{code}
+this should probably be INFO or WARN
+----
+
+Style: please add a blank line between functions in RecoveryContext.java
+
+----
+TestNameNodeRecovery:
+- do we need data nodes in these tests? if it's just metadata ops, 0 DNs should be fine
+- move the EditLogTestSetup interface down lower in the file, just above where you define the implementations
+- extra space between {{interface}} and {{EditLogTestSetup}}
+- please add blank lines between functions in that interface, and expand the javadoc out so the {{/**}} line is on its own, like the rest of the codebase
+- removeFromArray -- really this is {{markTxnIdFound}} where {{-1}} is used as a mark, right? I think it might be much clearer to just use Set<Integer> here and remove the ints from the set -- that's essentially what you're doing?
+- some funky indentation in a few places
+- rather than catching, logging, and calling fail(), you can just let the Throwable pass out of the test case - that'll also fail the test case, with the advantage that the stack trace of the failure becomes clickable in IDEs
+- tip: you can use StringUtils.stirngifyException to get an exception's stack trace into a String without StringWriter
+- instead of the if (stream != null) checks, you can use IOUtils.closeStream, or IOUtils.cleanup, which takes care of that for you
+
+
+Todd said:
+
+bq. Am I reading this wrong, or is the logic backwards? It seems like the first prompt allows you to say "continue, skipping bad edit", but doesn't call continue (thus applying the bad edit). The second one gives you the choice "continue, applying edits" but does skip the bad one.
+
+The logic isn't backwards, but the prompts possibly could be phrased better.
+
+Basically, we NEVER want to apply a transaction that has a lower or equal ID to the previous one.  That's why the ''continue'' is there in the else clause.  We will try to recover from an edit log with gaps in it, though.  (That is sort of the point of recovery).
+
+I'll see if I can phrase the prompts better.
+
+* address Todd's suggestions
+
+-1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12520296/HDFS-3004.034.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 21 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 eclipse:eclipse.  The patch built with eclipse:eclipse.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed these unit tests:
+                  org.apache.hadoop.cli.TestHDFSCLI
+                  org.apache.hadoop.hdfs.TestGetBlocks
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/2110//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/2110//console
+
+This message is automatically generated.
+
+* TestNameNodeRecovery: don't need data nodes for this test
+    
+* TestNameNodeRecovery: use set rather than array
+
+
+-1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12520544/HDFS-3004.035.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 21 new or modified tests.
+
+    -1 patch.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/2125//console
+
+This message is automatically generated.
+
+* rebase on trunk
+
+* slight cleanup of EditLogBackupInputStream::nextValidOp()
+
++1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12520690/HDFS-3004.036.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 21 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 eclipse:eclipse.  The patch built with eclipse:eclipse.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed unit tests in .
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/2132//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/2132//console
+
+This message is automatically generated.
+
+Looking pretty good, just style nits:
+
+{code}
++    /* This is a trivial implementation which just assumes that any errors mean
++     * that there is nothing more of value in the log.  You can override this.
++     */
+{code}
+Style: use // comments for inline comments. I think it's clearer to say "subclasses will likely want to override this" instead of "You can override this". The other option, which I think is somewhat reasonable, is to just do: {{throw new UnsupportedOperationException(this.getClass() + " does not support resyncing to next edit");}} since it seems like the implementation that's there now is worse than just failing.
+
+----
+{code}
++   * After this function returns, the next call to reaOp will return either
+{code}
+typo: readOp
+
+----
+
+bq. Basically, we NEVER want to apply a transaction that has a lower or equal ID to the previous one. That's why the ''continue'' is there in the else clause. We will try to recover from an edit log with gaps in it, though. (That is sort of the point of recovery).
+
+I can see cases where we might want to "apply the out-of-order edit anyway". But let's leave that for a follow-up JIRA.
+
+----
+
+{code}
++            LOG.error("Encountered exception on operation " +
++              op.toString() + ": \n" + StringUtils.stringifyException(e));
+{code}
+Use the second argument of LOG.error to log the exception, rather than using stringifyException.
+
+----
+{code}
++    }
++    finally {
+{code}
+style: combine to one line. Also an example of this inside EltsTestGarbageInEditLog later in the patch.
+
+----
+{code}
++            /* If we encountered an exception or an end-of-file condition,
++             * do not advance the input stream. */
+{code}
+// comments
+
+----
+{code}
++          if (!skipBrokenEdits)
++            throw e;
++          if (in.skip(1) < 1)
++            return null;
+...
++      if (response.equalsIgnoreCase(firstChoice))
++        return firstChoice;
+...
++    if (operation == StartupOption.RECOVER)
++      return;
+{code}
+need {} braces (also a few other places).
+
+For simple "return" or "break", you can put it on the same line as the if, without braces, if it fits, but otherwise, we always use {}s
+
+----
+{code}
++        } else {
++        assertEquals(prevTxId, elts.getLastValidTxId());
++        }
+{code}
+indentation
+
+----
+{code}
++  public static Set<Long> setFromArray(long[] arr) {
+...
+{code}
+
+Instead of this, you can just use Sets.newHashSet(1,2,3...) from guava
+
+----
+
+{code}
++      Set <Long> validTxIds = elts.getValidTxIds();
+{code}
+no space between {{Set}} and {{<Long>}}
+
+----
+{code}
++      if ((elfos != null) && (elfos.isOpen()))
++        elfos.close();
++      if (elfis != null)
++        elfis.close();
+{code}
+use IOUtils.cleanup
+
+
+* style fixes
+
+-1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12521059/HDFS-3004.037.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 21 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 eclipse:eclipse.  The patch built with eclipse:eclipse.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    -1 core tests.  The patch failed these unit tests:
+                  org.apache.hadoop.hdfs.TestLeaseRecovery2
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/2163//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/2163//console
+
+This message is automatically generated.
+
+I couldn't reproduce the TestHardLeaseRecoveryafterNameNodeRestart failure, so I filed HDFS-3181 to look into it.
+
++1, I'll commit this momentarily. Thanks for the heroic effort through all my nit-picking.
+
+arg, looks like another patch went in which generated a couple conflicts. Can you rebase on trunk again?
+
+* rebase
+
++1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12521415/HDFS-3004.038.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 21 new or modified tests.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 eclipse:eclipse.  The patch built with eclipse:eclipse.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed unit tests in .
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/2187//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/2187//console
+
+This message is automatically generated.
+
+You're going to kill me, but this isn't compiling anymore. At least this time it's your own patch that it conflicted against :)
+
+[INFO] -------------------------------------------------------------
+[ERROR] COMPILATION ERROR : 
+[INFO] -------------------------------------------------------------
+[ERROR] /home/todd/svn/hadoop-trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogOp.java:[2454,11] cannot find symbol
+symbol  : variable opInstances
+location: class org.apache.hadoop.hdfs.server.namenode.FSEditLogOp
+[INFO] 1 error
+[INFO] -------------------------------------------------------------
+
+
+Sorry for coming late.  Some comments:
+
+- Since the recover mode may cause data lost, we should prompt and warn the user in the very beginning.
+
+- What happen if "-autoChooseDefault" is run with other options or standalone?
+
+- It is hard to understand the option "-autoChooseDefault" from its name.  Could it be changed to something related to "recover", say "-recoverAutoChooseDefault"?
+
+- Why remove JournalStream?
+
+- Please change RequestStop to RequestStopException.  It is better to add an error message to it.  Also, please add javadoc to describe what does it mean.
+
+- Could you should some sample screen shots on the recover mode?
+
+- Please remove createRecoveryContext() from HdfsServerConstants.  It does not sound like a constant.
+
+- Why askOperator(..) belongs to FSEditLogLoader but not RecoveryContext?
+
+- Could you rename RecoveryContext to something related to image/edit, say ImageEditRecovery.
+
+Todd:
+> this isn't compiling anymore...
+
+Sigh.  Will rebase on trunk... again.
+
+Nicholas:
+> Since the recover mode may cause data lost, we should prompt and warn the user in the very beginning.
+
+We prompt the user before doing anything destructive, unless the -autoChooseDefault option is enabled.
+
+> What happen if "-autoChooseDefault" is run with other options or standalone?
+
+There are no other options for recovery mode except autoChooseDefault.  Check the usage or run -h for more information.
+
+> Why remove JournalStream?
+
+It's deadcode which does nothing.
+
+> Please change RequestStop to RequestStopException. It is better to add an error
+> message to it. Also, please add javadoc to describe what does it mean.
+
+Ok.
+
+> Why askOperator(..) belongs to FSEditLogLoader but not RecoveryContext?
+
+Because it relates to FSEditLogLoader, not to RecoveryContext.
+
+> Could you rename RecoveryContext to something related to image/edit, say ImageEditRecovery.
+
+I suppose MetaRecoveryContext could work.  This would avoid confusion with "name node lease recovery" or "datanode recovery."  Similarly we could add "meta" before some other recovery-related things.
+
+An example of recovery in action:
+
+{code}
+ERROR namenode.FSImage (FSEditLogLoader.java:loadEditRecords(174)) - Error replaying  edit log at offset 202.  Expected transaction ID was 5
+Recent opcode offsets: 17 74 136 202
+
+ERROR namenode.FSImage (FSEditLogLoader.java:askOperator(111)) - We failed to read    txId 5
+
+namenode.MetaRecoveryContext (MetaRecoveryContext.java:ask(61)) - Enter 'c' to  continue, skipping the bad section in the log
+Enter 's' to stop reading the edit log here, abandoning any later edits
+Enter 'q' to quit without saving
+Enter 'a' to always select the first choice in the future without prompting(c/s/q/a) c
+
+Continuing.
+{code}
+
+* rebase on trunk
+
+* rename RecoveryContext to MetaRecoveryContext
+
+* rename -autoChooseDefault to -noPrompt
+
+* EditLogInputException.java: remove pointless whitespace change
+
+* some whitespace and punctuation improvements to the recovery prompt text.
+
+-1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12521605/HDFS-3004.039.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 7 new or modified test files.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 eclipse:eclipse.  The patch built with eclipse:eclipse.
+
+    -1 findbugs.  The patch appears to introduce 1 new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed unit tests in .
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/2205//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/2205//artifact/trunk/hadoop-hdfs-project/patchprocess/newPatchFindbugsWarningshadoop-hdfs.html
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/2205//console
+
+This message is automatically generated.
+
+* update findbugsExcludeFile.xml to reflect the fact that RecoveryContext is now called MetaRecoveryContext
+
+> We prompt the user before doing anything destructive, unless the -autoChooseDefault option is enabled.
+
+We really need a warning about the potential data lost in the beginning.  Operators performing recovery do not expect it would cause data lost.
+
+> rename -autoChooseDefault to -noPrompt
+
+How about calling it -force?
+
+{noformat}
+MODE OF OPERATION
+The NameNode recovery tool will be invoked from the command line by using:
+
+  ./bin/hdfs recover -b <backup-dir-name> -e <errors.log>
+
+If the backup directory name is not specified, the name backup-YYYY-MM-DD
+will be used.
+{noformat}
+
+The implementation seems different from the doc.  The backup-dir is a good idea so that there is always a backup.
+
+Hi Nicholas,
+
+If the -noPrompt option prompts, it will be impossible for the unit tests to use it to test recovery.  Basically, we need a way of running recovery without human intervention.
+
+We don't prompt before wiping the entire fsimage when the user specifies -format.  I don't see why -recover should operate any differently, especially when the user has to specify both -recover and -noPrompt in order to have the potential of data loss without a prompt.
+
+We don't want to get in the habit of presenting the user with lots of nag messages that he'll just blindly say "yes" to out of annoyance.  The best practice is to back up the edit log and image directories before modifying them, just the same as now.
+
+As far as flag naming: yeah, --force might work.  I'll think about it and give others a chance to make suggestions as well.
+
+thanks,
+C.
+
+> We don't prompt before wiping the entire fsimage when the user specifies -format. ...
+This is not true.
+{noformat}
+szetszwo b-1$./bin/hadoop namenode -format
+12/04/05 18:27:47 INFO namenode.NameNode: STARTUP_MSG: 
+/************************************************************
+STARTUP_MSG: Starting NameNode
+STARTUP_MSG:   host = Sunnyvale.local/10.10.10.60
+STARTUP_MSG:   args = [-format]
+STARTUP_MSG:   version = 1.1.0-SNAPSHOT
+STARTUP_MSG:   build = https://svn.apache.org/repos/asf/hadoop/common/branches/branch-1 -r 1309623; compiled by 'szetszwo' on Thu Apr  5 12:43:22 PDT 2012
+************************************************************/
+Re-format filesystem in /tmp/hadoop-szetszwo/dfs/name ? (Y or N) 
+{noformat}
+
+
+Hmm.  I always run -format from within a script, and it never prompts.  Looking at the script, it seems that the reason is because the script deletes the metadata directories beforehand, and -format is smart enough to recognize this and skip the prompt in the case where there are no existing metadata directories.
+
+Anyway, I stand corrected.  If -format by default requires a prompt, then recovery mode can as well.
+
+I suppose we can display this prompt even when -force is specified, too.  Just one prompt at the beginning.  I don't think recovery mode is the sort of thing that we'll be putting into scripts any time soon.
+
+Anyway, if anyone else has any input on this, please post.  Otherwise I'll make the changes mentioned above in the next patch.
+
+Please also warn that recovery may cause further data lost and tell the user to first backup the image.
+
+BTW, could you update the doc to tell what are actually implemented?
+
++1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12521620/HDFS-3004.040.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 7 new or modified test files.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 eclipse:eclipse.  The patch built with eclipse:eclipse.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed unit tests in .
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/2208//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/2208//console
+
+This message is automatically generated.
+
+* implement -force
+
++1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12521639/HDFS-3004.041.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 7 new or modified test files.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 eclipse:eclipse.  The patch built with eclipse:eclipse.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed unit tests in .
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/2210//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/2210//console
+
+This message is automatically generated.
+
+* update design document
+
+-1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12521701/HDFS-3004__namenode_recovery_tool.txt
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    -1 tests included.  The patch doesn't appear to include any new or modified tests.
+                        Please justify why no new tests are needed for this patch.
+                        Also please list what manual steps were performed to verify this patch.
+
+    -1 patch.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/2214//console
+
+This message is automatically generated.
+
+* always prompt about possible data loss, even when -force is specified
+
+* update hdfs_user_guide.xml so that it talks about -force
+
+just to avoid confusion, the above jenkins mutterings are the result of it trying to apply the design document as a patch.
+
+Latest rev looks great. +1 to HDFS-3004.042.patch
+
+@Nicholas, I think Colin address your feedback, lemme know if you have additional feedback and I'll hold off
+
+
+@Eli, I would like to take a look the latest patch later today.  Please hold on.
+
+@Colin, please re-post the HDFS-3004.042.patch in the meantime.  Otherwise, it won't get tested by Jenkins.
+
+Are we smart enough to not recover mixed versions? i.e., if I try recovery on a 1.x fsimage/edits on a 2.x fsimage/edits, it should fail.
+
+Same patch for jenkins.
+
+* reposting so jenkins will test
+
+Hi Allen,
+
+Recovery uses the normal edit log loading code, so we support loading slightly older versions, just the same way that the normal edit log loading code does.  The EditLogInputStream will give you back correctly deserialized opCodes for several different version flavors.  EditLogInputStream::getVersion will let you know what version of the edit log you are reading.
+
+If your version is too old, you'll have to upgrade it with "./bin/hadoop namenode -upgrade".  Unfortunately, we don't support combining recovery mode and upgrade mode.  We could potentially address this in the future if there is enough demand, but I'm not sure there will be.
+
++1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12521789/HDFS-3004.042.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 7 new or modified test files.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 eclipse:eclipse.  The patch built with eclipse:eclipse.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed unit tests in .
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/2220//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/2220//console
+
+This message is automatically generated.
+
+{quote}
+- Please remove createRecoveryContext() from HdfsServerConstants. It does not sound like a constant.
+{quote}
+Hi Colin, you have not responded the above comment.
+
+{quote}
+There are no other options for recovery mode except autoChooseDefault. Check the usage or run -h for more information.
+{quote}
+Then would it show an error message for the invalid options, say "hadoop namenode -format -force" or "hadoop namenode -force"?
+
+{quote}
+> Why askOperator(..) belongs to FSEditLogLoader but not RecoveryContext?
+
+Because it relates to FSEditLogLoader, not to RecoveryContext.
+{quote}
+It seems related to MetaRecoveryContext more: 
+- it is a static method and have MetaRecoveryContext as a parameter
+- it throws MetaRecoveryContext.RequestStopException
+- it uses MetaRecoveryContext.LOG
+
+- Please do not call toString() with the + operator.  It will be invoked automatically.
+
+- In your screen shot, is it better to have a new line before "Enter 'c' to continue"?  Otherwise, the line is too long.
+
+- "Metadata recovery mode often permanently deletes data from your filesystem.":  Do you mean local filesystem?  How about "... permanently deletes data from editlog and image."
+
+Please feel free to commit the patch once my comments are addressed.
+
+Colin, you have done a great job!
+
++1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12521795/HDFS-3004.042.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 7 new or modified test files.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 eclipse:eclipse.  The patch built with eclipse:eclipse.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed unit tests in .
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/2221//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/2221//console
+
+This message is automatically generated.
+
+> Then would it show an error message for the invalid options, say
+> "hadoop namenode -format -force" or "hadoop namenode -force"?
+
+Yes, it would.
+
+> [askOperator] seems related to MetaRecoveryContext more...
+
+Fair enough.  I'll move it there.
+
+> "Metadata recovery mode often permanently deletes data from your
+> filesystem.": Do you mean local filesystem? How about "... permanently
+> deletes data from editlog and image."
+
+Perhaps "permanently deletes data from your HDFS filesystem" would be clearer. 
+
+> In your screen shot, is it better to have a new line before
+> "Enter 'c' to continue"? Otherwise, the line is too long.
+
+Ok (this would make it more symmetrical with the other lines too).
+
+Thanks for your reviews. -C
+
+* remove many unecessary calls to toString
+
+* move FSEditLog::askOperator to MetaRecoveryContext::editLogLoaderPrompt
+
+* nag prompt now talks about "losing data from your HDFS filesystem" rather than just "filesystem" (to eliminate any possible ambiguity)
+
+* add newline before "enter 'c' to continue' prompt, so that it lines up with the other prompts.
+
++1 overall.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12521835/HDFS-3004.043.patch
+  against trunk revision .
+
+    +1 @author.  The patch does not contain any @author tags.
+
+    +1 tests included.  The patch appears to include 7 new or modified test files.
+
+    +1 javadoc.  The javadoc tool did not generate any warning messages.
+
+    +1 javac.  The applied patch does not increase the total number of javac compiler warnings.
+
+    +1 eclipse:eclipse.  The patch built with eclipse:eclipse.
+
+    +1 findbugs.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    +1 release audit.  The applied patch does not increase the total number of release audit warnings.
+
+    +1 core tests.  The patch passed unit tests in .
+
+    +1 contrib tests.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/2222//testReport/
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/2222//console
+
+This message is automatically generated.
+
++1 diff'd latest patch against the previous, addresses Nicholas' feedback.
+
+Integrated in Hadoop-Common-trunk-Commit #2030 (See [https://builds.apache.org/job/Hadoop-Common-trunk-Commit/2030/])
+    HDFS-3004. Implement Recovery Mode. Contributed by Colin Patrick McCabe (Revision 1311394)
+
+     Result = SUCCESS
+eli : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1311394
+Files : 
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/dev-support/findbugsExcludeFile.xml
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/contrib/bkjournal/src/main/java/org/apache/hadoop/contrib/bkjournal/BookKeeperEditLogInputStream.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/contrib/bkjournal/src/test/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogTestUtil.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/docs/src/documentation/content/xdocs/hdfs_user_guide.xml
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/common/HdfsServerConstants.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/BackupImage.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/Checkpointer.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogBackupInputStream.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogFileInputStream.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogInputStream.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogOutputStream.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLog.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogLoader.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogOp.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImageTransactionalStorageInspector.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FileJournalManager.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/JournalStream.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/MetaRecoveryContext.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NNStorage.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNode.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/EditLogTailer.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/offlineEditsViewer/OfflineEditsXmlLoader.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSCluster.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestEditLog.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestEditLogRace.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSEditLogLoader.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestNameNodeRecovery.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestSecurityTokenEditLog.java
+
+
+I've committed this and merged to branch-2.  Nice work Colin!
+
+Integrated in Hadoop-Hdfs-trunk-Commit #2105 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk-Commit/2105/])
+    HDFS-3004. Implement Recovery Mode. Contributed by Colin Patrick McCabe (Revision 1311394)
+
+     Result = SUCCESS
+eli : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1311394
+Files : 
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/dev-support/findbugsExcludeFile.xml
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/contrib/bkjournal/src/main/java/org/apache/hadoop/contrib/bkjournal/BookKeeperEditLogInputStream.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/contrib/bkjournal/src/test/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogTestUtil.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/docs/src/documentation/content/xdocs/hdfs_user_guide.xml
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/common/HdfsServerConstants.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/BackupImage.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/Checkpointer.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogBackupInputStream.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogFileInputStream.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogInputStream.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogOutputStream.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLog.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogLoader.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogOp.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImageTransactionalStorageInspector.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FileJournalManager.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/JournalStream.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/MetaRecoveryContext.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NNStorage.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNode.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/EditLogTailer.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/offlineEditsViewer/OfflineEditsXmlLoader.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSCluster.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestEditLog.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestEditLogRace.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSEditLogLoader.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestNameNodeRecovery.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestSecurityTokenEditLog.java
+
+
+Can you add a release note field for this issue, with brief description of the new feature and a pointer to the docs that describe it?
+
+Integrated in Hadoop-Mapreduce-trunk-Commit #2041 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk-Commit/2041/])
+    HDFS-3004. Implement Recovery Mode. Contributed by Colin Patrick McCabe (Revision 1311394)
+
+     Result = SUCCESS
+eli : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1311394
+Files : 
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/dev-support/findbugsExcludeFile.xml
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/contrib/bkjournal/src/main/java/org/apache/hadoop/contrib/bkjournal/BookKeeperEditLogInputStream.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/contrib/bkjournal/src/test/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogTestUtil.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/docs/src/documentation/content/xdocs/hdfs_user_guide.xml
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/common/HdfsServerConstants.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/BackupImage.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/Checkpointer.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogBackupInputStream.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogFileInputStream.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogInputStream.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogOutputStream.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLog.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogLoader.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogOp.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImageTransactionalStorageInspector.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FileJournalManager.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/JournalStream.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/MetaRecoveryContext.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NNStorage.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNode.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/EditLogTailer.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/offlineEditsViewer/OfflineEditsXmlLoader.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSCluster.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestEditLog.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestEditLogRace.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSEditLogLoader.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestNameNodeRecovery.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestSecurityTokenEditLog.java
+
+
+Integrated in Hadoop-Hdfs-trunk #1010 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/1010/])
+    HDFS-3004. Implement Recovery Mode. Contributed by Colin Patrick McCabe (Revision 1311394)
+
+     Result = FAILURE
+eli : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1311394
+Files : 
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/dev-support/findbugsExcludeFile.xml
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/contrib/bkjournal/src/main/java/org/apache/hadoop/contrib/bkjournal/BookKeeperEditLogInputStream.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/contrib/bkjournal/src/test/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogTestUtil.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/docs/src/documentation/content/xdocs/hdfs_user_guide.xml
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/common/HdfsServerConstants.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/BackupImage.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/Checkpointer.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogBackupInputStream.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogFileInputStream.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogInputStream.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogOutputStream.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLog.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogLoader.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogOp.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImageTransactionalStorageInspector.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FileJournalManager.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/JournalStream.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/MetaRecoveryContext.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NNStorage.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNode.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/EditLogTailer.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/offlineEditsViewer/OfflineEditsXmlLoader.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSCluster.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestEditLog.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestEditLogRace.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSEditLogLoader.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestNameNodeRecovery.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestSecurityTokenEditLog.java
+
+
+Integrated in Hadoop-Mapreduce-trunk #1045 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/1045/])
+    HDFS-3004. Implement Recovery Mode. Contributed by Colin Patrick McCabe (Revision 1311394)
+
+     Result = SUCCESS
+eli : http://svn.apache.org/viewcvs.cgi/?root=Apache-SVN&view=rev&rev=1311394
+Files : 
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/dev-support/findbugsExcludeFile.xml
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/contrib/bkjournal/src/main/java/org/apache/hadoop/contrib/bkjournal/BookKeeperEditLogInputStream.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/contrib/bkjournal/src/test/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogTestUtil.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/docs/src/documentation/content/xdocs/hdfs_user_guide.xml
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/common/HdfsServerConstants.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/BackupImage.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/Checkpointer.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogBackupInputStream.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogFileInputStream.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogInputStream.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/EditLogOutputStream.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLog.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogLoader.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSEditLogOp.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImage.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSImageTransactionalStorageInspector.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FileJournalManager.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/JournalStream.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/MetaRecoveryContext.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NNStorage.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/NameNode.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/ha/EditLogTailer.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/tools/offlineEditsViewer/OfflineEditsXmlLoader.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/MiniDFSCluster.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestEditLog.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestEditLogRace.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestFSEditLogLoader.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestNameNodeRecovery.java
+* /hadoop/common/trunk/hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/namenode/TestSecurityTokenEditLog.java
+
+
+Colin, if you could, can you please update the design document with more details on the approach, especially the Implementation section? Currently it does not have much details and going over various comments in this and possibly other jiras is tedious. 
+
+Here is an updated Recovery Mode design document.
+

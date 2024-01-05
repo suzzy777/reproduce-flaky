@@ -1,0 +1,739 @@
+For Observer read, The edit log tail period is set to 0, (dfs.ha.tail-edits.period)
+There are three Journal nodes, the tailing process succeeds if it is able to fetch the response from majority of the JN's and then moves out. i.e succeeds and returns if it gets response from 2 JN. The thread for the third JN keeps on trying 10 times on ConnectException. But since the tailing period is quite low, By the time one stuck thread completes. Similar retrying stuck threads, Piles up. Leading to OOM
+
+Thanks for reporting this and really appreciate the investigation [~ayushtkn]. So just to clarify based on the description. NN that crashed is Observer node, or other Standby as well? Were all the observer nodes died eventually? Because based on what you mentioned, looks like chances are all the observers will be run into this at some point.
+
+Thanx [~vagarychen]
+
+Yes, It affected all the observers.
+
+In standby NN we didn't enable tailling edits so the standby namenode were not affected, they stayed intact. But when the ONN was restarted after the crash, it starts in Standby state. so it was crashing in that state too.
+
+The problem is with tailing. It can happen with standby too, if edit log tailing is enabled. But we just had it enabled in our Observer node only, To prevent stale reads
+
+ 
+
+Thanks [~ayushtkn]. Then looks like even without observer read, as long as {{dfs.ha.tail-edits.period}} is set low enough, due to we require only a quorum, not all standby to response to proceed, when next edit tailing call happens, there can be connections from previous call still pending, piling up more outstanding calls. But I haven't found where the "the third JN keeps on trying 10 times on ConnectException" is happening. Would you mind elaborating on this part a bit? What ConnectException exactly was it?
+
+Thanx [~vagarychen], If you check the trace, the first line shows that too. (Well if you require some more logs on that, I will try arrange more for that).
+
+That is the general retry logic for connection. Check in Client.java handleConnectionFailure(..),
+
+What I think is, May be we can change the {{createParallelExecutor()}} in {{IPCLoggerChannel.java}} to restrict the number of threads..
+
+Or even before returning once we get the quorum, We should try kill the other threads and then return. Or may be both, Or something else!!!
+
+Thanks [~ayushtkn]. I'm also thinking of cancelling outstanding calls if we have got response from a quorum. For restricting number of threads though, the outstanding calls may still pile up and use up the threads counts. So we will need to restrict number of threads with some strategy, e.g. restricting number of threads on per JN level.
+
+Post a POC patch with the idea of cancelling unfinished calls after getting quorum for read. I marked as POC as I still haven't found a good way to verify this fix the issue, since I don't have the setup to reproduce the issue at the moment. Still share the patch though, to hopefully get some comments/insights.
+
+Basically, the idea of the POC patch is if a read has got a quorum response, call Future#cancel() on the remaining tasks. One tricky trade-off is that if it is not a actually failed read, just a slow one, it may also got killed here. I'm a bit concerned that this idea could mean we effectively always read from just 2 JNs.
+
+I added a POC unit test, please be aware this is NOT a finalized test, just to illustrate the idea. I log the total number of threads. In my local run, without the cancelling change, the thread count started at 53, always end up at ~210 threads. With the change, the thread count started at 53, always end up at ~70. (In this test though, for there was no retry connecting, always just connection refused).
+
+Thanx [~vagarychen] we too tried with just the approach of cancelling the outstanding calls before we move hand. 
+ Firstly when the {{dfs.ha.tail-edits.period}} period is 0. With this approach, the problem doesn't get solved. As when we call, we don't actually kill the thread, but just call interrupt, and when the connection thread comes in the next iteration and sees it being interrupted, then it stops. So this whole process also has some latency. With 0 as configured value, The pace at which the thread is removed by cancel is outsmarted by the tailing frequency.
+ Secondly, As you said, for normal scenario also, this shall be happen, when majority comes fast and others were just suppose to come(We can't expect practically for all responses together), so we will land up killing them too. And this is little noise too as the LOGs shall also be filled with InterruptedException.
+
+ 
+
+Thanks for sharing the details [~ayushtkn]! I also wondered if just calling cancel() is enough to reclaim resources. Then I guess unless we have a way to clean up failed threads fast enough (which I doubt), we will have to have a cap on how much resources can be allocated on failed JNs, i.e. have a cap on how many threads can be created for it in some manner. 
+
+About the issue of killing the slow ones as well though, I think even now,  it can already be happening, i.e. skipping responses if some response is slow. The contract of requiring only a quorum, not all, to response already suggests allowing slow ones to be missed. Also, given that we do tail-edits very frequently in this case, we should be catching very fast and if a JN is slow, it might already be consistently skipped, so I'm not too much concerned about this.
+
+Since it seems you have been actively working on this and have done some great investigation already. Would you mind picking up this Jira :)? I will be closely watching as well.
+
+Thanx [~vagarychen]. The solution that we have is, We too cancel the remaining thread(though it doesn't immediately clears up), But better than retrying 10 times.
+ And a change here in the {{IPCLoggerChannel}}
+{code:java}
+  protected ExecutorService createParallelExecutor() {
+    return Executors.newCachedThreadPool(
+        new ThreadFactoryBuilder()
+            .setDaemon(true)
+            .setNameFormat("Logger channel (from parallel executor) to " + addr)
+            .setUncaughtExceptionHandler(
+                UncaughtExceptionHandlers.systemExit())
+            .build());
+  }
+{code}
+Change this thread pool with one which we can limit the maximum threads. This way the OOM got solved but not sure this is the best thing to do. Or if there is better way to do it.
+
+Will see we can get some more opinions here.
+
+[~shv] [~xkrogen] [~stevel@apache.org] Any pointers?
+
+Great discussion here. [~ayushtkn], particularly good call on the issue that cancelling is not fully sufficient to fix this issue.
+
+I agree that calling cancel + limiting the size of the {{parallelExecutor}} seems to be a good approach. That executor is scoped to a single JN, so a limit will not affect other JNs if one is running slowly. Plus, the {{parallelExecutor}} is only used by {{getJournaledEdits}} and {{getEditLogManifest}} (others use the {{singleThreadExecutor}}) so no other operations besides edit log tailing should be affected. It seems we'll need to use {{new ThreadPoolExecutor()}} directly instead of the {{Executors}} convenience method.
+
+You said that many {{InterruptedException}} instances are being logged, is there any way we can suppress them? Where are they logged from?
+
+edit: [~ayushtkn], I am assigning to you for now since you seem to be driving the effort
+
+Hey guys, discussed this with Chen. It seems that we need a pool of only 3 threads, which can be reused for each iteration of tailing. Here 3 = number of Journal Nodes. Creating threads with such high frequency seems to be expensive in all aspects. How hard would it be to make this change?
+
+Have uploaded patch to limit thread as of now to 1, We can even make the number configurable, being default to 1, if that seems required.
+
+bq. You said that many InterruptedException instances are being logged, is there any way we can suppress them? Where are they logged from?
+We faced this issue in 3.1.1, so I guess HADOOP-16208 might have solved the problem,  IIRC that is the catch block which was creating some trouble.
+
+
+[~xkrogen] [~surendrasingh] can you give  a look?
+
+-[~ayushtkn] isn't 1 thread insufficient to perform the calls in parallel? Shouldn't the max thread pool size be equal to the number of JNs by default?- Nevermind, I reread my previous comment and reminded myself that the {{parallelExecutor}} is scoped to a single JN. Given that the intent of this executor (IIUC) is to allow multiple requests to execute in parallel, it seems we should allow _some_ parallelism at least, but maybe scope it to some reasonable limit of threads (10?).
+
+[~shv], regarding your previous comment, if I understand correctly this pool of threads is already re-used due to the use of the {{ThreadPoolExecutor}}. Let me know if I'm missing anything.
+
+Thanks for working on this [~ayushtkn]! v01 patch LGTM overall, one quick note though. Executors already has {{newSingleThreadExecutor()}} which seems a better fit here. Additionally if we want to make num of threads configurable, there is also {{newFixedThreadPool(int nThreads, ThreadFactory threadFactory)}}.
+
+[~xkrogen] IIUC, {{IPCLoggerChannel}} here is used on per JN communication, that's why here creating single thread pool should be sufficient. I think Konstantin's previous comments was meant to say at max we should need no more than 3 threads?
+
+[~chliang] I don't think we want a fixed thread pool, something which can dynamically expand (with a limit) when parallelism is needed seems better than spinning up a fixed number of threads even if we don't need them. Let me know if you disagree.
+
+[~xkrogen] I agree. But in the particular case here, the only concern I think, is if one thread stuck talking to a (potentially dead) JN in a previous call, having another thread talking to this JN will likely stuck as well. In which case parallelism does not give much benefit, but just overhead. But if it is for some other reason one thread is slow, having more threads helps. I don't have a strong opinion on single thread vs no more than some number of threads here. Either way is fine by me.
+
+Thanx [~vagarychen] [~xkrogen] for the discussion. I agree in general as Chen mentioned parallelism will not pitch in general, as we are also canceling the threads too. But still in extreme cases, there might be chances where it may be usefull. I have uploaded v2 with a config. Using the {{newFixedThreadPool}}. Give a check.
+
+v2 looks good to me except that I don't think {{newFixedThreadPool}} is the right approach. This will create 5 threads per JN even if only 1 is ever used since it sets the core pool size equal to the maximum pool size:
+{code:title=HadoopExecutors}
+  public static ExecutorService newFixedThreadPool(int nThreads,
+      ThreadFactory threadFactory) {
+    return new HadoopThreadPoolExecutor(nThreads, nThreads,
+        0L, TimeUnit.MILLISECONDS,
+        new LinkedBlockingQueue<Runnable>(),
+        threadFactory);
+  }
+{code}
+Instead, what we want is:
+{code}
+new HadoopThreadPoolExecutor(1, numThreads, 1L, TimeUnit.MINUTES, new LinkedBlockingQueue<Runnable>(), threadFactory);
+{code}
+This gives a core pool size of 1 thread, so there will always be 1 running for use. More can be spawned as-needed, but only up to {{numThreads}} at maximum.
+
+Thanx [~xkrogen], Have uploaded v3 with said change.
+
+Looks better to me, thanks [~ayushtkn]! I do think we should rename the config and update the description to represent that this config is a _maximum_ thread count; the way it reads now, I would assume that there are always this many threads being used.
+
+One thing I noticed, you used a keepalive time of 0:
+{code}
+    return new HadoopThreadPoolExecutor(1, numThreads, 0L,
+        TimeUnit.MILLISECONDS, new LinkedBlockingQueue<Runnable>(),
+{code}
+I feel a longer time would probably be better; if more than 1 thread is needed, it will probably be needed again soon (might represent a slow JN?), so it seems some keepalive would be helpful to avoid the thread creation overhead. Also you can use [diamond-typing|https://docs.oracle.com/javase/tutorial/java/generics/types.html#diamond] here for the {{LinkedBlockingQueue}} instantiation.
+
+[~shv], does the current approach address your previous concerns?
+
+Thanx [~xkrogen], Well we can change it to 60 seconds. As it was previously, I guess that should be enough since we are cancelling the threads too?
+
+
+Hm. I believe that when you call {{cancel()}} on the {{ListenableFuture}}, it does not kill the thread, it just interrupts it so that it can go on to fetch another task. But it would be good to confirm this.
+
+Yes, As I said above too, It interrupts But doesn’t kill, Then is Client.java it checks whether the thread is interrupted or not, if interrupted then it stops retrying, IIRC
+So thread can be reused..
+
+Agreed, I think we are saying the same thing. I'm +1 on v004 patch.
+
+[~shv] and [~vagarychen] are both at a conference until Friday, would you mind if we wait until then to see if they want to provide any input before we commit?
+
+No issues, We can definitely wait. It would be good if we can get feedback from them too. :)
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 43s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:red}-1{color} | {color:red} test4tests {color} | {color:red}  0m  0s{color} | {color:red} The patch doesn't appear to include any new or modified tests. Please justify why no new tests are needed for this patch. Also please list what manual steps were performed to verify this patch. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 18m 34s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 55s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 49s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m  3s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 13m 21s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m  1s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 51s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 59s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 52s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 52s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 43s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 58s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} xml {color} | {color:green}  0m  2s{color} | {color:green} The patch has no ill-formed XML file. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 12m 43s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 15s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 51s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}105m 38s{color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 30s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}163m 44s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hdfs.server.blockmanagement.TestBlockTokenWithDFS |
+|   | hadoop.hdfs.server.balancer.TestBalancerWithMultipleNameNodes |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=19.03.0 Server=19.03.0 Image:yetus/hadoop:bdbca0e53b4 |
+| JIRA Issue | HDFS-14655 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12980112/HDFS-14655-04.patch |
+| Optional Tests |  dupname  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  xml  |
+| uname | Linux 5e1a891a2b03 4.15.0-58-generic #64-Ubuntu SMP Tue Aug 6 11:12:41 UTC 2019 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 64ed6b1 |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_222 |
+| findbugs | v3.1.0-RC1 |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/27847/artifact/out/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/27847/testReport/ |
+| Max. process+thread count | 2827 (vs. ulimit of 5500) |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs U: hadoop-hdfs-project/hadoop-hdfs |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/27847/console |
+| Powered by | Apache Yetus 0.8.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+[~xkrogen] [~vagarychen] [~shv] any further comments...
+
+Hey guys, would it possible to add a test case? We clearly didn't capture it in testing.
+
+Thanx [~shv]
+Have added a UT(thanks to Chen, used parts from his poc patch). Well have a check confirming the number doesn't shoot more then 5(the default number of threds for a JN). Works at my local.  May be we can relax number a bit, to prevent flakiness..
+Pls review!!!
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  1m  0s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 19m 19s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m  0s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 49s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m  6s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 13m 27s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m  5s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 49s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m  0s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 54s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 54s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 45s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m  2s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} xml {color} | {color:green}  0m  2s{color} | {color:green} The patch has no ill-formed XML file. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 12m 48s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 14s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 48s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}106m 58s{color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 32s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}166m 26s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hdfs.TestDFSUpgradeFromImage |
+|   | hadoop.hdfs.TestMultipleNNPortQOP |
+|   | hadoop.hdfs.tools.TestDFSZKFailoverController |
+|   | hadoop.hdfs.server.balancer.TestBalancer |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=19.03.2 Server=19.03.2 Image:yetus/hadoop:39e82acc485 |
+| JIRA Issue | HDFS-14655 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12980615/HDFS-14655-05.patch |
+| Optional Tests |  dupname  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  xml  |
+| uname | Linux fa411fafa806 4.15.0-60-generic #67-Ubuntu SMP Thu Aug 22 16:55:30 UTC 2019 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / 419dd0f |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_222 |
+| findbugs | v3.1.0-RC1 |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/27902/artifact/out/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/27902/testReport/ |
+| Max. process+thread count | 3368 (vs. ulimit of 5500) |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs U: hadoop-hdfs-project/hadoop-hdfs |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/27902/console |
+| Powered by | Apache Yetus 0.8.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Thanks for adding a test [~ayushtkn]! I'm worried about using {{Thread.getAllStackTraces()}}, as you pointed out it could be flaky. Can we at least filter the names of running threads to make it more specific? We should be able to use "Logger channel (from parallel executor)", and the thread name also contains the address of the JN, so if we could filter to the specific JN's threads, that would be even better.
+
+Also, can we please use the constant {{DFS_HA_TAILEDITS_NUM_THREADS_DEFAULT}} instead of hard-coding 5 into the test case?
+
+Thanx [~xkrogen] for the review.
+Have made said changes in the test in v6.
+
+v6 LGTM! If you want, I think the thread counting can be expressed a bit more concisely like:
+{code}
+    String expectedName =
+        "Logger channel (from parallel executor) to " + ipcAddr;
+    long num = Thread.getAllStackTraces().keySet().stream()
+        .filter((t) -> t.getName().contains(expectedName))
+        .count();
+{code}
+But I'm +1 either way.
+
+looks better. updated in v07.
+
+Awesome! +1 from me. [~shv], does it look okay to you after the addition of the test?
+
+Hey guys I could not reproduce the problem with the new test. It passes even when I reverse the patch for QuorumJournalManager, QuorumCall, and IPCLoggerChannel. If we could replace the assert condition with
+{code}
+    assertEquals(DFSConfigKeys.DFS_HA_TAILEDITS_NUM_THREADS_DEFAULT, num);
+{code}
+then it would fail on current code, but {{num ==1}} in the test with the patch. Is this expected?
+Should we add some failures in {{selectInputStreams()}} to involve use of more threads?
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 26s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 16m  9s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 58s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 54s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m  5s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 12m 40s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 55s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 56s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 57s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 53s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 53s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 47s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 58s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} xml {color} | {color:green}  0m  1s{color} | {color:green} The patch has no ill-formed XML file. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 11m 39s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 58s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 50s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 83m 54s{color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 36s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}137m 33s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hdfs.server.namenode.TestRedudantBlocks |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=19.03.1 Server=19.03.1 Image:yetus/hadoop:39e82acc485 |
+| JIRA Issue | HDFS-14655 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12980643/HDFS-14655-07.patch |
+| Optional Tests |  dupname  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  xml  |
+| uname | Linux ad034b4eac2e 4.15.0-58-generic #64-Ubuntu SMP Tue Aug 6 11:12:41 UTC 2019 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / f16eb09 |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_222 |
+| findbugs | v3.1.0-RC1 |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/27905/artifact/out/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/27905/testReport/ |
+| Max. process+thread count | 4574 (vs. ulimit of 5500) |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs U: hadoop-hdfs-project/hadoop-hdfs |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/27905/console |
+| Powered by | Apache Yetus 0.8.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+[~shv] I previously tried the same (revert the production code changes and run the test) and got a test failure as expected. I just re-downloaded the patch and tried again now and got the same result. I added a print message to the assertion to print out how many threads were seen and got:
+{code}
+[INFO] -------------------------------------------------------
+[INFO]  T E S T S
+[INFO] -------------------------------------------------------
+[INFO] Running org.apache.hadoop.hdfs.qjournal.client.TestQuorumJournalManager
+[ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 5.54 s <<< FAILURE! - in org.apache.hadoop.hdfs.qjournal.client.TestQuorumJournalManager
+[ERROR] testSelectThreadCounts(org.apache.hadoop.hdfs.qjournal.client.TestQuorumJournalManager)  Time elapsed: 5.335 s  <<< FAILURE!
+java.lang.AssertionError: num was 568
+        at org.junit.Assert.fail(Assert.java:88)
+        at org.junit.Assert.assertTrue(Assert.java:41)
+        at org.apache.hadoop.hdfs.qjournal.client.TestQuorumJournalManager.testSelectThreadCounts(TestQuorumJournalManager.java:1060)
+        at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+        at sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:62)
+{code}
+Are you sure you correctly reverted the changes?
+
+Thanx [~shv] and [~xkrogen].
+ I too verified by reverting and the test fails for me too without the fix.
+
+[~shv] May be you can try once commenting this line too in the test {{TestQuorumJournalManager}} :
+{code:java}
+    // Don't retry connections - it just slows down the tests.
+    conf.setInt(CommonConfigurationKeysPublic.IPC_CLIENT_CONNECT_MAX_RETRIES_KEY, 0);
+{code}
+And may be try increasing the number in the loop too, to some even bigger number:
+{code:java}
+   for (int i = 0; i < 1000; i++) {
+{code}
+
+May be environment specific. Let me know if you still can't repro,
+
+Thanks [~ayushtkn] for detailed investigation and patch.
+
+Initially I too wasn't able to fail the test without src changes. It was always passing.
+{quote}conf.setInt(CommonConfigurationKeysPublic.IPC_CLIENT_CONNECT_MAX_RETRIES_KEY, 0);
+{quote}
+Commenting this line failed the test without src changes and with src changes it passed as expected.
+
+So [~ayushtkn], can you update the test to enable retries only for this test. Not for others, as mentioned it slows down test if its enabled for all tests.
+
+ 
+ Configuration name *{{dfs.ha.tail-edits.num-threads}}* does not seem to be correct. Problem area is Qjournal. Not edit tailing. Edit tailing is the feature which uses these APIs.
+
+it could be named  something like *{{dfs.qjournal.parallel-read.num-threads}}* ?
+
+Thanx [~vinayakumarb] for the review.
+ Have made the suggested changes.
+ Pls Review!!
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  1m 21s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+|| || || || {color:brown} trunk Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 21m 27s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m  2s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 55s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m 10s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 13m 41s{color} | {color:green} branch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 20s{color} | {color:green} trunk passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 15s{color} | {color:green} trunk passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m  2s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 57s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 57s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 44s{color} | {color:green} hadoop-hdfs-project/hadoop-hdfs: The patch generated 0 new + 497 unchanged - 1 fixed = 497 total (was 498) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m  1s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} xml {color} | {color:green}  0m  3s{color} | {color:green} The patch has no ill-formed XML file. {color} |
+| {color:green}+1{color} | {color:green} shadedclient {color} | {color:green} 12m 54s{color} | {color:green} patch has no errors when building and testing our client artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 14s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 12s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 97m  5s{color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 31s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}160m 42s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hdfs.server.namenode.TestNameNodeMXBean |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=18.09.7 Server=18.09.7 Image:yetus/hadoop:efed4450bf1 |
+| JIRA Issue | HDFS-14655 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12980980/HDFS-14655-08.patch |
+| Optional Tests |  dupname  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  xml  |
+| uname | Linux f3d995183c35 4.15.0-58-generic #64-Ubuntu SMP Tue Aug 6 11:12:41 UTC 2019 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | trunk / a94aa1f |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_222 |
+| findbugs | v3.1.0-RC1 |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/27932/artifact/out/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/27932/testReport/ |
+| Max. process+thread count | 3010 (vs. ulimit of 5500) |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs U: hadoop-hdfs-project/hadoop-hdfs |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/27932/console |
+| Powered by | Apache Yetus 0.8.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Test failure seems unrelated.
+[~vinayakumarb] [~shv] any further comments?
+
++1 Yes it does work as expected now for me.
+
++1
+
+Committed to trunk, 3.2 and 3.1
+Thanx [~vinayakumarb] [~shv] [~xkrogen] [~vagarychen] for the reviews!!!
+
+Thank you [~ayushtkn]! Would you be open to helping us get this in branch-2 as well? The affected code is present there also.
+
+SUCCESS: Integrated in Jenkins build Hadoop-trunk-Commit #17373 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/17373/])
+HDFS-14655. [SBN Read] Namenode crashes if one of The JN is down. (ayushsaxena: rev eb96a3093ea34a7749410a63c72b6d0a9636d80f)
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/client/QuorumJournalManager.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/client/IPCLoggerChannel.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/qjournal/MiniJournalCluster.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/qjournal/client/TestQuorumJournalManager.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/qjournal/client/QuorumCall.java
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/resources/hdfs-default.xml
+* (edit) hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+
+
+Sure [~xkrogen] would shoot a branch-2 patch for it in a couple of days. The cherry-pick didn't work.
+
+Hi [~ayushtkn], are you still working on the backport?
+
+Reopening for backporting to branch-2
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 38s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+|| || || || {color:brown} branch-2 Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  8m 37s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 53s{color} | {color:green} branch-2 passed with JDK v1.7.0_95 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 48s{color} | {color:green} branch-2 passed with JDK v1.8.0_222 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 40s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 55s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 49s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 10s{color} | {color:green} branch-2 passed with JDK v1.7.0_95 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 46s{color} | {color:green} branch-2 passed with JDK v1.8.0_222 {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:red}-1{color} | {color:red} mvninstall {color} | {color:red}  0m 30s{color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:red}-1{color} | {color:red} compile {color} | {color:red}  0m 33s{color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.7.0_95. {color} |
+| {color:red}-1{color} | {color:red} javac {color} | {color:red}  0m 33s{color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.7.0_95. {color} |
+| {color:red}-1{color} | {color:red} compile {color} | {color:red}  0m 29s{color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.8.0_222. {color} |
+| {color:red}-1{color} | {color:red} javac {color} | {color:red}  0m 29s{color} | {color:red} hadoop-hdfs in the patch failed with JDK v1.8.0_222. {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 35s{color} | {color:green} hadoop-hdfs-project/hadoop-hdfs: The patch generated 0 new + 450 unchanged - 1 fixed = 450 total (was 451) {color} |
+| {color:red}-1{color} | {color:red} mvnsite {color} | {color:red}  0m 30s{color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} xml {color} | {color:green}  0m  1s{color} | {color:green} The patch has no ill-formed XML file. {color} |
+| {color:red}-1{color} | {color:red} findbugs {color} | {color:red}  0m 21s{color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m  3s{color} | {color:green} the patch passed with JDK v1.7.0_95 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 43s{color} | {color:green} the patch passed with JDK v1.8.0_222 {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}  0m 30s{color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 22s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 24m 10s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=19.03.1 Server=19.03.1 Image:yetus/hadoop:da675796017 |
+| JIRA Issue | HDFS-14655 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12981913/HDFS-14655-branch-2-01.patch |
+| Optional Tests |  dupname  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  xml  |
+| uname | Linux b6b55021f197 4.15.0-58-generic #64-Ubuntu SMP Tue Aug 6 11:12:41 UTC 2019 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | branch-2 / c57e6bc3 |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_222 |
+| Multi-JDK versions |  /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_95 /usr/lib/jvm/java-8-openjdk-amd64:1.8.0_222 |
+| findbugs | v3.0.0 |
+| mvninstall | https://builds.apache.org/job/PreCommit-HDFS-Build/28001/artifact/out/patch-mvninstall-hadoop-hdfs-project_hadoop-hdfs.txt |
+| compile | https://builds.apache.org/job/PreCommit-HDFS-Build/28001/artifact/out/patch-compile-hadoop-hdfs-project_hadoop-hdfs-jdk1.7.0_95.txt |
+| javac | https://builds.apache.org/job/PreCommit-HDFS-Build/28001/artifact/out/patch-compile-hadoop-hdfs-project_hadoop-hdfs-jdk1.7.0_95.txt |
+| compile | https://builds.apache.org/job/PreCommit-HDFS-Build/28001/artifact/out/patch-compile-hadoop-hdfs-project_hadoop-hdfs-jdk1.8.0_222.txt |
+| javac | https://builds.apache.org/job/PreCommit-HDFS-Build/28001/artifact/out/patch-compile-hadoop-hdfs-project_hadoop-hdfs-jdk1.8.0_222.txt |
+| mvnsite | https://builds.apache.org/job/PreCommit-HDFS-Build/28001/artifact/out/patch-mvnsite-hadoop-hdfs-project_hadoop-hdfs.txt |
+| findbugs | https://builds.apache.org/job/PreCommit-HDFS-Build/28001/artifact/out/patch-findbugs-hadoop-hdfs-project_hadoop-hdfs.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/28001/artifact/out/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/28001/testReport/ |
+| Max. process+thread count | 96 (vs. ulimit of 5500) |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs U: hadoop-hdfs-project/hadoop-hdfs |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/28001/console |
+| Powered by | Apache Yetus 0.8.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 34s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+|| || || || {color:brown} branch-2 Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  8m  7s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 53s{color} | {color:green} branch-2 passed with JDK v1.7.0_95 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 48s{color} | {color:green} branch-2 passed with JDK v1.8.0_222 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 39s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 55s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 47s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 10s{color} | {color:green} branch-2 passed with JDK v1.7.0_95 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 45s{color} | {color:green} branch-2 passed with JDK v1.8.0_222 {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  0m 48s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 48s{color} | {color:green} the patch passed with JDK v1.7.0_95 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 48s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 42s{color} | {color:green} the patch passed with JDK v1.8.0_222 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 42s{color} | {color:green} the patch passed {color} |
+| {color:orange}-0{color} | {color:orange} checkstyle {color} | {color:orange}  0m 35s{color} | {color:orange} hadoop-hdfs-project/hadoop-hdfs: The patch generated 2 new + 450 unchanged - 1 fixed = 452 total (was 451) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  0m 48s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} xml {color} | {color:green}  0m  2s{color} | {color:green} The patch has no ill-formed XML file. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 50s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m  4s{color} | {color:green} the patch passed with JDK v1.7.0_95 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 41s{color} | {color:green} the patch passed with JDK v1.8.0_222 {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 60m 51s{color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 28s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 86m 41s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hdfs.qjournal.server.TestJournalNodeRespectsBindHostKeys |
+|   | hadoop.hdfs.server.namenode.ha.TestDelegationTokensWithHA |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=19.03.1 Server=19.03.1 Image:yetus/hadoop:da675796017 |
+| JIRA Issue | HDFS-14655 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12981915/HDFS-14655-branch-2-01.patch |
+| Optional Tests |  dupname  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  xml  |
+| uname | Linux ba0aef680074 4.15.0-58-generic #64-Ubuntu SMP Tue Aug 6 11:12:41 UTC 2019 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | branch-2 / c57e6bc3 |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_222 |
+| Multi-JDK versions |  /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_95 /usr/lib/jvm/java-8-openjdk-amd64:1.8.0_222 |
+| findbugs | v3.0.0 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HDFS-Build/28002/artifact/out/diff-checkstyle-hadoop-hdfs-project_hadoop-hdfs.txt |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/28002/artifact/out/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/28002/testReport/ |
+| Max. process+thread count | 2607 (vs. ulimit of 5500) |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs U: hadoop-hdfs-project/hadoop-hdfs |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/28002/console |
+| Powered by | Apache Yetus 0.8.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Two Checkstyle warning, I need to fix.
+ [~xkrogen]  can you give a check once
+
+Thanks [~ayushtkn]! Would you mind explaining any major differences between the 3.x and branch-2 patch so I know what to focus on?
+
+In the test, Lambda Expression was to be replaced and in the {{IPCLoggerChannel}} replaced the diamond typing
+
+Got it. +1 from me on the branch-2 patch but can we fix the two checkstyle issues?
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  1m 15s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+|| || || || {color:brown} branch-2 Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 17m 12s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m  5s{color} | {color:green} branch-2 passed with JDK v1.7.0_95 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m  0s{color} | {color:green} branch-2 passed with JDK v1.8.0_222 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 47s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m  8s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 12s{color} | {color:green} branch-2 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 19s{color} | {color:green} branch-2 passed with JDK v1.7.0_95 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 52s{color} | {color:green} branch-2 passed with JDK v1.8.0_222 {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m  2s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 59s{color} | {color:green} the patch passed with JDK v1.7.0_95 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 59s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 52s{color} | {color:green} the patch passed with JDK v1.8.0_222 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 52s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  0m 35s{color} | {color:green} hadoop-hdfs-project/hadoop-hdfs: The patch generated 0 new + 451 unchanged - 1 fixed = 451 total (was 452) {color} |
+| {color:green}+1{color} | {color:green} mvnsite {color} | {color:green}  1m  0s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} xml {color} | {color:green}  0m  2s{color} | {color:green} The patch has no ill-formed XML file. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 19s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  1m 13s{color} | {color:green} the patch passed with JDK v1.7.0_95 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 48s{color} | {color:green} the patch passed with JDK v1.8.0_222 {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 83m 20s{color} | {color:red} hadoop-hdfs in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 29s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}122m 19s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hdfs.server.namenode.ha.TestSeveralNameNodes |
+|   | hadoop.hdfs.server.namenode.ha.TestBootstrapStandby |
+|   | hadoop.hdfs.qjournal.server.TestJournalNodeRespectsBindHostKeys |
+|   | hadoop.hdfs.server.namenode.ha.TestDelegationTokensWithHA |
+|   | hadoop.hdfs.TestRollingUpgrade |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=19.03.2 Server=19.03.2 Image:yetus/hadoop:da675796017 |
+| JIRA Issue | HDFS-14655 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12982456/HDFS-14655-branch-2-02.patch |
+| Optional Tests |  dupname  asflicense  compile  javac  javadoc  mvninstall  mvnsite  unit  shadedclient  findbugs  checkstyle  xml  |
+| uname | Linux ca325a7543fd 4.15.0-58-generic #64-Ubuntu SMP Tue Aug 6 11:12:41 UTC 2019 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/provided.sh |
+| git revision | branch-2 / 56e2ad2 |
+| maven | version: Apache Maven 3.3.9 |
+| Default Java | 1.8.0_222 |
+| Multi-JDK versions |  /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_95 /usr/lib/jvm/java-8-openjdk-amd64:1.8.0_222 |
+| findbugs | v3.0.0 |
+| unit | https://builds.apache.org/job/PreCommit-HDFS-Build/28030/artifact/out/patch-unit-hadoop-hdfs-project_hadoop-hdfs.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HDFS-Build/28030/testReport/ |
+| Max. process+thread count | 1891 (vs. ulimit of 5500) |
+| modules | C: hadoop-hdfs-project/hadoop-hdfs U: hadoop-hdfs-project/hadoop-hdfs |
+| Console output | https://builds.apache.org/job/PreCommit-HDFS-Build/28030/console |
+| Powered by | Apache Yetus 0.8.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Thanx [~xkrogen]
+Fixed checkstyle and pushed to branch-2.
+
+Thanks [~ayushtkn]!
+
+This issue may cause HDFS-14934.
+
+We have this fix in our deployment, one thing I found is that it prints a ton of WARN {{java.util.concurrent.CancellationException}} in NN logs, can we make a fix to suppress the warnings? 
+
+[~vagarychen] is that different from the issue reported in HDFS-14934?
+
+[~xkrogen] seems like a different message, looks to me that this one happens when a {{Future}} instance got cancelled.
+
+[~vagarychen]  can you share the log trace?
+
+[~ayushtkn] shared below, it may not help too much though, as it seems to be thrown from the thread being cancelled
+{code:java}
+2020-01-03 17:50:10,887 WARN org.apache.hadoop.util.concurrent.ExecutorHelper: Caught exception in thread Logger channel (from parallel executor) to [...some JN hostname:port...]:
+2020-01-03 17:50:10,887 WARN org.apache.hadoop.util.concurrent.ExecutorHelper: Caught exception in thread Logger channel (from parallel executor) to [...some JN hostname:port...]:java.util.concurrent.CancellationException at java.util.concurrent.FutureTask.report(FutureTask.java:121) at java.util.concurrent.FutureTask.get(FutureTask.java:192) at org.apache.hadoop.util.concurrent.ExecutorHelper.logThrowableFromAfterExecute(ExecutorHelper.java:47) at org.apache.hadoop.util.concurrent.HadoopThreadPoolExecutor.afterExecute(HadoopThreadPoolExecutor.java:90) at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1157) at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:624) at java.lang.Thread.run(Thread.java:748) {code}
+
+Thanx [~vagarychen] for sharing. I think this should be fixed by HDFS-14934
+
+Although it's a different message, checked again, does look like HDFS-14934 should fix this too. Thanks  for the pointer [~ayushtkn]!
+

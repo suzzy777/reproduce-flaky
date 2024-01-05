@@ -1,0 +1,47 @@
+CC [~fly_in_gis] do you have some ideas?
+
+Forgot to attach the example. This is the streaming WordCount example that I modified to have two "inputs", similar to how the WordCount example is used in the YARN/kerberos/Docker test. Instead of using the input once we use it like this:
+{code}
+text = env.readTextFile(params.get("input")).union(env.readTextFile(params.get("input")));
+{code}
+to create two inputs from the same path.
+
+-Each TM contains 3 slots, and one TM should be able to carry the job. So the issue may be that why the RM requested 2 new TMs when only 3 new slots are requested.-
+-Another issue is that why the 2nd requested TM cannot be fulfilled, yet I'm not sure if it's an expected cluster limitation.-
+Sorry I made a mistake here. Just ignore it.
+
+I think I find the cause of this issue.
+
+I was looking at this [log|https://api.travis-ci.org/v3/job/614505046/log.txt] that [~gjy] reported in [FLINK-14834|https://issues.apache.org/jira/browse/FLINK-14834]. The corresponding commit is 4d28d3f783e48708ab1175b323aa9ed332cf207e.
+
+According to the log, RM first received on slot request, and started a TM for that request. After the first TM is registered, RM received another 2 slot requests, this time it started only 1 TM. We have seen similar problems before.
+
+When RM starts a TM, it also generates pending task slots according to the number of slots the new TM should have (in our case 1), so that RM can assign slot requests to pending slots before the TM is registered. Later when TM registers to RM, the registered actual slots will be mapped to the pending slots if they have the same profile, and slot requests assigned to the pending slot will be assigned to the corresponding actual slot (see {{SlotManagerImpl#registerSlot}}). If the profile of registered slot is different from the pending slot, the pending slot will not be consumed.
+
+In our case, when the first request arrives, RM starts a new TM, generates a pending slot, and assign the request to the pending slot. When the TM is registered, the pending slot is not consumed because the slot profile doesn't match. Yet, the request will be assigned to the registered slot, and the pending slot becomes unassigned. Then the next 2 slot requests arrive, 1 of the request will be assigned to the pending slot, so RM only starts new TM for the other request. As a result, there's no pending TM and the slot request assigned to the pending slot will never be satisfied.
+
+The reason that pending slot and registered slot may have different profile, is because memory sizes on RM / TM are calculated from configuration in different code paths, so the calculated results may suffer from slight rounding errors due to the fraction multiplying. Previously in 1.9, we solve this problem by explicitly overwriting managed memory size in the configuration to make sure RM / TM have the same managed memory size, which is the only value in slot profile the is actually used. That solves most of the problem. But we failed to discover the problem in 1.9 that there is a bytes -> megabytes -> bytes conversion of managed memory size on TM side, which may also introduce errors. In 1.9 all the fields of ResourceProfile are represented by MB, so the conversion should not cause problems. But recently we changed them to MemorySize that stores the bytes value, which uncovers the accuracy loss.
+
+I think this also explains [~aljoscha]'s finding that not all the value of `taskmanager.heap.size` triggers the problem. Because different value of `taskmanager.heap.size` can result in different managed memory size, and not all managed memory sizes have accuracy loss in the conversions.
+
+The problem should be fixed by FLIP-49, which will be merged soon. In FLIP-49 we calculated the memory sizes with exactly same code paths, to eliminate the differences between resource profiles calculated on RM / TM sides.
+
+I think [~xintongsong] is right. I am developing the active Flink Kubernetes Integration and come across the same problem. Set different `taskmanager.heap.size` may lead to different result. The root cause is precision loss in TaskManager when convert to bytes value to mega bytes value.
+
+I checked, the problem resolves after merging FLIP-49: [https://github.com/apache/flink/pull/10161]
+ It would be still nice to understand in detail where in source code the slot request was rejected for the newly launched TM
+ [~xintongsong] could you post references in source code where it happens? and maybe where the calculations diverged
+
+The matching between pending slots and registered slots happens in {{SlotManagerImpl#registerSlot}}, {{findExactlyMatchingPendingTaskManagerSlot}} to be specific. If the resource profile does not match, {{findExactlyMatchingPendingTaskManagerSlot}} will return {{null}}, thus {{pendingTaskManagerSlot}} will also be {{null}}, and the codes will not executed to the else branch below, where {{pendingTaskManagerSlot}} is removed from {{pendingSlots}}.
+
+If you look at {{ActiveResourceManagerFactory#createActiveResourceManagerConfiguration}} in commit {{4d28d3f783e48708ab1175b323aa9ed332cf207e}} (or other commits with this problem), you will find that managed memory size is explicitly set into configuration in bytes. This value is later used in {{ResourceManager#createWorkerSlotProfiles}} for creating profiles of pending slots.
+
+On the TM side, the explicitly configured managed memory size is first read in {{TaskManagerServicesConfiguration#fromConfiguration}}, by {{ConfigurationParserUtils#getManagedMemorySize}} which parses the bytes value but only returns the megabytes value. Then in {{TaskManagerServices#calculateMemorySizeByType}}, this megabytes value is converted back to bytes, which is used for calculating slot profile on the TM side in {{TaskManagerServices#computeSlotResourceProfile}}.
+
+The conversion from bytes into megabytes ({{>> 20}}), then to bytes again ({{<< 20}}) leads to accuracy loss.
+
+Thanks for the explanation [~xintongsong], makes sense to me.
+[~aljoscha] I think we can close this issue if you agree
+
+I checked this myself and it is in fact fixed.
+

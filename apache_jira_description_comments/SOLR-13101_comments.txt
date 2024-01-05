@@ -1,0 +1,386 @@
+[~yseeley@gmail.com], FYI, i had a POC with these, see:
+https://github.com/oleewere/solr-cloud-storage-poc
+https://github.com/apache/ambari-infra/tree/cloud-storage-poc (custom solr build based on solr tarball)
+(used hdfs client ... worked on only real environments... but included localstack, gcs emulator as a container..actually s3a setup can work against localstack, but that one is broken)
+some notes:
+- i replaced hadoop jars with custom hwx ones (those with 2.7.x build contains some classes that is not there in apache maven repo ones)
+- s3n looked good, s3a seems to be broken but it would require some changes in aws-sdk (requires to use shared connection pool, that can be set in http client).
+- wasb/wasbs looked good
+- adlsV2 had some ssl related issues (although it did not used ssl) - some cipher problems, i used solr with jdk10 in docker, maybe that caused some issues
+- gcs connector uses guava 27, solr is using like 14, so that results a ClassDefNotFound exception during loading the gcs fs implementation, maybe that can be solved with updating to a new guava or shade gcs-connector jar with the dependencies
+
+what i have mostly see, i could create shards then adding documents as well. interestingly a simple delete query only deleted like 40% of the documents (then request failed)
+also after stopping solr containers, write.lock files needs to be deleted from cloud storage, it would be nice if we would have an option to delete those on startup (not sure solr already have this or not)
+
+Thinking about how to kick this off... 
+At the most basic level, looking at the HDFS layout scheme we see this ("test" is the name of the collection):
+{code}
+local_file_system://.../node1/test_shard1_replica_n1/core.properties
+hdfs://.../data/test/core_node2/data/
+{code}
+And core.properties looks like:
+{code}
+numShards=1
+collection.configName=conf1
+name=test_shard1_replica_n1
+replicaType=NRT
+shard=shard1
+collection=test
+coreNodeName=core_node2
+{code}
+
+It seems like the most basic desirable change would be to the naming scheme for collections with shared storage.
+Instead of .../<collection_name>/<core_node_name>/data
+it should be .../<collection_name>/<shard_name>/data
+since there is only one canonical index per shard.
+
+
+
+h2. SolrCloud + Blobstore
+
+I've attached a PR containing all of the existing blobstore code to this Jira ([https://github.com/apache/lucene-solr/pull/864]). The following description can be found in that PR description, and in my branch under lucene-solr/solr/README-BLOB.md. I'm posting it here as well for extra visibility. 
+h3. Overview
+
+This repo introduces a new framework which allows SolrCloud to integrate with an external (typically cloud-based) blobstore. Instead of maintaining a copy of the index on each Solr host, replicating updates to peers, and using a transaction log to maintain consistent ordered updates, Solr hosts will push and pull cores to/from this external store.
+
+TL;DR: For now, SolrCloud can be configured to use blobstore at a collection level. Collections backed by blobstore use a new SHARED replica type. When a Solr node makes an update request to a shared shard, it indexes locally and then pushes the change through to a shared blobstore. Zookeeper manages index versioning and provides a source of truth in the case of concurrent writes. Solr nodes in a cluster will no longer use peer-to-peer replication, and instead will pull updates directly from the shared blobstore.
+
+Please note that this project is a work in progress, and is by no means production-ready. This code is being published early get feedback, which we will incorporate in future work.
+
+In order to modularize these changes and maintain existing functionality, most of the blobstore-related code is isolated to the _solr/core/src/java/org/apache/solr/store/blob directory_. However, there some key integration touchpoints in _HttpSolrCall#init_, _DistributedZkUpdateProcessor_, and _CoreContainer#load_. These classes all have special handling for blobstore-based shards.
+h3. Pulling from Blobstore
+
+Core pulls are, for the most part, asynchronous. When a replica is queried, it enqueues a pull from blobstore but doesn’t wait for the pull to complete before it executes the query, unless the replica is missing a copy of that core altogether. If your operation requires that local cores are in-sync with blobstore, use the method _BlobStoreUtils#syncLocalCoreWithSharedStore_.
+
+A more in-depth walkthrough of the pull code:
+ * _BlobCoreSyncer_: manages threads that sync between local and blob store, so that if a pull is in progress, we do not create duplicate work.
+ * Calls into _CorePullTracker_: creates _PullCoreInfo_ object containing data about the core to be pulled and adds to a deduplicated list.
+ * This queue of pull objects is polled by the _CorePullerFeeder_, which uses threads from its dedicated thread pool to execute CorePullTasks.
+ * _CorePullTask_: checks if a pull is already underway for this core; if not, executes a pull from blob store. Resolves differences between blob’s version of the core and local version, and stores the updated core
+
+h3. Pushing to Blobstore
+
+This happens synchronously. On every local commit, we push to blobstore and only ack that the update was successful when it is committed both locally and in the shared store.
+
+A more in-depth walkthrough of the push code:
+ * _DistributedZkUpdateProcessor_: once a commit is complete for a _SHARED_ replica (_onFinish_), we _writeToShareStore_.
+ * This calls into _CoreUpdateTracker_, which creates a _PushPullData_ object containing data about the collection, core, and most recently pulled version of the core on this replica.
+ * _CorePusher_: resolves the differences between blob’s version of the core and local version, and pushes the updated version to blob store
+
+h3. Resolving Local and Blobstore
+
+The _SharedStoreResolutionUtil_ handles resolving diffs between the Solr node’s local copy of a core and the copy in blobstore. It does so by pulling the metadata for the core from blobstore (_BlobCoreMetadata_), comparing against the local metadata (_ServerSideMetadata_), and creating a list of segments to push or pull.
+h3. Version Management
+
+Only the leader node can push updates to blobstore. Because a new leader can be elected at any time, there is still a possibility for race conditions on writes to blobstore. In order to maintain a consistent global view of the latest version of a core, we keep version data in Zookeeper.
+
+Zookeeper stores this version data as a random string called _metadataSuffix_. When a SolrCloud node makes an update request, it first pushes the files to blobstore and then makes a conditional update to the metadataSuffix variable. If Zookeeper rejects the conditional update, the update request fails, and the failure is propagated back to the client.
+
+This communication with Zookeeper is coordinated in the _SharedShardMetadataController_. The SharedShardMetadataController belongs to the _Overseer_.
+h3. Try it yourself
+
+If you want to try this out locally, you can start up SolrCloud with the given blobstore code. The code will default to using the local blobstore client, with "/tmp/BlobStoreLocal" as the blobstore directory (see _LocalStorageClient_). You can create a shared collection through the Solr admin UI by setting “shared store based” to true.
+
+Note: if you want to try testing with the _S3StorageClient_, you need to store a valid S3 bucket name and credentials as environment variables (see _S3StorageClient#AmazonS3Configs_).
+
+The new package management system already has a blob store . We can probably combine these efforts to avoid confusion
+
+The ticket is SOLR-13710
+
+Solr already has a [Blob Store|https://lucene.apache.org/solr/guide/8_0/blob-store-api.html] for jars (plugins).  And as Noble points out, SOLR-13710 introduces _a second_ Blob Store in SOLR-13710 that appears duplicative with the former, committed to 8.x.  Eventually either could be used for not just plugins but resources (e.g. language models, etc.) generally.  Does it make sense to use the same name "blob store" for index data?  That would imply not just a common name but some common APIs as well that work seamlessly.  I'm not sure if these use cases fit well together or not.  If we separate them, I suggest we abandon this nebulous word "blob" and be more specific – a "Resource Store" and a "Index Store".  What do others think?
+
+Yep, we definitely can't have 3 "blob store" APIs!  It possibly could make sense to use a common config or shared class to access shared storage like S3, but that unification could be done at a later point as well. I could get behind terminology like "Index Store" for the SHARED replica type.  And perhaps referring to the lower levels like S3 as "Shared Storage"?
+
+
+
+We can have multiple file share systems. Just use a different name so that we don't confuse the users
+
+I plan on creating a branch jira/SOLR-13101 soon for future work on this issue.
+edit: this has been done.
+Please use this branch for future pull requests:
+https://github.com/apache/lucene-solr/tree/jira/SOLR-13101
+
+Can we collaborate over the ASF slack for discussing harmonizing the 3 blob stores? I am okay with having all three, if they serve different usecases; just that we need to have a cohesive and consistent story around it in terms of documentation.
+
+bq. I plan on creating a branch jira/SOLR-13101 soon for future work on this issue.
+How far do you think is it complete? Do you forsee a lot of more work going in here? Or, do you suggest we start reviewing it and attempt to merge it soon (in a week or so?).
+
+bq. How far do you think is it complete? Do you forsee a lot of more work going in here? Or, do you suggest we start reviewing it and attempt to merge it soon (in a week or so?).
+
+I think it's got a bit more to go.  It would be nice if the behavior matched normal solr semantics a little closer... would be easier to get better test coverage by reusing existing tests and changing the replica type.  Some things off the top of my head:
+ - a commit doesn't cause latest changes to be visible on replicas (a query on a non-leader replica actually causes an async pull from blob of the latest index)
+ - there are currently some concurrency issues with index pushing
+ - I *think* one still needs to specify a commit to get a push to blob... this needs to be implicit (commit=true,openSearcher=false) for data durability by default
+I need to dig into the code in general more... as you can see from the commits on the branch, this work was all done by my colleagues, not me.  But we're working on encouraging more open development!
+
+
+Commit 8a34ce0257cd48ad2c65a94ace2d9d3e8d102f60 in lucene-solr's branch refs/heads/jira/SOLR-13101 from Yonik Seeley
+[ https://gitbox.apache.org/repos/asf?p=lucene-solr.git;h=8a34ce0 ]
+
+SOLR-13101: fix test compilation
+
+
+Commit 57245e9c93caa2173deede6f28dc29b6105e60f5 in lucene-solr's branch refs/heads/jira/SOLR-13101 from Yonik Seeley
+[ https://gitbox.apache.org/repos/asf?p=lucene-solr.git;h=57245e9 ]
+
+Merge branch 'branch_8_3' into jira/SOLR-13101
+
+
+Commit 619dde553a0510a5380691bbe6037d0dcdee46c3 in lucene-solr's branch refs/heads/jira/SOLR-13101 from Yonik Seeley
+[ https://gitbox.apache.org/repos/asf?p=lucene-solr.git;h=619dde5 ]
+
+SOLR-13101: merge 8.3 branch
+
+
+Commit 0e66beca46d193fed0fc864d55487961ce7f4cc5 in lucene-solr's branch refs/heads/jira/SOLR-13101 from Yonik Seeley
+[ https://gitbox.apache.org/repos/asf?p=lucene-solr.git;h=0e66bec ]
+
+SOLR-13101: disable SharedStorageSplitTest.testLiveSplit
+
+
+The branch https://github.com/apache/lucene-solr/tree/jira/SOLR-13101 has been brought up to date by this PR:
+https://github.com/apache/lucene-solr/pull/983
+None of the commits mentioned this JIRA, which is why I think this issue wasn't automatically updates.
+
+Is it possible to give an example of how one would use this new feature?
+
+like workflow, APIs, public interfaces, new additions to ZK etc?
+
+We still need to work on adding some documentation to the ref-guide on how to configure/use the feature from an end-user prospective. I suppose a doc would will be useful covering public interfaces, additions to ZK, and the overall design for solr developers as well.
+
+ 
+
+Commit 9201c586ba05537a049e6406070361cdda561a4c in lucene-solr's branch refs/heads/jira/SOLR-13101 from Bilal Waheed
+[ https://gitbox.apache.org/repos/asf?p=lucene-solr.git;h=9201c58 ]
+
+SOLR-13101:These are pretty much non functional changes, related to SHARED replica concurrent updates (#1028)
+
+https://github.com/apache/lucene-solr/pull/983/commits/581f468f9914ce2488201efbed42fd43dc4b481
+- Pull read lock is only required before the local indexing starts. If indexing has to pull it can acquire and release write lock without anything to do with read lock first. Removing the unneeded lock upgrade/downgrade logic to simplify things.
+- Added one pager explanation in the start of SharedCoreConcurrencyController around overall concurrency design.
+- Added mores comments around BlobCoreMetadata#generation number and its usage.
+
+Commit db72b8b2061875bd421e1a657caecbca0c922817 in lucene-solr's branch refs/heads/jira/SOLR-13101 from Andy Vuong
+[ https://gitbox.apache.org/repos/asf?p=lucene-solr.git;h=db72b8b ]
+
+SOLR-13101: Address flakiness of tests using async pulls and handle interrupt properly (#1029)
+
+
+
+Commit 1a6e1e6ebcddc73c488c1eaee0201cb2fa518109 in lucene-solr's branch refs/heads/jira/SOLR-13101 from Bilal Waheed
+[ https://gitbox.apache.org/repos/asf?p=lucene-solr.git;h=1a6e1e6 ]
+
+SOLR-13101: Don't invoke push to shared store for isolated commits. (#1065)
+
+-Disable the noisy "going back to task queue" log line.
+
+Commit 036ce539525aa9c0eb0270d94e4105cd1a0313e9 in lucene-solr's branch refs/heads/jira/SOLR-13101 from Bilal Waheed
+[ https://gitbox.apache.org/repos/asf?p=lucene-solr.git;h=036ce53 ]
+
+SOLR-13101: Concurrency tests for SHARED collection. (#1081)
+
+* SOLR-13101: Concurrency tests for SHARED collection.
+
+-Concurrency tests for SHARED collection.
+-On core container shutdown, shutdown the background blob delete manager too.
+-Use correct casing for SharedCoreStage enum.
+-Added INDEXING_BATCH_FINISHED to indicate the end of a batch (BLOB_PUSH_FINISHED does not help if push itself runs into error)
+
+* -CR feedback.
+
+
+Commit 036ce539525aa9c0eb0270d94e4105cd1a0313e9 in lucene-solr's branch refs/heads/jira/SOLR-13101 from Bilal Waheed
+[ https://gitbox.apache.org/repos/asf?p=lucene-solr.git;h=036ce53 ]
+
+SOLR-13101: Concurrency tests for SHARED collection. (#1081)
+
+* SOLR-13101: Concurrency tests for SHARED collection.
+
+-Concurrency tests for SHARED collection.
+-On core container shutdown, shutdown the background blob delete manager too.
+-Use correct casing for SharedCoreStage enum.
+-Added INDEXING_BATCH_FINISHED to indicate the end of a batch (BLOB_PUSH_FINISHED does not help if push itself runs into error)
+
+* -CR feedback.
+
+
+Is there  any reason why wee can't release this as a third party plugin using the new package manager instead of pushing this to Solr codebase?
+
+ 
+
+bq. Is there  any reason why wee can't release this as a third party plugin
+
+Yes, the fundamentals (the new SHARED replica type) need to be in core.  Specific storage options (such as S3) are already designed to be pluggable.
+Another point is that deployment in public cloud environments is now the norm, as is separation of compute and storage.  It deserves first-class support.
+
+I would love to see a few more details
+
+ 
+
+Is it a standard Solr plugin that I can define in solrconfig.xml? Can it be configured through remote API?
+If yes? which one
+If not, let's have a separate discussion
+
+What are the public touch points? 
+* remote APIs
+* configurations
+* files created/used in ZK/filesystem
+
+We need to make every new addition to Solr easily digestible to a casual observer.
+
+
+
+Sorry, haven't looked into the branch yet.
+bq. Yes, the fundamentals (the new SHARED replica type) need to be in core. Specific storage options (such as S3) are already designed to be pluggable.
+This means that the fundamentals stay in solr-core and the specific pluggable storage options go into separate modules (contribs?), right?
+
+If that's the case, would it be possible (for easier reviewing) to please split this up into two separate PRs, i.e. one for the solr-core changes, and another PR for the separate modules?
+
+Commit ef01979c6484012e1369cb2aedf927fd58152709 in lucene-solr's branch refs/heads/jira/SOLR-13101 from Megan Carey
+[ https://gitbox.apache.org/repos/asf?p=lucene-solr.git;h=ef01979 ]
+
+SOLR-13101: ant precommit fixes (#1117)
+
+* Fix the gson version reference
+
+* Fixed all precommit failures
+
+Co-authored-by: Andy Vuong <andyvuong@users.noreply.github.com>
+
+
+The issue definitely deserves a [SIP|https://cwiki.apache.org/confluence/display/SOLR/Solr+Improvement+Proposals]!
+
+Commit 5c797bfa31063a6532e223a18db16c0a2dc8effe in lucene-solr's branch refs/heads/jira/SOLR-13101 from ebehrendt
+[ https://gitbox.apache.org/repos/asf?p=lucene-solr.git;h=5c797bf ]
+
+SOLR-13101: Log accurate file counts for Push and Pull in CorePushPull (#1195)
+
+* CorePushPull blob interaction log line inaccurate in case of failures. Fix logged file and bytes count to be accurate in both success and failure
+
+* Move file transfer count data into inner class to preserve incremented values when exception is thrown
+
+
+Commit 51bf98cf8367a67d5d17fec6e172625967221cb4 in lucene-solr's branch refs/heads/jira/SOLR-13101 from ebehrendt
+[ https://gitbox.apache.org/repos/asf?p=lucene-solr.git;h=51bf98c ]
+
+SOLR-13101: Convert nanotime to ms (#1208)
+
+* Convert nanoseconds to milliseconds
+
+* Clean up from incorrect merge
+
+* Incorporate CR feedback to move time to a utility function. Use TimeUnit java util to convert from nanoseconds to milliseconds.
+
+* Rename method from getCurrentNanoTimeInMs to getCurrentTimeMs
+
+
+Commit ca6dc53c78b897a7f402fa1681d825c5cd7b412f in lucene-solr's branch refs/heads/jira/SOLR-13101 from Andy Vuong
+[ https://gitbox.apache.org/repos/asf?p=lucene-solr.git;h=ca6dc53 ]
+
+SOLR-13101: Make dir hash computation optional and resilient (#1359)
+
+* Make dir hash computation optional and resilient
+
+* Throw illegalstateexception and update comments
+
+* Delete unused method, fix typo
+
+Commit 738dbb35c7c1db82141d90b200c0bc69c6fa1b9b in lucene-solr's branch refs/heads/jira/SOLR-13101 from Andy Vuong
+[ https://gitbox.apache.org/repos/asf?p=lucene-solr.git;h=738dbb3 ]
+
+SOLR-13101: Enable shared store via system property only (#1424)
+
+
+
+Commit ad3f0a30181aa4d7ba099ee67fd45fa98cf9c2c0 in lucene-solr's branch refs/heads/jira/SOLR-13101 from Bilal Waheed
+[ https://gitbox.apache.org/repos/asf?p=lucene-solr.git;h=ad3f0a3 ]
+
+SOLR-13101: SHARED replica's distributed indexing (#1430)
+
+* SOLR-13101: SHARED replica's distributed indexing
+The basic purpose of this change was to refactor most of the SHARED replica logic out of DistributedZkUpdateProcessor. Along with that refactoring I came across couple of functional issues in the logic that have been fixed too.
+
+Functional fixes:
+-If a replica looses its leadership in the middle of indexing batch, it should still push its changes to the shared store.
+-SHARED replica does not need to process soft commits and does not need to broadcast hard commits to all the shards of a collection.
+-Previously we would pull from the shared store even when the doc being added/deleted is not meant for the current core/shard.
+-Previously DistributedZkUpdateProcessor#processDelete was running its pull logic even before the request had been setup (DistributedZkUpdateProcessor#setupRequest).
+-DistributedZkUpdateProcessorTest have been deleted in favor of new SharedStoreDistributedIndexingTest SharedCoreIndexingBatchProcessorTest.
+
+Refactoring:
+-Most of DistributedZkUpdateProcessor's SHARED replica logic is moved into a new SharedCoreIndexingBatchProcessor. The purpose of this class is to pull from the shared store at the start of an indexing batch (if the core is stale) and push to the shared store at the end of a successfully committed indexing batch.
+-CoreUpdateTracker has been deleted and its only persistShardIndexToSharedStore method has been renamed to pushCoreToSharedStore and moved to CorePusher.
+-BlobStoreUtilsTest#syncLocalCoreWithSharedStore is renamed to pullCoreFromSharedStore and moved into a new CorePuller class and the tests to CorePullerTests.
+-I did rename phrase "blob store" to "shared store" at some places in the changed classes. But it was not meant to be an exhaustive attempt.
+
+* -Throw error for pull request for an unknown.
+-Log warning when indexing a non-active shard.
+
+* Address CR feedback.
+
+Commit ad3f0a30181aa4d7ba099ee67fd45fa98cf9c2c0 in lucene-solr's branch refs/heads/jira/SOLR-13101 from Bilal Waheed
+[ https://gitbox.apache.org/repos/asf?p=lucene-solr.git;h=ad3f0a3 ]
+
+SOLR-13101: SHARED replica's distributed indexing (#1430)
+
+* SOLR-13101: SHARED replica's distributed indexing
+The basic purpose of this change was to refactor most of the SHARED replica logic out of DistributedZkUpdateProcessor. Along with that refactoring I came across couple of functional issues in the logic that have been fixed too.
+
+Functional fixes:
+-If a replica looses its leadership in the middle of indexing batch, it should still push its changes to the shared store.
+-SHARED replica does not need to process soft commits and does not need to broadcast hard commits to all the shards of a collection.
+-Previously we would pull from the shared store even when the doc being added/deleted is not meant for the current core/shard.
+-Previously DistributedZkUpdateProcessor#processDelete was running its pull logic even before the request had been setup (DistributedZkUpdateProcessor#setupRequest).
+-DistributedZkUpdateProcessorTest have been deleted in favor of new SharedStoreDistributedIndexingTest SharedCoreIndexingBatchProcessorTest.
+
+Refactoring:
+-Most of DistributedZkUpdateProcessor's SHARED replica logic is moved into a new SharedCoreIndexingBatchProcessor. The purpose of this class is to pull from the shared store at the start of an indexing batch (if the core is stale) and push to the shared store at the end of a successfully committed indexing batch.
+-CoreUpdateTracker has been deleted and its only persistShardIndexToSharedStore method has been renamed to pushCoreToSharedStore and moved to CorePusher.
+-BlobStoreUtilsTest#syncLocalCoreWithSharedStore is renamed to pullCoreFromSharedStore and moved into a new CorePuller class and the tests to CorePullerTests.
+-I did rename phrase "blob store" to "shared store" at some places in the changed classes. But it was not meant to be an exhaustive attempt.
+
+* -Throw error for pull request for an unknown.
+-Log warning when indexing a non-active shard.
+
+* Address CR feedback.
+
+Hey Solr Community!
+
+I wanted to share an update on this JIRA. We've recently decided to continue work on this project internally for convenience and as we work through new challenges and re-visit our design of shared storage. Some of these challenges include:
+ * Forcing commits and pushes to Blob on each (sub) indexing batch makes things expensive (paying traffic to S3) and less efficient from a SolrCloud perspective (too many small commits, merge cost),
+ * Delaying ack to client on an indexing batch until data is indexed, segment is created then pushed to S3 slows things down considerably,
+ * Transaction logs are used heavily in SolrCloud code. Having nodes with non persistent storage is challenging (for example post shard split recovery mode)
+
+Work is progressing but we'll no longer use our feature branch for this work. We'll be sure to keep the community updated in the future as we progress on addressing these issues.
+
+[~andy_vuong]Vuong is it anything that stops us from making this a plugin available through Solr's package system?
+
+Making it as a package helps many more users to use it and make the feedback loop faster
+
+Noble; you asked on the 21st of December last year (13 comments up) and Yonik answered the next day.  In summary, the approach here is not at all pluggable, just as our other current replica types (NRT/PULL/TLOG) aren't pluggable either.
+
+How do we know that this support won't suffer the same neglect that HDFS and CDCR suffered? I haven't seen a design document for the proposed work here, so I can't comment on specifics, but in general we do not want such a massive patch into Solr core for a non essential feature such as this. We should start with defining the interfaces that can stay in core and concrete implementations that should stay outside.
+
+As ishan mentioned, I see this as a problem of lack of modularity. We are not thinking in terms of separation of concerns. Why are we not able to define the interaction points with existing Solr? If this is not an integral part of Solr, it should have a set of interfaces thorough which it interacts with Solr. When people say that it has to be intertwined with Solr, the onus is on them to explain why it is so. 
+
+[~dsmiley] I do not see any answers to [this question|https://issues.apache.org/jira/browse/SOLR-13101?focusedCommentId=17002508&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-17002508]
+
+TBH adding this into SolrCloud under its current form (of this work and of SolrCloud) is going to be very challenging, and as David said, this is not the kind of abstraction that can be pluggable.
+But not to worry: there are no short term intentions to merge anything here. 
+
+Thanks [~ilan] for the clarification
+
+Hi, any updates on this issue? I would be keen to see a working version of this feature available in SolrCloud. We're having to scale our SolrCloud permanent storage environment in a GKE cluster on a regular basis, so it would be nice to have the data persisted in GCS so that we don't have to scale our storage every time. 
+
+I would like to close this issue as won't-fix because the substance and feature branch (with linked PRs) pointing to this issue is dead-in-the-water (will not be merged, or further publicly contributed to).  However the issue title, "Shared storage support" (rather general) is not a "won't-fix" !  So with that, I propose I re-title the issue to "Shared storage via new SHARED replica type" because in my mind, that's the most stand-out aspect of this PR compared to other alternatives.  WDYT [~ilan]?
+
+That said, do not lose hope for a solution to come into being!  I've been excitedly working on a new plan I've been internally sharing that solves the contribut-ability matters that the SHARED replica type implementation lacks.  If things go well in the coming weeks... there will end up being a new Jira issue to be called "BlobDirectory, a shared storage approach" that will link here.
+
+I have no issue with "will not fix" this Jira.
+
+From my perspective, the fundamental problem of this approach is not the introduction of a new replica type but the need to commit every batch to be able to push segments and having to wait for the push to complete and succeed before calling the indexing itself as successful (there are a few possible optimizations such as pushing files before commit happens so they're ready on blob by then, but the fundamental issues do not go away). That's a major performance degradation.
+
+So yes, please close it. Thanks.
+
+Looking forward to see a different approach that does not have the problems listed above! (or less of them :))
+

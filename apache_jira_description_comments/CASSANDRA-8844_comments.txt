@@ -1,0 +1,1498 @@
+So, ultimately you need a way to implement per-table replication-event synchronous listeners. Like triggers, but without the ability to make additional changes, and invoked on every receiving node, not just the coordinator.
+
+That has been requested many times before and is ultimately doable. Providing anything but the API itself is arguably out of scope for Cassandra-proper, though.
+
+bq. Providing anything but the API itself is arguably out of scope for Cassandra-proper, though.
+
++1
+
+
+To clarify what I think is the minimum viable feature set that Cassandra should support:
+# A DDL mechanism for turning on and off logging for a given table
+# Either file-based logging built in, or a pluggable interface where such logging could be built
+# If it's a pluggable interface, the ability to specify the classname of the logger in the DDL command
+
+Ideally, I'd love to see the pluggable interface to allow for other logging mechanisms, but for Cassandra itself to include a bare-bones logger that could be integrated with out of the box, and to serve as an example for how others should implement the interface.
+I certainly see the CQL delivery mechanism, as well as the more flexible logging (multiple logs per table along with filtering), as out of scope for this ticket. I would create another "future" one for both of those.
+
+Having a mutation log available for clients would be great. +1 for multiple clients, and some form of making the change reporting pluggable.
+
+I've wanted more than once over the last few years to enable stateful front end services that watch for changes in portions of the store. Here's a current example: a visualization server managing a websocket to web/mobile clients and displaying 'live' charts that update as you watch. If the underlying data in cassandra changes, the viz server needs to notice and push a message to the web/mobile client.
+
+Support for multiple clients would help for this scenario. I don't understand why mutliple mutation logs per table are required though. Isn't it sufficient to have a single log and only track an offset for each client? Also, consider having the clients track their own offsets to make the cassandra implementation easier.
+
+Shouldn't cassandra clean the mutation log? The cleaning policy could be influenced by the client, but if the client dies the mutation log shouldn't grow without bound.
+
+In this scenario the front end clients don't want to watch the entire store, but only a small portion.  How 'bout making the portion that reports changes pluggable? One reporter would report all changes for replication scenarios. I'd like to have a reporter that reports on a small dynamic set of partitions.
+
+I think I need this for the Spark Cassandra Connector https://datastax-oss.atlassian.net/browse/SPARKC-40
+
+
+I would argue not for logs but for 'listener' queries for each table. 
+
+If a client want to listen for a certain or all changes he is free to submit where clauses. So every time a changed row of that table fulfills the where clause the client listener gets notified.
+
+A client may issue many where clauses and would be able to query its active where clauses for a table. By removing all where clauses the listener will actually remove itself from the listener list for that table.
+
+One could even extend that by submitting real select statements working on only the currently change row. Maybe the listener may even add a timing setting allowing a node to aggregate multiple update events and send one single notification for multiple changed rows (if this makes sense for a system using hashing for partition / sharding).
+
+Since many clients may listen using the same where clause the performance would be manageable and not depending on how many clients are listening but how many different select statements where listened to by all clients.
+
+By being able to name the listening where clauses one could even generated named events where a combination of name and where clause makes it unique. 
+
+An additional option is being able to add an additional value for each row containing the names of all event names associated with the listener select statements (queries).
+
+Pro:
+  * Easy to understand
+  * Easy to manage 
+  * Fine-tuning is possible (like a single client listens to only a single user or a list of particular users)
+  * Lot of reuse capabilities (just query over the changed row(s) not all rows, grammar etc.)
+  * Works on shared tables
+  * Avoids maintaining disk logs
+  * Only three operations are necessary to implement (add listener query, remove listener query and get all active listener queries).
+  * Performance improvements possible by combining (almost) similar where clauses and by adding special cases (like where clauses for certain user IDs will result in a huge lists.
+  * All in memory operation no disk writes necessary
+
+Contra:
+   * Ensuring  being notified exactly once might be challenging
+   * Only works on changes about to happen afterwards and not changes happened in recent time (no travel back in time like it would be possible while having change logs). 
+
+Similar can also be achieved by Custom Secondary Index path and stream the changes to Kafka. https://github.com/adkhare/CassandraKafkaIndex
+
+Linking prelim design doc with different high-level designs so we can get this conversation going.
+
+Summary:
+The design I'm leaning towards is #6 with #7 as a followup - C* writing CDC history data to a flat file (per configured table) and performing a user-configurable behavior (UE, drop oldest, etc) on write if the CDC log for the table in question is full.
+
+An external user-provided daemon will read, ship off, and delete the files when complete. If daemon dies and we hit our disk size limit, we can no longer satisfy the CDC requirement on that table and writes will throw UE (or drop oldest / delete old file / ? if specified in yaml policy). Could also allow configuration of policy per-table rather than for all CDC enabled tables in system.
+
+Enable/disable on tables via DDL, per-DC.
+
+No repair / consistency: expectation is that CDC data is transient as far as c* is concerned (consumed within 10s of ms) and shipped off to an external system w/the intelligence to store/sort/query. CL requirements are satisfied by at-least-once egress semantics - whatever CL you're requiring on your write, we guarantee that # of nodes will write that CDC information to disk or the nodes will throw UE.
+
+More details on the doc w/the CQL proposals as to why CDC data stored in CQL presents some specific challenges for querying back out.
+
+Also more information in the doc w/general estimates as to C* impl complexity, user impl complexity, GC pressure, and write performance impact of the various approaches.
+
+A potential parallel ticket:
+* Provide either a thread or external daemon that parses this file and ships it off to a configured ip:port specified in the .yaml (or another config file). Tails the logs on the local file-system to see updates.
+
+Potential follow-up tickets:
+* Allow filtering on which columns get written to CDC log
+* Support for multiple consumers before clearing old records
+* History querying?
+
+Ideally we'd parallelize the construction of the thread/daemon that reads the files and sends them out with working on the base implementation so we can deliver both at the outset.
+
+Update on current status - DDL/CQL changes are in, as is schema. I nested the set of DC's in TableParams.
+
+When considering writing to a CL and CDC log atomically, I run into the fact that it's [very hard to do|https://commons.apache.org/proper/commons-transaction/], if not impossible on top of current filesystems.
+
+If we keep a separate CDC log, we have the following design options with the following problems:
+h6. 1: Write to CL, then write to CDC log, throw UE if CDC Log write fails
+# If CDC log write fails and we throw UE, we still have data in the CL that can be replayed on node restart with no CDC record, and we have CL/memtable mismatch.
+## We could also replay CDC information on commit log replay, but we'd have to pull that data from 2 sources
+## We duplicate a lot of work, even if it's just decorating CL serialization w/Role.
+
+h6. 2: Write to CDC log, then write to CL, if CL fail, write redact record to CDC
+# We want to write to CL 1st. Adding another step before writing CL means reducing data integrity/speed to on-disk
+# Still duplicating a lot of I/O
+# Consumers have to deal with CDC record invalidation
+
+----
+If, however, we serialize Role information into the CL itself and have CDC clients parse CommitLogs, that opens up the following:
+h6. 1: If on a table w/CDC, serialize Role into CL. Consumer reads CL for CDC information and marks the entire CL as complete when all records are processed
+# Slow consumer could kill nodes w/CL space being used up.
+# Node's notion of flushing when CL nearing limit would be invalid. Slow consumer would lead to used CL space being full and node would loop on attempting to flush memtable to free up CL space.
+
+And the final option that I *think* gives us the best of all worlds:
+h6. 2:  Add custom post-processing on memtable flush: If on a table w/CDC, on write serialize Role into CL. Consumer reads CL for CDC info, marks entire CL complete when records are processed. On memtable flush, if CL not processed by CDC, it's moved into a logical "CDC-overflow" pool w/its own configurable size limit. Writes to CDC-enabled tables either throw UE or just drop old CDC logs depending on .yaml
+# Can't think of any major problems with this. Yet.
+(note: Rather than "if not processed by CDC", it probably makes more sense to flag a CL as containing CDC records or not, and during flush if a segment is marked as containing CDC-data, just leave the file for a CDC consumer to clean up and add its size to the CDC-overflow counter)
+
+The final option gives us:
+* ConsistencyLevel guarantee - successful writes to CL are guaranteed to have a corresponding logical CDC-entry, as it's the write itself
+* performance profile - performance is only slower if you have CDC enabled on a table, only slower by the time it takes to serialize the extra role data
+* the best "downtime" logical profile - writes to CDC-enabled tables only are impacted by slow consumer, not entire node
+* low disk overhead - configurable space for the CDC Overflow pool used when consumers are behind memtable flushing. Only writing delta of Role rather than serializing the entire CL record.
+
+CASSANDRA-7075 would further help mitigate any extra overhead of extra serialization, however this should not be necessary for this to work.
+
+Any thoughts on the last idea (or any of them really) are greatly appreciated.
+
+Potentially relevant, CASSANDRA-9834
+
+The efforts here should be easy to integrate into CASSANDRA-9834; actually looks like that would make CDC handling in the code-base less complex/unique as it would introduce the idea of invalidating specific records and we'd be able to add the notion of "CDC invalidation" to that ledger. Not necessary for this effort but shouldn't be difficult to integrate either, depending on scheduling.
+
+
+
+A question that's come up - if we have a small % (1% for instance) of CL records as CDC-enabled, we end up with a large amount of wasted space in CDC and hit our limit much earlier due to fragmentation/wasted space.
+
+A simple "compaction" of CL->CDC log would better facilitate long-term storage of CDC records. On CL discard/recycle, we can pass the CL segment over to a CDC-cleaning task that iterates through the file, discarding all non-CDC records and all records behind the timestamp of the currently consumed CDC offset, writing these records to a new file for future CDC consumption.
+
+This should allow CDC to better support both the more immediate consumption model (CDC consumed within < 100 ms for instance) and the long-term consumption model (files sit on cluster for months to be collected in bulk). This would also open the door for us to add CDC-compression in the future as well.
+
+
+
+Questions on the operational side:
+
+1) What happens with repair (nodetool or read-repair). Does the proposed impl re-push the notifications to consumers ?
+2) What happens with the corner case when a replica DID received a mutation but did not ack the coordiniator in timely manner so it will receive a hint later ? Notification pushed twice ?
+3) What happens in case of  a new node joining accepting writes for the token range as well as the old node that is still accepting writes for this portion of token range ? Notification will be pushed to any consumer attached to the "joining" node ?
+4) What happens with the write survey mode ? Do we push notifications in this case ?
+
+I know that the Deliver-at-least-once semantics allow us to send notifications more than once but it's always good to clarify all those ops scenarios to have less surprise when the feature is deployed
+
+bq. What happens with repair (nodetool or read-repair). Does the proposed impl re-push the notifications to consumers ?
+We recently added a form of mutation-based-repair on the path on repair for MV -> it passes the mutation through to apply to view replicas without applying to the local CommitLog as the SSTables are swapped in to the Tracker. With minimal modification we can use a similar path for repair on CDC-enabled tables.
+
+bq. What happens with the corner case when a replica DID received a mutation but did not ack the coordiniator in timely manner so it will receive a hint later ? Notification pushed twice ?
+Yes. Currently the guarantee is at-least-once delivery of CDC messages. While we could theoretically keep a set of all seen CDC messages and ignore duplicates, I'd prefer we start out conservative on the resource footprint and evolve the feature in the future as needs arise (unless you have a strong case for this now).
+
+bq. What happens in case of a new node joining accepting writes for the token range as well as the old node that is still accepting writes for this portion of token range ? Notification will be pushed to any consumer attached to the "joining" node ?
+Any node that performs a write to the CL will also have a CDC-record for that write (since logically the CL record will be the CDC record).
+
+bq. 4) What happens with the write survey mode ? Do we push notifications in this case ?
+Great question. I don't feel strongly either way; we could either allow write-survey nodes to participate in CDC and thus open them to throwing UE if CDC logs aren't consumed or we could specifically exclude CDC participation on nodes in this mode. Have any strong feelings on it?
+
+bq. We recently added a form of mutation-based-repair on the path on repair for MV -> it passes the mutation through to apply to view replicas without applying to the local CommitLog as the SSTables are swapped in to the Tracker. With minimal modification we can use a similar path for repair on CDC-enabled tables.
+
+Excellent, it will reduce the overhead for repair
+
+bq. we could either allow write-survey nodes to participate in CDC and thus open them to throwing UE if CDC logs aren't consumed
+
+I believe the primary goal of write survey mode, as its name states, is to watch the behavior of a new node under write workload with various settings. Since adding CDC will have a perf impact on the write path (be it small impact or not doesn't matter), I think it is relevant to activate CDC on write survey node too so that the user has the real perf metrics
+
+Quick update as to where things stand here - I'm prototyping 2 different models for PoC on performance, both based on "CL-format as CDC log".
+
+# trigger an immediate "compaction" of CL->CDC on CL flush in a separate thread. Avoids risk of changing CL subsystem and complexity of interaction w/multi-threaded segment management.
+# write to 2 separate CL, 1 of which is non-CDC data and managed as normal and another that's CDC-data and needs to be flagged as consumed before removal. Updates to CommitLogReplayer should be trivial, and primary concern is having multiple CL on host and segment allocation complexity.
+
+I see #1 as being the immediate, lowest-impact "correct" answer, and #2 as being a long-term solution for highest performance on a saturated node. Want to get some actual performance #'s out of the 2 options before moving forward w/API clarification and full implementation.
+
+Currently we parse the backup SSTable files to integration the data from C* to other storage system. And it is hard to capture change data this way. So I will definitely vote for this feature.
+
+I always wonder what is it in the commit log of Cassandra? Won't it be exactly the change data? It is a black box right now for us, like bin log of MySQL database?
+
+RE Separate CDC log
+For CDC in VoltDB what we did was have the commit log replay generate CDC data. Commit log replay would truncate the CDC data based on the first visible commit log record to avoid some duplicate delivery in the event of a very large commit log replay.
+
+IMO a failed CDC log write is a failed write period. You could write to the memtable and buffer CDC writes in memory until failure or block writes until the CDC log is writable or some combination.
+
+I see the CL as your source of truth. If the DB commits doing something in the CL then on replay we do or die modulo any opt-in escape hatches. If we can't do something we have to either halt, or buffer and not truncate the CL.
+
+RE CL as CDC log
+I like how Postgres just has "the WAL." It presents design and technical challenges, but the uniformity of the mechanism and the test and quality advantages seem worth it to me.
+
+I don't grok the multiple commit log volumes as a must have. Especially of the log is asynchronous. They are a nice to have in terms of allowing people to parallelize the commit log without using RAID, but we should be able to write a commit log at hundreds of megabytes/second to a single file.
+
+In VoltDB we didn't use the commit log for CDC because the CDC data was not a straight mirror of table data. It was enriched by application logic and could be a different schema and represent logic + multiple reads from the DB transforming and enriching. If that is a direction we are interested in then writing bare mutations to the CL is less interesting.
+
+Read a little further down in the comments (and yeah, I should probably update the design doc - haven't been active on this ticket for a bit). Current approach is to write to CL and compact to CDC log on CL flush, meaning you get the same guarantees for CDC writes as you get for general writes by virtue of it piggybacking on the standard write process (sync window considerations, etc).
+
+CL is source of truth, and we compact the CDC-enabled CF into a separate log so we don't have to munge w/coordinating marking records as clean in CL segments from an external source and injecting that external dep. into our CL management, as 1st pass of CDC is going to be CDC-log file only w/external user-supplied consumption daemon.
+
+re: different place/size bound for CDC log, we don't want nodes to fall over because of unbounded CDC data on disk. User-configurable limit on disk-space to allocate for CDC and UE on CDC-enabled writes when at limit gives us that guarantee.
+
+For our use-case / design, CDC data is a straight mirror of table data.
+
+I don't want to scope creep this ticket. I think that this is heading the right direction in terms of deferring most of the functionality around consumption of CDC data and getting a good initial implementation of buffering and writing the data.
+
+I do want to splat somewhere my thoughts on the consumption side. VoltDB had a CDC feature that went through several iterations over the years as we learned what did and didn't work.
+
+The original implementation was a wire protocol that clients could connect to. The protocol was a pain and the client had to be a distributed system with consensus in order to load balance and fail over across multiple client instances and the implementation we maintained for people to plug into was a pain because we had to connect to all the nodes to acknowledge consumed CDC data at replicas. And all of this was without the benefit of already being a cluster member with access to failure information. The clients also had to know way too much about cluster internals and topology to do it well.
+
+For the rewrite I ended up hosting CDC data processors inside the server. In practice this is not as scary as it may sound to some. Most of the processors were written by us, and there wasn't a ton they could do to misbehave without trying really hard and if they did that it was on them. It didn't end up being a support or maintenance headache, and I don't think we had instances of the CDC processing destabilizing things.
+
+You could make the data available over a socket as one of these processors, there was a JDBC processor to insert into a database via JDBC, there was a Kafka processor to load data into Kafka, one to load the data into another VoltDB instance, and a processor that wrote the data to local disk as a CSV etc.
+
+The processor implemented by users didn't have to do anything to deal with fail over and load balancing of consuming data. The database hosting the processor would only pass data for a given range on the hash ring to one processor at a time. When a processor acknowledged data as committed downstream the database transparently sends the acknowledgement to all replicas allowing them to release persisted CDC data. VoltDB runs ZooKeeper on top of VoltDB internally so this was pretty easy to implement inside VoltDB, but outside it would have been a pain.
+
+The goal was that CDC data would never hit the filesystem, and that if it hit the filesystem it wouldn't hit disk if possible. Heap promotion and survivor copying had to be non-existent to avoid having an impact on GC pause time. With TPC and buffering mutations before passing them to the processors we had no problem getting data out at disk or line rate. Reclaiming spaced ended up being file deletion so that was cheap as well.
+
+I'm a little concerned about this part of the spec:
+
+{quote}Takes place on every node, not just the coordinator, so RF number of copies are logged.{quote}
+
+Every use case I can think of will require de-duplication of the CDC logs.  Shouldn't Cassandra provide this?  Or was that part changed and I'm not seeing it in the comments?
+
+It is designed to be RF copies for redundancy and high availability. If Cassandra were to deduplicate, and then the node that owned the remaining copy goes down, you have CDC data loss (failure to capture and send some data to a remote system). It is essential that the consumer be given enough capability that they can build a highly reliable system out of it. I believe that there will need to be a small number of reliably-enqueuing implementations built on top of CDC that will have any necessary de-dupe logic built in. What I would *most* like to see is a Kafka consumer of CDC that could then be used as the delivery mechanism to other systems. 
+
+I share [~rustyrazorblade]'s concerns here. It would be good to think about how to consume the CDC logs without having to process each mutation RF times. That is in many cases redundant work that may be prohibitive in some/many cases. At-least-once processing is what the goal should be. If there is a way to layer at-least-once semantics (but not at-least-RF) then okay, but that is not clear here. 
+
+At to [~tupshin]'s Kafka suggestion, you cannot specify the IDs/offsets on writing into the queue, so you would end up enqueueing RF times and not really solve the problem. 
+
+[~JoshuaMcKenzie] can you explain what happens in the following case. I do a CL_ONE write and only one replica is available, so the other 2 (assume RF=3) are not available. The other 2 come back online and a repair operation happens to bring those nodes up to date. Then the original node that got the write goes down. At this point, I want to process the changes. But the mutation is not in the commitlog of either of the online nodes. Is that correct?
+
+I'm worried that there is a mutation that made it into this cluster but is now not in any CDC log and that the CDC log is not resilient in this case. Do I have this correct? 
+
+bq. I do a CL_ONE write and only one replica is available
+CL_ONE implications for data consistency are the same between regular mutations and CDC, however from a consistency perspective (CL vs. CDC)...
+
+bq. a repair operation happens to bring those nodes up to date.
+This raises a good point. My initial reaction / thought is that an approach similar to the mutation-based repair we're using for MV would allow replicas to process CDC-records for mutations as they're written to the local CL during that repair, meaning the CDC records would then be available and CL / CDC consistency would be retained. I'd like to see more data on the impact on repair performance this has vs. the traditional approach so I'll take a look at that while working on this.
+
+While I haven't really followed how MVs are doing mutation-based repair, your idea to go down that path mirrors my own thinking. 
+
+to clarify, I believe there are two separate issues:
+1) Currently, nothing, including repair, is able to cause a partially replicated CDC table to converge towards fully CDC-replicated, even when only worrying about delivering the latest copy and not caring about intermediate mutations
+2) intermediate mutations aren't retained, and therefore any plausible fixes to #1, short of mutation-based repair, will still not recover all mutations that were applied to mutable-state columns.
+
+So +1 to [~JoshuaMcKenzie]'s suggestion.
+
+bq. I haven't really followed how MVs are doing mutation-based repair
+
+[3.0 mutation-based MV repair|https://github.com/apache/cassandra/blob/cassandra-3.0.2/src/java/org/apache/cassandra/streaming/StreamReceiveTask.java#L158-L178]
+
+Is that actually equivalent? MV is materializing an end state. CDC is a change log with a record of the intermediate states and all those state changes need to be replicated. HT to Brian Hess.
+
+This is about getting the CDC-log to reflect changes in the local CL or SSTables for any given replica. With respect to that context, the usage of mutations for repair should be equivalent.
+
+How do the mutations get generated? There is no state in the base table reflecting that the mutations need to propagate. So when repair runs and generates a merkle tree is that going to include the CDC log containing the mutations that are a side effect of state transitions no longer visible in the base table?
+
+I think I understand what you're getting at: mutations from a mutation-based repair would represent the delta on the current state so interim states that data passed through that a replica missed would not be reflected in the CDC-log on the replica that was offline. Mutation-based repair would only give us a point-in-time snapshot of the CDC record for that key so, if the original node failed, you'd be able to have an accurate view of the state of the data if not the full history.
+
+My original proposal of our consistency guarantee is "At the consistency-level of the query that generated the CDC-record", so if you CL ONE, have 2 nodes down with RF=3, and then repair, you still only have the guarantee of the full, accurate state-history of the CDC-transaction reflected on one node. If you CL QUORUM, you should have quorum copies, etc.
+
+On aggregation (assuming no node failure on the CL ONE), since CDC data from the original node will be consumed along with CDC data from replicas that will have this "temporal gap", the combined result of aggregating all the CDC-data together should still be accurate.
+
+This makes the consistency level of the CDC log completely defined by the CL of the mutation as it is written. That impacts anyone using CDC all the way to the application. The CDC log should transparently be additive to the table. That is, the user should not have to write to the table in any special or prescribed way in order to get the mutations captured. Requiring the client to write at CL_QUORUM of CDC is enabled is not okay. 
+
+The thing that concerns me is that the consistency/replication of the CDC log now has a completely different guarantee than the base table (system, actually). The fact that a user can use Cassandra with any CL on writes and the system will eventually get to a consistent state is a good thing. The CDC log should be similarly eventually consistent, via any CL for the mutations. 
+
+The situation described above is a situation that Cassandra covers just fine and results in an eventually consistent state. However, it will result in CDC loss which is not acceptable. The goals of CDC is not to get to snapshot differences, but to capture every mutation (including the intermediate mutations). The solution should tolerate nodes being offline and not lose any mutations, without requiring the application producing the mutations to be modified. 
+
+bq. the user should not have to write to the table in any special or prescribed way in order to get the mutations captured. Requiring the client to write at CL_QUORUM of CDC is enabled is not okay.
+If we're offering an ==RF level guarantee for CDC consistency at the granular, per-mutation level, that would mean transparently upgrading all CL_ONE to CL_QUORUM and ignoring the client's requested write consistency. We have to keep the write level from a CommitLog perspective in sync with the CDC-perspective or we run the risk of ending up with the inverse scenario, where we have CDC data on a replica that never receives a base mutation (though unlikely).
+
+bq. that the consistency/replication of the CDC log now has a completely different guarantee than the base table (system, actually
+That depends on what the stated goals/features/guarantees of CDC are. This gets down to the question of which of the 2 (or both) things are requirements with regard to CDC as a feature:
+# A one-way data replication mechanism that's fast, lightweight, real-time, and integrated, or
+# A record of every single mutation to a key that's occurred on a cluster, regardless of whether the mutations are on a node that goes down
+
+The original proposal(s) would suggest a relaxation of the guarantee on point 2 in favor of drastically reducing the complexity and shortening the delivery time of the feature.
+
+bq. a situation that Cassandra covers just fine and results in an eventually consistent state. However, it will result in CDC loss which is not acceptable.
+There's 2 things here. First, Cassandra covers this situation "just fine" through some heavy-weight logical operations and relaxed (re: eventual) consistency guarantees. Merkle trees, repair, streaming, etc - things that are consistently hot spots for code complexity, cluster load, and ops headaches and failure. Second, *from the perspective of the replica* the CDC log is an exact copy of what's taking place on the replica w/regards to mutations to keys.
+
+I say all this, not to advocate for the "CDC reflects CL, not history of mutations", but rather to offer some logical counterpoints and consequences to your rather strongly worded statements above.
+
+While it is technically feasible for us to also merkle/sync CDC logs (or use some other byte-level synchronization, though I can't think of any other really viable approach w/potential small missing mutations in the middle of a log), IMO this is opening pandora's box and better resolved by reflecting the CL of a query in the CL of the CDC data. Otherwise, we will have to start tracking whether or not CDC-state is synchronized between replicas, reflect that sync in the life-cycle of CDC logs on top of whether or not they've yet been consumed by a local daemon/consumer, and incorporate a repair mechanism to get CDC records in sync between those replicas as well (much like Ariel was alluding to above).
+
+At face value, to me it makes a lot more sense to either a) tell users of this limitation of CDC (if you write at CL.ONE, you may miss interim CDC-state on data if you lose the one node that got it) or b) upgrade mutations on a CDC-enabled CF to QUORUM. The ROI of either of these two approaches is far greater than the alternative in my opinion.
+
+I certainly think that Cassandra should not transparently "upgrade" or alter the requested consistency level of the write from the application.  Doing so is "surprise behavior" and I think should be avoided, especially since the client requested a specific consistency level (which we'd be then ignoring and doing something different).  So, I'm -1 on that approach (do we do anything like that anywhere else in the system?).
+
+I'm also -1 on the choice that the resiliency of the CDC log is only up to the original consistency level of the write.  CDC is a layer that should be additive to a table without needing to alter the application that is writing to that table.  The semantics of RF and CL for the CDC log itself should be governed by separate settings, though having the RF be equivalent to the base table and the CL equivalent to the original write make sense - however, the semantics should allow for the CDC log to achieve the full RF just as the base table does (e.g., via repair, etc).
+
+Essentially, I think I disagree with this Assumption in the design doc:
+
+bq. Don’t have to worry about repair - guarantee is CL # of nodes have the update and it will be consumed by client within ms. at-least-once semantics and time horizon mean we don’t have to worry about repairing CDC data.
+
+I think the second goal/requirement you laid out above (a record of all mutations seen by the cluster) is an important part of the purpose of this ticket (and the original intent I had when [~tupshin] and I discussed this).  Many uses stem from this interpretation of CDC logs, especially when the goal is for consumers other than other Cassandra clusters are processing the CDC log, but in some cases even Cassandra clusters would need to see every mutation, not just the final delta (e.g., Cassandra triggers on the destination system that provide for side-effects to mutations).
+
+The issue of capturing every mutation in a durable/distributed/resilient way is intertwined with my belief that we should not have to process all RF copies of the CDC log.  Needing to process all RF copies of the CDC log puts a processing burden on the consuming system that is at least undesirable (and at most prohibitive).  There does not appear to be an approach to avoiding processing all RF copies to ensure at-least-once-delivery (but not at-least-RF-deliveries).  Moreover, the resiliency approach depends on requiring the consumer to process all RF copies of the logs in order to ensure processing every mutation.  In addition, processing all RF copies of the CDC log will incur a large processing overhead (200% extra in the RF=3 case, for example).  So, I'm also -1 on needing to process all the CDC logs on all replicas.  
+
+
+My take on this:
+If you chose ONE, you chose "If one node goes down completely, I might lose data", you also chose "If one node goes down, I might miss intermediate steps on other nodes".  This is the nature of choosing ONE, you are only guaranteed the data is on ONE node.
+
+For CDC then, if you write with ONE and two nodes are down long enough that hints to not replay to them, then those nodes are going to miss all the intermediate writes for a given value and only receive the final value when repair is run.
+
+With CDC being local to the nodes, the CDC log on those nodes will be correct if it gets the final value when the data is repaired, as far as those nodes are concerned the data went from value 1 to value 10 with no steps in between.
+
+If you want your CDC data to survive single node complete loss, then just like your normal data, you need to use something other than ONE, that is not counter to how Cassandra works, it is completely in line with how the rest of Cassandra works.
+
+With local CDC you also do not get a total ordering of the mutations, as nodes in the system will get the mutations in different orders, as a consumer you need to understand how to process C* mutations and the fact that you can get duplicates, and you can get things out of order, and you need to apply the same "highest timestamp wins" logic when processing data from the CDC logs.
+
+Unless we want to impose severe performance penalties on all writes which use CDC such that CDC becomes global and not local to a node, I do not see any way around this.  Once you have the CDC log on each node you can have some external thing process them and present the data in what ever ordering you want, but I definitely agree this should not be part of the critical path, and users of CDC will need to keep the possible edge cases in mind when using it.
+
+Just like with normal INSERTS where using ONE will almost definitely lose some acked data if a node up and dies never to come back, using ONE with CDC will almost definitely lose some transactions if a node up and dies never to come back.
+
+bq. I certainly think that Cassandra should not transparently "upgrade" or alter the requested consistency level of the write from the application. Doing so is "surprise behavior"
+After thinking some more on this over the weekend: I'm inclined to agree. There's not a precedent for this (to my knowledge) and it smells on the "Surprise your query is slow!" front.
+
+That being said...
+
+bq. I'm also -1 on the choice that the resiliency of the CDC log is only up to the original consistency level of the write. CDC is a layer that should be additive to a table without needing to alter the application that is writing to that table
+If your cluster is RF=3 and you write CL=1, you have no guarantee that your write (and thus your CDC record of it) got to the subsequent 2 nodes. On top of that, without transparently changing things in the background w/respect to the coordinator nodes and how C* is treating that query, we don't really have a way (other than eventual consistency and repair) to make sure we can transparently give that guarantee. In order to make that CDC data "repairable", we'd need the CDC-log in an indexable format we could incrementally diff against in order to stream CDC mutations to other replicas to have that CDC data available. Which is starting to sound an awful lot like storing CDC-data in a Cassandra table. While that's technically feasible, the lessons we've learned with both hints and batchlog should make us think *really* long and *really* hard before going down that road w/another feature that's basically going to double write mutation overhead for an enabled CF.
+
+bq. Needing to process all RF copies of the CDC log puts a processing burden on the consuming system that is at least undesirable (and at most prohibitive)
+Somebody, somewhere, is going to have to pay this price. Whether we add that complexity into the C* code-base (which I'm -1 on) or there's an interim middle-man process that de-duplicates this stream, this is an unavoidable reality to having multiple replicas, where some of the replicas may have data another does not. Short of forcing a repair before pulling CDC-data from a single replica (having hand-waved away the real problem w/repairing CDC-data mentioned above), I don't see a way around *someone* having to eat this cost. My original orientation was about getting this feature into C* in as minimally invasive a way as possible (both from a complexity and a performance standpoint) and building from there, likely w/a reference daemon, middle-man de-duper, and consumer implementation later.
+
+bq. So, I'm also -1 on needing to process all the CDC logs on all replicas.
+I might be missing something here. Could you help clarify how you could guarantee that you saw all writes for a CF w/respect to the CDC-logs w/out actually reading the CDC-logs on each replica? Or is your concern that forcing a consumer to do that, instead of C*, is what you're looking to avoid?
+
+One thing I want to mention regarding the concept of storing CDC-writes in a C* table: while that'd give us the repair semantics and give a queryable interface for pulling out CDC-data where C* eats the cost of de-duping the data, we've gone down that road before and learned the hard way that using C* as a backing store for internal processes like that amplifies failure scenarios and, in general, makes headaches a lot bigger when things go wrong.
+
+Agree with [~JoshuaMcKenzie] that we should keep the complexity at minimum in C*.
+
+
+
+Updated design doc w/a refinement on the "separate CDC log vs. CommitLog". General and details on page 2 and 3.
+
++1 to the new design.
+
+Josh and I had some offline discussions about the new design. Given the constraints around requiring the CDC log to be persisted at the same time as the commitlog, this change in direction makes a lot of sense. It seems to address most of the concerns presented at the beginning; notably, it will require the daemon to be written in Java, as it will require using the CommitLogReplayer.
+Since we aren't going to be able to have a separate, stable format for CDC but will instead be relying on the format of the commitlog, I think we'll need to provide a simple testing daemon, along with an easy-to-run test, so that as the internal format and API changes we actually keep up to date (unlike triggers post-8099). Also, using the internal APIs is going to be difficult.
+Finally, I think it's important that we keep this change as non-invasive to the rest of the system as possible; the less we have to change non-CDC code, the more likely it is that we won't have inadvertently broken the commitlog.
+
+
+A couple comments/question
+1. You seem to have changed from specifying CDC at the table level to the Keyspace level.  Is that correct?  That sort of contradicts one of the requirements in your document.
+2. The CDC consumer needs to process a serialized mutation.  How will a developer write that?  Is there a commitlog serialized mutation format document that someone can use?  Do they need to write that in Java and link to the full Cassandra jars (and dependencies)?
+
+
+# Yes, it was moved to keyspace to handle atomic mutations. Atomicity is provided at the keyspace level, not the table level; if we were to split apart an atomic mutation into CDC and non-CDC commit logs, we would be breaking that atomicity
+# Yes, the daemon will require using the {{CommitLogReplayer}}, and thus the full Cassandra jars. We don't have any document describing the mutation format or the commit log format, and it is subject to change with versions. Changes to the mutation format or the commit log format will also require deploying a new version of the daemon
+
+
+With respect to the atomicity, saying that you break into CDC and non-CDC commit logs would not change existing behavior, as essentially prior to this ticket all tables have CDC disabled.
+If I have a table in a non-CDC keyspace and I choose enable CDC on that table, how would I do that here?  Or vice versa.  I expect that turning on CDC after the fact is likely to come up (possibly often).
+
+The only supported language for CDC consumer is Java, then?  Will there be an example consumer leveraging the CommitLogReplayer?  Will that program need to have Cassandra running on that machine to process the logs?  As in, will I be able to copy off the CDC logs to be processed elsewhere?
+
+Relying on the Cassandra libs doesn't prevent you from copying the logs elsewhere and processing there, and doesn't require cassandra to be running on those machines. It does require the Java consumer to be implemented in a JVM language, however. I'm not fond of that last part, and would love it if we formalized the format, but I suppose I'll start by reverse engineering it. :)
+
+{quote}
+With respect to the atomicity, saying that you break into CDC and non-CDC commit logs would not change existing behavior, as essentially prior to this ticket all tables have CDC disabled.
+{quote}
+This would represent a change as we wouldn't be writing all of the mutation to the same commit log and flushing it out to disk. If we were to enable CDC at the table level, they could be flushed to different devices and one could fail while the other was synced, which would mean the whole mutation was not atomically applied.
+
+{quote}
+If I have a table in a non-CDC keyspace and I choose enable CDC on that table, how would I do that here? Or vice versa. I expect that turning on CDC after the fact is likely to come up (possibly often).
+{quote}
+It will require altering the keyspace. All of the tables in that keyspace will now be persisting to the CDC log. On the daemon side, it would be possible to filter the CF so that it only processes one.
+
+
+
+The semantics don't change.  There are additional semantics - mutations have to be in the same keyspace, have the same partition, have the same CDC-enabled flag, and can be in different tables.  That is the same as today, as all tables have the CDC-enabled flag set to false.
+
+Changing the whole keyspace would mean my CDC consumer is now processing a lot of unneeded data, just to get to the one table of interest.
+
+{quote}
+Will there be an example consumer leveraging the CommitLogReplayer?
+{quote}
+I would expect we will provide a very simple example which can be used to test CDC and make sure that future changes don't break the interface, as well as demonstrate how to use the {{CommitLogReplayer}}.
+
+{quote}
+Will that program need to have Cassandra running on that machine to process the logs? As in, will I be able to copy off the CDC logs to be processed elsewhere?
+{quote}
+It won't need to have Cassandra running, but it will require access to the schema in order to be able to understand the mutations.
+
+{quote}
+The semantics don't change. There are additional semantics - mutations have to be in the same keyspace, have the same partition, have the same CDC-enabled flag, and can be in different tables. That is the same as today, as all tables have the CDC-enabled flag set to false.
+{quote}
+I disagree. It would be surprising that altering the CDC flag of a previously created table changes the semantics regarding batch queries against that keyspace. Also, from a user point of view, I think it makes sense that you are dealing with which DCs are going to process the data at the keyspace level, as that is also where we deal with the replication strategy.
+
+
+
+bq. You seem to have changed from specifying CDC at the table level to the Keyspace level. Is that correct? That sort of contradicts one of the requirements in your document.
+Definitely changed, and that's due to an implementation detail of our existing infrastructure and atomicity guarantees surrounding a Mutation. Either *all* of a Mutation or *none* of a Mutation will be applied. Mutations are grouped at the Keyspace level. Given that restriction, we can either:
+# Allow CDC flagging on a per-CF basis. We would need to write all mutations to the existing CommitLog infrastructure, mixing CDC w/non, and have a consumer be responsible for filtering out non-CDC mutations on consumption. This pushes the responsibility for being schema-aware into the CDC consumption daemon scope. Since all or none of a Mutation must succeed, we cannot write that data to separate buffers and fsync to separate files and still give that guarantee.
+# make the CDC vs. non-CDC a per-keyspace flag (which fits nicely w/keyspace level replication options). This allows us to write a Mutation as an atomic unit to either the CDC CommitLog or the non-CDC CommitLog and prevents the added scope creep of schema-awareness on consumption daemon. Along with that, it lightens the filtering burden on consumption and allows us to discard CommitLog segments for non-CDC related data much quicker than if the data were interleaved.
+
+To me, option #2 is the clear winner and why we settled on that for this phase of the design.
+
+As to the statement that it contradicts a requirement in the doc: that depends on how you read it and what we actually need. Since CF is encoded in the mutation in the CDC-log, you have the ability to track, per table, what data has changed.
+
+bq. Changing the whole keyspace would mean my CDC consumer is now processing a lot of unneeded data, just to get to the one table of interest.
+See above for reasons from a technical perspective why per-keyspace is a better fit for our existing architecture. Either you have an entire keyspace with a select amount of data you need to read and thus filter out, or you have to filter out *all mutations in the entire system*.
+
+I vote the lesser of two evils.
+
+I've read the updated design doc and I have a concern with the following proposal:
+
+- _.yaml configurable limit of on-disk space allowed to be take up by cdc directory. If at or above limit, throw UnavailableException on CDC-enabled mutations_
+
+ I certainly understand the need to raise a warning if the on-disk space limit for CDC overflows, but raising an UnavailableException will basically block the server for any future write (until the disk space is released). This situation occurs when CDC client does not "consume" CDC log as fast as C* flush incoming data. So we have basically a sizing/throughput issue with the consumer.
+
+ Throwing UnavailableException is rather radical, and I certainly understand the need to prevent any desync between base data and consumer, but raising a WARNING or at least, proposing different failure strategy (similar to **disk_failure_policy**) like EXCEPTION_ON_OVERFLOW, WARN_ON_OVERFLOW, DISCARD_OLD_ON_OVERFLOW would offers some flexibility. Not sure how much complexity it would add to the actual impl. WDYT ?
+
+bq. similar to *disk_failure_policy*
+I'm +1 on that. Should be easy to implement and provide more flexibility for people to determine how to treat failures of CDC logging.
+
+Could also make it a property per keyspace along with CDC being enabled or not rather than a system-wide, but I'm not sure the benefits of that flexibility outweigh the costs since that would be considerably more work to implement.
+
+Clarified primary drivers (i.e. why we're going for minimal implementation rather than integrated full w/C*) and added a note about consumer-configurable approach to CDC-log consumption.
+{quote}
+Write a separate file in cdc_overflow directory for each CDC-enabled CommitLogSegment where we record the current fsync’ed offset from the CLS. Consumer can choose:
+a) (Lower latency option): To tail the primary CDC and get all data, regardless of whether it’s fsynced (kernel buffer will feed up non-fsynced data from people tailing file)
+b) (100% correctness option): To read the offset specified in the corresponding cdc_overflow file(name/format TBD) and only parse data from the primary CDC-log that’s been fsynced
+{quote}
+
+bq. Could also make it a property per keyspace along with CDC being enabled or not rather than a system-wide, but I'm not sure the benefits of that flexibility outweigh the costs since that would be considerably more work to implement.
+
+No need to go down this path, cluster-wide config à-la *disk_failure_policy* is largely enough for the initial scope.
+
+As I understand it, making it per-keyspace could be problematic with DISCARD_OLD_ON_OVERFLOW since each CDC file will have data from all keyspaces. So, if you say to discard some but not others, then you would need to process the CDC file to only discard the ones that have the DISCARD_OLD_ON_OVERFLOW but keep the others. Is that feasible?
+The other 2 seem fine, though. 
+
+I think you are looking at this from the wrong direction. If the setting is per-keyspace, then what you do is only put the tables that should be captured (or only tables that shouldn't be) into a keyspace.
+
+You don't start with an existing keyspace here, you account for capture during data modelling.
+
+But this would allow you to have 2 CDC keyspaces, one with ERROR_ON_OVERFLOW and one with DISCARD_OLD_ON_OVERFLOW. As it's designed (as I understand it), mutations from both keyspaces end up in the same CDC log files. So, if you hit overflow on the keyspace that has DISCARD_OLD_ON_OVERFLOW you need to discard some files, but you probably shouldn't discard mutations from the keyspace that has ERROR_ON_OVERFLOW. 
+
+That's the situation I'm thinking about. 
+
+Oh. I see. I guess if the behaviour on overflow option is made per-keyspace, then you'd need to keep separate CDC segments - one per mode.
+
+I'm in favor of the cluster-wide policy vs. per-keyspace after chewing on it over the weekend. We're already adding a significant amount of complexity to working with the CommitLog by having 2 paths for files to be written (CDC vs. non), adding a 3rd and then working with the resultant 2 overflow directories, tracking, etc - I don't think the benefits of the flexibility justify the complexity on implementation.
+
+{quote}
+I'm in favor of the cluster-wide policy vs. per-keyspace
+{quote}
+You mean node-wide, not cluster-wide, correct? That is, this setting will end up in the yaml, not the schema, right?
+
+For consistency's sake, we'd want this setting to be the same across all replicas servicing CDC. I can't think of any value in having it be configurable on a per-node basis other than the complexity delta between it being .yaml vs. schema.
+
+This would be the first setting at the cluster level instead of at the node level. We have been able to get by with just node-level settings up until now, including for settings like {{commit_log_failure_policy}}; it'd be good to have rationale for why that won't be satisfactory for the CDC settings.
+
+If we do pursue adding cluster level settings, we should create a separate ticket to track it instead of include it with this ticket.
+
+We don't really have any cluster-global configuration at the moment (unless you count schema as such). The assumption is generally that for settings like {{commit_log_failure_policy}} there is no reason to have them different on different nodes, so users just set them to the same value everywhere.
+
+I'd say just have it be set in the yaml, like Carl is suggesting, unless we find a very good reason to come up with a new mechanism (FWIW if we find that it is necessary for the setting value to match everywhere, we can gossip it and error out on disagreement).
+
+bq. This would be the first setting at the cluster level
+bq. We don't really have any cluster-global configuration at the moment
+Two eloquent phrasings pointing to the 1 reason why keeping it in the .yaml is the Right Thing To Do.
+
+In the current design doc it says 
+
+bq. Matches replication strategy
+
+Does this mean if RF was say, three, that three CDC commit logs would be written to across the cluster (compared to say, one write at the coordinator)? In turn I guess that means systems consuming the capture logs will have to perform some kind of de-duplication as de-duplication's not in scope for the design.
+
+
+bq. Does this mean if RF was say, three, that three CDC commit logs would be written to across the cluster (compared to say, one write at the coordinator)? In turn I guess that means systems consuming the capture logs will have to perform some kind of de-duplication as de-duplication's not in scope for the design.
+
+ Yes it is, each replica will notify to its CDC consumer the mutation so at the client level you'll need to perform de-duplication yourself.
+
+ 
+
+bq. Does this mean if RF was say, three, that three CDC commit logs would be written to across the cluster (compared to say, one write at the coordinator)?
+That really was rather poorly phrased initially. I was originally trying to convey that DDL logic would be similar to RF on a KS but even that's not set in stone. I've pulled that from the design doc as the way it currently reads is redundant (anywhere data's written, as per replication strategy, will by definition have CDC).
+
+As for the de-duplication that will need to be done client-side. Whether or not we have a reference implementation for that now (as we will for the CDCConsumerDaemon) is currently up in the air.
+
+bq. Which is starting to sound an awful lot like storing CDC-data in a Cassandra table. While that's technically feasible, the lessons we've learned with both hints and batchlog should make us think really long and really hard before going down that road w/another feature that's basically going to double write mutation overhead for an enabled CF.
+
+
+[~JoshuaMcKenzie] where can I read more about that? Is there anything like a write-up or something? Or should I just read a handful of tickets with comments? Can you help me to compile a list?
+
+I'm looking forward to having this feature, although I think there's a core problem with the current design. I'm trying to learn more around all that and to read thoroughly and comprehend current design doc before making my comment.
+
+bq. where can I read more about that? Is there anything like a write-up or something? Or should I just read a handful of tickets with comments? 
+No centralized store, more tribal knowledge and wisdom of experience. Searching through JIRA for tickets on those topics is your best bet (note: we moved to file-based hints for 3.0 as a particularly salient example of lessons learned)
+
+bq. Can you help me to compile a list?
+Don't have time right now unfortunately as I'm elbows deep in CDC implementation. :)
+
+Something that came up during impl that got me thinking: we currently rely on all segments for a {{CommitLogSegmentManager}} to be located in the same directory. Easy enough design, reliable, rely on OS for separation etc. Good enough for our use-case thus far.
+
+Adding a 2nd CommitLogSegmentManager muddies that water as we'd have some segments allocated by 1 allocator, some by another. Rather than go the route of sharing a directory for both CommitLogSegmentManagers and flagging type / ownership / responsibility by file name regex / filter, I'm leaning towards having cdc commit log segments exist in a subdirectory under commitlog, so:
+
+{noformat}
+data/commitlog
+data/commitlog/cdc
+{noformat}
+
+This leads to the next observation that there's little point in having a cdc_overflow folder with this design as we can simply fail allocation when our /cdc folder reaches our configured size threshold. It's a little dicier on the "consumer deletes segments" front as there's no longer the differentiator of "any segment in this folder, we're done with it", however it's trivial to write the names of completed segment files to a local metadata file to indicate to consumers when we're done with segments.
+
+The only other thing I can think of that's a downside: this will be a change for any other external tools / code that's relying on all segments to be stored in a single directory, hence my update here. Can anyone think of a really good reason why storing commit log segments in 2 separate directories for 2 separate managers would be a Bad Thing?
+
+Edit: Just to clarify one thing: having flushed-to-sstable cdc files in the commitlog/cdc folder vs. in a cdc_overflow folder is a trivial delta w/some bookkeeping differences. Not a big deal nor what I was trying to get at above, so I'll probably end up moving those into cdc_overflow anyway just for separation.
+
+This change seems simple to me. We might want to be able to have the cdc overflow in a different directory, just so that they could put on a separate disk from our live commit logs, but having the cdc commit log files themselves in a separate directory makes sense.
+
+Yeah, I kind of brain-barfed that previous comment.
+
+Right now I'm targeting having a cdc_directory and cdc_overflow_directory, configurable via yaml. Default for cdc_directory is commitlog/cdc, overflow is data/cdc_overflow.
+
+v1 is ready for review.
+
+h5. General outline of changes in the patch
+* CQL syntax changes to support CDC:
+** CREATE KEYSPACE ks WITH replication... AND cdc_datacenters={'dc1','dc2'...}
+** ALTER KEYSPACE ks DROP CDCLOG;
+*** Cannot drop keyspaces w/CDC enabled without first disabling CDC.
+* Changes to Parser.g to support sets being converted into maps. Reference normalizeSetOrMapLiteral, cleanMap, cleanSet
+* Statement changes to support new keyspace param for Option.CDC_DATACENTERS
+* Refactored {{CommitLogReplayer}} into {{CommitLogReplayer}}, {{CommitLogReader}}, and {{ICommitLogReadHandler}} in preparation for having a CDC consumer that needs to read commit log segments.
+* Refactored commit log versioned deltas from various read* methods into {{CommitLogReader.CommitLogFormat}}
+* Renamed {{ReplayPosition}} to {{CommitLogSegmentPosition}} (this is responsible for quite a bit of noise in the diff - sorry)
+* Refactored {{CommitLogSegmentManager}} into:
+** {{AbstractCommitLogSegmentManager}}
+** {{CommitLogSegmentManagerStandard}}
+*** Old logic for alloc (always succeed, block on allocate)
+*** discard (delete if true)
+*** unusedCapacity check (CL directory only)
+** {{CommitLogSegmentManagerCDC}}
+*** Fail alloc if atCapacity. We have an extra couple of atomic checks on the critical path for CDC-enabled (size + cdc overflow) and fail allocation if we're at limit. CommitLog now throws WriteTimeoutException for allocations returned null from CommitLog, which the standard should never do as it infinite loops in {{advanceAllocatingFrom}}.
+*** Move files to cdc overflow folder as configured in yaml on discard
+*** unusedCapacity includes lazy calculated size of CDC overflow as well. See DirectorySizerBench.java for why I went w/separate thread to lazy calculate size of overflow instead of doing it sync on failed allocation
+*** Separate size limit configured in cassandra.yaml for CDC and CommitLog so they each have their own unusedCapacity checks. Went with 1/8th disk or 4096 on CDC as default, putting it at 1/2 the size of CommitLog.
+* Refactored buffer management portions of {{FileDirectSegment}} into {{SimpleCachedBufferPool}}, owned by a {{CommitLogSegmentManager}} instance
+** There's considerable logical overlap between this and BufferPool in general, though this is considerably simpler and purpose-built. I'm personally ok leaving it separate for now given it's simplicity.
+* Some other various changes and movements around the code-base related to this patch ({{DirectorySizeCalculator}}, some javadoccing, typos I came across in comments or variable names while working on this, etc)
+
+h5. What's not yet done:
+* Consider running all / relevant CommitLog related unit tests against a CDC-based keyspace
+* Performance testing (want to confirm that added determination of which {{CommitLogSegmentManager}} during write path is negligable impact along w/2 atomic checks on CDC write-path)
+* dtests specific to CDC
+* fallout testing on CDC
+* Any code-changes to specifically target supporting a consumer following a CDC log as it's being written in CommitLogReader / ICommitLogReader. A requester should be able to trivially handle that with the {{CommitLogReader.readCommitLogSegment}} signature supporting {{CommitLogSegmentPosition}} and {{mutationLimit}}, however, so I'm leaning towards not further polluting CommitLogReader / C* and keeping that in the scope of a consumption daemon
+
+h5. Special point of concern:
+* This patch changes us from an implicit singleton view of {{CommitLogSegmentManager}} to having multiple CommitLogSegmentManagers managed under the CommitLog. There have been quite a few places where I've come across undocumented assumptions that we only ever have 1 logical object allocating segments (the latest being FileDirectSegment uncovered by CommitLogSegmentManagerTest). I plan on again checking the code to make sure the new "calculate off multiple segment managers" view of some of the things exposed in the CommitLog interface don't violate their contract now that there's no longer single CLSM-atomicity on those results.
+
+h5. Known issues:
+* dtest is showing a pretty consistent error w/an inability to find a cdc CommitLogSegment during recovery that looks to be unique to the dtest env
+* a few failures left in testall
+* intermittent failure in the new {{CommitLogSegmentManagerCDCTest}} (3/150 runs - on Windows, so I haven't yet ruled out an env. issue w/the testing)
+
+[~blambov]: while [~carlyeks] is primary reviewer on this and quite familiar with the changes as he worked w/me on the design process, I'd also appreciate it if you could provide a backup pair of eyes and look over the CommitLog changes, CommitLogReplayer refactor, and CommitLogSegmentManagerCDC changes since you've done a good bit of work on the CommitLog subsystem and it should be familiar to you.
+
+||branch||testall||dtest||
+|[8844|https://github.com/josh-mckenzie/cassandra/tree/8844_review]|[testall|http://cassci.datastax.com/view/Dev/view/josh-mckenzie/job/josh-mckenzie-8844_review-testall]|[dtest|http://cassci.datastax.com/view/Dev/view/josh-mckenzie/job/josh-mckenzie-8844_review-dtest]|
+
+Targeting 3.6 for this so we have 4 weeks until freeze.
+
+edit: had a hiccup w/params on the ci jobs, so updating branch name and job links
+
+"adding {{cqlsh}} completion for new CQL features" should be added to the list of things not yet done.
+
+Already in the [diff|https://github.com/apache/cassandra/compare/trunk...josh-mckenzie:8844#diff-7f177c2eab93884c78255b62b8aa50d0L389]. Working for me locally - there something more that needs to be done that I don't know about?
+
+Sorry, nope. I was just reading off your change description, my mistake.
+
+Added link to PR on ccm to fix cdc directory pathing on nodes in ccm cluster. Going to re-run dtests w/that branch shortly.
+
+Since this new feature has evolved significantly since the original description, is there a good summary available for the current form of the feature? Not like full doc or the internal implementation details, but a concise summary at the user level, like where the CDC data will be stored, its format, how to retrieve it, and potential performance impact, both in terms of amount of CPU time required and additional memory required if CDC is enabled. Thanks.
+
+Nothing user-consumable as yet since we're still finalizing what all those things look like.
+
+In its current state, the data resides in CASSANDRA_HOME/data/cdc and CASSANDRA_HOME/data/cdc_overflow, configurable in the .yaml. Format is the 3.6 C* CommitLog format, performance impact of having it enabled should be negligible (checks an extra boolean during write path and looks up an ArrayList entry), and no extra memory requirement.
+
+That being said, the actual user consumption of CDC data will in fact take up CPU cycles and memory on the machine but independently of the C* JVM, so impact should be limited depending on how the consumer daemon / client is written.
+
+Assuming the patch goes through in its current form, a consumer would want to implement the [ICommitLogReadHandler|https://github.com/josh-mckenzie/cassandra/blob/8844_review/src/java/org/apache/cassandra/db/commitlog/ICommitLogReadHandler.java] interface and use the newly refactored out [CommitLogReader|https://github.com/josh-mckenzie/cassandra/blob/8844_review/src/java/org/apache/cassandra/db/commitlog/CommitLogReader.java] to parse the files from disk. These files will be kept up to date as CommitLog formats change, so porting to future revisions of the subsystem and potential file format changes should be relatively easy to do.
+
+[~carlyeks] / [~blambov]: I realized on a call today that I'd overlooked the whole "respect CDC being enabled per-DC" and instead originally implemented the CommitLog routing to SegmentManager as a simple on/off per keyspace. I've pushed a fairly trivial commit that computes and caches a hasLocalCDC flag per local keyspace on create/alter time that's checked on the write path now.
+
+Figured I'd point that out if either / both of you came up with that during your review.
+
+I've finished my first pass of reviewing this ticket. Some of these are some cleanups that came about because of the renames.
+
+- On recovery, we are going to delete the CDC Commit Logs instead of moving them to the CDC Overflow folder; we use {{ACLSM#deleteUntrackedCommitLogSegment}}, which isn't overwritten for the CDC case
+- Right now, there is no way to avoid getting a failed allocation even if the consumer is matching the speed of the CDC overflow logic. CDC keyspaces will have at least 250ms of failure after it has written up to capacity files, even though the space could have been reclaimed. I suggest that in {{CommitLogSegmentManagerCDC#discard}}, we also call {{maybeUpdateCDCSizeCounterAsync}} so that we update the size, but not too quickly
+- The reset of {{recalculating}} in {{CLSMCDC#updateCDCDirectorySize}} should happen inside of a finally; for example, if we get an IOException, we will never be able to recalculate the CDC directory size. If this is intentional, we should make sure that we explicitly flag that decision
+
+- We aren't actually splitting the space between the regular Commit Log and the CDC log, so I'd think we should use the same space for the commit log and the CDC log
+- In {{DropKeyspaceStatement#announceMigration}}, we should keep the catching of the exception as we had before; this check is not sufficient, as it is the same as in the validate step. Even though we've passed validation, we could still get an exception when we try to update the schema
+- The {{FileUtils.createDirectory}} calls should be in the checks for cdc being empty; right now, it only works if saved_caches hasn't been specified
+- In {{Parser.g}}, do we need to use anything in the value of the map? or can we just use a null value?
+- In {{Config.java}}, the change in name from {{commitlog_max_compression_buffers_in_pool}} to {{commitlog_max_compression_buffers_per_pool}} isn't compatible for users who used that option; we need a NEWS entry for it
+- In {{PropertyDefinitions#getSet}}, can we just use the {{keySet}} instead of creating a new {{HashSet}} for it?
+- In {{AbstractCommitLogSegmentManager#start}}, we should include the type in the name of the Thread so that we can tell whether the thread is for the standard CL or the CDC CL
+- Would be good to add a flag to {{CommitLogReadErrorReason}} to tell whether the error is recoverable or not; this would explain whether we will check the return value or not in {{CR#readMutation}}
+- Not sure if there is a reason to keep {{MutationInitiator}}, it serves a similar role to the new {{ICommitLogReadHandler}}
+- Don't understand the immediate use case in the comment above {{ICommitLogReadHandler#prepReader}}
+- In {{KeyspaceParams}}, we should combine those two constructors and just use the {{create()}} calls where the 2 parameter case is used
+- The {{KeyspaceParams#validate}} is a "best-effort", since we can do things like change the topology on one side of a split and change the CDC DC's on the other
+- The comment in {{CommitLogSegmentManagerCDCTest#testCDCFunctionality}} about the directory structure should also be in the test .yaml
+
+nits:
+- In {{cassandra.yaml}} above cdc_overflow_directory, should be /data/cdc_overflow
+- potentailly -> potentially in cassandra.yaml
+- {{CommitLogTest#testRecovery(byte[])}} doesn't look used
+- In {{AbstractCommitLogSegmentManager#awaitManagementTasksCompletion}} could add a new job, and use a signal to signal the current thread. Since they will be done, all previous jobs will have been completed
+- Comment at the end of {{ACLSM#forceRecycleAll}} mention that the method has a return value, but it is void
+- In {{CommitLog#recoverSegmentManager}}, the comment above {{manager.allocatingFrom()}} refers to Standard, works for both Standard and CDC
+- We should annotate {{CommitLog#resetUnsafe}}, {{stopUnsafe}}, and {{restartUnsafe}} as {{VisibleForTesting}}
+- {{CommitLogReader#ALL_MUTATIONS}} should be public, possibly with {{VisibleForTesting}} since we refer to it in the javadocs for the public method {{CommitLogReader#readCommitLogSegment}}
+- {{CommitLogReader#readCommitLogSegment}} should be {{VisibleForTesting}}
+- There are a lot of params in javadocs that aren't properly defined, we should remove them
+- In {{CommitLogReader#readMutation}}, can replace the catch statement with {{invalidMutations.computeIfAbsent(ex.cfId, id -> new AtomicInteger()).incrementAndGet();}}
+- Split the {{CommitLogReplayer}} constructor on multiple lines
+- Comments in {{CommitLogReplayer#construct}} refer to replay position by abbeviation, should be update to CLSP
+- There are a lot of variable names {{rp}} which should be updated because of the {{ReplayPosition}} rename
+- There is a comment above {{CommitLogSegment.Allocation}} that no longer applies; the logic was removed in CASSANDRA-7515, but the comment was not updated
+- In {{CommitLogSegmentManagerCDC#updateCDCDirectorySize}}, {{IEXception}} should be {{IOException}}
+- Above {{CLSMCDC#atCapacity}}, typo: submit should submitted
+- {{CommitLogSegmentReader#EncryptedSegmenter}} and {{CommitLogSegmentReader#CompressedSegmenter}} should share the same constructor signature
+- Interfaces don't normally start with 'I': {{ICommitLogReadHandler}}
+- Typo in {{DirectorySizeBench#setUp}}; "div size" should be "dir size"
+- In {{CDCStatementTest}}, both in {{testAlterAddBadCDCNts}} and in {{testDropWithCDCFails}}, we need to make sure that we call {{fail}} if we reach the end of the {{try}}, since we're expecting an exception
+- In {{CommitLogReaderTest}} and {{CommitLogSegmentManagerCDCTest}}, we should be using the junit {{Assert}}
+- In {{CommitLogSegmentManagerCDCTest#testCDCWriteTimeout}}, we can just use {{fail}} at the end of the {{ try { for}} block, and removing the {{pass = true}} in {{catch}}
+
+
+These are some of the stray observations that I had while looking at this code:
+
+- Not sure what the implications of CDC is on using {{Keyspace.writeOrder}} in {{ACLSM#forceRecycleAll}}
+- Seems like we are shoehorning WTE to work when we can't allocate a new CDC segment; it should be something between WTE and UE. WTE is fine for now, but we should consider adding a new exception to protocol 5
+
+I'm not sure that I understand the workflow that will allow users to be able to read out of the CDC Log while it is still being written.
+
+Thanks for the feedback [~carlyeks]. Some of those I'm fine reverting (rename of the param in the .yaml for instance), and there's a lot of really good points above (always rejecting a mutation on CDC boundary alloc, replay deleting, etc). Thanks for the feedback!
+
+Some initial thoughts as reactions to your questions at the end there:
+bq. Not sure what the implications of CDC is on using Keyspace.writeOrder in ACLSM#forceRecycleAll
+I believe no measurable impact. A WTE (or whatever we settle on) from ACLSM should decrement the {{Keyspace.writeOrder}} immediately since we're try-with-resources on that block in {{Keyspace.apply}}, so it shouldn't hang that process waiting for writes that never allocate nor succeed.
+
+bq. Seems like we are shoehorning WTE to work when we can't allocate a new CDC segment; it should be something between WTE and UE. WTE is fine for now, but we should consider adding a new exception to protocol 5
+That's a fair point. We're certainly not fully encapsulating the "CDC is full" portion with the type of exception used. When we settle on things here, I'll make a note to create a subtask for CASSANDRA-9362 for this.
+
+bq. I'm not sure that I understand the workflow that will allow users to be able to read out of the CDC Log while it is still being written.
+It would be a bit of work but I believe not too much of a burden. A consumer should be able to have some kind of reader where they periodically poll the in-process segment (since multiple readers on a single file share kernel buffers so don't require fsync, if you're into a non-reliable CDC-maybe-having-data-that's-not-written scenario), and when there's enough data available in the file (after their currently held CommitLogSegmentPosition sentinel) indicating they should be able to deserialize a mutation's size, they pull that size value then watch for when the file's written to past that bound and then deserialize the mutation. Since 3.0 it's an unsigned VInt so it shouldn't be too hard, as a consumer, to determine there's more data past your latest CommitLogSegmentPosition by deserializing that value and reading when there's at least enough for a single mutation, incrementing your segment position from there.
+
+It's all work done in the consumer space rather than provided within C* as a reference, but that's something we can visit in a follow-up effort rather than with the V1 of doing the back-end plumbing in C* to support CDC. Sound reasonable?
+
+{quote}
+I believe no measurable impact. A WTE (or whatever we settle on) from ACLSM should decrement the Keyspace.writeOrder immediately since we're try-with-resources on that block in Keyspace.apply, so it shouldn't hang that process waiting for writes that never allocate nor succeed.
+{quote}
+My worry was more directed at whether something weird could happen with 2 CL's using the same OpOrder, but after talking it over, I think this is fine.
+
+{quote}
+That's a fair point. We're certainly not fully encapsulating the "CDC is full" portion with the type of exception used. When we settle on things here, I'll make a note to create a subtask for CASSANDRA-9362 for this.
+{quote}
++1. I don't want to block this ticket for it, but would be nice to have that for end users.
+
+{quote}
+It's all work done in the consumer space rather than provided within C* as a reference, but that's something we can visit in a follow-up effort rather than with the V1 of doing the back-end plumbing in C* to support CDC. Sound reasonable?
+{quote}
+I'm happy to push this off as well.
+
+First round of comments (I haven't looked at the read/replay part yet):
+
+- I was a fan of the {{ReplayPosition}} name. It stands for a more general concept which happens be the commit log position for us. Further to this, it should be a {{CommitLogPosition}} rather than {{..SegmentPosition}} as it does not just specify a position within a given segment but an overall position in the log (for a specific keyspace). I am also wondering if it should not include a keyspace id / reference now that it is keyspace-specific to be able to fail fast on mismatch.
+- I'd prefer to throw the {{WriteTimeoutException}} directly from {{allocate}} (instead of catching null in {{CommitLog}} and doing the same). Doing the check inside the {{while}} loop will avoid the over-allocation and do less work in the common case.
+- Do we really need to have separate buffer pools per manager? Static (or not) shared will offer slightly better cache locality, and it's better to block both commit logs if we're running beyond allowed memory (we may want to double the default limit).
+- [{{segmentManagers}} array|https://github.com/apache/cassandra/compare/trunk...josh-mckenzie:8844_review#diff-05c1e4fd86fea19b8e0552b1f289be85R119]: An {{EnumMap}} (which boils down to the same thing) would be cleaner and should not have any performance impact.
+- [{{shutdownBlocking}}|https://github.com/apache/cassandra/compare/trunk...josh-mckenzie:8844_review#diff-05c1e4fd86fea19b8e0552b1f289be85R465]: Better shutdown in parallel, i.e. initiate and await termination separately.
+- [{{reCalculating}} cas in {{maybeUpdateCDCSizeCounterAsync}}|https://github.com/apache/cassandra/compare/trunk...josh-mckenzie:8844_review#diff-878dc31866184d5ef750ccd9befc8382R72] is fishy: makes you think it would clear on exception in running update, which isn't the case. The {{updateCDCDirectorySize}} body should be wrapped in {{try ... finally}} as well to do that. 
+- You could use a scheduled executor to avoid the explicit delays. Or a {{RateLimiter}} (we'd prefer to update ASAP when triggered, but not too often) instead of the delay.
+- [{{updateCDCOverflowSize}}|https://github.com/apache/cassandra/compare/trunk...josh-mckenzie:8844_review#diff-878dc31866184d5ef750ccd9befc8382R227]: use {{while (!reCalculating.compareAndSet(false, true)) {};}}. You should reset the value afterwards.
+- I don't get the {{DirectorySizeCalculator}}. Why the {{alive}} and {{visited}} sets, the {{listFiles}} step? Either list the files and just loop through them, or do the {{walkFileTree}} operation -- you are now doing the same work twice. Use a plain long instead of the atomic as the class is still thread-unsafe.
+- {{CDCSizeCalculator.calculateSize}} should return the size, and maybe made synchronized for a bit of additional safety.
+- [Scrubber change|https://github.com/apache/cassandra/compare/trunk...josh-mckenzie:8844_review#diff-30afe7671ae9073cb81bb7c364d37f3fR327] should be reverted.
+- "Permissible" changed to "permissable" at some places in the code; the latter is a misspelling.
+
+While working on figuring out a separate issue related to being over the CDC limit, I realized that currently the keyspace could have CDC DCs and have {{durable_writes=false}}. This would mean that we would not be writing to the CDC logs in all of our DCs. We can either:
+# Add the CDC local DC check in {{Mutation#apply()}}, where we currently only check whether the keyspace has durable writes
+# Validate that CDC isn't used with {{durable_writes=false}} keyspaces
+
+1 seems more in line with CDC - allowing the performance to only affect operations in a single datacenter. However, we would also probably have to replay the CDC logs on startup even though {{durable_writes=false}}; otherwise there would be data in the CDC log that doesn't exist in the cluster.
+
+bq. On recovery, we are going to delete the CDC Commit Logs instead of moving them to the CDC Overflow folder; we use ACLSM#deleteUntrackedCommitLogSegment, which isn't overwritten for the CDC case
+Fixed.
+
+bq. Right now, there is no way to avoid getting a failed allocation even if the consumer is matching the speed of the CDC overflow logic. CDC keyspaces will have at least 250ms of failure after it has written up to capacity files, even though the space could have been reclaimed. I suggest that in CommitLogSegmentManagerCDC#discard, we also call maybeUpdateCDCSizeCounterAsync so that we update the size, but not too quickly
+Fixed, though I also augmented that signature to allow for bypassing the sleep interval. Rather than forcing a 250ms wait / throttling like we need on mutation application, I think it's reasonable to have no sleep on the discard path and immediately recover any unknown free space in the counter if a consumer is live.
+
+bq. The reset of recalculating in CLSMCDC#updateCDCDirectorySize should happen inside of a finally; for example, if we get an IOException, we will never be able to recalculate the CDC directory size. If this is intentional, we should make sure that we explicitly flag that decision
+Good catch. Changed to put the manager wake and CAS in finally so it shouldn't be exposed to a potential hang there.
+
+bq. We aren't actually splitting the space between the regular Commit Log and the CDC log, so I'd think we should use the same space for the commit log and the CDC log
+Not sure I understand here. The data/cdc_overflow and data/cdc are split on disk, but not necessarily split as far as us having independent allocation space for each directory. Same goes for cdc and commitlog. I'd actually be more in favor of allowing tuning of all three rather than glomming cdc w/commitlog. Thoughts?
+
+bq. In DropKeyspaceStatement#announceMigration, we should keep the catching of the exception as we had before; this check is not sufficient, as it is the same as in the validate step. Even though we've passed validation, we could still get an exception when we try to update the schema
+Reverted. I dislike the flow of the code in this method and I'm fairly sure {{ifExists && oldKsm == null}} better reflects the logical intent of what we were trying for before (ConfigurationException on non-existant w/ifExists is ok), but I concede the point that the new code isn't strictly necessarily in terms of this patch and is also subtly behaviorally different.
+
+bq. The FileUtils.createDirectory calls should be in the checks for cdc being empty; right now, it only works if saved_caches hasn't been specified
+Not sure I follow. It's also in DatabaseDescriptor.createAllDirectories. Could you clarify the context of this point a bit?
+
+bq. In Parser.g, do we need to use anything in the value of the map? or can we just use a null value?
+Done
+
+bq. In Config.java, the change in name from commitlog_max_compression_buffers_in_pool to commitlog_max_compression_buffers_per_pool isn't compatible for users who used that option; we need a NEWS entry for it
+Keeping, noted in NEWS.txt. This was an undocumented variable in the .yaml so I suspect overrides are limited in the wild. Also added a more formal NEWS.txt entry and CHANGES.txt for CDC as a feature
+
+bq. In PropertyDefinitions#getSet, can we just use the keySet instead of creating a new HashSet for it?
+Fixed. Missed the forest for the trees while implementing that one.
+
+bq. In AbstractCommitLogSegmentManager#start, we should include the type in the name of the Thread so that we can tell whether the thread is for the standard CL or the CDC CL
+Added.
+
+bq. Would be good to add a flag to CommitLogReadErrorReason to tell whether the error is recoverable or not; this would explain whether we will check the return value or not in CR#readMutation
+I augmented the enum names to indicate which are recoverable and which are not and extended the interface to support that. I didn't like having those 2 concepts (recoverable and unrecoverable errors) living in the same method since it was rather misleading to have a "shouldStopOnX" with a caller that didn't care about your return. In the case of the CommitLogReplayer, it will continue to pass that into a single method for logical purposes, but subsequent implementers can take more granular action.
+
+bq. Not sure if there is a reason to keep MutationInitiator, it serves a similar role to the new ICommitLogReadHandler
+Similar, but different enough (hijacking the futures operations for mocking in tests) that I'd prefer leaving that to a future effort if we choose to go that route.
+
+bq. Don't understand the immediate use case in the comment above ICommitLogReadHandler#prepReader
+Removed comment - had that as a rough example of what it could be used for, but people can dig around and figure that out for themselves so we don't couple the comment in the interface w/an implementation detail. Check the code and usage of globalPosition in CommitLogReplayer.java for context.
+
+bq. In KeyspaceParams, we should combine those two constructors and just use the create() calls where the 2 parameter case is used
+Needed a 2 param .create() method that took ReplicationParams. Went ahead and created one of those so we have a single ctor, though I'm kind of neutral on the topic.
+
+bq. The KeyspaceParams#validate is a "best-effort", since we can do things like change the topology on one side of a split and change the CDC DC's on the other
+As we discussed offline, since we don't re-validate after reconciliation of a partition event, this comes down to a) don't make schema changes during a partition event, and b) if you fat-finger the CDC datacenter name while performing this update during a time window you shouldn't, well, there's only so much we can do. It's trivial to alter and re-create the cdc_datacenters param so I say we just acknowledge this here on the ticket and move on.
+
+bq. The comment in CommitLogSegmentManagerCDCTest#testCDCFunctionality about the directory structure should also be in the test .yaml
+Good point, and done.
+
+bq. In cassandra.yaml above cdc_overflow_directory, should be /data/cdc_overflow
+fixed
+
+bq. potentailly -> potentially in cassandra.yaml
+fixed
+
+bq. CommitLogTest#testRecovery(byte[]) doesn't look used
+It's not, but that's code from CASSANDRA-6018 so I'm not sure whether or not Jason had plans to use that. Wasn't added by this patch nor touched by it, so going to keep it out of this ticket.
+
+bq. In AbstractCommitLogSegmentManager#awaitManagementTasksCompletion could add a new job, and use a signal to signal the current thread. Since they will be done, all previous jobs will have been completed
+That's already noted in the comment by Jason. Didn't want to scope creep CDC effort.
+
+bq. Comment at the end of ACLSM#forceRecycleAll mention that the method has a return value, but it is void
+Predates CDC, but fixed.
+
+bq. In CommitLog#recoverSegmentManager, the comment above manager.allocatingFrom() refers to Standard, works for both Standard and CDC
+
+bq. We should annotate CommitLog#resetUnsafe, stopUnsafe, and restartUnsafe as VisibleForTesting
+fixed
+
+bq. CommitLogReader#ALL_MUTATIONS should be public, possibly with VisibleForTesting since we refer to it in the javadocs for the public method CommitLogReader#readCommitLogSegment
+Made public, and not necessary to annotate as VisibleForTesting since scope wasn't increased to accommodate unit tests. We could also keep it private and expose another signature that accepts a CommitLogSegmentPosition without a mutationLimit, but for now I'd prefer to keep from having exposed methods that aren't used by anyone.
+
+bq. CommitLogReader#readCommitLogSegment should be VisibleForTesting
+Added though with minor hesitation. I partially relaxed scope on these methods with the notion that future CDC Consumers will write to the CommitLogReader interface and will thus need them.
+
+bq. There are a lot of params in javadocs that aren't properly defined, we should remove them
+If you're referring to the ones I left blank with a hyphen, I basically skipped definition of anything that was completely self-identifying to avoid redundancy. My approach is that these serve as extra meta-info for IDE's during development as I don't know of anyone generating an actual set of API documentation from the Javadoc. That being said, I've tidied it up, commented the ones that were missing, and normalized the spacing.
+
+bq. In CommitLogReader#readMutation, can replace the catch statement with invalidMutations.computeIfAbsent(ex.cfId, id -> new AtomicInteger()).incrementAndGet();
+This code was copied over from CommitLogReplayer and I wasn't (and still am not) really looking to clean up / refactor the guts of the functionality of the initial implementation.
+
+bq. Split the CommitLogReplayer constructor on multiple lines
+Done, though it barely violated the 120 char constraint. :)
+
+bq. Comments in CommitLogReplayer#construct refer to replay position by abbeviation, should be update to CLSP
+Fixed.
+
+bq. There are a lot of variable names rp which should be updated because of the ReplayPosition rename
+I think I got them all now. Don't quote me on that.
+
+bq. There is a comment above CommitLogSegment.Allocation that no longer applies; the logic was removed in CASSANDRA-7515, but the comment was not updated
+Reomved.
+
+bq. In CommitLogSegmentManagerCDC#updateCDCDirectorySize, IEXception should be IOException
+InterruptedException is to deal with a shutdown interrupting the thread sleep. The inner caught IOException is handled by CommitLog.handleCommitError so IOException will never propogate up.
+
+bq. Above CLSMCDC#atCapacity, typo: submit should submitted
+fixed.
+
+bq. CommitLogSegmentReader#EncryptedSegmenter and CommitLogSegmentReader#CompressedSegmenter should share the same constructor signature
+Fixed.
+
+bq. Interfaces don't normally start with 'I': ICommitLogReadHandler
+{{IAsyncCallback}}, {{IAuthenticator}}, {{IBitSet}}, {{ICache}}, {{ICompressedFile}}... I could keep going. :) Snarkiness aside, the aforementioned don't constitute the "normal" majority of our interface and, upon further reflection, it's a tautology. Changed.
+
+bq. Typo in DirectorySizeBench#setUp; "div size" should be "dir size"
+Not a typo. 8192/32, "div size". Refined comment to make that more clear.
+
+bq. In CDCStatementTest, both in testAlterAddBadCDCNts and in testDropWithCDCFails, we need to make sure that we call fail if we reach the end of the try, since we're expecting an exception
+Funny you should mention that, since one of the tests was a: missing CDC entirely in the statement, and b: trying to catch the wrong kind of exception. Fixed.
+
+bq. In CommitLogReaderTest and CommitLogSegmentManagerCDCTest, we should be using the junit Assert
+Fixed.
+
+bq. In CommitLogSegmentManagerCDCTest#testCDCWriteTimeout, we can just use fail at the end of the {{ try { for}} block, and removing the pass = true in catch
+Fixed.
+
+[~blambov]: Thanks for the feedback. I'll start working through that tomorrow, along with your update from earlier today [~carlyeks].
+
+Some confusion in the read / replay part, probably my fault for not documenting the details well.
+
+Replay positions (or CLSP) are given as a segment id, and uncompressed (or "logical" as Jason calls it) position within the segment file. For Cassandra 2.2+ logical position does not have to match file position. When replaying, anything with greater segment id, or with equal segment id but greater-or-equal logical position, must be replayed.
+
+The following are potential problems with that:
+
+- [Descriptor parsed id mismatch error|https://github.com/apache/cassandra/compare/trunk...josh-mckenzie:8844_review#diff-9fe0bd988c4fc47a022f589f5ad72b09R148] doesn't look right. The replay position specifies from which id (and position within that id) we should replay. In addition to (parts of) the file with the same id, this includes all files with higher ids. Mismatch is normal.
+- [Mutation before offset check|https://github.com/apache/cassandra/compare/trunk...josh-mckenzie:8844_review#diff-9fe0bd988c4fc47a022f589f5ad72b09R246] compares file position with logical segment position and is only valid for uncompressed files.
+- [{{shouldSkipSegment}} JavaDoc|https://github.com/apache/cassandra/compare/trunk...josh-mckenzie:8844_review#diff-0184f4e288c68732ceb30cdc49a76c4aR73] should make it clear which kind of position it needs (it is used correctly).
+- It's not a good thing that these weren't caught by tests.
+
+Other remarks:
+
+- [{{prepReader}}|https://github.com/apache/cassandra/compare/trunk...josh-mckenzie:8844_review#diff-9fe0bd988c4fc47a022f589f5ad72b09R108] is only called for pre-2.1 segments. JavaDoc does not say so. I don't think we want this in the handler interface, inline it at its one use site.
+- [{{statusTracker.flagError}}|https://github.com/apache/cassandra/compare/trunk...josh-mckenzie:8844_review#diff-9fe0bd988c4fc47a022f589f5ad72b09R270] isn't a very fitting name for what is actually a termination request.
+- [{{flagError}} and return|https://github.com/apache/cassandra/compare/trunk...josh-mckenzie:8844_review#diff-9fe0bd988c4fc47a022f589f5ad72b09R305] is inconsistent with the rest in {{readSection}}. It should also return regardless of the shouldStop result as there's nothing meaningful to be done with the rest of the section.
+The old code does this differently, always breaks sync _and_ segment replay on errors, which AFAIR is done to make certain we don't try to replay old data in a partially overwritten pre-2.2 segment. Such data should have an invalid sync marker, though, so this change is fine, and should be an improvement as it could be able to scavenge more on bit rot. In the common file-not-fully-written case, though, you will get a second error due to this change when it tries to read the next section.
+
+Pre-existing issues:
+
+- [segmentId|https://github.com/apache/cassandra/compare/trunk...josh-mckenzie:8844_review#diff-9fe0bd988c4fc47a022f589f5ad72b09R120] confuses that it would be the one used later. We should rename this to {{segmentIdFromFilename}}.
+- [tolerateErrorsInSection &=|https://github.com/apache/cassandra/compare/trunk...josh-mckenzie:8844_review#diff-9fe0bd988c4fc47a022f589f5ad72b09R186]: I don't think it was intended for the value to depend on previous iterations.
+
+
+bq. I was a fan of the ReplayPosition name. It stands for a more general concept which happens be the commit log position for us. Further to this, it should be a CommitLogPosition rather than ..SegmentPosition as it does not just specify a position within a given segment but an overall position in the log (for a specific keyspace). I am also wondering if it should not include a keyspace id / reference now that it is keyspace-specific to be able to fail fast on mismatch.
+I appreciate the feedback here on naming but I disagree on both counts. In "ReplayPosition" vs. "CommitLogSegmentPosition", the former couples the name with an intended usage / implementation whereas the latter is strictly a statement of what the object is without usage context. Regarding CommitLogPosition vs. CommitLogSegmentPosition, the class itself contains 2 instance variables: a segmentId and a position. Again, calling it a CommitLogPosition would couple the name of the class with an intended usage rather than leaving it modularly decoupled in my opinion.
+
+As for adding a keyspace id / reference and failing fast, what immediate use-case / optimization do you have in mind where that would help us? Replay should be limited to files in directories and a user of the CommitLogReader that's working with reading CDC logs should really have an all-or-nothing perspective on the keyspaces in the logs they're parsing, I believe.
+
+bq. I'd prefer to throw the WriteTimeoutException directly from allocate (instead of catching null in CommitLog and doing the same). Doing the check inside the while loop will avoid the over-allocation and do less work in the common case.
+Changed.
+
+bq. Do we really need to have separate buffer pools per manager? Static (or not) shared will offer slightly better cache locality, and it's better to block both commit logs if we're running beyond allowed memory (we may want to double the default limit).
+I originally changed this code due to CommitLogSegmentManagerTest.testCompressedCommitLogBackpressure failing since, upon raising the limit to 6, the standard CLSM was "stealing" one of the allotted buffers from the extra 3. What I didn't really take into account was the fact that, given the AbstractCommitLogService is now using a CommitLog.sync() that essentially does a sequential sync across all CLSM, a delay in any of the CLSM's will lead to a delay in all of them, so having them operate with independent buffers doesn't make any difference.
+
+Made the pool static and upped max to 6. I prefer having this pool discrete rather than embedded in FileDirectSegment.
+
+bq. segmentManagers array: An EnumMap (which boils down to the same thing) would be cleaner and should not have any performance impact.
+Changed. Much preferred - thanks for the heads up.
+
+bq. shutdownBlocking: Better shutdown in parallel, i.e. initiate and await termination separately.
+Agreed. Changed.
+
+{quote}reCalculating cas in maybeUpdateCDCSizeCounterAsync is fishy: makes you think it would clear on exception in running update, which isn't the case. The updateCDCDirectorySize body should be wrapped in try ... finally as well to do that.
+You could use a scheduled executor to avoid the explicit delays. Or a RateLimiter (we'd prefer to update ASAP when triggered, but not too often) instead of the delay.
+updateCDCOverflowSize: use while (!reCalculating.compareAndSet(false, true)) {};. You should reset the value afterwards.
+CDCSizeCalculator.calculateSize should return the size, and maybe made synchronized for a bit of additional safety.
+{quote}
+Changed to RateLimiter, tossed the premature optimization of the atomic bool protection around runnables that are going to get discarded (should all be eden and small), and moved the scheduling code and refactored a bit into CDCSizeCalculator. The class as a whole and flow are much cleaner now IMO - the above points should either be addressed or no longer apply after the change. Let me know what you think.
+
+bq. I don't get the DirectorySizeCalculator. Why the alive and visited sets, the listFiles step? Either list the files and just loop through them, or do the walkFileTree operation – you are now doing the same work twice. Use a plain long instead of the atomic as the class is still thread-unsafe.
+This class is actually a straight up refactor / extraction of {{Directories.TrueFilesSizeVisitor}} on trunk. I don't doubt this class could use some work (code's from CASSANDRA-6231 back in 2013) but I'd prefer to handle that as a follow-up ticket.
+
+bq. Scrubber change should be reverted.
+Thanks. intellij idea got over-zealous on a refactor/rename and I thought I'd tracked all of those down.
+
+bq. "Permissible" changed to "permissable" at some places in the code; the latter is a misspelling.
+Fixed.
+
+Rebased to current trunk for good measure. Going to continue working through feedback in chronological order come Monday.
+
+Thanks again for the work on feedback thus far.
+
+bq. the former couples the name with an intended usage / implementation whereas the latter is strictly a statement of what the object is without usage context
+
+This sounds a lot like you would prefer to use a {{PairOfDoubles}} class to store complex numbers or planar coordinates. I wouldn't say that's wrong, just very _not_ useful and a missed opportunity.
+
+If it were the case that we used {{ReplayPosition}} for another purpose than to specify the point in the commit log stream we can safely start replay from, I would agree with you, but that's not the case. Such a position happens to be a segment id plus offset; should the architecture change, a replay position may become something else and the modularity and abstraction is achieved by _not_ specifying what the object contains, but rather what it specifies. 
+
+With your changes, a replay position actually does become something different, and to make it as clean and transparent as possible you may need both {{ReplayPosition}} and {{CommitLogPosition}} classes. The commit log now becomes _two_ continuous streams of data, each with its own _unrelated_ position. This means that they need to be treated separately, and both need to be accounted for. In particular, [{{CommitLogReplayer.construct}}|https://github.com/apache/cassandra/compare/trunk...josh-mckenzie:8844_review#diff-348a1347dacf897385fb0a97116a1b5eR113] is incorrect. Since you have two commit logs, each with their independent position, and you don't account for the log type when calculating the replay position to start from, you will fail to replay necessary records in one of the logs.
+
+This needs more work and tests, especially around switching CDC status. We probably need to store the log type in the sstable (or some other kind of id that does not change when CDC is turned on/off).
+
+bq. Regarding CommitLogPosition vs. CommitLogSegmentPosition, the class itself contains 2 instance variables: a segmentId and a position
+
+A good analogy is an address in memory: it is composed of a 20/52-bit page id and a 12-bit offset within that page, yet it is still a memory address, while a memory page address would denote something very different. A commit log is a continuous stream of records. The fact that we split the stream in segments is an implementation detail.
+
+There is an issue with {{CDCSizeCalculator}}; it does not clear out the previously calculated before each time we recalculate the size of the directories, so we are always adding more to that size each time we use the sizer.
+
+bq. it does not clear out the previously calculated before each time we recalculate the size of the directories
+
+[~carlyeks] What SHA are you checking? As of {{9045d0a3075c98ef837c637988bb54f1144e32ad}}, {{DirectorySizeCalculator.rebuildFileList}} resets size to 0, which we now query directly via {{getAllocatedSize}}. While the size only grows on files moving into overflow, we call {{submitOverflowSizeRecalculation}} on both failed allocations and on segment discard, so it should be brought back down by those operations.
+
+
+
+Quote w/a little revising:
+
+{quote} currently the keyspace could have CDC DCs and have durable_writes=false. This would mean that we would not be writing to the CDC logs in all of our DCs. We can either:
+# Add the CDC local DC check in Mutation#apply(), where we currently only check whether the keyspace has durable writes (thus allowing CDC and CommitLog writing even though durableWrites=false), or
+# Validate that CDC isn't used with durable_writes=false keyspaces
+{quote}
+
+[~tupshin] / [~brianmhess]: Either of you have thoughts on the "Do we allow mixing durableWrites w/CDC" question? I don't feel strongly either way.
+
+
+
+{quote}
+What SHA are you checking? As of 9045d0a3075c98ef837c637988bb54f1144e32ad, DirectorySizeCalculator.rebuildFileList resets size to 0, which we now query directly via getAllocatedSize.
+{quote}
+
+You're right, I was looking at a previous commit.
+
+bq. Descriptor parsed id mismatch error doesn't look right. The replay position specifies from which id (and position within that id) we should replay. In addition to (parts of) the file with the same id, this includes all files with higher ids. Mismatch is normal.
+The logical flow should be identical to trunk. It only returns at that point if {{CommitLogReadHandler.shouldStopOnError}} returns true, which {{CommitLogReplayer.shouldStopOnError}} doesn't ever do. It's either permissable(not in this case), ignored, or we throw from CLR.
+
+bq. Mutation before offset check compares file position with logical segment position and is only valid for uncompressed files.
+My understanding of this code - the before offset check is against [reader.getFilePointer|https://github.com/apache/cassandra/compare/trunk...josh-mckenzie:8844_review#diff-9fe0bd988c4fc47a022f589f5ad72b09R232], which in the compressed and encrypted case is from [syncSegment.input|https://github.com/apache/cassandra/compare/trunk...josh-mckenzie:8844_review#diff-9fe0bd988c4fc47a022f589f5ad72b09R196]. That consists of a [FileSegmentInputStream|https://github.com/josh-mckenzie/cassandra/blob/8844_review/src/java/org/apache/cassandra/db/commitlog/CommitLogSegmentReader.java#L290] wrapped around the uncompressed buffer in the compressed case, so the raw sentinel checking in Mutation skipping logic should correctly apply as though it were a normal uncompressed file as the {{getFilePointer}} calls in {{FileSegmentInputStream}} (and {{EncryptedFileSegmentInputStream}} for that matter) take their offsets into account. As CommitLogReaderTest.testReadFromMidpoint passes on test-compression and validates that the replayed indexes after the passed in offset are the correct numeric value, I'd be surprised if that sentinel check didn't work as I tried to explicitly test for that. Added comments surrounding this fact to the comparison for Mutation skipping. Also - please let me know if there's something I'm missing or if I've misread this code.
+
+bq. shouldSkipSegment JavaDoc should make it clear which kind of position it needs (it is used correctly).
+Added clarification that it's a logical position
+
+bq. prepReader is only called for pre-2.1 segments. JavaDoc does not say so. I don't think we want this in the handler interface, inline it at its one use site.
+Documented in javadoc. Since globalPosition exists inside CommitLogReplayer, I've left it in the interface for now as I don't see a need to move globalPosition into the reader.
+bq. statusTracker.flagError isn't a very fitting name for what is actually a termination request.
+Renamed to requestTermination.
+
+bq. flagError and return is inconsistent with the rest in readSection. It should also return regardless of the shouldStop result as there's nothing meaningful to be done with the rest of the section...
+I'd actually prefer to revert this delta and consider opening a follow-up ticket with this change if we consider it an improvement. There's enough going into this CDC refactor that my primary goal is to keep the reading logic itself untouched.
+
+bq. segmentId confuses that it would be the one used later. We should rename this to segmentIdFromFilename.
+Good call. Changed.
+
+bq. tolerateErrorsInSection &=: I don't think it was intended for the value to depend on previous iterations.
+Given the implementation of [tolerateSegmentErrors|https://github.com/josh-mckenzie/cassandra/blob/8844_review/src/java/org/apache/cassandra/db/commitlog/CommitLogSegmentReader.java#L229] I'm inclined to agree. That being said, this is also another change I'd prefer to create as a follow-up ticket rather than changing behavior of non-CDC related things on this ticket.
+
+I'll address your further feedback in another update. The above changes are pushed.
+
+bq. the before offset check is against reader.getFilePointer
+
+You are absolutely right. My bad, the check is against the correct type of offset.
+
+There is a bigger oversight on my part as well -- I did not notice that you don't pass the global offset to {{readCommitLogSegment}}. This is a significant change and the reason why some parts of the logic work when I don't expect them to. You currently have two different start positions, enforced in very different ways. Why? I don't think that's a good or necessary change. It makes a lot of the reader code useless and worse structured than it should be.
+
+To me the job of seeking to the start position and the details of skipping over segments, sync sections and mutations that fall before it, belongs entirely in the reader. It is best equipped to deal with format differences and knowing correctly where in the file it is. In fact, I would argue that the {{CommitLogReplayer}} should not know or make use of the global replay position in any way other than to pass it on as the {{startPosition}} argument to all {{readCommitLogSegment}} calls. {{prepReader}}, {{logAndCheckIfShouldSkip}}, {{shouldSkipSegment}} serve no useful purpose in the handler interface other than to work around not having this information and not handling positioning in the reader.
+
+bq. This class is actually a straight up refactor / extraction of {{Directories.TrueFilesSizeVisitor}} on trunk.
+
+Well, I'd rather you did not bring this class into existence then. It is completely unnecessary, a simple
+{code}
+Arrays.stream(path.listFiles()).mapToLong(File::length).sum();
+{code}
+will do a better job. If you do want to keep it (the difference being a visitor class would also walk subdirectories which you don't need), move the {{alive}} and {{visited}} sets as well as {{rebuildFileList}} back to {{SSTableSizeSummer}}.
+
+{{DirectorySizerBench}} should give you a nice improvement from either option.
+
+I am impressed (and bothered) at how much I missed the forest for the trees on that one - I refactored out the {{CommitLogReplayer}} behavior quite awhile before adding the segment/offset skipping logic in the CommitLogReader for CDC and it never clicked that I was just duplicating the existing CommitLogReplayer globalPosition skip. I better understand where the confusion on our discussion (and your reading of the code) stemmed from.
+
+Pushed a commit that does the following:
+* Moved {{CommitLogReplayer}} skip logic into {{CommitLogReader}}
+* Unified on minPosition in {{CommitLogReader}} rather than old startPosition
+* Removed superfluous interface methods
+* Tidied up and commented various read* methods in CommitLogReader
+* Commented CommitLogSegment.nextId to clarify that we rely on it for correct ordering between multiple CLSM
+* Revised static initializer in CommitLogSegment to take CDC log location into account on idBase determination
+* Added comment in CommitLog reinforcing the need for the above
+
+The fact that none of us caught the idBase determination in CommitLogSegment's init makes me wary, and I agree with you that this needs further testing. Where are we with that [~mambocab]?
+
+Regarding the DirectorySizeCalculator, while I much prefer the elegance of your one-liner
+
+# I like to avoid changing code that's battle-tested and working during an unrelated refactor
+# it's a micro-optimzation in a part of the code that's not critical path and where the delta will be on the order of microseconds for the average case (though a large simplification and reduction in code as well, so I'd do it for that alone), and
+# the benchmarking results of testing that on both win10 and linux had some surprises in store:
+
+{noformat}
+Windows, skylake, SSD:
+   DirectorySizeCalculator
+      [java] Result: 31.061 ¦(99.9%) 0.287 ms/op [Average]
+      [java]   Statistics: (min, avg, max) = (30.861, 31.061, 33.028), stdev = 0.430
+      [java]   Confidence interval (99.9%): [30.774, 31.349]
+   One liner:
+      [java] Result: 116.941 ¦(99.9%) 1.238 ms/op [Average]
+      [java]   Statistics: (min, avg, max) = (115.163, 116.941, 124.950), stdev = 1.854
+      [java]   Confidence interval (99.9%): [115.703, 118.179]
+Linux, haswell, SSD:
+   DirectorySizeCalculator
+      [java] Result: 76.765 ±(99.9%) 0.876 ms/op [Average]
+      [java]   Statistics: (min, avg, max) = (75.586, 76.765, 81.744), stdev = 1.311
+      [java]   Confidence interval (99.9%): [75.889, 77.641]
+   One liner:
+      [java] Result: 57.608 ±(99.9%) 0.889 ms/op [Average]
+      [java]   Statistics: (min, avg, max) = (56.365, 57.608, 61.697), stdev = 1.330
+      [java]   Confidence interval (99.9%): [56.719, 58.497]
+{noformat}
+
+I think that makes a strong case for us having a platform independent implementation of this and doing this in a follow-up ticket.
+
+I also haven't done anything about CommitLogSegmentPosition's name yet. I don't have really strong feelings on it but am leaning towards {{CommitLogPosition}}.
+
+Re-ran CI since we've made quite a few minor tweaks/refactors throughout, and there's a small amount (14 failures) of house-cleaning left to do on the tests. I'll start digging into that tomorrow.
+
+Thank you, this sorts out the replay issues perfectly. I am also fine with leaving other details for a separate ticket.
+
+However, there's still potential for error due to segment id disorder. We can't force (as you allude in the [{{idBase}} calculation comment|https://github.com/apache/cassandra/commit/a7737b3bad578f530a33b309a575d6f65348334b#diff-7720d4b5123a354876e0b3139222f34eR57]) the positions from the two commitlogs to increase chronologically. Imagine, for example
+- one of the two has lots of traffic, the other has little (e.g database with CDC on on everything except system)
+- segment ids in the heavily used advance
+- flushes in the other one are few and usually don't need to advance segment
+- they issue low commit log positions long after the other log has issued higher ones
+
+and even without this construction positions will jump a segment forward and back continuously which is prone to bugs.
+
+In normal use, since you take the lower of the two starting positions for seeking, I can only see this causing inefficient replay, which isn't much of a problem and I'll happily leave it for another ticket.
+
+But I don't understand how you deal with the issue while turning CDC on/off, for example:
+- we were writing in non-CDC log
+- some data is in memtables, log has dirty position on that CF
+- CDC status switches
+- we start writing in the CDC log
+- flush is requested
+- non-CDC log doesn't know its data has been flushed and has to retain segment
+
+More importantly, if non-CDC log had flushes with a higher segment id and the machine dies some time after that first post-switch flush, the log will see an sstable with a higher commit log position and will ignore the data in the CDC log.
+
+Another concern is how we synchronize schema changes with CDC data. Imagine some writes in the CDC log, change to incompatible schema (e.g. deleted column) written in the non-CDC log, more writes to the CDC log. Before the patch, since we apply everything in order the schema will be correct for both portions of the writes. After the patch the first half of the writes will most probably fail.
+
+bq. Where are we with that Jim Witschey?
+
+Currently auditing the commitlog dtests and extending them to work with CDC keyspaces.
+
+I'm not sure I understand if you're saying there's an error or not:
+bq. However, there's still potential for error due to segment id disorder.
+bq. And even without this construction positions will jump a segment forward and back continuously which is prone to bugs.
+
+But you then state:
+bq. In normal use... I can only see this causing inefficient replay, which isn't much of a problem and I'll happily leave it for another ticket.
+Not trying to nit-pick, just honestly trying to wrap my head around whether there may be a correctness timing issue due to relying on a single globalPosition for both CLSM streams. Assuming we tackle the split-CF issue, I think things should be correct with the current implementation on replay. It admittedly adds a new "pathological" scenario as you've laid out, and one that I believe will end up being common (all CDC except system), so I think it would certainly warrant a follow-up ticket.
+
+bq. But I don't understand how you deal with the issue while turning CDC on/off, for example:
+In short: right now the code is not dealing with that correctly. I would initially think something along the lines of an OpOrder for CDC writes combined with a "block writes to CDC and flush MT/logs" on any CDC toggle or CDC-enabled CF schema changes, however I don't think OpOrder has any provisions for a non-chained / block-the-producers type model; the needs of CDC might take a new synchronization mechanism for this to be done correctly, and I'm not sure if it would be more appropriate to hold up writes during that flush or just WTE them.
+
+I believe that guaranteeing mutations for any given CF will only exist in a single CommitLogSegmentManager's un-flushed logs on disk at any given time will resolve the sstable flush time vs. data in log time scenario and better preserve the previous assumptions of a single CommitLog.
+
+For both the above and for general schema changes screwing up replay ordering, I see two possible solutions. First, and more complex, would be creating a point-in-time "checkpoint" of before and after that schema change that's in-line (i.e. same CommitLogSegment stream) with the data we're parsing. In our case, that would mean flushing that CDC data and the schema changes, blocking CDC writes until that flush is complete (using the general mechanism mentioned above). A second, simpler method would be to disallow schema changes on tables while CDC is enabled and restricting setting CDC status on a keyspace to creation time in v1 of this ticket.
+
+While that would greatly restrict the flexibility of using the initial cut of the feature, given how close we are to 3.6 freeze and the fact that CDC being per-keyspace instead of per-CF means taking this into consideration during modeling time anyway, I'm in favor of restricting schema change on CDC-enabled CF and disallowing CDC toggling via ALTER on v1.
+
+[~brianmhess]: could you chime in on both this potential restriction and the above question concerning mixing durableWrites with CDC? I would expect to create a few follow-up tickets from this immediately and hope to have those in by 3.8.
+
+This is starting to sound way too hairy and scary for my comfort -- you can disable the problem points I could see, but what about the ones I couldn't?
+
+Can't we go with a simpler v1? Still single log with an archiver that moves _all_ log data to the CDC directory and work on the reader/extractor part to add some trivial code to skip over anything not needed? That way we can't mess up the commit log core, and we can easily move on to v2 where we either strip out unwanted data during the "archiving" step, or think more carefully how to properly maintain order in a segregated implementation such as this one. Such a v2 wouldn't need any changes to extractors or syntax and depending on complexity could also ship in a point-odd release.
+
+bq. This is starting to sound way too hairy and scary for my comfort
+I agree.
+
+bq. Can't we go with a simpler v1? ...work on the reader/extractor part to add some trivial code to skip over anything not needed?
+This puts a heavier CPU burden on the consumer to deserialize and discard unwanted data. After the points / concerns you've raised (and acknowledging that the unknown-unknowns in this case could be far worse), I think the right call is to have them accept this much smaller relative burden than expose Cassandra to correctness risks and the complexity this current implementation introduces.
+
+bq. That way we can't mess up the commit log core
+Exactly the reason I wanted a second pair of eyes on the review, specifically yours given your experience in this portion of the code-base.
+
+bq. strip out unwanted data during the "archiving" step
+Hm. One of our design options we discussed was doing something similar to this, however it was going from the Mutation in memory to selective serialization to a 2nd log, and the lack of atomicity across multiple log writes made it a no-go. If we instead performed this filtering as part of the CDC-move process, we'd get the atomicity of the initial write and could instead have our "CDC correctness" point be at flush. This also shouldn't further negatively impact the "realtime" CDC consumption use-case as they should be able to tail and parse the live CommitLogSegment, utilizing their filtering logic from v1 to exclude unwanted mutations.
+
+The only other concern I have with the approach of "write all to single CommitLogSegment stream, filter on archival / move" is that we pull the CPU and heap pressure burden of that filtering into the C* JVM proper. At this point, compared to what we're facing w/the dual CLSM approach, I think that's the lesser of two evils. As a final counter-point to that - there's no reason the C* daemon would need to be the one to perform that filtering, as an external process could simply scrape through cdc_overflow and compact the data into a 3rd directory for final consumption (a.k.a. the unix philosophy).
+
+This design change would open us back up to the option to enable CDC on a per-CF basis again instead of per-Keyspace, as writing all mutations to a single CommitLog stream would remove the batch atomicity needs that led to pushing to a per-keyspace basis in the first place.
+
+I'm going to take a day to think on this and discuss with a few people as these changes would clearly push us past 3.6. Thanks for the extensive feedback [~blambov].
+
+I think that restricting a user to not be able to ALTER any table in side a keyspace that has CDC enabled is a bit too much.  Additionally, I see use cases where the keyspace exists already and is in use and then a user layers in CDC - namely, that CDC is enabled after the keyspace exists.  So, I'm -1 on saying that CDC needs to be there at keyspace creation time.  One big reason is that if I want to add CDC later, there isn't a good way in Cassandra to create a new keyspace (with CDC enabled) and then copy all the data from the first one to the second one (no INSERT-SELECT in Cassandra).  So, I'd be stuck.
+
+As for the durability question, I think we should throw an error if someone wants to set the keyspace to have DURABLE_WRITES=false and CDC enabled - or to alter the keyspace to put it in that position.  I do not like the idea of automagically changing the DURABLE_WRITES=true for the user.  I don't like that surprise behavior.
+
+After offline discussion, this feature is going to target 3.8 with the following major changes from where it is now:
+* single CommitLogSegmentManager, no separate CLSM for CDC and non (will refactor dir sizing and other things into CLSM)
+* CDC feature / operations enabled/disabled on a per-node basis. Thinking .yaml since we have no precedent for changing settings via DDL/cqlsh
+* When enabled, all CommitLogSegments will go to data/cdc_overflow (or other configured dir) when flushed
+* CDC can be enabled on a per-CF basis
+* Writes to CDC-enabled CF will be rejected if at limit in cdc_overflow, specified in yaml (no change from before)
+* There will be a provided "CDC-compactor" (separate binary in tools) that uses the refactored CommitLogReader code to read the CDC logs and write mutations for enabled CF's
+
+That final piece will need a little more fleshing out but shouldn't be too complex. Specify output dir, file sizes, read schema from C*, and re-read schema from C* if we see a mutation come by for system_schema.tables since that could be a CDC toggle for a CF. Only write mutations for tables w/CDC enabled.
+
+Will need specific tests to check the above for correctness and performance capabilities.
+
+This approach should avoid all the messy replay, correctness, and schema issues we were getting into above with the added cost being that we don't get the "free" separation of CDC from non-CDC mutations at write time by C*.
+
+[~brianmhess] / [~blambov] / [~carlyeks] / [~iamaleksey]: any concerns about the above revisions?
+
+
+A few things I think we should nail out before we embark on yet another CDC journey:
+
+- How will cdc space be measured? Since we have a compaction process, users will want to have two CDC directories, cdc_overflow (where the commit log files get moved to), and cdc_compacted (where the compacted files would be written to). Also, need to make sure that we are calculating it frequently enough that we don't mark it as over size.
+- Will you keep the size rejection in the same place as it is now (inside the commit log)? We will have to reject all updates, because if someone turns on the CDC in the yaml, but doesn't have any daemon running, we'll be moving all of the files to the cdc_overflow folder regardless of whether any CFs have CDC enabled.
+- Not sure how we can handle someone turning off CDC and then restarting their daemon; this will probably end up being an edge case we won't handle well. All of the updates before they turn off CDC should be included in the compacted file, the ones after should not be. However, if we read state from C*, we won't be getting the latest values out.
+- How will we guarantee atomicity between the overflow and the compacted files? Can we compact the same overflow file multiple times (in the case of multiple restarts of the daemon)? I'm thinking of the case where we mark the compacted file complete, and then fail before we can delete the overflow file.
+
+
+bq. How will cdc space be measured?
+2 contexts:
+# from C*, same as the current branch. Check on discard, check on failed alloc if CDC on, only care about cdc_overflow.
+# from compactor, check size of target folder / config in options, if at limit, just stop compacting. Backpressure flows into C*, writes for cdc-enabled get rejected.
+
+bq. We will have to reject all updates...
+Initial thoughts on ways around this: On segment creation, if there is not room to accommodate another CLS in cdc_overflow we can flag the segment as not accepting CDC writes. .allocate calls on Mutation containing CDC-enabled CF's reject if acceptingCDCWrites is false, use current logic to re-check on-disk size w/RateLimiter, and if cdc_overflow + segment size <= allowable on return, we toggle accepting on the active segment back on. On a successful CDC mutations, we idempotently enable a different bool to indicate that a segment has accepted a CDC write. On segment discard, check if segment accepted any CDC writes and, if so, move to cdc_overflow. If not, delete.
+
+Few immediate concerns I see
+# idempotent hammering of volatile bool on each CDC mutation write probably has some perf implications
+# possibility of overallocation since there's a temporal split between when we allocate a segment and when we discard it
+# Determining whether or not a Mutation is CDC-enabled w/out sequential scanning contained PartitionUpdate CFMetaData might matter. Might not. Worth microbenching, and it'd only affect nodes w/CDC-enabled anyway.
+# Doesn't really allow for toggling CDC acceptance back off during run, but I'm personally fine w/us tolerating an extra segment or two slipping into cdc_overflow past the allowable limit rather than constantly checking and toggling CDC acceptance on and off in a segment.
+
+bq. Not sure how we can handle someone turning off CDC and then restarting their daemon
+Maybe flush all cdc-enabled CF on daemon shutdown to prevent this? Or document it and recommend flushing all CDC-enabled CF before toggling the setting.
+
+bq. How will we guarantee atomicity between the overflow and the compacted files?
+Don't think we have to. At-least-once semantics should allow an edge-case like this where some data gets re-compacted and delivered multiple times. It's a little cpu overhead but not worth tackling on the complexity front IMO.
+
+bq. Initial thoughts on ways around this: On segment creation, if there is not room to accommodate another CLS in cdc_overflow we can flag the segment as not accepting CDC writes. .allocate calls on Mutation containing CDC-enabled CF's reject if acceptingCDCWrites is false, use current logic to re-check on-disk size w/RateLimiter, and if cdc_overflow + segment size <= allowable on return, we toggle accepting on the active segment back on. On a successful CDC mutations, we idempotently enable a different bool to indicate that a segment has accepted a CDC write. On segment discard, check if segment accepted any CDC writes and, if so, move to cdc_overflow. If not, delete.
+
+This means we'll be bringing the checking of whether or not we have a CDC write back into the CommitLog. One of the things that I really liked about the direction this proposal is going in was that we were removing a lot of the runtime dependencies on state, as well as providing a much lower burden to the C* process, at the cost of an additional outside process that would need to be managed if CDC was enabled on a node.
+
+bq. Maybe flush all cdc-enabled CF on daemon shutdown to prevent this? Or document it and recommend flushing all CDC-enabled CF before toggling the setting.
+Yeah, documenting is probably the right way of helping this. It seems like the caveat is that the data written between the last flush and changing the CDC setting is not guaranteed to follow the CDC setting.
+
+bq. At-least-once semantics should allow an edge-case like this where some data gets re-compacted and delivered multiple times. 
+
+Perfect; I was thinking that we might have issues with more-than-once delivery at the node-level, but there is always the possibility we'd replay hints and cause the identical mutation to be in the commit log twice, so would always have had to have been handled.
+
+bq. This means we'll be bringing the checking of whether or not we have a CDC write back into the CommitLog. One of the things that I really liked about the direction this proposal is going in was that we were removing a lot of the runtime dependencies on state, as well as providing a much lower burden to the C* process, at the cost of an additional outside process that would need to be managed if CDC was enabled on a node.
+
+I agree, but in order for us to selectively reject mutations w/CDC-enabled CF's in them, this is something we're going to have to do. Only alternatives I can see are:
+# full reject of all mutations if cdc is enabled and we're at limit
+# don't allow setting a cdc limit and strongly advise users to put it on its own disk, so we don't backpressure from it, so we don't have to check mutations. And you can lose CDC data if the drive fills.
+
+I don't see reject all being viable since it'll shut down your cluster, and reject none on a slow consumer scenario would just lead to disk space exhaustion and lost CDC data.
+
+bq. I don't see reject all being viable since it'll shut down your cluster, and reject none on a slow consumer scenario would just lead to disk space exhaustion and lost CDC data.
+
+ Didn't we agree in the past on the idea of having a parameter in Yaml that works similar to disk_failure_policy and let users decide which behavior they want on CDC overflow (reject writes/stop creating CDC/ ....) ?
+
+The issue we're discussing here is less about policy for handling CDC failures, and more about that policy impacting both CDC and non-CDC writes unless we distinguish whether a Mutation contains CDC-enabled CF in them at write-time or not.
+
+If we treat all Mutations equally, we would apply that policy to both CDC and non-CDC enabled writes, so CDC space being filled / backpressure would reject all writes on the node.
+
+edit: On re-reading my comment, I want to make sure you don't think I'm dismissing the "CDC failure policy" portion of the discussion. We don't have that in the v1 spec but it should be a relatively easy addition after we get the basic framework in.
+
+Branch updated with the following major changes:
+* Moved to single CLSM per CommitLog
+* CQL Statement changes - now a property on CF instead of Keyspace
+* tab-completion changes for grammar
+* .yaml changes: cdc is now per-node config
+* Added test-cdc build target, skip CommitLogSegmentManagerCDCTest w/non / regular build
+* Increment CDC tracked size on segment replay (oversight from v1)
+* Only reject mutations tracked by CDC if at limit. Do not reject non-cdc mutations
+* Flag Mutation as cdc-containing on add of PartitionUpdate
+* track flushed and unflushed CDC used space.
+* Add CDC-containing flag to CommitLogSegment to more intelligently handle discard of non-cdc segments if at capacity limit. This way we can reject all CDC mutations and, on discard, if a segment does not have any CDC data in it we can just delete it. This prevents the cdc_raw directory from growing unbounded w/non-cdc mutations or us having to reject all mutations when at cdc limit as we're sharing a single CommitLogSegment stream.
+* Reject CDC mutations on CDC limit w/failed allocation.
+* revert change on # compressed buffer pools to 3
+* fix view schema, make discard test more robust, revise CHANGES and NEWS
+* Fix CommitLogStressTest (bad changes from v1 and previous test setup design was faulty on Windows)
+
+I'm running test-cdc offline to see what the results look like. My suspicion is there's not going to be immediate value in running all the tests due to the number of assumptions we often make about files and our subsystem while testing, but it should provide a starting point for us to filter down to relevant tests.
+
+CI re-running now:
+||branch||testall||dtest||
+|[8844_review|https://github.com/josh-mckenzie/cassandra/tree/8844_review]|[testall|http://cassci.datastax.com/view/Dev/view/josh-mckenzie/job/josh-mckenzie-8844_review-testall]|[dtest|http://cassci.datastax.com/view/Dev/view/josh-mckenzie/job/josh-mckenzie-8844_review-dtest]|
+
+Results from test-cdc are much better than I expected.
+    
+{noformat}
+    [junit] Test org.apache.cassandra.cql3.ViewFilteringTest FAILED (timeout)
+    [junit] Test org.apache.cassandra.cql3.ViewTest FAILED (timeout)
+    [junit] Test org.apache.cassandra.cql3.validation.entities.UFTest FAILED (timeout)
+{noformat}
+
+TriggerExecutorTest also failed across the board but that's due to the test not initializing the schema for the KS/CF's it uses as it passes around CFMetaData to respective units. I'll see about cleaning that up and the above for this test target.
+    
+Also - that test run uncovered / reinforced my view of there being a problem w/the CDC check in {{Mutation.add(PartitionUpdate)}}. Adding a dependency on the keyspace being initialized is proving to be a bit troublesome; I'll think on that and get something in for that shortly.
+
+By virtue of Materialized Views and Tables having the same schema and relying on properties in our parser, it's possible w/this current branch to ALTER VIEW mv1 WITH cdc=true; and have that "work".
+
+I'm thinking we need to fail validation for alter statements and create statements on MV's w/CDC since it doesn't make logical sense (if you want CDC on the data, do it on the base table). Along with that, this would allow cases where MV writes would fail w/base writes succeeding assuming a CDC-enabled and CDC-disabled split, respectively.
+
+[~brianmhess] / [~carlyeks]: any objections?
+
++1 to not allowing cdc on views, and it seems like validation makes the most sense.
+
+If either of you ([~carlyeks] / [~blambov]) have started reviewing, there are a couple of logical flaws in the way I've used the value of "combined un-flushed cdc-containing segment size and cdc_raw". Currently a non-cdc mutation could fail an allocation, advance in allocatingFrom(), and allow subsequent cdc-based mutations to succeed since the new code doesn't check for {{atCapacity}} until the case of allocation failure. The current logic strictly precludes allocation of a new CommitLogSegment by a cdc-containing Mutation allocation so it works when tested on cdc-only streams of Mutations but not mixed; I'll be writing a unit test to prove that shortly. Problem #2: if we track un-flushed full cdc-containing segment size in {{atCapacity}} and use that as part of metric to reject CDC-containing Mutations *before* that allocation attempt, we would then prematurely reject cdc mutations in the final CommitLogSegment created in the chain before filling it.
+
+I'm going to need to spend some more time thinking about this. My initial hunch is that we may be unable to track un-flushed segment size w/CDC data in them as a meaningful marker of future CDC-data, thus meaning we cannot guarantee adherence to the user-specified disk-space restrictions for CDC due to in-flight data not yet being counted.  As new segment allocation takes place in the management thread and the current logic is strongly coupled to the invariant that new segment allocation always succeeds (even if back-pressured by compression buffer usage), the approach of forcibly failing is less palatable to me than us being a little loose with our interpretation of cdc_total_space_in_mb by 1-N segment units, assuming N tends to be low single digits leading to <5% violation in the default case. This should hold true unless flushing gets wildly backed up relative to ingest of writes; I don't know enough about that code to speak to that but will likely read into it a bit.
+
+Anyway - figured I'd point that out in case either of you came across it and registered it mentally as a concern or if either of you have any immediate ideas on this topic.
+
+(edit x2: Thinking is hard.)
+
+Setting back to Patch Available.
+
+There is now an implemented solution for the size tracking problems listed above. The branch is post-rebase of the addition of lower/upper bound to segments, and tests are in a mostly complete place.
+
+Have 3 failed dtests and 7 failed in testall that I believe are unrelated (read: flakey) but I'm going to track down each locally to confirm.
+
+I've fixed the CreateTest and CommitLogStressTest since the last CI run. No sense in paying for another run until I've confirmed these final 10 tests aren't a problem from the branch.
+
+Not ready to commit, still under code review.
+
+Not sure who the "Anonymous" is that flipped it to Ready to Commit.
+
+All tests that failed in CI are known issues or flaky tests and pass locally. I spent more time on that SASIIndexTest failure than I would have preferred before I realized it was the deadlock during flush introduced by CASSANDRA-9669.
+
+I did a quick experiment, I picked up the code from feature branch and setup a 3 node cluster. Created the keyspace with RF=3 and a table with cdc=true. But after I inserted a row into the table, I don't see the cdc log in the cdc_raw folder. However, after restart a node, it seems in the log replay phase the cdc log is generated in cdc_raw. So is that the expected behavior? 
+
+bq. is that the expected behavior?
+It's a bit more subtle than that - check the attached design doc. The particularly relevant bit on page 2:
+
+bq. On discard, segments with CDC data will be moved to cdc_raw
+So don't expect to see the data in CDC available until CL is recycled. If you need more immediate CDC data, you can write a consumer using the CommitLogReader and CommitLogReadHandler interfaces relatively easily and tail live data, using the move to cdc_raw as a signal that C* is done with the file.
+
+Reviewed the commitlog part again, this is a much safer approach. The issues I saw are relatively minor:
+
+* [{{CommitLogSegmentManagerCDC.allocate}}|https://github.com/apache/cassandra/compare/trunk...josh-mckenzie:8844_review#diff-878dc31866184d5ef750ccd9befc8382R100] has some asymmetry that hints at a concurrency issue. Indeed, if one thread sets {{atCapacity}} and another advances a segment with non-tracked data while a third is stopped at line ~117, we will overrun the capacity by one segment. I'm not sure this is such a big deal -- perhaps we should just document that possibility and go on.
+The alternative is to take your worst-case approach a little further -- add an {{acceptsCDCMutations}} flag and set it when the segment is created or space is freed, reserving the capacity. If the segment ends up not having any, release the capacity at {{discard}}. This will simplify {{allocate}} as it won't need to check {{atCapacity}} at all. You could also combine the two booleans into an enum for the CDC mutations state of a segment: FORBIDDEN -> PERMITTED -> CONTAINS.
+
+* [{{CommitLogSegmentManagerCDC.discard}}|https://github.com/apache/cassandra/compare/trunk...josh-mckenzie:8844_review#diff-878dc31866184d5ef750ccd9befc8382R63] should swap the order of {{removeUnflushedSize}} and {{addFlushedSize}}, otherwise {{atCapacity}} may flip in-between when space isn't actually available.
+
+* [Stopping replay on error|https://github.com/apache/cassandra/compare/trunk...josh-mckenzie:8844_review#diff-0a01d2ee3c5e4d183d9dc73f5e900163R50] actually stops _segment_ replay on error, and allows the process to continue with the next segment. The old code didn't do anything different, but we now claim returning true stops replay which isn't entirely correct -- at the very least we should state so in the comment, but I'd rather just remove that option. The comment should also say that to fully stop replay one must throw an exception (as {{CommitLogReplayer}} does).
+
+* [Pre-2.1 replay|https://github.com/apache/cassandra/compare/trunk...josh-mckenzie:8844_review#diff-9fe0bd988c4fc47a022f589f5ad72b09R130] should also set {{mutationLimit}} on the tracker.
+
+* [{{SimpleCachedBufferPool}}|https://github.com/apache/cassandra/compare/trunk...josh-mckenzie:8844_review#diff-7298664d3f49b2a705d1b4fafd0621b0R83] should provide {{getThreadLocalReusableBuffer(int size)}} which should automatically reallocate if the available size is less, and not expose a setter at all.
+
+* [{{AbstractCommitLogSegmentManager.start}}|https://github.com/apache/cassandra/compare/trunk...josh-mckenzie:8844_review#diff-85e13493c70723764c539dd222455979R114]: You can use {{AbstractCommitLogSegmentManager.this}} instead of explicitly saving {{parent}}.
+
+* [for each loop vs {{forEach}}|https://github.com/apache/cassandra/compare/trunk...josh-mckenzie:8844_review#diff-05c1e4fd86fea19b8e0552b1f289be85R370]: I'm not a big fan of these transformations. The way lambdas are currently implemented the latter incurs an extra allocation -- it is not a showstopping inefficiency, but since that isn't unequivocally better, I wouldn't change the loops when it doesn't significantly improve readability.
+
+* [{{commitLogUpperBound}}|https://github.com/apache/cassandra/compare/trunk...josh-mckenzie:8844_review#diff-98f5acb96aa6d684781936c141132e2aR979] is replaced incorrectly in comments.
+
+
+I've made a PR containing some CDC dtests here:
+
+https://github.com/riptano/cassandra-dtest/pull/1008
+
+Is that possible that I capture the data change with CommitLogReader by directly reading the live commit logs (while Cassandra is still using it)?  We are struggling on an active-active Cassandra setup, and need to capture the data changes to reflect the change in application (ie, invalidating cache). Thanks!
+
+Yep - CommitLogReader, sort logs in data/commitlog by timestamp, and exploit the fact that we only ever actively append to one file in that directory. Requires more book-keeping to do the live tailing but it shouldn't be a super-difficult thing to implement.
+
+bq. add an acceptsCDCMutations flag and set it when the segment is created or space is freed, reserving the capacity...
+This suggestion piqued my interest. I went ahead and implemented this which further re-inforced my general frustration surrounding trying to get deterministic behavior out of the order of CommitLogSegment allocation (for purposes of tracking size, in our case). I moved the size tracking logic into the CDCSizeTracker (was SizeCalculator) which I think is much cleaner and easier to reason about.
+
+For now, there's synchronized blocks around the adjustment of flushed and unflushed size, primarily to try and work around potential races between the segment allocation thread and the executor for directory walking size calculation. There's the potential for 2 races that I can think of:
+# there's a window of time between rebuildFileList and Files.walkFileTree where there could be uncaught changes in the underlying filesystem.
+# the changes in CDCSizeTracker.size() are incremental per-file while walking the file tree, so changes to that value could race with changes from the segment management thread.
+
+Those two being acknowledged, I think we're close to as good as we're going to get regarding the correctness of the tracked size of the CDC folder w/out making the calc synchronous on allocation or adding a hook for external consumers to signal C*. Another added benefit of this approach is that it's a very simple check on mutation application with CDC-enabled.
+
+My gut feeling is that this is a premature optimization if approached strictly for making the CDC mutations faster, however I find the relationships more clearly defined now and easier to reason about. Let me know what you think.
+
+bq. CommitLogSegmentManagerCDC.discard should swap the order of removeUnflushedSize and addFlushedSize, otherwise atCapacity may flip in-between when space isn't actually available.
+Should be addressed w/new code.
+
+bq. Stopping replay on error actually stops segment replay on error, and allows the process to continue with the next segment. The old code didn't do anything different, but we now claim returning true stops replay which isn't entirely correct – at the very least we should state so in the comment, but I'd rather just remove that option. The comment should also say that to fully stop replay one must throw an exception (as CommitLogReplayer does).
+I'd rather we more deliberately change the current "skip this segment" to "forcibly terminate reading" in a separate ticket rather than tacked along on this one. I'm fine with (and have done) renaming the method to "shouldSkipSegmentOnError" and updated the comments accordingly.
+
+bq. Pre-2.1 replay should also set mutationLimit on the tracker.
+Good catch. Fixed.
+
+bq. SimpleCachedBufferPool should provide getThreadLocalReusableBuffer(int size) which should automatically reallocate if the available size is less, and not expose a setter at all.
+This is a simple refactor of the existing code in use in FileDirectSegment on trunk. I'd prefer we tackle changing its usage patterns and functionality in a separate ticket so as not to add any further dependencies or changes into this ticket with CDC.
+
+bq. AbstractCommitLogSegmentManager.start: You can use AbstractCommitLogSegmentManager.this instead of explicitly saving parent.
+No longer applies w/changed code, as createSegment is now a virtual w/size tracking on the CDC side, etc.
+
+bq. for each loop vs forEach: I'm not a big fan of these transformations. The way lambdas are currently implemented the latter incurs an extra allocation – it is not a showstopping inefficiency, but since that isn't unequivocally better, I wouldn't change the loops when it doesn't significantly improve readability.
+Reverted the ones in CommitLog. Largely an artifact of the multiple CLSM approach.
+
+bq. commitLogUpperBound is replaced incorrectly in comments.
+Bad rebase. Fixed.
+
+Last but not least, in commit {{a7afe74d5c6c0c444ebc4c38c9b55f6a44a96c3a}} I modified the CommitLogReader to suppress handleMutation calls for mutations that originate below the now passed in CommitLogSegmentPosition specified as minimum position to the reading process. Prior to this (and on trunk), the logic skips SyncSegments where the end position is > that then min start, however we replay mutations in the overlapping SyncSegment regardless of whether they are before or after our requested min position. This isn't a huge issue during traditional CommitLogReplay, however now that we're exposing an interface with a count of mutations to replay, we need to respect that contract and thus not read mutations nor count them against the limit unless they're past the min.
+
+So long as EncryptedFileSegmentInputStream doesn't implement {{FileDataInput.seek}}, we're going to have to go through the considerably more expensive path of deserializing the mutation, checking CRC, etc, however this only applies to mutations within the SyncSegment so should be a relatively constrained performance penalty. This can be resolved in a follow-up ticket.
+
+A local run of ant test-cdc has only 1 failure w/anticompaction unrelated to this ticket. I'm debating whether or not to run this in CI until I get your feedback on these changes and Carl's next round of feedback.
+
+Given our time horizon (a few weeks out from freeze for 3.8), I'd prefer this be the last sizeable change to the implementation that we make assuming no major flaws or obstructions come up from this change.
+
+Thanks for the update.
+
+I am worried about the {{cdcSizeCalculationExecutor}} task list size. On one hand we can add tasks at a high rate if there are a lot of attempted cdc writes, on the other size recalculation and [{{processNewSegment}}|https://github.com/apache/cassandra/commit/5ff4adb0e01ea0668b513211298dacc829887e97#diff-878dc31866184d5ef750ccd9befc8382R193] both call each other, which in a space-exhausted situation this will mean a new task added for each one removed by {{cdcSizeCalculationExecutor}} and its list never shrinking.
+
+The easiest way I can think of to sort this out is to use an executor with a bounded queue of small size (I don't think we want any more than 1 or 2 trailing re-runs anyway) with [{{DiscardPolicy}}|https://docs.oracle.com/javase/7/docs/api/java/util/concurrent/ThreadPoolExecutor.html] as the rejected execution policy.
+
+Nits:
+I think it's safer to synchronize on the segment in {{processNewSegment/processDiscardedSegment}} and make {{setCDCState}} also synchronize if {{newState != cdcState}}.
+
+The [{{setCDCstate}} comment|https://github.com/apache/cassandra/commit/5ff4adb0e01ea0668b513211298dacc829887e97#diff-7720d4b5123a354876e0b3139222f34eR616] is not what the code does.
+
+{quote}
+bq. CommitLogSegmentManagerCDC.discard should swap the order of removeUnflushedSize and addFlushedSize, otherwise atCapacity may flip in-between when space isn't actually available.
+
+Should be addressed w/new code.
+{quote}
+We still have the same problem (as {{totalCDCSizeOnDisk}} does not sync). Since we use atomics that enforce happens-before, swapping the order in [{{processDiscardedSegment}}|https://github.com/apache/cassandra/commit/5ff4adb0e01ea0668b513211298dacc829887e97#diff-878dc31866184d5ef750ccd9befc8382R202] will be sufficient to fix it.
+
+I've pushed another PR with a new CDC dtest:
+
+https://github.com/riptano/cassandra-dtest/pull/1023
+
+It depends on the previous one.
+
+I've been testing this using the process from CASSANDRA-11575. Everything seems to be working.
+
+One thing that is pathologically bad is when someone mixes writes with a slow flushing and fast flushing tables. There probably needs to be some backpressure between the commitlogs (especially those which are counting against the CDC total) and the memtables -- should be part of a follow-on ticket, though.
+
+I'm still reviewing the patch.
+
+bq. I am worried about the cdcSizeCalculationExecutor task list size.
+I'm fairly certain this got lost in some refactoring somewhere - my original intent was to have a single-threaded DiscardPolicy executor but clearly that didn't happen. I believe only having a single recalc in flight is appropriate. A given write is going to be rejected regardless of the result of that async recalc call, so the in-flight recalc that causes discard of a new request should satisfy the intent of that submission.
+
+Nits:
+bq. I think it's safer to synchronize on the segment in processNewSegment/processDiscardedSegment and make setCDCState also synchronize if newState != cdcState.
+Originally I made cdcState volatile so as to work around the fact that we're essentially setting the state to CONTAINS on every successful CDC write and minimize the impact of repeatedly grabbing a lock for writes, and relying on the synchronization in CDCSizeTracker to keep allocations / discards from stomping over one another. I'm comfortable just using a synchronization on the setCDCState as well and synchronizing on the segment for the initial implementation and we can revisit this if it proves to be an issue. Added some comments in there to point that out; synchronizing on an object in two different classes makes me wary.
+
+bq. The setCDCstate comment is not what the code does.
+Old comment; removed.
+
+bq. We still have the same problem (as totalCDCSizeOnDisk does not sync). Since we use atomics that enforce happens-before, swapping the order in processDiscardedSegment will be sufficient to fix it.
+Thought I had that order fixed. Thanks for catching that.
+
+Fixed PascalCase that snuck in and rebased to curent trunk.
+
+[~carlyeks]: Going to have to chew on that one for a bit. May make sense in a v2 to either push pressure up to flushing a table if CDC is full and/or add some more intelligence into conflated non-CDC unflushed data that's causing CDC to hang around.
+
+bq. Thought I had that order fixed. Thanks for catching that.
+
+My bad. You had fixed it in [{{cab5c9de256348614cb1190875c44977e6289812}}|https://github.com/josh-mckenzie/cassandra/commit/cab5c9de256348614cb1190875c44977e6289812#diff-878dc31866184d5ef750ccd9befc8382R204] and I looked at the individual commits, managed to miss it, and made you break it again. Apologies.
+
+Apart from that, the commit log changes look good to me.
+
+Yeah. So we talked offline about that this morning, and apparently I'm just physically incapable of reasoning about double negatives. Thanks Atomic interface.
+
+Fixed and pushed.
+
+Re-ran CI w/current and all failures are unrelated/known issues.
+
+- don't need to change name of convertPropertyMap in Parser.g
+- we shouldn't be creating the cdc_raw directory unless we have cdc enabled, or at least shouldn't fail if we can't create it
+- there are no substantive changes in Create/DropKeyspaceStatement; we can get rid of the whitespace changes there since we aren't modifying them anymore
+- comment was removed from line 75 in Memtable.java, the remaining comment doesn't make much sense without it
+- CDC (and VIEW) need to be included in the protocol spec, so we should make a new ticket under the v5 protocol to add both of those write types
+- capitalization: CommitLogReader#readcommitLogSegment => readCommitLogSegment
+- Do we need to continue support for reading CommitLogs from before 2.1?
+- We can get rid of the {{@SuppressWarnings("resource")}} above CommitLogReplayer#pointInTimeExceeded (looks like it was left over from before)
+- CommitLogSegment#GetCurrentCommitLogPosition lower case 'g'
+- CommitLogSegmentManagerCDC#discard: the else if case is weirdly laid out
+- The todo above CDCSizeTracker should become a follow up ticket
+- In SchemaKeyspace#createTableParamsFromRow, we need to handle the case where the row does not contain cdc, which will be the case on upgrade
+- DirectorySizeCalculator has windows line endings
+
+
+Looks like you may have added at least two new Eclipse warnings ({{ant eclipse-warnings}}):
+
+{code}
+[java] ----------
+[java] 1. ERROR in /Users/carl/oss/cassandra/src/java/org/apache/cassandra/db/commitlog/CommitLogSegmentReader.java (at line 292)
+[java]     return new SyncSegment(input, startPosition, nextSectionStartPosition, (int)nextLogicalStart, tolerateSegmentErrors(nextSectionStartPosition, reader.length()));
+[java]     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[java] Potential resource leak: 'input' may not be closed at this location
+[java] ----------
+[java] 2. ERROR in /Users/carl/oss/cassandra/src/java/org/apache/cassandra/db/commitlog/CommitLogSegmentReader.java (at line 363)
+[java]     return new SyncSegment(input, startPosition, nextSectionStartPosition, (int)nextLogicalStart, tolerateSegmentErrors(nextSectionStartPosition, reader.length()));
+[java]     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[java] Potential resource leak: 'input' may not be closed at this location
+{code}
+
+
+bq. don't need to change name of convertPropertyMap in Parser.g
+Reverted. I agree.
+
+bq. we shouldn't be creating the cdc_raw directory unless we have cdc enabled, or at least shouldn't fail if we can't create it
+Disabled directory creation in {{DatabaseDescriptor.createAllDirectories}} if cdc not enabled.
+
+bq. there are no substantive changes in Create/DropKeyspaceStatement; we can get rid of the whitespace changes there since we aren't modifying them anymore
+I see import order changes but no WhiteSpace on Drop. On Create, convention in other files is to have spaces between classes of imports so I think we should leave that.
+
+bq. comment was removed from line 75 in Memtable.java, the remaining comment doesn't make much sense without it
+Think that was a merge / rebase hiccup. Added it back.
+
+bq. CDC (and VIEW) need to be included in the protocol spec, so we should make a new ticket under the v5 protocol to add both of those write types
+Jira's being kinda of terrible lately, so I'll get to this once it starts responding. I'm planning on scraping the comments of this JIRA for the word "ticket" to add all the stuff that came up that were considered outside the scope of the primary CDC effort, and this'll be one of them.
+
+bq. capitalization: CommitLogReader#readcommitLogSegment => readCommitLogSegment
+Fixed.
+
+bq. Do we need to continue support for reading CommitLogs from before 2.1?
+If not, we can create another ticket to deal with that. Out of scope for this ticket.
+
+bq. We can get rid of the @SuppressWarnings("resource") above CommitLogReplayer#pointInTimeExceeded (looks like it was left over from before)
+Removed.
+
+bq. CommitLogSegment#GetCurrentCommitLogPosition lower case 'g'
+Fixed.
+
+bq. CommitLogSegmentManagerCDC#discard: the else if case is weirdly laid out
+Wrapped else in braces and left nested if without. Clearer now.
+
+bq. The todo above CDCSizeTracker should become a follow up ticket
+See above.
+
+bq. In SchemaKeyspace#createTableParamsFromRow, we need to handle the case where the row does not contain cdc, which will be the case on upgrade
+I think this falls under the "Don't change your schema while you're upgrading" advice we give people. Until we have separate messaging versions for sub-systems within the DB I don't see an elegant solution to this problem that doesn't leave vestigial code around to atrophy from version changes.
+
+bq. DirectorySizeCalculator has windows line endings
+Oops. Fixed.
+
+bq. Looks like you may have added at least two new Eclipse warnings (ant eclipse-warnings):
+I get 19 on trunk and 19 on my branch, identical failures.
+
+{quote}
+I think this falls under the "Don't change your schema while you're upgrading" advice we give people. Until we have separate messaging versions for sub-systems within the DB I don't see an elegant solution to this problem that doesn't leave vestigial code around to atrophy from version changes.
+{quote}
+No, this falls under the "you won't be able to start the database after upgrading". You need to handle this in the schema creation code, since this is the code path that we go through when we are creating the CFMetadata at startup.
+
+bq. No, this falls under the "you won't be able to start the database after upgrading"
+# No need to get snippy. There's a reason I said "I think" as I'm not super-familiar with the schema code.
+# Have a fix in and pushed, but I have a hard time thinking there's not a better way than:
+
+{noformat}
+.cdc(row.has("cdc") ? row.getBoolean("cdc") : false)
+{noformat}
+
+Is there?
+
+{quote}
+No need to get snippy.
+{quote}
+Hmm, the text has lost the all-important tone; rather than bemused riffing, it reads much more as "DO WHAT I SAID NOW!"
+
+{quote}
+I have a hard time thinking there's not a better way than:
+{code}
+.cdc(row.has("cdc") ? row.getBoolean("cdc") : false)
+{code}
+Is there?
+{quote}
+That's what is in the code and I've done before; it'd be cleaner if we used optional, but to get this ticket shipped, let's go with that.
+
+bq. That's what is in the code
+That's a pretty nasty idiom as it leaves a lot of inter-version cruft around. Would be really nice to have versioned schema for these things cleanly abstracted so we could just deserialize a version and construct w/the appropriate method from there.
+
+But that's a problem for another day.
+
+Rebased to current trunk and pushed.
+
+[~blambov] / [~carlyeks]: Either of you have any outstanding unaddressed concerns?
+
+Nothing more from me - code looks good and I just ran CASSANDRA-11575 against it again to make sure it was all still working.
+
++1
+
++1, with a final rename nit: [{{Allocation.GetCommitLogPosition}}|https://github.com/apache/cassandra/compare/trunk...josh-mckenzie:8844_review#diff-7720d4b5123a354876e0b3139222f34eR669] is in PascalCase.
+
+Switching between C# and Java everyday has its costs.
+
+Fixed that, tidied up NEWS.txt (spacing and ordering on Upgrading and Deprecation), and [committed|https://git-wip-us.apache.org/repos/asf?p=cassandra.git;a=commit;h=e31e216234c6b57a531cae607e0355666007deb2].
+
+Thanks for the assist [~carlyeks] and [~blambov]!
+
+I'll be creating a follow-up meta ticket w/subtasks from all the stuff that came up here that we deferred and link that to this ticket, as well as moving the link to CASSANDRA-11957 over there.
+
+When is GA release planned for this feature? How can I evaluate it in the mean time for my use case ?
+
+CDC is part of 3.8, which will be released during July.
+
+The feature is already committed to trunk, so you could [pull Cassandra and build it|http://wiki.apache.org/cassandra/HowToBuild] yourself if you wanted to test it before we have a release including this.
+
+How to confirm if cdc is enabled on a CF? I did ALTER TABLE <tableName> WITH CDC = true; and did a DESCRIBE TABLE <tablename>; and there is nothing related to cdc
+
+It is a setting per table, but it also requires that the node has it enabled in its yaml as well. There needs to be a corresponding update to cqlsh's {{DESCRIBE TABLE}} which was overlooked in this patch.
+
+Yes, I have it enabled in yaml and I see the cdc_raw directory. Also I see a few entries in the CL under cdc_raw about the inserts I made to the table (I read whatever I could although the format is not human readable). So I guess cdc is enabled on the table. Is cqlsh update to describe table being worked on?
+
+[~findadit@gmail.com]: No, but I've created CASSANDRA-12041 to track progress on it.
+
+I am fairly new to Cassandra. I have a requirement to be able to read any changes to tables, as in inserts deletes or updates from a given timestamp. I believe the new implementation of CDC should help me with this.
+However, with CDC enabled, I want to know if there is yet a way to read the data inserts,updates or deletes to a table through CQL. I do see implementations of CommitLogReader. But, I want to know if it is possible to read the changes using CQL. If yes, how?
+
+Please advise.
+
+Thanks.
+
+[~sridhar.nemani@whamtech.com]: No, this is still a low-level, mutation-based output. I would suggest asking on the [user mailing list|http://cassandra.apache.org/community/] instead, as this Jira ticket is only about the feature as it has been implemented.
+
+[~jbellis] Sorry, It seems that I unexpectedly changed the assignment with a keyboard shortcut. Thank you for your fix.
+
+Not sure if I should start a new thread, but I am wondering how CDC works with delete, especially whether it supports range delete or partition delete? 
+
+Good question for the user or possibly dev mailing list. You'll want to clarify what you mean by: "but I am wondering how CDC works with delete,", but as a general point: any mutations that are flushed to the CommitLog will end up available via CDC.
+

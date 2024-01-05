@@ -1,0 +1,98 @@
+Hello,
+
+I have been checking out what happened with this test and found out that the keyspace1 does not exist on the node2 because all 3 submitted migration tasks failed to complete.
+After there were no more migration tasks in progress {{MigrationManager.waitUntilReadyForBootstrap}} returned and the node bootstrapped.
+
+From the discussion in CASSANDRA-10731 I understood that bootstrapping a node with out of sync schema is undesired behavior.
+In case the {{MigrationTask.inflightTasks}} queue is empty and the schema wasn't pulled yet, does it make sense to schedule more MigrationTasks one by one until at least one of them succeeds?
+
+What do you think?
+
+The failure in the test ("keyspace keyspace1 does not exist") happened because during the pre-bootstrap schema migration all the migration tasks failed to complete and the node was bootstrapped with schema being out of sync.
+{{MigrationManager.waitUntilReadyForBootstrap}} (which is invoked by {{StorageService.waitForSchema}}) just waits for the inflight tasks to finish and discards ones that take longer than {{MIGRATION_TASK_WAIT_IN_SECONDS}} to complete.
+Schema migration tasks are scheduled when there is a big change in an endpoint state - it joins the cluster, becomes alive or its schema version has changed.
+
+The idea is that it is safe to restart the migration task if it has timed out because either the task will succeed on one of the next retries or will be eventually killed by {{FailureDetector}} if the endpoint is marked as unreachable.
+AFAIU there will be at least one migration task per endpoint. With the retry mechanism {{MigrationManager.waitUntilReadyForBootstrap}} will run until migration tasks to all the reachable nodes succeed.
+This means that either we will receive the migration data from at least one of the nodes or all the nodes will be unreachable, but then the bootstrap is supposed to fail anyway.
+
+*Steps to reproduce*
+
+To test the retry, I commented out sending reply in {{org.apache.cassandra.schema.SchemaPullVerbHandler.doVerb}} and ran the original {{snitch_test.TestGossipingPropertyFileSnitch.test_prefer_local_reconnect_on_listen_address}} test.
+_NB:_ the test will run forever because without response the migration requests timeout and then being restarted.
+
+*Code*
+https://github.com/Gerrrr/cassandra/tree/13196-3.11
+
+*CI builds*:
+
+* https://cassci.datastax.com/job/ifesdjeen-13196-trunk-dtest/
+* https://cassci.datastax.com/job/ifesdjeen-13196-trunk-testall/
+
+There's a real risk (in large clusters, or in clusters with large schemas, or when upgrading versions where we run in a mixed-version state) that we can have a lot of migrationtasks in flight, so much so that we can actually kill nodes ( see CASSANDRA-11748 for example ) - re-queueing more migration tasks when one times out is a good way to make the problem worse, not better. I'm very concerned with the approach [here|https://github.com/Gerrrr/cassandra/commit/463f3fecd9348ea0a4ce6eeeb30141527b8b10eb#diff-f484a759f797776d9cc5d8af92b29e5eR156] where we just blindly schedule another poll. 
+
+Do we even know why this failed in the first place? Isn't the right fix understanding why all 3 migration tasks failed, not just making more and more and more migration tasks?
+
+Hi Jeff,
+
+Thank you for the feedback and the reference to CASSANDRA-11748, I agree that blind retry might not be the best approach here. I checked available logs once again, compared them against the logs of the passing tests and found the following details. Here are the selected parts including 2 out of 3 failing migration tasks (node2_debug.log):
+
+{NOFORMAT}
+DEBUG [GossipStage:1] 2017-02-06 22:13:17,494 Gossiper.java:1524 - Received a regular ack from /127.0.0.3, can now exit shadow round
+DEBUG [RequestResponseStage-1] 2017-02-06 22:13:17,544 Gossiper.java:1013 - removing expire time for endpoint : /127.0.0.3
+INFO  [RequestResponseStage-1] 2017-02-06 22:13:17,544 Gossiper.java:1014 - InetAddress /127.0.0.3 is now UP
+
+...
+
+DEBUG [MessagingService-Outgoing-/127.0.0.3-Small] 2017-02-06 22:13:19,540 OutboundTcpConnection.java:389 - Attempting to connect to /127.0.0.3
+INFO  [HANDSHAKE-/127.0.0.3] 2017-02-06 22:13:19,542 OutboundTcpConnection.java:502 - Handshaking version with /127.0.0.3
+DEBUG [MessagingService-Outgoing-/127.0.0.3-Small] 2017-02-06 22:13:19,547 OutboundTcpConnection.java:474 - Done connecting to /127.0.0.3
+INFO  [ScheduledTasks:1] 2017-02-06 22:13:20,175 TokenMetadata.java:498 - Updating topology for all endpoints that have changed
+DEBUG [GossipStage:1] 2017-02-06 22:13:20,582 FailureDetector.java:457 - Ignoring interval time of 3091069037 for /127.0.0.3
+INFO  [GossipStage:1] 2017-02-06 22:13:20,583 Gossiper.java:1050 - Node /127.0.0.3 is now part of the cluster
+DEBUG [GossipStage:1] 2017-02-06 22:13:20,585 StorageService.java:2183 - Node /127.0.0.3 state NORMAL, token [-1004975124483382337, -1043780946254161012, -1171220283294501102, -1633901128898670626, -2841540313718334770, -3101553897858755861, -3621837948233406461, -3885385423954957338, -4732725481887392373, -6179581950298736502, -6981606078877819247, -7346004435634569033, -8212720784299798818, -8540770738419743277, -9144476684623172343, -9177835532129132670, 2008413755392462902, 2811132152336883532, 3686445661174337927, 3782543114949044043, 4077664166716898608, 4223225346596811804, 4829686036948015467, 5983186107673554538, 6452742755557526311, 6973900262646615849, 7254341221965284892,
+8057149706767269849, 8062244717118882837, 8473826416444317568, 8957680003056564562, 9045604815824506670]
+
+...
+
+DEBUG [GossipStage:1] 2017-02-06 22:13:20,622 MigrationManager.java:85 - Submitting migration task for /127.0.0.3
+INFO  [GossipStage:1] 2017-02-06 22:13:20,623 TokenMetadata.java:479 - Updating topology for /127.0.0.3
+DEBUG [MigrationStage:1] 2017-02-06 22:13:20,623 MigrationTask.java:74 - Can't send schema pull request: node /127.0.0.3 is down.
+INFO  [GossipStage:1] 2017-02-06 22:13:20,628 TokenMetadata.java:479 - Updating topology for /127.0.0.3
+DEBUG [GossipStage:1] 2017-02-06 22:13:20,631 MigrationManager.java:85 - Submitting migration task for /127.0.0.3
+DEBUG [MigrationStage:1] 2017-02-06 22:13:20,631 MigrationTask.java:74 - Can't send schema pull request: node /127.0.0.3 is down.
+...
+DEBUG [RequestResponseStage-1] 2017-02-06 22:13:20,665 Gossiper.java:1013 - removing expire time for endpoint : /127.0.0.3
+INFO  [RequestResponseStage-1] 2017-02-06 22:13:20,665 Gossiper.java:1014 - InetAddress /127.0.0.3 is now UP
+{NOFORMAT}
+
+Following the reconnect ("Attempting to connect to /127.0.0.3") the migration tasks were submitted after the endpoint is considered NORMAL by the StorageService, but before it was marked alive by Gossiper.realMarkAlive. Can there be a rare race condition based on the order of these actions?
+Can you please tell me if this might make sense or provide with any suggestions on what to look at?
+
+Thanks,
+Aleksandr
+
+Wouldn't be surprised if there was a race condition there - there was a not-dissimilar race solved recently in CASSANDRA-12653 where the race was in setting up token metadata as the node came out of shadow round, and this is fairly similar - we come out of shadow round at {{2017-02-06 22:13:17,494}} , we submit the migration tasks at {{2017-02-06 22:13:20,622}} and immediately {{2017-02-06 22:13:20,623}} decide not to send it, and FD finally sees the nodes come up at {{2017-02-06 22:13:20,665}} - at the very least, I'm not sure why we'd even try to submit the migration task knowing the instance was down - requeueing the schema pull immediately on failure here definitely wouldn't have helped (we'd have failed to send it again, as the instance was still down). I'm sort of wondering if this test still fails with #12653 committed - it doesn't seem like it's the exact same issue, but maybe the changes from 12653 also help with this race? 
+
+I'm not sure of the history here, but it seems like [MigrationManager#shouldPullSchemaFrom|https://github.com/Gerrrr/cassandra/blob/463f3fecd9348ea0a4ce6eeeb30141527b8b10eb/src/java/org/apache/cassandra/schema/MigrationManager.java#L125] could potentially check that endpoint's UP/DOWN in addition to messaging version.  
+
+
+Failed again here: https://ci-cassandra.apache.org/blue/organizations/jenkins/Cassandra-devbranch/detail/Cassandra-devbranch/459/tests/
+
+Patch to simplify a good portion of this test with a sprinkle of regular expressions.  I believe the flakiness may have been looking for the INTERNAL_IP state on 4.0, which could be affected by CASSANDRA-16381 and CASSANDRA-16525, but it is neither necessary nor logical to look for on a clean 4.0+ cluster.
+
+[!https://ci-cassandra.apache.org/job/Cassandra-devbranch/497/badge/icon!|https://ci-cassandra.apache.org/blue/organizations/jenkins/Cassandra-devbranch/detail/Cassandra-devbranch/497/pipeline]
+
+
+I am +1 on the new version of the test. The patterns are way more reliable and remove the need of updating the previous strings all the time. 
+
+I haven't been able to reproduce the test failure or find recent CI failures. Looking at the log from Caleb what you say seems reasonable to me from code inspection. 
+
+I suggest we commit the new version and close the ticket. If the issue reappears we will reopen it. WDYT?
+
+PS I ran the new version also locally with 3.0 and 3.11 and it passes successfully
+
+Sounds like a plan, committed.
+
+Thank you :) 
+

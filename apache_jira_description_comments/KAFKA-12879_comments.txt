@@ -1,0 +1,85 @@
+I'm trying to understand the reason to _*not*_ throw the {{UnknownTopicOrPartitionException}} if it determines that a topic doesn't exist 🤔
+
+Are meta data operations in Kafka (e.g. topic creation) atomic across the cluster? Or is the admin client code retrying optimistically, hoping that the topic will soon be available across the cluster?
+
+Also, there's code elsewhere in Kafka that will perform retries but note any {{UnknownTopicOrPartitionException}} to throw if all of the retries are exhausted:
+
+[https://github.com/apache/kafka/blob/trunk/trogdor/src/main/java/org/apache/kafka/trogdor/common/WorkerUtils.java#L273]
+
+ 
+
+Almost all of the {{Admin}} client's public API methods are meant to be consumed asynchronously. Most of the exceptions that can occur are thrown when the {{Future#get}} method is invoked, not when the {{Admin}} API call itself is invoked.
+
+However, there are some exceptions (pun intended):
+ # Creation of the client propagates errors if any occur during configuration
+ # {{close}} throws an error if the given {{timeout}} is negative
+ # {{deleteTopics}} throws an {{IllegalArgumentException}} if the {{TopicCollection}} parameter is not of an expected sub-class
+ # {{updateFeatures}} throws an {{IllegalArgumentException}} if the the {{featureUpdates}} map is empty or contains a blank feature name
+
+The above are just those that are thrown directly in the {{KafkaAdminClient}} itself.
+
+Of the above list, item four seems like it stands out as being extra "picky" compared to, say, {{describeTransactions}}, which doesn't check the collection its given for emptiness.
+
+[~tombentley] - is there a specific way you're invoking {{{}listOffsets{}}}? Are you doing it via one of the scripts or a custom program? Just looking for the best way to reproduce. Thanks!
+
+cc [~rhauch], [~chia7712], [~kkonstantine]
+
+The original intent of [KAFKA-12339|https://issues.apache.org/jira/browse/KAFKA-12339]'s changes were to retry the `listOffsets(...)` if a retriable exception were thrown, as other methods within the AdminClient automatically handle retries. In hindsight, I should have sought clarification on that change, since [KIP-396|https://cwiki.apache.org/confluence/pages/viewpage.action?pageId=97551484] that added `listOffsets(...)` was ambiguous about retries while [KIP-117|https://cwiki.apache.org/confluence/display/KAFKA/KIP-117%3A+Add+a+public+AdminClient+API+for+Kafka+admin+operations] that added `AdminClient` included automatic retry support.
+
+Having said that, we need to decide whether to:
+1. Revert the changes from [KAFKA-12339|https://issues.apache.org/jira/browse/KAFKA-12339] so that `listOffsets(...)` does not retry. IMO this would leave the `AdminClient` in a strange state where some methods retry and others don't, with no documentation about which methods do and do not retry. We would also have to change the Connect code that uses this to perform the retries, though that's doable.
+2. Keep the changes from [KAFKA-12339|https://issues.apache.org/jira/browse/KAFKA-12339] so that `listOffset(...)` that does retry on retriable exceptions, but throws `UnknownTopicOrPartitionException` when the topic does not exist (after successive retries) rather than the timeout exception.
+3. Keep as-is and simply better document the behavior, perhaps by making an addendum to KIP-396.
+
+WDYT, [~mimaison], [~cmccabe], and others?
+
+My suggestion is to do 3 and to make sure the cause of `TimeoutException` is `UnknownTopicOrPartitionException`. Since 2.5.2 and newer have the updated behavior, it's now more disruptive to change it back.
+
+Let me give a little context here on the behavior.
+
+The Producer and Consumer typically retry most operations if the partition in question doesn't exist. The thinking there is that if the user specified they want to consume from topic foo-0, they knew what they were doing, and we should just wait for foo-0 to appear. This is particularly useful because Kafka has eventually consistent metadata -- even after creating a topic, it may take a few seconds for every broker to become aware of the new topic.
+
+For the AdminClient, we usually don't retry if a topic doesn't exist. For example, if you try to delete a topic, we don't loop forever if the topic doesn't exist -- we just return UNKNOWN_TOPIC_OR_PARTITION immediately. You could view this as inconsistent, but being consistent with Producer / Consumer here would result in a somewhat useless API. People do not want their topic deletes to take a long time and then fail with TimeoutException if the topic doesn't exist.
+
+I would argue that listOffsets is more similar to the second case here. It's very rare that you would be invoking listOffsets on a partition that had just been created. Looping forever if the partition doesn't exist isn't really a useful behavior in most scenarios. It seems like Connect has a use case for this -- since Connect knows for sure that the topic exists (or will exist), it should do the retries itself, rather than pushing this into AdminClient.
+
+So I would argue we should just revert the change.
+
+Also, as to the "without documentation" part -- we do make an effort to document the exceptions admin methods can throw. We're missing a lot of them (PRs would be very welcome here!) For example, listPartitionReassignments documents that it can return UnknownTopicOrPartitionException, ClusterAuthorizationException, TimeoutException, etc. If we revert the change, we should also add this kind of documentation to the listOffsets function.
+
+bq. My suggestion is to do 3 and to make sure the cause of `TimeoutException` is `UnknownTopicOrPartitionException`. Since 2.5.2 and newer have the updated behavior, it's now more disruptive to change it back.
+
+I think this is still quite harmful for people who want to build tools to poll partition offsets. It's really a very disruptive behavior to time out, which could take several minutes and many retries.
+
+I almost would suggest adding an option for this... but I just think the retry behavior is wrong and not consistent with how most admin operations work.
+
+[~cmccabe] It's straightforward to do `describe topics` before `list offsets` if you want to check if a topic exists or not, right? It is not clear to me that calling `listOffsets` on a topic that was recently created is that rare. Do we have evidence for that?
+
+Are there any practical use cases for listing the offsets of a just-created topic? Are any of these use cases more likely than ones that would involve describing a just-created topic?
+
+It seems a little heavy-handed to suggest to users that they invoke {{Admin::describeTopics}} before {{Admin::listOffsets}} in order to handle non-existing topics, at least if this pattern hasn't already been documented as a best practice for people using the Java admin client.
+
+Preserving existing behavior (which IMO is valid for the reasons Colin has laid out) seems like the correct move here.
+
+The approach we decided to take was to revert the previous admin client changes from KAFKA-12339 to bring the admin client behavior back to previous expectations, and to implement retries within the KafkaBasedLog to handle cases like those identified in that issue.
+
+For example, a likely root cause of KAFKA-12339 was a Connect worker instantiates its KafkaConfigBackingStore (and other internal topic stores), which creates a KafkaBasedLog that as part of start() creates the topic if it doesn't exist and then immediately tries to read the offsets. That reading of offsets can fail if the metadata for the newly created topic hasn't been propagated to all of the brokers. We can solve this particular root cause easily by retrying the reading of offsets within the KafkaBasedLog's start() method, and since topic metadata should be propagated relatively quickly, we don't need to retry for that long – and most of the time we'd probably successfully retry within a few retries.
+
+I've just merged to trunk a PR that does this. When trying to backport this, some of the newer tests were flaky, so [~pnee] created another PR (plus another) to hopefully eliminate that flakiness, and it seemed to work. 
+
+I'm in the process of backporting this all the way back to 2.6 -2.5- branch, since that's how far back the regression from KAFKA-12339 was backported.
+
+Update: I'm having trouble with backporting the Connect changes to the 2.5 branch. Because this branch is so old, I'm going to just revert the AdminClient behavior to the 2.5 branch, and _NOT_ backport the Connect retry changes.
+
+Note: the break due to KAFKA-12339 was never released in the 2.5 branch.
+
+Reopening due to https://github.com/apache/kafka/pull/13432
+
+Looks like this behavior change has resurfaced in [https://github.com/apache/kafka/pull/13432|https://github.com/apache/kafka/pull/13432], which has not been included in a release yet. I've reopened the ticket, upgraded it to a blocker, and given it a fix version of 3.6.0.
+
+[~rhauch] [~tombentley] [~cmccabe] [~ijuma] [~dajac] [~dengziming] [~dimitarndimitrov] Do we want to continue to preserve this behavior? If so, we should move quickly to get a fix merged in time for the upcoming 3.6.0 release.
+
+Good catch, let's file a new issue perhaps? This one has so much history.
+
+Thanks Ismael. I've filed KAFKA-15425 to track the resurfacing of this behavioral change and reverted the recent changes to this ticket.
+

@@ -1,0 +1,97 @@
+So interestingly I worked on another ticket that reported the exact same test as being flaky (see https://issues.apache.org/jira/browse/KAFKA-13531) and I couldn't reproduce any flakiness (hence the reason why that ticket is closed).
+
+I rebased my fork of Kafka to the latest version in trunk and started running this test and so far I have 1.6k runs without a failure (continuously running the tests in loop as I post this comment).
+
+[~cadonna] Would it be possible to state how you are running the tests and also which JDK version (and which branch if you are not running latest trunk?). Personally I am using Java 16 and to run the tests I am using the JUnit (not gradle) runner with Intellij (primarily because it gives the ability to run a test until it fails).
+
+Okay so I just noticed the linked builds with different JDK versions (11/17 versus my 16) so I will rerun the tests using those JDK versions to see if I can simulate the CI.
+
+So I ran the tests overnight with JDK 11 and have no failure with ~10k runs, I suspect that JDK 17 will also provide the same result.
+
+This means that a few more possibilities are opened up when it comes to why I may not be able to reproduce the failure locally
+
+1. This is gradle specific (going to create a runner in gradle)
+2. JVM on the CI is being run with different options that could be causing the failure? (I have to check up on how the CI works)
+3. In addition to this test maybe other tests are being run concurrently on the CI and the extra load is causing certain parts of the test setup to take longer which may be causing race conditions?
+
+I will look into this a bit later, any other hints/clues for possible reasons behind the failure would be greatly appreciated!
+
+[~mdedetrich-aiven] Thank you for looking into this!
+
+KAFKA-13531 reported the same test but the failure was different. It could also be that the test was refactored and the message changed.
+
+I saw this failure a lot in the CI builds.
+
+I would bet on point 3 in your list. However, I would also not exclude the others.
+
+Maybe the log in the builds I linked to contain some hints.
+
+[~cadonna] So I did some debugging on this ticket over the past week and I found out some interesting things.
+
+To start off with I did manage to predictably replicate the test's flakiness and it does appear to be related to load, i.e. the test is more flaky the less CPU resources it has. I am using docker (i.e. running the tests within docker gradle image) by using the --cpu flag to limit resources.
+
+Interestingly I have gone up to 5 cpu's and its still flaking out albeit less often. I attempted to increase the various timeouts that is used in t he test but this had no effect so I am going to dig a bit further.
+
+Note that 5 cpu's is already considered "high" (at least for a machine that would reasonably run kafka streams). The machine I am running has 12 "cpus"'s (6 cores, 12 threads) and at least when running with all of the resources on the machine I couldn't replicate the flaky test.
+
+[~mdedetrich-aiven] Thank you for the investigation! That is indeed interesting!
+Maybe you can restructure the test to make it less flaky.
+
+[~wcarlson5][~ableegoldman] Do you maybe have some hints to make the test less flaky given Matthew's findings?
+
+So I think I have gotten somewhere. I tried adjusting various timeouts to no avail so I moved onto another theory which is that some topology/stream based methods are asynchronous, i.e they are doing something in the background even after the calling function has finished. 
+
+To test this theory I have adjusted the flaky test by adding some manual Thread.sleep's to account for this supposed synchronicity, i.e.
+{code:java}
+final AddNamedTopologyResult result1 = streams.addNamedTopology(topology2Client1);
+Thread.sleep(500);
+streams2.addNamedTopology(topology2Client2).all().get();
+Thread.sleep(500);
+result1.all().get();
+Thread.sleep(500);{code}
+This appears to be greatly reducing the flakiness. Originally I used 200 millis which roughly increased the amount of time until failure by 4x however I still got a failure so now I am testing it with the 500 millis as shown above.
+
+Okay so another update, I think my async theory doesn't hold up. After running the above code over a few days it doesn't appear to be making a difference if you account for the extra time that the test is taking due to the Thread.sleep
+
+I did however notice something interesting, three are actually 2 types of stack traces that you can get, the one mentioned in the ticket and this one
+
+
+{code:java}
+org.apache.kafka.streams.integration.NamedTopologyIntegrationTest > shouldAllowRemovingAndAddingNamedTopologyToRunningApplicationWithMultipleNodesAndResetsOffsets FAILED
+java.lang.AssertionError: 
+Expected: <[KeyValue(B, 1), KeyValue(A, 2), KeyValue(C, 2)]>
+but: was <[KeyValue(B, 1), KeyValue(A, 2), KeyValue(C, 1), KeyValue(C, 2)]>
+at org.hamcrest.MatcherAssert.assertThat(MatcherAssert.java:20)
+at org.hamcrest.MatcherAssert.assertThat(MatcherAssert.java:6)
+at org.apache.kafka.streams.integration.NamedTopologyIntegrationTest.shouldAllowRemovingAndAddingNamedTopologyToRunningApplicationWithMultipleNodesAndResetsOffsets(NamedTopologyIntegrationTest.java:544){code}
+As you can see, in this case C appears to be counted twice, once with  a value 1 and the other with a value 2. Due to this I have a suspicion that there may be some issue with the underlying stream that only appears when under heavy load?
+
+Encountered again:
+{code:java}
+java.lang.AssertionError: 
+Expected: <[KeyValue(B, 1), KeyValue(A, 2), KeyValue(C, 2)]>
+     but: was <[KeyValue(B, 1), KeyValue(A, 2), KeyValue(C, 1)]>
+	at org.hamcrest.MatcherAssert.assertThat(MatcherAssert.java:20)
+	at org.hamcrest.MatcherAssert.assertThat(MatcherAssert.java:6)
+	at org.apache.kafka.streams.integration.NamedTopologyIntegrationTest.shouldAllowRemovingAndAddingNamedTopologyToRunningApplicationWithMultipleNodesAndResetsOffsets(NamedTopologyIntegrationTest.java:540)
+{code}
+
+https://ci-builds.apache.org/job/Kafka/job/kafka-pr/job/PR-12453/3/testReport/org.apache.kafka.streams.integration/NamedTopologyIntegrationTest/Build___JDK_8_and_Scala_2_12___shouldAllowRemovingAndAddingNamedTopologyToRunningApplicationWithMultipleNodesAndResetsOffsets/
+
+In case people want to reproduce the flakiness, assuming you have a working docker installation you can do the following
+{code:java}
+docker run -it --cpus=2 --rm -u gradle -v "$PWD":/home/gradle/project -w /home/gradle/project gradle sh{code}
+where cpus=2 is how you can toggle how many cpus you want (there is a tradeoff between higher occurrence to encounter the flakiness vs how fast the test runs). I wouldn't recommend doing lower than cpus=2 otherwise even building the kafak project in gradle can take ages.
+
+The above command will put you into a shell at which point you can do
+{code:java}
+while [ $? -eq 0 ]; do ./gradlew :streams:test --tests org.apache.kafka.streams.integration.NamedTopologyIntegrationTest.shouldAllowRemovingAndAddingNamedTopologyToRunningApplicationWithMultipleNodesAndResetsOffsets; done{code}
+Which will re-run the tests until there is a failure. 
+
+Note that due to how Gradle cache's test runs, you need to do something like [https://github.com/gradle/gradle/issues/9151#issue-434212465] or put
+{code:java}
+test.outputs.upToDateWhen {false}{code}
+in order to force gradle to re-run the test every time.
+
+Test disabled in https://github.com/apache/kafka/pull/14830 since feature will be removed.
+

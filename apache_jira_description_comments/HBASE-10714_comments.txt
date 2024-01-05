@@ -1,0 +1,152 @@
+Good one Jimmy.
+
+I tried to add a unit test and found the test is flaky. The flakiness is because the replaceWriter thread races with the syncRunner thread. ReplaceWriter publishes the sync future, then closes the writer, and switches it with the new one. SyncRunner gets the sync future, tries to sync the writer, and the writer is closed by replaceWriter. If replaceWriter is closing the writer, syncRunner should not rush to do the sync, right?
+
+Attached patch v1 that set SyncFuture.NOT_DONE to -1 instead. It also added a check in SyncRunner to make sure replaceWriter is not going on while syncing. This could slow down replaceWriter a little since SyncRunner can start to work only after the writer is switched.
+
+Good on you [~jxiang]
+
+Could this code be put into a method, hidden?  There is some duplication of code from replaceWriter:
+
+{code}
++            SafePointZigZagLatch zigzagLatch = (ringBufferEventHandler == null)
++              ? null: ringBufferEventHandler.zigzagLatch;
++            if (zigzagLatch != null && !zigzagLatch.isCocked()) {
++              // Someone is replacing the writer now. To avoid racing with
++              // writer#close, let's wait till the writer is closed.
++              zigzagLatch.safePointReleasedLatch.await();
++            }
+{code}
+
+Also, since no locking going on, we could come out of the above and the sync could still fail because its being swapped under us -- but that should be ok.. right.  We'll catch the IOE and try a new log roll?
+
+Thanks Jimmy for fixing holes in this stuff.
+
+bq. +            if (zigzagLatch != null && !zigzagLatch.isCocked()) {
+
+I think it should be:             if (zigzagLatch != null && zigzagLatch.isCocked()) {
+
+For if the latch is not cocked that means there is no point in waiting on it, right ? 
+
+{color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12633744/hbase-10714.patch
+  against trunk revision .
+  ATTACHMENT ID: 12633744
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 3 new or modified tests.
+
+    {color:green}+1 hadoop1.0{color}.  The patch compiles against the hadoop 1.0 profile.
+
+    {color:green}+1 hadoop1.1{color}.  The patch compiles against the hadoop 1.1 profile.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 lineLengths{color}.  The patch does not introduce lines longer than 100
+
+  {color:green}+1 site{color}.  The mvn site goal succeeds with this patch.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in .
+
+Test results: https://builds.apache.org/job/PreCommit-HBASE-Build/8939//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/8939//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-hadoop2-compat.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/8939//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-prefix-tree.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/8939//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-client.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/8939//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-common.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/8939//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-protocol.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/8939//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-server.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/8939//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-examples.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/8939//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-thrift.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/8939//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-hadoop-compat.html
+Console output: https://builds.apache.org/job/PreCommit-HBASE-Build/8939//console
+
+This message is automatically generated.
+
+One issue I see is SyncRunner may be invoking the writer.sync() call while log rolling is replacing (and closing) the writer concurrently. This could happen because we have > 1 SyncRunner. 
+
+Let's say LogRolling issues a safePoint request in the replaceWriter method, with a "marker" SyncFuture with sequenceId 150. The five SyncRunners could be syncing their different sequenceIds (for sake of simplicity, assume SyncRunner1 is syncing sequenceId from 101-110, SyncRunner2 is doing from 111-120, and so on), and SyncRunner5 is doing 141-150. If SyncRunner5 happen to finish before other SyncRunner(s), it would update the highestSyncedSequence to 150, and replaceWriter would start replacing the writer instance underneath. But, other SyncRunners could be in the middle of their sync() call, and they would see the writer being closed in the middle of the call.
+
+I am thinking if we should ensure that attainSafePoint means "all" the SyncRunners are done with their call, and not just relying on the highestSyncedSequence.
+
+
+
+bq. ...and they would see the writer being closed in the middle of the call.
+
+Do you have evidence this is needed or is this hypothesis?
+
+The call to close flushes all data to datanodes and waits on ACK of current packet if there is one before setting the close flag.
+
+
+
+A simpler patch that makes sure the sequence starts from 1 instead of 0.
+
+Patch looks good.  No need of the check for write/sync thread clash?
+
+No need. RingBufferEventHandler#attainSafePoint seems to do the check.  For the first patch, we need the additional checking because highestSyncedSequence is 0 too initially. We can't just set SyncFuture.NOT_DONE to -1. We need to change highestSyncedSequence's initial value too.  Instead, the second patch just makes sure the sequence starts from 1, the same purpose, just a little simpler.
+
+Chatted with Himanshu.  There could be other issues but I am not sure. With patch 2, the newly added test is not flaky any more.  Other tests are good too.
+
+Integrated patch v2 to trunk.
+
+{color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12633774/hbase-10714_v2.patch
+  against trunk revision .
+  ATTACHMENT ID: 12633774
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 3 new or modified tests.
+
+    {color:green}+1 hadoop1.0{color}.  The patch compiles against the hadoop 1.0 profile.
+
+    {color:green}+1 hadoop1.1{color}.  The patch compiles against the hadoop 1.1 profile.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 lineLengths{color}.  The patch does not introduce lines longer than 100
+
+  {color:green}+1 site{color}.  The mvn site goal succeeds with this patch.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in .
+
+Test results: https://builds.apache.org/job/PreCommit-HBASE-Build/8940//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/8940//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-hadoop2-compat.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/8940//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-prefix-tree.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/8940//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-client.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/8940//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-common.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/8940//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-protocol.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/8940//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-server.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/8940//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-examples.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/8940//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-thrift.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/8940//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-hadoop-compat.html
+Console output: https://builds.apache.org/job/PreCommit-HBASE-Build/8940//console
+
+This message is automatically generated.
+
+SUCCESS: Integrated in HBase-TRUNK #4995 (See [https://builds.apache.org/job/HBase-TRUNK/4995/])
+HBASE-10714 SyncFuture hangs when sequence is 0 (jxiang: rev 1576118)
+* /hbase/trunk/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/FSHLog.java
+* /hbase/trunk/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestLogRolling.java
+
+
+FAILURE: Integrated in HBase-TRUNK-on-Hadoop-1.1 #113 (See [https://builds.apache.org/job/HBase-TRUNK-on-Hadoop-1.1/113/])
+HBASE-10714 SyncFuture hangs when sequence is 0 (jxiang: rev 1576118)
+* /hbase/trunk/hbase-server/src/main/java/org/apache/hadoop/hbase/regionserver/wal/FSHLog.java
+* /hbase/trunk/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/wal/TestLogRolling.java
+
+
+Closing this issue after 0.99.0 release. 
+

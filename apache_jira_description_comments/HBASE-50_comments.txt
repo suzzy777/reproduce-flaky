@@ -1,0 +1,3216 @@
+Backup/snapshot should take each region as is and copy it to a folder and meta data for table should be backed up also with the snapshot.
+
+For a fast load of the restore we could 
+stop serveing (disable) the table
+delete current regions and meta data for the table
+copy the backup regions in to the correct locations for hbase region serving
+reload the backup meta data.
+enable the table
+
+On the next rescan of the master the new meta would be picked up and the master could start assigning the regions to regionservers this way no time is spend reloading the data.
+
+
+Here's some ideas for how this might work Billy.
+
+HADOOP-1958 talks of making a table read-only.  It also talks of being able to send a flush-and-compact command across a cluster/table so all in-memory entries are persisted followed by a compaction to tidy-up the on-disk representation.  Jim is currently working on HADOOP-2478 which will move all to do with a particular table under a directory named for the table in hdfs.  Hadoop has a copy files utility that can take a src in one fileystem and a target in the same or another filesystem and will run a mapreduce command to do a fast copy.
+
+Deploying the backup copy would run pretty much as you suggest only I'd imagine we'd have a tool that read the backed up table directory and per-region-found, did an insert into the catalog .META. table (Same tool run with a different option would purge a table from the catalog). 
+
+Adjusting the priority down to Minor, as this is new functionality. Also setting Fix Version to 0.17, as we have a lot of stuff to get done before 0.16 as it is.
+
+Other ideas.  A command on the master would send a signal to all regionservers.  They would dump their in-memory content and tell the master when done.  They would then block until they got the all-clear from the master and take reads but no updates.   Master would then do a listing of the current content of the filesystem and dump a file listing of all files.  The all-files-listing could then be used as input for a discp job.  Master would wait until it gets a prompt from the admin that the distcp was complete or it would give the all-clear after the dump of the catalog of all files and instead of file delete on compaction or region delete, instead, files would get a '.deleted' suffix.  The running distcp, if it couldn't find the original file would look for the same file with the '.deleted' suffix and copy that instead.
+
+Sort of like 'safe mode' in hdfs?
+
+HADOOP-3637 "Support for snapshots"
+
+Ideal solution would be to exec this from hbase
+
+example
+
+exec the snapshot command with the correct args
+
+1. hbase turns the tables in to read-only mode
+2. we exec the snapshot stuff on hadoop for the hbase dir
+3. Then we turn the tables back into read-write mode.
+
+I guess somewhere in there we should remember what tables where 
+disabled and where in read-only mode before the snapshot started.
+
+
+I've been thinking about this recently. I'd like to be able to take a
+snapshot backup of all of our tables, and a requirement
+here is that the snapshot be consistent. What this mean with respect
+to transactions, is that either none or all of a transaction makes it
+into the snapshot (atomicity)
+
+Another requirement is to minimize the time we have to be read-only as
+much as possible. I'd like to keep in on the order of a few seconds.
+
+My first thinking was along the lines of what Stack's suggested above:
+Go to read-only, flush, then copy the files. As I understand it, I
+could go back to allowing writes as soon as the memcache flush
+begins. The subsequent writes would just go to memory....
+
+Then I realized that once we have proper appending to the
+write-ahead-log (HLog), then I can simply copy that log over rather
+than doing the memcahe flush.
+
+So I was thinking it would work roughly like this: (I use the term
+message generically here. Originally I was thinking this could all be
+orchestrated by passing around HMsgs with the normal mechanism, but
+now I think it would be better to do it with explicit RPC calls to
+speed things up.)
+
+
+- Master sends RegionServers a BeginSnapshot message
+
+- RegionServers recieve BeginSnapshot and put thier regions into
+  read-only mode, and prevent flushes/compactions/splits. 
+
+- Commit-pending transactions (EG, transactions which we have voted to
+  commit, but not committed yet) for a region are allowed to
+  finish. This is needed to ensure atomicity. The time that
+  transactions are commit-pending should be very small.
+
+- After all commit-pending transactions have completed, the Region
+  move the write ahead logger to a new file. The old one(s) will be
+  copied in the snapshot. When all regions in a RegionServer are
+  ready, it sends a CopyOk message to the Master. This means that our
+  hdfs files are ready to be copied.
+
+- After all RegionServers have sent the CopyOk message, the
+  Master sends a WritesOk message to all regionServers, and begins the HDFS copy.
+
+- When Regions get the WritesOK message, they can allow writes to the
+  memcache and new WAL. (If they need to spill to disk then we have to handle that
+  specially. Either abort the snapshot, or spill to something that
+  won't be included in the snapshot)
+
+- After the hdfs copy is done, then the Master sends a
+  SnapshotComplete message. This tells the RegionServers that they can
+  start spilling to disk again.
+
+
+So how does this sound? It seems I can avoid the memcache flush if I
+really trust my WAL. And it seems I should be able to keep the
+read-only time fairly low. Any problems I'm not seeing?
+
+
+I foresee problems with running compactions might have to get a compaction lock on all the regions before starting all of the above.
+
+Say you flushed the logs and then ran a compaction and waited for the cluster to chill out. Unless you had extremely  high churn rates I would suggest: A mapreduce with a region per task which fails and retries in case of flushes or compactions. In the case of a split you can fail the job, disable splitting, or have some way of getting the children later.
+
+Even though you would have kindof data throughout a time period, you would at least have a timestamp of when that backup was made. I.E. consistency on a region level which is all a lot of us really want.
+
+Hi folks, is somebody working on (or have a patch) this? How important is this for most users?
+
+Ah thanks for reminding me about this.  I was working on something here at my last company, but with my new job I don't know if I have anytime to work on this anytime soon. I do think it would be quite useful, although the approach I was taking seemed a bit tricky.
+
+@Dhruba Alex was taking a look but no one that I know of is working on this issue currently.  Lots of ideas but no dev.  What you thinking?
+
+Let me freshen this issue by synopsizing what has gone before and adding some new remarks (This issue has been labeled gsoc so candidates are taking a look trying to figure whats involved).
+
+The current state of a table is comprised of the memstore content of all currently running regionservers and the content of the /${hbase.rootdir}/TABLENAME directory in HDFS.  There is also metadata -- mainly the current state of its schema and the regions of which it is comprised -- kept up in .META. "catalog" table.
+
+In the above, there is talk of  'offlining' or flipping the table 'read-only'.  Realistically we cannot require a production hbase be offlined or even flipped read-only making a snapshot.
+
+So, snapshotting needs to something like Clint Morgan describes above where we don't depend on memstore flush, where we instead get the memstore content from WAL files, and where snapshotting is triggered by sending a signal across the cluster, probably best distributed via zookeeper.  On receipt, regionservers roll their WAL and dump a manifest of all the files they have in their care; e.g. a list of all regions they are currently serving and the files of which these are comprised.  The regionserver hosting the .META. would also dump the metadata for said table at this time.  During this WAL roll and manifest dump, we would continue to take on writes but there might be some transitions we'd suspend for the short time it would take to write out manifest, etc., such as memstore flushing.
+
+So a snapshot can be saved aside or reconstituted in-situ, regionservers cannot delete files.  For example, a compaction instead moves the old files aside rather than delete them when the new compacted file is made.  The moved aside, non-deleted files might be copied elsewhere by some other process (a distcp MR job).  They might also be cleaned up by a cleaner that could distingush old snapshots from the more recent (be careful not to remove files still in use).
+
+We'd need a script, something like add_table.rb that could fixup .META. with the snapshotted .META. state and that moved files around in the filesystem -- from snapshot location back into the running position.
+
+One idea floated around here was to use HDFS-level hard links on files that would prevent HBase from being able to move/delete them.
+
+Why is it that you say we cannot flush and instead need to use the WAL?  Just an overhead thing?  If so, makes sense, but just wondering if you think it's a requirement or just a different strategy.
+
+It's likely that we will need to spend some effort on this jira in the near future.  Thanks for freshening.
+
+But HDFS does not have hard -links. The trunk version of HDFS has soft-links. Ad far as I know, there is no proposal to implement hard links in HDFS.
+
+@Dhruba Ah, okay.  Can you think of any ways we could get tricky at the HDFS level to prevent HBase from deleting files we need?  Otherwise we just add some logic to this special HBase mode to prevent it from doing anything like that.
+
+.bq Why is it that you say we cannot flush and instead need to use the WAL? Just an overhead thing?...
+
+Yes. Want to keep snapshot window narrow.  Don't want it spanning flush signal and wait on flush to complete.
+
+This has the gsoc label on it.  Let me know if you want me to remove it because you fellas want to grab it.
+
+Can keep the gsoc label for now.  We'll make a decision soon and if we definitely need it and are going to build it I will take the tag off.
+
+Here are some questions received in private mail on the above:
+
+.bq When the master gets a listing of files of the table, the all file list as well as WAL will be used as input for a distcp job to generate the snapshot, right?
+
+The list of files does not go to the master, at least in my thinking.  We'd just dump them into the filesystem into a well-known place under a subdir named for the name of the snapshot.  But yeah, the list can then be used as input to the distcp job.
+
+.bq Should compaction and split be suspended during the running of distcp?
+
+Sort of.  I think splits and compactions and splits can be oingoing during snapshot but transitions -- e.g. swapping the compacted file for all the files compacted -- need to be temporarily suspended.  Anything that will cause movement of files in the filesystem.
+
+.bq You mentioned that "The moved aside, non-deleted files might be copied elsewhere". What does these files refer to?
+
+Where now, on completion of a compaction, we put in place the new file and when that is successful, we delete the old.  Similarly on completion of a split, we'll delete old regions.  An hbase that supports snapshotting never deletes.  It never deletes because if we want to restore a snapshot, we need the old data doing reconstruction.  Since hbase does lots things like listing of directories to find the current set of data files for say a column family, we either change this behavior and keep a catalog of 'live' files or, instead on completion of compaction and splits, the old files that are no longer used should be moved aside -- moved to a shadow directory structure or some such (we'd need to be careful to ensure no name clashing).
+
+Just to add that Todd had a really nice idea yesterday morning where another use for snapshot would be so you could do mapreduce against the raw hbase table hfiles rather than go via the hbase API (when we write storefiles to the manifest, we should preserve their order so newest is first and so on).  Before starting the MR job, you'd trigger a snapshot and give the snapshot number as the MR job input.  We'd then write a snapshot input format that could read all the manifests and feed hfile content as KeyValue inputs.
+
+Hi folks,
+
+I'd like to work on this issue as my GSOC project. Based on the comments i've got some initial ideas on this issue. Here is my proposal and any comments are welcome.
+
+1. Snapshot is triggered by sending a signal across the cluster, probably distributed via zookeeper
+
+2. On receipt, there are two options for region servers:
+a). One option is to flush the memstore so that all writes to the table are persistentbefore the snapshot.
+b). Another option is to roll the Write-Ahead-Log so that we can get the memstore content from the WAL. This is the same as Clint Morgan describes above. This might narrow snapshot window but extra work is needed to extract the memstore content. And if writeToWAL is set to false for the Put, data might be lost for the snapshot. (Maybe we could let the user chooses whether to use memstore or WAL)
+
+3. Regionservers dump a manifest of all regions they are currently serving and the files of which these are comprised. The regionserver hosting the .META. would also dump the metadata for the table. The manifest as well as the metadata make up the snapshot information file. It can be stored in file <tablename>-time.info under the snapshot directory, say "snapshot.dir". 
+
+4. Since hbase data files are immutable except compaction and split(right?), then the files listed in <tablename>-time.info keep the same until a compaction or split occur. So we can use some technique similar to copy-on-write. When compaction and split occur, old files will not be deleted but moved aside if it is contained in any <tablename>-time.info file under snapshot directory. At the same time, the snapshot information file should also be updated because the locations of these files have been changed.
+
+5. For subsequent operations of the snapshot, e.g distcp or mapreduce job, first read the snapshot information file <tablename>-time.info, and then read the corresponding data files for the operation. 
+
+6. This method can guarantee that snapshot window is narrow and snapshot request can be answered quickly because there is no actual copy.
+
+7. If a snapshot is deleted, check the files listed in <tablename>-time.info. If a file is the moved old file and not used in other snapshot, it can be deleted from the file system. Finally delete the snapshot information file <tablename>-time.info.
+
+Example: 
+a) Table A is comprised of three regions: region1[a], region2[b,c], region3[d], (data files for the region are listed in brackets). Then snapshot of this table obtains the snapshot information file A-20100404.info which is comprised of {a, b, c, d, meta1}. 
+
+b) Then some more writes are performed to table A. The three regions become region1[a,e], region2[b,c], region3[d]. Another snapshot of table A will result in A-20100405.info of {a, b, c, d, e, meta2}. 
+
+c) Compaction is performed for region1 and region2 so that we have region1[f], region2[g], region3[d] for table A. Since file a,b,c,e are used in previous snapshot information file. These files will be moved aside as a.old, b.old, c.old, e.old. Accordingly A-20100404.info will be updated as {a.old, b.old, c.old, d, meta} and A-2010-0405.info will be updated as {a.old, b.old, c.old, d, e.old, meta2}
+
+d) At this time, snapshot of table A will result A-20100406.info {f, g, d, meta3}
+
+
+I think the general design sounds good, but there are a few open questions (the things that make this issue both very hard and very fun!):
+
+- How do we make snapshot creation very low impact on the cluster?
+- What happens if the snapshot is initiated during a transition? eg a region is in the middle of a split or recovery?
+- How do we do the reference counting in an efficient way?
+- If old files are moved aside after a compaction, how do we deal with concurrent readers of the snapshot?
+
+I think there are a couple tasks that could come before snapshots as concrete steps along the way:
+- Ensure that enough data is present in HFiles themselves so that if all metadata is lost, and there are extra non-GCed store files around, we can still reconstruct the correct table state.
+- Change all data deletions to be garbage collected by the master process instead of by the region server in transition
+- Add reference counting, perhaps via ZK, to the ondisk files, so they aren't GCed if they're in use by some snapshot. This would also enable more safe distcp backups.
+- Actual snapshot trigger feature, management tools, etc
+
+@ Li Chongxin Let me add to Todd's great comments.
+
+.bq ...And if writeToWAL is set to false for the Put, data might be lost for the snapshot
+
+If user sets 'do not write WAL' on their Puts, then user should not be surprised if their data does not show in the snapshot going route b.) in 2 above (IMO option a.) in 2 above will make it so you can't come near to the first of Todd's bullet points above).
+
+Above you suggest that manifests can be edited subsequent to their writing.  I'd suggest that once written, they are never changed.  Regards how to find a file that has been 'moved'/'renamed', i'd suggest we run with a pattern.  Files that hbase is done with get moved to a shadow directory structure of deleted stuff or else the files are renamed with a 'deleted' suffix.  Getting a file, if we fail to find the file with the path in the manifest, we'll add the '.deleted' and try again.
+
+Yes, split does not mutate files.
+
+I think that the manifest needs to be made up of a file per running regionserver.  If regions are offline at the time of the snapshot, that shouldn't be too hard to figure and accommodate.
+
+In talking to some HDFS guys, it seems there may be a way we could hard-lock files in HDFS so HBase could continue to do this thing but we could guarantee files would not be deleted or moved.  This could be much simpler than managing a long-running special state inside of HBase, and then the snapshot-mode can be much shorter lived (rather than having to stay around for distcp or whatever)
+
+@ Todd Lipcon Here are some comments for your questions
+
+*  How do we make snapshot creation very low impact on the cluster?
+According to the proposal, there is no memstore flush for the snapshot creation, and no real copy is performed. What snapshot creation does is to dump the manifest and meta data as well as roll the WAL. I think this does not impact the cluster very much. What do you think?
+
+* What happens if the snapshot is initiated during a transition? eg a region is in the middle of a split or recovery?
+In current implementation, a write lock is acquired when the system is trying to do a transition. When the snapshot is requested, we can try to acquire this write lock. Snapshot is initiated only If the write lock can be obtained.
+
+* How do we do the reference counting in an efficient way?
+I'm not sure what Jonathan Gray mean is hard-link or hard-lock in HDFS. If hard-links is supported in HDFS, then everything is simple since HDFS wil handle the reference counting of the files. But if hard-link is not supported, then we will have to count the reference by outselves. Probably  via metadata, zookeeper or ondisk files. Any ideas?
+
+* If old files are moved aside after a compaction, how do we deal with concurrent readers of the snapshot?
+I'm not very clear about this question. What's the problem with concurrent readers of the snapshot? Can you give some more comments?
+
+bq. In current implementation, a write lock is acquired when the system is trying to do a transition. When the snapshot is requested, we can try to acquire this write lock. Snapshot is initiated only If the write lock can be obtained.
+
+This is the part I'm not clear on. Are you attempting to achieve a simultaneous write lock across all region servers in the cluster? Also will have to make sure that we "lock" any regions that are currently being moved, etc. Doing this without impacting realtime workload on the cluster is the tricky part in my opinion.
+
+Perhaps since we're accepting "sloppy snapshot" we can do without this kind of lock, and the master instead sends out a "request for snapshot" and each regionserver can do its thing at the appropriate time.
+
+bq. If hard-links is supported in HDFS, then everything is simple since HDFS wil handle the reference counting of the files
+
+Yes, hard links would make it easier, but in a large cluster with thousands of regions each with many hfiles and many column families, iterating over every store file could be prohibitively expensive if we have to lock everything while doing it. I think it's fine if snapshots take 15 seconds to create, but if the cluster is frozen for those 15 seconds, it's a much less useful feature, no?
+
+bq. If old files are moved aside after a compaction, how do we deal with concurrent readers of the snapshot?
+
+The hardlink solution avoids this issue. I was imaginging that the "snapshot manifest" which would point to explicit paths on HDFS.
+
+@Todd Lipcon
+bq. This is the part I'm not clear on. Are you attempting to achieve a simultaneous write lock across all region servers in the cluster? Also will have to make sure that we "lock" any regions that are currently being moved, etc. Doing this without impacting realtime workload on the cluster is the tricky part in my opinion.
+
+Sorry for the mistake that rather than write lock,  a read lock instead should be acquired when the snapshot is requested. So this read lock will only block the regions that are currently being moved and other operations such as Get, Put, Delete etc are not impacted at all. Also this lock is not held across all region servers but only per region. A Region is locked only when we dump the manifest of  the region and other regions will not be affected. I think this process is pretty quick and will not impact the whole cluster a lot.
+
+bq.  Hard links would make it easier, but in a large cluster with thousands of regions each with many hfiles and many column families, iterating over every store file could be prohibitively expensive if we have to lock everything while doing it. 
+
+Yes, totally agree with you. Iterating over stored files is not efficient. That's why I want to find some other mechanism to manage the reference counting problem. Probably via .META. data or Zookeeper, I still don't have a concrete solution, any good ideas?
+
+I'm working on this issue as my gsoc project right now. For the last few days, I've developed a test for starting a snapshot via ZooKeeper. Attached are the source code and a flow chart which depicts the whole process on master and region servers. Any feedbacks are welcome.
+
+I develop and test this program under package src/test. I didn't extend the HBaseClusterTestCase or HBaseTestCase because these classes are more like simulators for region server and master. To execute the program, just put the files under right package, that is org.apache.hadoop.hbase.snapshot under src/test. The main method is in class Master. 
+
+I was trying to start/end the snapshot using a method like Double Barriers (http://hadoop.apache.org/zookeeper/docs/r3.0.0/recipes.html#sc_doubleBarriers). But there are a lot of situations when run several region servers concurrently, even with a small number of them. When some exceptions are taken into consideration, things become complex. Here I just start three threads to simulate three region servers. Two test cases are provided in the source code, one is to start the snapshot normally and the other is to start the snapshot when one region server is down. It'll be great if you can test the program under some other cases. I also have thinked about the situation where region server goes down during the processing of snapshot, but no good solution yet.
+
+
+One more problem:
+When I run the test with standalone ZooKeeper, everything is fine, while running with MiniZooKeeperCluster a exception might be thrown, although the output is still correct. Below is the exception stack trace and it shoud be related with MiniZooKeeperCluster. I don't know if it is a configuration problem.
+
+===================================================================================
+2010-05-06 22:05:27,062 ERROR [Thread-1] server.NIOServerCnxn$Factory$1(82): Thread Thread[Thread-1,5,main] died
+java.nio.channels.CancelledKeyException
+ at sun.nio.ch.SelectionKeyImpl.ensureValid(SelectionKeyImpl.java:55)
+ at sun.nio.ch.SelectionKeyImpl.interestOps(SelectionKeyImpl.java:64)
+ at org.apache.zookeeper.server.NIOServerCnxn$SendBufferWriter.wakeup(NIOServerCnxn.java:927)
+ at org.apache.zookeeper.server.NIOServerCnxn$SendBufferWriter.checkFlush(NIOServerCnxn.java:909)
+ at org.apache.zookeeper.server.NIOServerCnxn$SendBufferWriter.flush(NIOServerCnxn.java:945)
+ at java.io.BufferedWriter.flush(BufferedWriter.java:236)
+ at java.io.PrintWriter.flush(PrintWriter.java:276)
+ at org.apache.zookeeper.server.NIOServerCnxn$2.run(NIOServerCnxn.java:1089)
+=====================================================================================
+
+
+@Li, this looks like a great start.  Rather than posting zip files, can you post diff/patch files instead?
+
+Also, rather than creating a mock Master and mock RegionServer, it might be more useful to just create classes that can be used by the real Master and RS processes.
+
+For example, the Master class you have could become SnapshotManager or SnapshotMonitor.  The RegionServer might become SnapshotExecutor.  Just suggestions for names but I would move to making patches against the svn repository and building stuff in a way that will make it easier to integrate after you get through early testing.
+
+Does your current design have it so that all RegionServers wait for every other RS to be ready, and then they concurrently perform their snapshots?  It seems like this could be dangerous behavior.  We might want to stagger snapshots across the cluster, otherwise this process could create too much load.
+
+The flow chart is great.  Could you add some different notation about the znode names and what things will have more than one process performing it?  For example, each RS might make the znode:  /snapshot/ready/RSNAME or some such.
+
+As far as this thing working in failure scenarios, that could potentially be very complex (or if designed in a region-centric view rather than regionserver-centric view maybe not so bad).  Let's try to flesh out the requirements early/now.  If we decide we won't work under failure, then let's make that explicit and ensure that under failure we can roll everything back.  If we want it to work under failure (Master and/or RegionServer), let's talk about it more now because the basic design could have big implications.
+
+In your flow chart, once the snapshot starts it looks like an RS won't communicate until it finishes.  If that RS is serving 1000 regions of the table being snapshotted, this could take a long time.  Does the RS need to keep a timestamp updated to let the master/client know it's still working (and maybe it's progress?).  Also, are splits and load balancing blocked during snapshot time across the whole cluster?
+
+I think it would be useful to generate a design document.  This would include your current flow chart as well as some of the stuff in comments on this jira.  I'd like to have something we can continue to iterate on rather than just comments.
+
+Great work so far!
+
+@Li Any progress to report?
+
+Here are some comments on the design requirments Li:
+
++ Add a date, add a link to this issue to give your design context.
++ FYI, there has been talk of adding snapshots to hdfs.  Its mentioned here: http://hadoop.apache.org/common/docs/current/hdfs_design.html#Snapshots.  The issue is stalled at the moment: HDFS-233.
++ I don't think you should take on requirement 1), only the hbase admin can create a snapshot.  There is no authentication/access control in hbase currently -- its coming but not here yet -- and without it, this would be hard for you to enforce.
++ Regards requirement 2., I'd suggest that how the snapshot gets copied out from under hbase should also be outside the scope of your work.  I'd say your work is making a viable snapshot that can be copied with perhaps some tests to prove it works -- that might copy off data -- but in general, i'd say how actual copying is done is outside of the scope of this issue.  
++ Requirement 6., resuming from a snapshot, yes, this is in scope (how the stuff is copied into place I'd argue is not.  Of course, if you have the time to work on copy out and copy in functionality, great, but I'd peg this lower priority).
++ Otherwise, the requirements are great.
+
+
+
+Coments on '3 Design Overview':
+
++ How you going to ensure tabke is in 'good status'.  Can you not snapshot it whatever its state?  All regions being on line is a requirement?
++ I like the bit where we roll wal log rather than wait on memstore flushes.  Good.
++ FYI, wal logs are now archived, not deleted.  Replication needs them.  Replication might also be managing clean up of the archives (j-d, whats the story here?)  If an outstanding snapshot, one that has not been deleted, then none of its wals should be removed.
+
+
+Comments on '4 Message Passing Via ZK"
+
++ I can say 'snapshot' all tables?  Can I say 'snapshot catalog tables -- meta and root tables?'
++ If a RS fails between 'ready' and 'finish', does this mean we abandon the snapshot?
++ I'd say if RS is not ready for snapshot, just fail it.  Something is badly wrong is a RS can't snapshot.
++ Would it make sense for there to be a state between ready and finish and the data in this intermediate state would be the RS's progress?
++ Diagram looks good.
+
+
+
+
+
+@Stack, Thanks for the comments. Here are some replies and questions for the comments.
+
+.bq + I don't think you should take on requirement 1), only the hbase admin can create a snapshot. There is no authentication/access control in hbase currently - its coming but not here yet - and without it, this would be hard for you to enforce.
+
+I think I didn't state it properly. I know access control is not included in hbase currently. What I mean here is, snapshot should be put in class HBaseAdmin instead of HTable. Client side operations being divided into these two classes is also for the consideration of access control which is provided in the future, isn't it?
+
+.bq + Regards requirement 2., I'd suggest that how the snapshot gets copied out from under hbase should also be outside the scope of your work. I'd say your work is making a viable snapshot that can be copied with perhaps some tests to prove it works - that might copy off data - but in general, i'd say how actual copying is done is outside of the scope of this issue. 
+
+Strictly, requirement 2 is not about how snapshot is copied out from under hbase. Actually, table data is not really copied when snapshot in current design. To make it fast, snapshot just captures the state of the table especially all the table files. So for requirement 2, just make sure the table data (hfiles indeed) are not mutated when snapshot.
+
+bq. + How you going to ensure tabke is in 'good status'. Can you not snapshot it whatever its state? All regions being on line is a requirement?
+
+Regarding tables that are disabled, all regions being on line should not be a requirement. As for 'good status', what I'm thinking is a table region could be in PENDING_OPEN or PENDING_CLOSE state, in which it might be half opened. I'm not sure wether RS or the master should take on the responsibility to perform the snapshot at this time. On the other side, if the table is completely opened or closed, snapshot can be taken by RS or the master.
+
+bq. + FYI, wal logs are now archived, not deleted. Replication needs them. Replication might also be managing clean up of the archives (j-d, whats the story here?) If an outstanding snapshot, one that has not been deleted, then none of its wals should be removed.
+
+Great. In current design, WAL log files are the only data files that are really copied. If they are now archived instead of deleted, we can create log files reference just as hfiles instead of copying the actual data. This will further shorten the snapshot time. Another LogCleanerDelegate, say ReferencedLogCleaner, could be created to check whether the log file should be deleted for the consideration of snapshot. What do you think?
+
+bq. + I can say 'snapshot' all tables? Can I say 'snapshot catalog tables - meta and root tables?'
+
+I think snapshot for meta works fine but snapshot for root table is a little tricky. When the snapshot is performed for a user table, .META. is updated to keep track of the file references. If a .META. table is snapshot, -ROOT- can be update to keep track of the file references. But where to keep the file references for -ROOT- table(region) if it is snapshot, still in -ROOT-? Should these newly updated file references information also be included in the snapshot?
+
+bq. + If a RS fails between 'ready' and 'finish', does this mean we abandon the snapshot?
+
+Yes. If a RS fails between 'ready' and 'finish', it should notify the client or master, whichever orchestrates, then the client or the master will send a signal to stop the snapshot on all RS via ZK. Something like this.
+
+bq. + I'd say if RS is not ready for snapshot, just fail it. Something is badly wrong is a RS can't snapshot.
+
+Currently, there is a timeout for snapshot ready. If a RS is ready, it'll wait for all the RS to be ready. Then the snapshot starts on all RS. Otherwise, the ready RS timeout and snapshot does not start on any RS. It's a synchronous way. Do you think this is appropriate? Will it create too much load to perform snapshot concurrently on the RS? (Jonathan perfer an asynchronous method)
+
+bq. + Would it make sense for there to be a state between ready and finish and the data in this intermediate state would be the RS's progress?
+
+Do you mean a znode is create for each RS to keep the progress? Then how do you define the RS's progress? What data will be kept in this znode?
+
+Thanks again for the comments. I will update the design document based on them.
+
+
+.bq ...What I mean here is, snapshot should be put in class HBaseAdmin instead of HTable. 
+
+OK.  I misunderstood.
+
+.bq 2, ...just make sure the table data (hfiles indeed) are not mutated when snapshot.
+
+Yes... but also after snapshot is done.... your design should include description of how files are archived, rather than deleted, when no longer needed post-snapshot.  Design should also describe how a snapshot-restore tool will know where to find files that have been put aside, rather than deleted, in archives.
+
+.bq I'm not sure wether RS or the master should take on the responsibility to perform the snapshot at this time. 
+
+I'd say just forge ahead with the snapshot.   Snapshot will be doing same thing whether table is partially online or not methinks?  If you can, warn user that the snapshot is of a table that is partially online but not important.  A partially-offlined table can be fixed up post snapshot restore.  Its outside the scope of your issue doing work to figure whether table is healthy or not, I'd say.
+
+.bq Another LogCleanerDelegate, say ReferencedLogCleaner, could be created to check whether the log file should be deleted for the consideration of snapshot. What do you think?
+
+Sounds good.
+
+I need to review J-D's replication.  I can add note that he needs to be consious that others will want a say on when files are cleaned up.
+
+Regards snapshot of -ROOT-, don't worry about it.  There is nothing in there.  Regards snapshot of .META., that should be possible.  In fact you'll probably be doing a snapshot of at least a subset of .META. on every table snapshot I'd imagine -- at least the entries for the relevant table.
+
+.bq It's a synchronous way. Do you think this is appropriate? 
+
+Yes.  I'm w/ JG on this.
+
+.bq Do you mean a znode is create for each RS to keep the progress? 
+
+OK. Lets not do this for now.  Its the kinda thing implementation will bring out.  At implementation time you may find you need it... but hopefully the snapshot runs so fast, there'll be no need of the intermediary.
+
+
+
+
+On, "5 Snapshot Creation"
+
+.bq "Because this table region must be online, dumping the HRegionInfo of the region to a file ".regioninfo" under the snapshot directory of this region will obtain the metadata."
+
+...The above is wrong, right?  We can snapshot online tables?
+
++1 on reading .META. data, flushing it to .regioninfo to be sure you have latest, and then copying that (Or, instead, you could ensure that on any transistion, the .regioninfo is updated.  If this is happening, no need to do extra flush of .META. at snapshot time.  This latter would be better IMO).
+
+So, do you foresee your restore-from-snapshot running split over the logs as part of the restore?  That makes sense to me.
+
+Why you think we need a Reference to the hfile?  Why not just a file that lists the names of all the hfiles?  We don't need to execute the snapshot, do we?  Restoring from a snapshot would be a bunch of file renames and wal splitting?  Or what are you thinking?  (Oh, maybe I'll find out when I read chapter 6).
+
+.bq ....can be created just by the master.
+
+Lets not have the master run the snapshot... let the client run it?
+
+Shall we name the new .META. column family snapshot rather than reference?
+
+I like this idea of keeping region snapshot and reference counting beside the region up in .META.
+
+On the filename '.deleted', I think it a mistake to give it a '.' prefix especially given its in the snapshot dir (the snapshot dir probably needs to be prefixed with a character illegal in tablenames such as a '.' so its not taken for a table directory).
+
+
+Regards 'Not sure whether there will be a name collision under this ".deleted" directory', j-d has done work to ensure WALs are uniquely named.  Storefiles are given a random-id.  We should probably do the extra work to ensure they are for sure unique... give them a UUID or something to we don't ever clash.
+
+After reading chapter 6, I fail to see why we should keep References to files.  Maybe I'm missing something.
+
+.bq Not decides where to keep all the snapshots information, in a meta file under snapshot directory
+
+Do you need a new catalog table called snapshots to keep list of snapshots, of what a snapshot comprises and some other metadata such as when it was made, whether it succeeded, who did it and why?
+
+On the other hand, a directory in hdfs of files per snapshot will be more robust.
+
+Section 7.4 is missing split of WAL files.  Perhaps this can be done in a MR job?
+
+Design looks excellent Li.
+
+
+bq. ... but also after snapshot is done.... your design should include description of how files are archived, rather than deleted...
+
+Are you talking about files that are no longer used by hbase table but are referenced by snapshot? I think this has been described in chapter 6 'Snapshot Maintenance'. For example, hfiles are archived in delete directory. And section 6.4 describes how these files will be cleaned up.
+
+bq. ..In fact you'll probably be doing a snapshot of at least a subset of .META. on every table snapshot I'd imagine - at least the entries for the relevant table.
+
+.META. entries for the snapshot table have been dumped, haven't they? Why we still need a snapshot of a subset of .META.?
+
+bq. So, do you foresee your restore-from-snapshot running split over the logs as part of the restore? That makes sense to me.
+
+Yes, restore-from-snapshot has to run split over the WAL logs. It will take some time. So restore-from-snapshot will not be very fast.
+
+bq. Why you think we need a Reference to the hfile? Why not just a file that lists the names of all the hfiles? We don't need to execute the snapshot, do we? Restoring from a snapshot would be a bunch of file renames and wal splitting?
+
+At first I thought snapshot probably should keep the table directory structure for the later use. For example, a reader like HalfStoreFileReader could be provided so that we could read from the snapshot directly. But yes, we actually don't execute the snapshot. So keeping a list of all the hfiles (actually one list per RS, right?) should be enough. And also restroing from snapshot is not just file renames. Since a hfile might be referenced by several snapshot, we should probably do real copy when restroing, right?
+
+bq. Shall we name the new .META. column family snapshot rather than reference?
+
+sure
+
+bq. On the filename '.deleted', I think it a mistake to give it a '.' prefix especially given its in the snapshot dir...
+
+Ok, I will rename the snapshot dir as '.snapshot'. For dir '.deleted', what name do you think we should use? Because there might be several snapshots under the dir '.snapshot', each has a snapshot name, I name this dir as '.deleted' to discriminate it from a snapshot name.
+
+bq. Do you need a new catalog table called snapshots to keep list of snapshots, of what a snapshot comprises and some other metadata such as when it was made, whether it succeeded, who did it and why?
+
+It'll be much more convenient if a catalog table 'snapshot' can be created. Will this impact normal operation of hbase?
+
+bq. Section 7.4 is missing split of WAL files. Perhaps this can be done in a MR job? 
+
+I'll add the split of WAL logs. Yes, a MR job can be used. Which method do you think is better? Read from the imported file and inserted into the table by hbase api. Or just copy the hfile into place and update the .META.?
+
+bq. Lets not have the master run the snapshot... let the client run it?
+bq. Snapshot will be doing same thing whether table is partially online or not..
+
+I put these two issues together because I think they are correlative. In current design, if a table is opened, snapshot will be performed by each RS which serves tha table regions. Otherwise, if a table is closed, snapshot will be performed by the master because the table is not served by any RS. For the first comment, it is talking about closed table. So master will perform the snapshot because client does not have access to underlying dfs. For the second one, I was thinking if a table is partially online, table regions might be partially served by RS and partially offline, right? Then who will perform the snapshot? If RS, the regions that are offline will be missed. If the master, regions that are online might lose data in memstore. I'm confused..
+
+bq. It's a synchronous way. Do you think this is appropriate? Yes. I'm w/ JG on this.
+
+This is another problem confusing me..In current design (which is a synchronous way), a snapshot is started when all the RS are ready for snapshot. Then all RS perform snapshot concurrently. This guarantees snapshot is not started if one RS fails. If we switch to an asynchronous approach. Should the RS start snapshot immediately when it is ready?
+
+.bq Are you talking about files that are no longer used by hbase table but are referenced by snapshot? I think this has been described in chapter 6 'Snapshot Maintenance'. For example, hfiles are archived in delete directory. And section 6.4 describes how these files will be cleaned up.
+
+That'll do for now.  I need to kick J-D so he's down with this change since he's going to want to have references to archived files doing his replications.  Let me get him to check this section out, make sure you two fellas are not fighting each other regards log file archiving.
+
+.bq .META. entries for the snapshot table have been dumped, haven't they? Why we still need a snapshot of a subset of .META.?
+
+You mean .regioninfo?  If so, thats fine, yes (as long as you ensure .regioninfo is up-to-date w/ snapshot).
+
+.bq Yes, restore-from-snapshot has to run split over the WAL logs. It will take some time. So restore-from-snapshot will not be very fast.
+
+We can work on speeding it up later, no problem.
+
+.bq ...actually one list per RS, right?
+
+Yes, this seems right since each RS will be responsible for snapshotting its portion of the total data.
+
+.bq ...we should probably do real copy when restroing, right?
+
+Yes, copy rather than rename I'd say.  We don't want to destroy the well of good hfiles, even if it is starting from a snapshot (this snapshot might be bad and we need to go back in time to earlier snapshots...etc.)
+
+Hmmm... here is where your use of a Reference might actually come in handy.  If snapshot directory had all References under it, perhaps, we could start against the snapshot directory but immediately after startup, as we do for half-references, we'd work hard to undo the Reference by writing a new hfile from what is referenced... This would make it so we came up quickly.   I'd say this latter idea would be a nice-to-have.  
+
+.bq Ok, I will rename the snapshot dir as '.snapshot'. For dir '.deleted', what name do you think we should use? Because there might be several snapshots under the dir '.snapshot', each has a snapshot name, I name this dir as '.deleted' to discriminate it from a snapshot name.
+
+I'd say ignore my comment.  You have good reason for naming it w/ the '.'  prefix.
+
+.bq It'll be much more convenient if a catalog table 'snapshot' can be created. Will this impact normal operation of hbase?
+
+it will in some regard; meta regions weill be bigger because they will now carry more data -- though it should be fairly small I'd say.  The extra data will bring on a .META. split the sooner.  We'll deal.    Having it in separate column family will make it so it doesn't get in the way during normal .META. accesses.  One problem though is that regions get deleted when there are no longer references to the a split parent.  Won't this mean you lose snapshot data?  Would this require you to keep snapshots in a table of its own?
+
+,bq Or just copy the hfile into place and update the .META.? 
+
+This latter would be better, but we can start simple at first... just run the main on the HLog script... pass it dir of WAL files to split.
+
+I did not understand why master needed to be in the mix.  Now I understand its role taking care of offlined regions.  This sounds right.
+
+I suppose you'll need to run a quick verification table is online.  There should be facility developed as part of fix for hbase-7 that should help here by the time you get to coding.
+
+.bq ...If we switch to an asynchronous approach. Should the RS start snapshot immediately when it is ready?
+
+I do not follow.  Please retry.
+
+
+
+
+Reviewing the doc with respect to replication, this feature will need to add itself to the chain of LogCleanerDelegates in Master. Currently there's TimeToLiveLogCleaner that runs by default, in HBASE-2223 I wrap it with ReplicationLogCleaner that adds more checks in ZooKeeper. HBASE-50 should do the same, and should make sure that if Replication is enabled that it wraps its log cleaner, else to wrap the TTL cleaner.
+
+Sounds good?
+
+@ J-D
+
+Yes..That sounds good. I will implement another LogCleanerDelegate, say ReferenceLogCleaner or SnapshotLogCleaner.
+
+Do you archive any other files besides log files, say HFiles?
+
+bq. ...make sure you two fellas are not fighting each other regards log file archiving.
+
+In current design for snapshot, only hfiles are archived. Log files are not archived but copied directly. However, given old log files are archived instead of deleted right now, I think I can back up log files by reference, just as hfile. When we roll the WAL log files at start of the snapshot, a list of references to these log files can be created. When we need split these old logs, we can follow the reference to find the log files. If a log file is removed from its original dir, then find it in the archived dir, just like hfiles. A LogCleanerDelegate for snapshot will be added to the chain to check if a log file should be deleted from the archived dir. What do you think?
+
+bq. here is where your use of a Reference might actually come in handy. If snapshot directory had all References under it, perhaps, we could start against the snapshot directory but immediately after startup, as we do for half-references..
+
+Yes,this will probably make restrore quick. Shall we create snapshot by Reference or just a file that lists the names of hfiles?
+
+bq. One problem though is that regions get deleted when there are no longer references to the a split parent. Won't this mean you lose snapshot data? Would this require you to keep snapshots in a table of its own?
+
+This scenario has been taken into account in section 6.2 'Split'. Split parent region will not be deleted until there are no daughter references as well as snapshot references to it.  (snapshot references are the references in 'snapshot' family). MetaScanner on the master side will check both references in .META. This is not the reason why a 'snapshot' catalog table is required.
+
+.META. table is in a region centric view. For each row in .META. table, it contains information about a single region, e.g. regioninfo, server that hosts the region, split daughters and hfiles that are referenced by snapshots. But there are some other information which are in snapshot centric view, or table centric view, e.g. table for which a snapshot is created, snapshot creation time. So snapshot catalog table is created to keep these information. But right now I think a meta info file created for each snapshot can do the same work. Snapshot will not be modified once it is created, right?
+
+.bq ...If we switch to an asynchronous approach. Should the RS start snapshot immediately when it is ready? I do not follow. Please retry.
+
+In current design, the snapshot is started and performed in a synchronous way. That is, if a RS is ready, it doesn't start the snapshot until all RS are ready. When all RS are ready, they will perform snapshot concurrently. This method guarantees snapshot is not started if one RS fails. But doing work concurrently might create too much load and impact normal operation, right?
+
+An alternative approach is to do snapshot asynchronous. When snapshot request is spread over the cluster via ZK, the client returns immediately. And each RS starts performing snapshot once it receives the snapshot request, without knowing the status of other RS, just as what compaction, split does.
+
+Which do you prefer?
+
+bq. Yes..That sounds good. I will implement another LogCleanerDelegate, say ReferenceLogCleaner or SnapshotLogCleaner.
+
+Latter. Some refactoring could be done on how to chain multiple delegates without doing a bunch of ifs in the code. Could be in the scope of another jira.
+
+bq. Do you archive any other files besides log files, say HFiles?
+
+AFAIK, no.
+
+
+Design document has been updated based on the discussion. Following changes have been made:
+
+* Requirements have been updated
+
+* Snapshot can now be created for both online (enabled) tables and offline (disabled) tables. For offline table, snapshot is performed by the master
+
+* Metadata for the table is not copied from .regioninfo any more but totally dumped from .META.
+
+* WAL logs are now archived instead of deleted, so snapshot does not copy the log files any more but take a file that lists the log names. A new section 6.5 is added on log maintenance
+
+* Rename 'reference' family in .META. to 'snapshot'
+
+* Add the same column family 'snapshot' to -ROOT- so that .META. can be snapshot too
+
+* A new file .snapshotinfo is created under each snapshot dir to keep the meta information of snapshot. List operation for snapshots will read the this meta file.
+
+* A new operation 'Restore' is added to restore a table from a snapshot on the same data center
+
+* Export and import are changed. Export and import are used to export a snapshot to or imort a snapshot from other data centers. Therefore, exported snapshot has the same file format as how a table is exported so that we can treat exported snapshot the same as exported table and import the exported snapshot with the same import facility.
+
+Pending Questions:
+1.
+What if the table with the same name is still online when we want to restore a snapshot? There will be a name collision in both HDFS and .META. ; We should not touch the existing table, right?
+2.
+Then shall we allow rename the snapshot as a new table name? For example the snapshot is created for table "table1", can we restore the snapshot as "table2"?
+
+.bq What if the table with the same name is still online when we want to restore a snapshot
+
+Fail with a warning.  A nice-to-have would be your suggestion of restoring snapshot into a table named something other than the original table's name (Fixing this issue is low-priority IMO).
+
+There a few things in the above that make me want to go over the design again.   I'll report back after I've done that.  Specifically:
+
+.bq Rename 'reference' family in .META. to 'snapshot'
+
+... didn't we discuss that .META. might not be the place to keep snapshot data since regions are deleted when the system is done w/ them (but a snapshot may outlive a particular region).
+
+
+
+
+
+Finally had a chance to look over the doc. Great to see such a thorough writeup on the plan! A couple thoughts:
+- Snapshot creation: rather than causing all of the RS to roll the logs, they could simply record the log sequence number of the snapshot, right? This will be a bit faster to do and causes even less of a "hiccup" in concurrent operations (and I don't think it's any more complicated to implement, is it?)
+- Snapshot restore: I do think it's a good idea to allow snapshot restore to a new table name while the original table is still online. And the restored snapshot should be able to share HFiles with the original table
+- Making the client orchestrate the snapshot process seems a little strange - could the client simply initiate it and put the actual snapshot code in the master? I think we should keep the client as thin as we can (in the future we may want to implement clients natively in other languages)
+- I'd be interested in a section about failure analysis - what happens when the snapshot coordinator fails in the middle? You briefly touched on this, but would be good just to enumerate the different points where a failure can happen and show that the operation is correctly aborted and that you don't end up with an HFile "reference leak"
+
+bq. Fail with a warning. A nice-to-have would be your suggestion of restoring snapshot into a table named something other than the original table's name (Fixing this issue is low-priority IMO).
+bq. .. it's a good idea to allow snapshot restore to a new table name while the original table is still online. And the restored snapshot should be able to share HFiles with the original table
+
+I will make this issue a low-priority sub-task. One more question, besides metadata and log file, what else data should take care to rename the snapshot to a new table name? Are there any other files (e.g. HFiles) containing table name?
+
+bq. ... didn't we discuss that .META. might not be the place to keep snapshot data since regions are deleted when the system is done w/ them (but a snapshot may outlive a particular region).
+
+I misunderstood... I thought you were talking about create a new catalog table 'snapshot' to keep the metadata of snapshots, such as creation time.
+In current design, a region will not be delete if it is still used by a snapshot, even if the system has done with it. This region would be probably marked as 'deleted' in .META. This is discussed in section 6.2, 6.3 and no new catalog table is added. Do you think it is appropriate to keep metadata in .META. for a deleted region? Do we still need a new catalog table?
+
+bq. rather than causing all of the RS to roll the logs, they could simply record the log sequence number of the snapshot, right? This will be a bit faster to do and causes even less of a "hiccup" in concurrent operations (and I don't think it's any more complicated to implement, is it?)
+
+Yes, sounds good. The log sequence number should also be included when the logs are split because log files would contain the data both before and after the snapshot, right?
+
+bq. Making the client orchestrate the snapshot process seems a little strange - could the client simply initiate it and put the actual snapshot code in the master? I think we should keep the client as thin as we can
+
+Ok, This will change the design a little.
+
+bq. I'd be interested in a section about failure analysis - what happens when the snapshot coordinator fails in the middle? ..
+
+That will be great!
+
+Also we should discuss implementation plan - it seems like we have a number of core changes necessary to support this feature. Could we do the feature in a branch and then merge later? We have some pretty important releases that we have to get out in the next month or two and if the snapshot stuff destabilizes it around the same timeframe it may be an issue.
+
++1 on feature branch once stuff is ready for commit
+
+Sure. We do need a branch for snapshot. Currently I'm working on TRUNK. Once the stuff is ready, I think we can create a new feature branch for commit. What do you think?
+
+Sounds good.  Yes, we will cut branch off of trunk so do your work from there until the branch is made.
+
+"HBase Snapshot Implementation Plan" describes the classes and methods that are going to be created and modified to support snapshot. Go over the document with the class diagram. Any comments are welcome!
+
+I'll make a branch to host Li's work going forward.
+
+Thinking on it, Li, maybe its best if you work up in github and just log here when you do big pushes to your github repro? That way you are in charge of it and not dependent on laggard hbase committers getting your work into the branch?
+
+Agree, github probably much better.  Would still be advisable to put patches onto reviewboard but I like idea of taking committers out of critical path.
+
+isSnapshot in HRI?
+
+In zk, writeZnode and readZnode ain't the best names for methods... what kinda znodes are these? (Jon says these already exist, that they are not your fault)
+
+Can you make a SnapShot class into which encapsulate all related to snapshotting rather than adding new data members to HMaster?  Maybe you do encapsulate it all into snapshotmonitor?  Maybe you do.  And all I'm seeing are the HMaster methods you need to add.
+
+Can you call RSSnapshotHandler just SnapshotHandler?
+
+Will keeping snapshot data in .META. work?  .META. is by region but regions are deleted after a split but you want your snapshot to live beyond this?
+
+You probably don't need to support String overloads.
+
+Your implemenation plan looks excellent.
+
+bq. isSnapshot in HRI? 
+bq. Will keeping snapshot data in .META. work? .META. is by region but regions are deleted after a split but you want your snapshot to live beyond this?
+
+Snapshot data, actually the reference count of hfiles, will be kept in .META. table, but in a different row than the original region row. So these reference count information will not be deleted after a split. Reference count information is saved here because it is also in a region centric view. Reference count information of a region's hfiles are kept together in a row in .META. no matter this hfile is still in use or has been archived. I described this in the Appendix A. of the document. 
+
+bq. In zk, writeZnode and readZnode ain't the best names for methods... what kinda znodes are these? (Jon says these already exist, that they are not your fault)
+
+Actually the method names for snapshot are startSnapshotOnZK, abortSnapshotOnZK, registerRSForSnapshot in ZooKeeperWrapper. I put writeZnode and readZnode in the diagram because I think I can use them inside the above methods.
+Do you think we should make writeZnode and readZnode private and just use them inside ZooKeeperWrapper?
+
+bq. Can you make a SnapShot class into which encapsulate all related to snapshotting rather than adding new data members to HMaster? Maybe you do encapsulate it all into snapshotmonitor?
+
+I haven't figured out all the data members in the design. I will create a Snapsnot class to encapsulate the related fields if necessary during implementation.
+
+bq. Can you call RSSnapshotHandler just SnapshotHandler?
+
+sure
+
+bq. You probably don't need to support String overloads.
+
+You mean methods in HBaseAdmin?
+
+A repository has been created in github with the initial content of hbase/trunk
+http://github.com/lichongxin/hbase-snapshot
+
+Some source code  have been committed to the github repository (http://github.com/lichongxin/hbase-snapshot) for the first two sub-tasks: start/monitor snapshot via ZooKeeper (HBase-2744) and create snapshot on master and region server (HBase-2745). Unit tests have not been ready and I'm still working on it. See if there are any problems. Any comments are appreciated.
+
+I took a quick look Li.
+
+What is the SNAPSHOTINFO_FILE?  Is it name of file that we write snapshot data to?  Should it be named for the snapshot name?  Looks like you name the dir that holds this file for the snapshot name?   Do we need a directory?  Can we get away with just files that are named fo the snapshot name and that hold the snapshot data?
+
+You should add javadoc comments to your classes; say what the class is for (hmm... seems like you usually doo... just the first few in this commit seem to be missing them... they are there for the others).
+
+So far, it looks great.  Keep up the good work.  Tests next I'd say.
+
+
+
+Message from: "Chongxin Li" <lichongxin@zju.edu.cn>
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+http://review.cloudera.org/r/467/
+-----------------------------------------------------------
+
+Review request for hbase.
+
+
+Summary
+-------
+
+This patch includes the first three sub-tasks of HBASE-50:
+1. Start and monitor the creation of snapshot via ZooKeeper
+2. Create snapshot of an HBase table
+3. Some existing functions of HBase are modified to support snapshot
+
+Currently snapshots can be created as expected, but can not be restored or deleted yet
+
+
+This addresses bug HBASE-50.
+    http://issues.apache.org/jira/browse/HBASE-50
+
+
+Diffs
+-----
+
+  src/main/java/org/apache/hadoop/hbase/HConstants.java c77ebf5 
+  src/main/java/org/apache/hadoop/hbase/HRegionInfo.java ee94690 
+  src/main/java/org/apache/hadoop/hbase/HSnapshotDescriptor.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/HTableDescriptor.java 0d57270 
+  src/main/java/org/apache/hadoop/hbase/TablePartialOpenException.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java 8b01aa0 
+  src/main/java/org/apache/hadoop/hbase/io/Reference.java 219203c 
+  src/main/java/org/apache/hadoop/hbase/ipc/HBaseRPCProtocolVersion.java d4bcbed 
+  src/main/java/org/apache/hadoop/hbase/ipc/HMasterInterface.java bd48a4b 
+  src/main/java/org/apache/hadoop/hbase/master/BaseScanner.java 69eab39 
+  src/main/java/org/apache/hadoop/hbase/master/HMaster.java e4bd30d 
+  src/main/java/org/apache/hadoop/hbase/master/LogsCleaner.java 9d1a8b8 
+  src/main/java/org/apache/hadoop/hbase/master/SnapshotLogCleaner.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/master/SnapshotMonitor.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/master/TableDelete.java 1153e62 
+  src/main/java/org/apache/hadoop/hbase/master/TableSnapshot.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java 6dc41a4 
+  src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java 6a54736 
+  src/main/java/org/apache/hadoop/hbase/regionserver/SnapshotThread.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/regionserver/Store.java ae9e190 
+  src/main/java/org/apache/hadoop/hbase/regionserver/StoreFile.java 757a50c 
+  src/main/java/org/apache/hadoop/hbase/regionserver/ZKSnapshotWatcher.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/regionserver/wal/HLog.java 9593286 
+  src/main/java/org/apache/hadoop/hbase/replication/master/ReplicationLogCleaner.java 4d4b00a 
+  src/main/java/org/apache/hadoop/hbase/util/FSUtils.java 5cf3481 
+  src/main/java/org/apache/hadoop/hbase/zookeeper/ZooKeeperWrapper.java 3827fa5 
+  src/main/resources/hbase-default.xml b73f0ff 
+  src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java 4d09fe9 
+  src/test/java/org/apache/hadoop/hbase/master/TestSnapshot.java PRE-CREATION 
+  src/test/java/org/apache/hadoop/hbase/master/TestSnapshotFailure.java PRE-CREATION 
+  src/test/java/org/apache/hadoop/hbase/regionserver/TestCompaction.java 34b8044 
+  src/test/java/org/apache/hadoop/hbase/regionserver/TestHRegion.java 98bd3e5 
+  src/test/java/org/apache/hadoop/hbase/regionserver/TestHRegionSnapshot.java PRE-CREATION 
+  src/test/java/org/apache/hadoop/hbase/regionserver/TestZKSnapshotWatcher.java PRE-CREATION 
+
+Diff: http://review.cloudera.org/r/467/diff
+
+
+Testing
+-------
+
+Unit tests and integration tests with mini cluster passed.
+
+
+Thanks,
+
+Chongxin
+
+
+
+
+Message from: "Todd Lipcon" <todd@cloudera.com>
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+http://review.cloudera.org/r/467/#review618
+-----------------------------------------------------------
+
+
+looks pretty good! I didn't et a chance to look through the test cases in detail, I'll try to look them over some more later this week.
+
+
+src/main/java/org/apache/hadoop/hbase/HConstants.java
+<http://review.cloudera.org/r/467/#comment2293>
+
+    since we also have a "log archive dir" somewhere, should specify this a little more - this is archived HFiles that are still referenced by snapshots?
+
+
+
+src/main/java/org/apache/hadoop/hbase/HSnapshotDescriptor.java
+<http://review.cloudera.org/r/467/#comment2294>
+
+    license
+
+
+
+src/main/java/org/apache/hadoop/hbase/HSnapshotDescriptor.java
+<http://review.cloudera.org/r/467/#comment2295>
+
+    no need for @param javadoc if there is no actual description attached. same thing below in a few places
+
+
+
+src/main/java/org/apache/hadoop/hbase/HSnapshotDescriptor.java
+<http://review.cloudera.org/r/467/#comment2296>
+
+    why not System.currentTimeMillis?
+
+
+
+src/main/java/org/apache/hadoop/hbase/HSnapshotDescriptor.java
+<http://review.cloudera.org/r/467/#comment2297>
+
+    empty @return
+
+
+
+src/main/java/org/apache/hadoop/hbase/HSnapshotDescriptor.java
+<http://review.cloudera.org/r/467/#comment2298>
+
+    since we're using the snapshot name as a directory name in HDFS, it has to be a UTF8 string, so why not just keep it as a String above too?
+
+
+
+src/main/java/org/apache/hadoop/hbase/TablePartialOpenException.java
+<http://review.cloudera.org/r/467/#comment2299>
+
+    no need for this javadoc (it's obvious)
+
+
+
+src/main/java/org/apache/hadoop/hbase/TablePartialOpenException.java
+<http://review.cloudera.org/r/467/#comment2300>
+
+    same with this one
+
+
+
+src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java
+<http://review.cloudera.org/r/467/#comment2301>
+
+    add "TODO" to this comment
+
+
+
+src/main/java/org/apache/hadoop/hbase/io/Reference.java
+<http://review.cloudera.org/r/467/#comment2302>
+
+    to keep compatibility with current storefiles, "entire" should be value 2, and bottom should be 0
+    
+    while we're at it, maybe rename these to be all caps - Range.TOP, Range.BOTTOM, etc
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/BaseScanner.java
+<http://review.cloudera.org/r/467/#comment2303>
+
+    no need to check size() - iterating the empty array should be fine
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/BaseScanner.java
+<http://review.cloudera.org/r/467/#comment2304>
+
+    if we crash between step 1 and 2, we orphan the archived file. Instead, we can do the delete first (ignoring failure if it doesn't exist) and then update META.
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+<http://review.cloudera.org/r/467/#comment2305>
+
+    you can just call mkdirs, I think, and it won't fail if it already exists
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+<http://review.cloudera.org/r/467/#comment2306>
+
+    should this be an exception, rather than a result code? ie is it normal to fail?
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+<http://review.cloudera.org/r/467/#comment2309>
+
+    do we have a race here? what if the table gets enabled while the snapshot is being processed? it seems we need some locking here around table status and snapshot modification
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+<http://review.cloudera.org/r/467/#comment2311>
+
+    shouldn't we rethrow in this error case? and in the above error case? ie these should be clauses like:
+    
+    boolean success=false;
+    try {
+      ... make snapshot ...
+      success = true;
+    } finally {
+      if (!success) {
+        deleteSnapshot();
+      }
+    }
+    
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+<http://review.cloudera.org/r/467/#comment2313>
+
+    would it be problematic to create a partially written snapshotinfo file? or would it get cleaned up at a higher layer?
+    
+    (perhaps worth creating snapshotinfo.tmp, then atomically rename it to snapshotinfo if it writes correctly)
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/SnapshotLogCleaner.java
+<http://review.cloudera.org/r/467/#comment2314>
+
+    license
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/SnapshotLogCleaner.java
+<http://review.cloudera.org/r/467/#comment2315>
+
+    worth noting that this class is not thread-safe? I don't know if these classes need to be thread safe, but you're using an unsynchronized hashset. Also, since refreshHLogsAndSearch clears hlogs before re-adding stuff, it needs to be synchronized more than just using a synchronized collection.
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/SnapshotLogCleaner.java
+<http://review.cloudera.org/r/467/#comment2317>
+
+    do we have a race here between the listStatus and creating a snapshot?
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/SnapshotLogCleaner.java
+<http://review.cloudera.org/r/467/#comment2316>
+
+    document that it may be null, and what null means? in fact, do we ever call this with null? it doesn't look like it.
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/SnapshotLogCleaner.java
+<http://review.cloudera.org/r/467/#comment2318>
+
+    do we really want to swallow this IOE?
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/SnapshotMonitor.java
+<http://review.cloudera.org/r/467/#comment2321>
+
+    this is basically a singleton per-master, right? not per-snapshot? ie this is created at master startup and destroyed at master shutdown, and can coordinate multiple snapshots over its lifetime? would be good to document how this fits into the overall design, and perhaps refactor into one part that is master-global and another part that is created once per-snapshot.
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/SnapshotMonitor.java
+<http://review.cloudera.org/r/467/#comment2331>
+
+    needs to be volatile - waitForFinish accesses this outside of synchronization
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/SnapshotMonitor.java
+<http://review.cloudera.org/r/467/#comment2319>
+
+    what is this mutex? better to name it based on what objects it synchronizes, and also use new Object() instead of new Integer(0)
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/SnapshotMonitor.java
+<http://review.cloudera.org/r/467/#comment2320>
+
+    are you sure this is the way we name HMaster's ZKW instance? can we just grab the existing zkWrapper instance out of the master object?
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/SnapshotMonitor.java
+<http://review.cloudera.org/r/467/#comment2322>
+
+    what's the synchronization story here? who calls this method?
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/SnapshotMonitor.java
+<http://review.cloudera.org/r/467/#comment2323>
+
+    useless doc
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/SnapshotMonitor.java
+<http://review.cloudera.org/r/467/#comment2325>
+
+    better to just do something like:
+    
+    if (!mkdirs(...)) {
+      throw IOE("could not create")
+    }
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/SnapshotMonitor.java
+<http://review.cloudera.org/r/467/#comment2324>
+
+    include path or snapshot name in exception msg
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/SnapshotMonitor.java
+<http://review.cloudera.org/r/467/#comment2328>
+
+    does ZKW automatically re-watch the nodes for you, here?
+    
+    Also, how does this interact with region server failure? We just assume that the snapshot will timeout and abort, instead of proactively detecting?
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/SnapshotMonitor.java
+<http://review.cloudera.org/r/467/#comment2326>
+
+    add a LOG.debug perhaps for this case - it seems rare that we'd have the correct count of servers but be missing one
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/SnapshotMonitor.java
+<http://review.cloudera.org/r/467/#comment2327>
+
+    assert that we're in ALLREADY state here?
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/SnapshotMonitor.java
+<http://review.cloudera.org/r/467/#comment2329>
+
+    log at least?
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/SnapshotMonitor.java
+<http://review.cloudera.org/r/467/#comment2330>
+
+    this should probably be rethrown?
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/SnapshotMonitor.java
+<http://review.cloudera.org/r/467/#comment2332>
+
+    consider rename to M_ALL_RS_READY and M_ALL_RS_FINISHED for clarity
+    
+    also, what is M?
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/SnapshotMonitor.java
+<http://review.cloudera.org/r/467/#comment2333>
+
+    rename to M_RS_READY and M_RS_FINISHED?
+    Should these RS-specific ones be in a separate enum? GlobalSnapshotStatus vs RSSnapshotStatus?
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/TableSnapshot.java
+<http://review.cloudera.org/r/467/#comment2334>
+
+    check return value of mkdirs instead
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/TableSnapshot.java
+<http://review.cloudera.org/r/467/#comment2335>
+
+    info level instead, perhaps? seems like a common issue given we're very flaky about region enable status currently.
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/TableSnapshot.java
+<http://review.cloudera.org/r/467/#comment2336>
+
+    is there a process that scans for cases where the reference count has gotten out of sync?
+    I'm worried about a case where a snapshot is half-done, and then it fails, so the snapshot is considered aborted, but we never clean up the references because META has been incremented.
+
+
+
+src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
+<http://review.cloudera.org/r/467/#comment2337>
+
+    update message to include snapshot case
+
+
+
+src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
+<http://review.cloudera.org/r/467/#comment2338>
+
+    rather than returning booleans, it might be better to throw back an exception to indicate error - this way the snapshot coordinator can actually show the reason for the failed snapshot, instead of forcing the user to grep all of the RS logs.
+
+
+
+src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
+<http://review.cloudera.org/r/467/#comment2339>
+
+    what happens if the snapshot coordinator dies before completing the snapshot? the region is left permanently in snapshot mode?
+
+
+
+src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
+<http://review.cloudera.org/r/467/#comment2340>
+
+    useless doc
+
+
+
+src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
+<http://review.cloudera.org/r/467/#comment2341>
+
+    check return value of mkdirs instead of separately calling exists
+
+
+
+src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
+<http://review.cloudera.org/r/467/#comment2342>
+
+    see above - just call fs.mkdirs
+
+
+
+src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
+<http://review.cloudera.org/r/467/#comment2343>
+
+    this code is duplicated from the master-driven snapshot - perhaps it can be factored out somewhere
+
+
+
+src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
+<http://review.cloudera.org/r/467/#comment2344>
+
+    this code is also duplicated
+
+
+
+src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+<http://review.cloudera.org/r/467/#comment2345>
+
+    in this case, though, we've already called startSnapshot on some other regions - is this problematic?
+
+
+
+src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+<http://review.cloudera.org/r/467/#comment2346>
+
+    missing " " before "on RS"
+
+
+
+src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+<http://review.cloudera.org/r/467/#comment2348>
+
+    at this point don't we have to wait for the snapshot coordinator to "commit" the snapshot?
+
+
+
+src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+<http://review.cloudera.org/r/467/#comment2347>
+
+    !regionsToBackup.isEmpty()
+
+
+
+src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+<http://review.cloudera.org/r/467/#comment2349>
+
+    "on RS" -> " on RS" (space)
+
+
+
+src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+<http://review.cloudera.org/r/467/#comment2350>
+
+    perhaps write to a tmp file then move into place, so it's atomic
+
+
+
+src/main/java/org/apache/hadoop/hbase/regionserver/StoreFile.java
+<http://review.cloudera.org/r/467/#comment2351>
+
+    this seems prone to collision if it's multithreaded, since the exists check and the use of the filename aren't atomic
+
+
+
+src/main/java/org/apache/hadoop/hbase/regionserver/ZKSnapshotWatcher.java
+<http://review.cloudera.org/r/467/#comment2352>
+
+    since createZNodeIfNotExists already does existance check, you don't need the .exists above
+
+
+
+src/main/java/org/apache/hadoop/hbase/regionserver/ZKSnapshotWatcher.java
+<http://review.cloudera.org/r/467/#comment2353>
+
+    does ZKWatcher automatically re-watch for you?
+
+
+
+src/main/java/org/apache/hadoop/hbase/regionserver/ZKSnapshotWatcher.java
+<http://review.cloudera.org/r/467/#comment2354>
+
+    should actually wait for the snapshotThread to exit here - otherwise maybe an aborting one is still doing some work, which might overlap with the next one
+
+
+
+src/main/java/org/apache/hadoop/hbase/util/FSUtils.java
+<http://review.cloudera.org/r/467/#comment2355>
+
+    more examples of checking mkdirs
+
+
+
+src/main/java/org/apache/hadoop/hbase/util/FSUtils.java
+<http://review.cloudera.org/r/467/#comment2356>
+
+    useless javadoc
+
+
+
+src/main/java/org/apache/hadoop/hbase/zookeeper/ZooKeeperWrapper.java
+<http://review.cloudera.org/r/467/#comment2357>
+
+    throw exceptions instead of returning false?
+
+
+
+src/main/java/org/apache/hadoop/hbase/zookeeper/ZooKeeperWrapper.java
+<http://review.cloudera.org/r/467/#comment2358>
+
+    throw exceptions instead of returning false
+
+
+
+src/main/java/org/apache/hadoop/hbase/zookeeper/ZooKeeperWrapper.java
+<http://review.cloudera.org/r/467/#comment2359>
+
+    throw exceptions to user
+
+
+
+src/main/java/org/apache/hadoop/hbase/zookeeper/ZooKeeperWrapper.java
+<http://review.cloudera.org/r/467/#comment2360>
+
+    these checks are inherently racy
+
+
+
+src/test/java/org/apache/hadoop/hbase/master/TestSnapshot.java
+<http://review.cloudera.org/r/467/#comment2361>
+
+    license
+
+
+
+src/test/java/org/apache/hadoop/hbase/master/TestSnapshotFailure.java
+<http://review.cloudera.org/r/467/#comment2362>
+
+    license
+
+
+
+src/test/java/org/apache/hadoop/hbase/regionserver/TestHRegionSnapshot.java
+<http://review.cloudera.org/r/467/#comment2363>
+
+    license
+
+
+- Todd
+
+
+
+
+
+Message from: "Ted Yu" <ted_yu@yahoo.com>
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+http://review.cloudera.org/r/467/#review631
+-----------------------------------------------------------
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/SnapshotMonitor.java
+<http://review.cloudera.org/r/467/#comment2373>
+
+    I think this should be (retries == 4) for 3 retries
+
+
+- Ted
+
+
+
+
+
+Message from: "Chongxin Li" <lichongxin@zju.edu.cn>
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+http://review.cloudera.org/r/467/
+-----------------------------------------------------------
+
+(Updated 2010-08-09 03:52:11.875655)
+
+
+Review request for hbase.
+
+
+Changes
+-------
+
+Quite a lot of changes have been made according Todd's review, here are some major ones:
+
+1. Refactor SnapshotMonitor into one part that is master-global and another part that is created once per-snapshot (SnapshotTracker). 
+2. Catch exceptions in HMaster.snapshot and clean up the snapshot if exceptions occur.
+3. Always quit snapshot mode for regions no matter whether the snapshot is created successfully on RS.
+4. Add a mechanism to check and synchronize the reference count in META with the number of reference files in BaseScanner.
+5. Add snapshot operations: DeleteSnapshot, RestoreSnapshot and corresponding tests (in TestAdmin).
+
+
+Summary
+-------
+
+This patch includes the first three sub-tasks of HBASE-50:
+1. Start and monitor the creation of snapshot via ZooKeeper
+2. Create snapshot of an HBase table
+3. Some existing functions of HBase are modified to support snapshot
+
+Currently snapshots can be created as expected, but can not be restored or deleted yet
+
+
+This addresses bug HBASE-50.
+    http://issues.apache.org/jira/browse/HBASE-50
+
+
+Diffs (updated)
+-----
+
+  src/main/java/org/apache/hadoop/hbase/HConstants.java c77ebf5 
+  src/main/java/org/apache/hadoop/hbase/HRegionInfo.java ee94690 
+  src/main/java/org/apache/hadoop/hbase/HSnapshotDescriptor.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/HTableDescriptor.java 0d57270 
+  src/main/java/org/apache/hadoop/hbase/SnapshotExistsException.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/TablePartialOpenException.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java 8b01aa0 
+  src/main/java/org/apache/hadoop/hbase/io/HalfStoreFileReader.java ed12e7a 
+  src/main/java/org/apache/hadoop/hbase/io/HbaseObjectWritable.java 85fde3a 
+  src/main/java/org/apache/hadoop/hbase/io/Reference.java 219203c 
+  src/main/java/org/apache/hadoop/hbase/io/hfile/HFile.java b2de7e4 
+  src/main/java/org/apache/hadoop/hbase/ipc/HBaseRPCProtocolVersion.java d4bcbed 
+  src/main/java/org/apache/hadoop/hbase/ipc/HMasterInterface.java bd48a4b 
+  src/main/java/org/apache/hadoop/hbase/mapreduce/LoadIncrementalHFiles.java 1183584 
+  src/main/java/org/apache/hadoop/hbase/master/BaseScanner.java 69eab39 
+  src/main/java/org/apache/hadoop/hbase/master/DeleteSnapshot.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/master/HMaster.java e4bd30d 
+  src/main/java/org/apache/hadoop/hbase/master/LogsCleaner.java 9d1a8b8 
+  src/main/java/org/apache/hadoop/hbase/master/RestoreSnapshot.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/master/SnapshotLogCleaner.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/master/SnapshotMonitor.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/master/SnapshotOperation.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/master/SnapshotTracker.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/master/TableDelete.java 1153e62 
+  src/main/java/org/apache/hadoop/hbase/master/TableSnapshot.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java 6dc41a4 
+  src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java 6a54736 
+  src/main/java/org/apache/hadoop/hbase/regionserver/SnapshotThread.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/regionserver/Store.java ae9e190 
+  src/main/java/org/apache/hadoop/hbase/regionserver/StoreFile.java 757a50c 
+  src/main/java/org/apache/hadoop/hbase/regionserver/ZKSnapshotWatcher.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/regionserver/wal/HLog.java 9593286 
+  src/main/java/org/apache/hadoop/hbase/replication/master/ReplicationLogCleaner.java 4d4b00a 
+  src/main/java/org/apache/hadoop/hbase/util/FSUtils.java 5cf3481 
+  src/main/java/org/apache/hadoop/hbase/zookeeper/ZooKeeperWrapper.java 3827fa5 
+  src/main/resources/hbase-default.xml b73f0ff 
+  src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java 4d09fe9 
+  src/test/java/org/apache/hadoop/hbase/client/TestAdmin.java c9b78b9 
+  src/test/java/org/apache/hadoop/hbase/master/TestSnapshot.java PRE-CREATION 
+  src/test/java/org/apache/hadoop/hbase/master/TestSnapshotFailure.java PRE-CREATION 
+  src/test/java/org/apache/hadoop/hbase/regionserver/TestCompaction.java 34b8044 
+  src/test/java/org/apache/hadoop/hbase/regionserver/TestHRegion.java 98bd3e5 
+  src/test/java/org/apache/hadoop/hbase/regionserver/TestHRegionSnapshot.java PRE-CREATION 
+  src/test/java/org/apache/hadoop/hbase/regionserver/TestStoreFile.java 38ef520 
+  src/test/java/org/apache/hadoop/hbase/regionserver/TestZKSnapshotWatcher.java PRE-CREATION 
+
+Diff: http://review.cloudera.org/r/467/diff
+
+
+Testing
+-------
+
+Unit tests and integration tests with mini cluster passed.
+
+
+Thanks,
+
+Chongxin
+
+
+
+
+Message from: "Chongxin Li" <lichongxin@zju.edu.cn>
+
+
+bq.  On 2010-08-02 13:41:35, Todd Lipcon wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/master/SnapshotLogCleaner.java, line 22
+bq.  > <http://review.cloudera.org/r/467/diff/2/?file=4140#file4140line22>
+bq.  >
+bq.  >     worth noting that this class is not thread-safe? I don't know if these classes need to be thread safe, but you're using an unsynchronized hashset. Also, since refreshHLogsAndSearch clears hlogs before re-adding stuff, it needs to be synchronized more than just using a synchronized collection.
+
+This class is only instantiated once by LogsCleaner so it can be seen as a singleton per master.
+
+
+bq.  On 2010-08-02 13:41:35, Todd Lipcon wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/master/SnapshotMonitor.java, line 116
+bq.  > <http://review.cloudera.org/r/467/diff/2/?file=4141#file4141line116>
+bq.  >
+bq.  >     does ZKW automatically re-watch the nodes for you, here?
+bq.  >     
+bq.  >     Also, how does this interact with region server failure? We just assume that the snapshot will timeout and abort, instead of proactively detecting?
+
+Yes, the ZKW automatically re-watch the nodes.
+
+For snapshot abort, if any region server fails to perform the snapshot, it will remove corresponding ready and finished nodes under snapshot directory. This would notify the master snapshot failure and further abort snapshot on all region servers via ZK
+
+For snapshot timeout, it is not detected here. In method waitToFinish, the snapshot status is checked at a regular time (3 seconds here). If this method timeout, exception would be thrown and master will abort the snapshot over the cluster.
+
+
+bq.  On 2010-08-02 13:41:35, Todd Lipcon wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/master/TableSnapshot.java, line 132
+bq.  > <http://review.cloudera.org/r/467/diff/2/?file=4143#file4143line132>
+bq.  >
+bq.  >     is there a process that scans for cases where the reference count has gotten out of sync?
+bq.  >     I'm worried about a case where a snapshot is half-done, and then it fails, so the snapshot is considered aborted, but we never clean up the references because META has been incremented.
+
+This is added in META scanner. Since scanning reference files is expensive, only a few regions are checked and synchronized in one scan. A last checking time is added so that all reference regions are guaranteed to be checked eventually
+
+
+bq.  On 2010-08-02 13:41:35, Todd Lipcon wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/zookeeper/ZooKeeperWrapper.java, line 1403
+bq.  > <http://review.cloudera.org/r/467/diff/2/?file=4153#file4153line1403>
+bq.  >
+bq.  >     these checks are inherently racy
+
+Then remove it?
+
+
+bq.  On 2010-08-02 13:41:35, Todd Lipcon wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/regionserver/StoreFile.java, line 585
+bq.  > <http://review.cloudera.org/r/467/diff/2/?file=4148#file4148line585>
+bq.  >
+bq.  >     this seems prone to collision if it's multithreaded, since the exists check and the use of the filename aren't atomic
+
+Then how to guarantee atomicity? This unique file name should be unique respecting existing files and files which are already compacted and deleted. Otherwise there might be a name collision in archive directory for HFiles
+
+
+bq.  On 2010-08-02 13:41:35, Todd Lipcon wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/HSnapshotDescriptor.java, line 132
+bq.  > <http://review.cloudera.org/r/467/diff/2/?file=4130#file4130line132>
+bq.  >
+bq.  >     since we're using the snapshot name as a directory name in HDFS, it has to be a UTF8 string, so why not just keep it as a String above too?
+
+I implemented this class following HTableDescriptor. And even for table name, it is usually used as a byte array instead of String
+
+
+bq.  On 2010-08-02 13:41:35, Todd Lipcon wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/io/Reference.java, line 61
+bq.  > <http://review.cloudera.org/r/467/diff/2/?file=4134#file4134line61>
+bq.  >
+bq.  >     to keep compatibility with current storefiles, "entire" should be value 2, and bottom should be 0
+bq.  >     
+bq.  >     while we're at it, maybe rename these to be all caps - Range.TOP, Range.BOTTOM, etc
+
+Have been renamed in the latest revision
+
+
+bq.  On 2010-08-02 13:41:35, Todd Lipcon wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/master/HMaster.java, lines 918-919
+bq.  > <http://review.cloudera.org/r/467/diff/2/?file=4138#file4138line918>
+bq.  >
+bq.  >     should this be an exception, rather than a result code? ie is it normal to fail?
+
+Currently all results except ALl_FINISH would throw an exception.
+
+
+bq.  On 2010-08-02 13:41:35, Todd Lipcon wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/master/HMaster.java, line 925
+bq.  > <http://review.cloudera.org/r/467/diff/2/?file=4138#file4138line925>
+bq.  >
+bq.  >     do we have a race here? what if the table gets enabled while the snapshot is being processed? it seems we need some locking here around table status and snapshot modification
+
+Why do we have a race here? I think we can't call HMaster.enableTable during the execution of this method, right? TableDelete is implemented in the same way, the table would not get enabled when it is being deleted, isn't it?
+
+
+bq.  On 2010-08-02 13:41:35, Todd Lipcon wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/master/SnapshotLogCleaner.java, line 47
+bq.  > <http://review.cloudera.org/r/467/diff/2/?file=4140#file4140line47>
+bq.  >
+bq.  >     do we have a race here between the listStatus and creating a snapshot?
+
+I've done this modification in the latest revision. SnapshotLogCleaner's cache is refreshed after listStatus of LogsCleaner and LogCleaner only cleans the archived logs, creating a new snapshot would not use the archived logs.
+
+
+bq.  On 2010-08-02 13:41:35, Todd Lipcon wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/master/SnapshotLogCleaner.java, line 115
+bq.  > <http://review.cloudera.org/r/467/diff/2/?file=4140#file4140line115>
+bq.  >
+bq.  >     do we really want to swallow this IOE?
+
+This implements a method from the interface. The method declaration does not throw any exceptions.
+
+
+bq.  On 2010-08-02 13:41:35, Todd Lipcon wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/master/SnapshotMonitor.java, line 40
+bq.  > <http://review.cloudera.org/r/467/diff/2/?file=4141#file4141line40>
+bq.  >
+bq.  >     this is basically a singleton per-master, right? not per-snapshot? ie this is created at master startup and destroyed at master shutdown, and can coordinate multiple snapshots over its lifetime? would be good to document how this fits into the overall design, and perhaps refactor into one part that is master-global and another part that is created once per-snapshot.
+
+This class has been refactored into two parts
+
+
+bq.  On 2010-08-02 13:41:35, Todd Lipcon wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/master/SnapshotMonitor.java, line 169
+bq.  > <http://review.cloudera.org/r/467/diff/2/?file=4141#file4141line169>
+bq.  >
+bq.  >     assert that we're in ALLREADY state here?
+
+right
+
+
+- Chongxin
+
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+http://review.cloudera.org/r/467/#review618
+-----------------------------------------------------------
+
+
+
+
+
+Message from: "Chongxin Li" <lichongxin@zju.edu.cn>
+
+
+bq.  On 2010-08-03 09:58:06, Ted Yu wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/master/SnapshotMonitor.java, line 246
+bq.  > <http://review.cloudera.org/r/467/diff/2/?file=4141#file4141line246>
+bq.  >
+bq.  >     I think this should be (retries == 4) for 3 retries
+
+this is actually not 'retry' for snapshot, but check whether the snapshot is finished for three times (retries = 0, 1, 2).
+
+
+- Chongxin
+
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+http://review.cloudera.org/r/467/#review631
+-----------------------------------------------------------
+
+
+
+
+
+Message from: "Ted Yu" <ted_yu@yahoo.com>
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+http://review.cloudera.org/r/467/#review799
+-----------------------------------------------------------
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+<http://review.cloudera.org/r/467/#comment2704>
+
+    Do we need to abort TableSnapshot processing in case of exception ?
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+<http://review.cloudera.org/r/467/#comment2707>
+
+    If you create directory for failed snapshots, you can also add listFailedSnapshots() method.
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+<http://review.cloudera.org/r/467/#comment2705>
+
+    It would be better to move crashed snapshots into a separate directory under snapshot rootDir.
+
+
+- Ted
+
+
+
+
+
+Message from: stack@duboce.net
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+http://review.cloudera.org/r/467/#review800
+-----------------------------------------------------------
+
+
+Made a start. More to follow.
+
+
+src/main/java/org/apache/hadoop/hbase/HConstants.java
+<http://review.cloudera.org/r/467/#comment2706>
+
+    Is this what I think it is?  We are keeping reference counts on a region up in .META.?  What about the question I had a while back on what happens when this row is deleted because the region has split and daughters no longer have reference to this parent?  Maybe this is something else.  I'll keep reading.
+
+
+
+src/main/java/org/apache/hadoop/hbase/HConstants.java
+<http://review.cloudera.org/r/467/#comment2708>
+
+    ok.. I think I see whats going to happen (perhaps ignore previous comment)
+
+
+
+src/main/java/org/apache/hadoop/hbase/HRegionInfo.java
+<http://review.cloudera.org/r/467/#comment2709>
+
+    How often is this called?  If it happens alot, it could add up -- be expensive.
+
+
+
+src/main/java/org/apache/hadoop/hbase/HRegionInfo.java
+<http://review.cloudera.org/r/467/#comment2710>
+
+    Ok.  Good.
+
+
+
+src/main/java/org/apache/hadoop/hbase/HSnapshotDescriptor.java
+<http://review.cloudera.org/r/467/#comment2711>
+
+    Drop the H.  Call it SnapshotDescriptor
+
+
+
+src/main/java/org/apache/hadoop/hbase/HSnapshotDescriptor.java
+<http://review.cloudera.org/r/467/#comment2712>
+
+    If it is in under the snapshot directory maybe just call this file snapshotinfo? Drop the '.' prefix.  The '.' prefix is usually to demark 'special' files we don't want to consider as part of normal operation.  In this case, we are under a snapshot directory, already outside of 'normal' operation.
+
+
+- stack
+
+
+
+
+
+Message from: "Ted Yu" <ted_yu@yahoo.com>
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+http://review.cloudera.org/r/467/#review803
+-----------------------------------------------------------
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/BaseScanner.java
+<http://review.cloudera.org/r/467/#comment2713>
+
+    IOException should be handled so that synchronization of reference counts isn't interrupted.
+
+
+- Ted
+
+
+
+
+
+Message from: stack@duboce.net
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+http://review.cloudera.org/r/467/#review823
+-----------------------------------------------------------
+
+
+I reviewed the first page of diffs.  Will do second page tomorrow (This is a lovely big patch Li -- so far, so good... keep up the good work).
+
+
+src/main/java/org/apache/hadoop/hbase/HTableDescriptor.java
+<http://review.cloudera.org/r/467/#comment2750>
+
+    This is fine for an hbase that is a fresh install but what about case where the data has been migrated from an older hbase version; it won't have this column family in .META.  We should make a little migration script that adds it or on start of new version, check for it and if not present, create it.
+
+
+
+src/main/java/org/apache/hadoop/hbase/HTableDescriptor.java
+<http://review.cloudera.org/r/467/#comment2751>
+
+    ditto
+    
+
+
+
+src/main/java/org/apache/hadoop/hbase/TablePartialOpenException.java
+<http://review.cloudera.org/r/467/#comment2752>
+
+    Maybe exception should be called TablePartiallyOpenException (Not important.  Minor).
+
+
+
+src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java
+<http://review.cloudera.org/r/467/#comment2753>
+
+    Can the snapshot name be empty and then we'll make one up?
+
+
+
+src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java
+<http://review.cloudera.org/r/467/#comment2754>
+
+    Sure, why not. Its stored in the filesystem?  If so, for sure use same rule.
+
+
+
+src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java
+<http://review.cloudera.org/r/467/#comment2755>
+
+    For restore of the snapshot, do you use loadtable.rb or Todd's new bulkloading scripts?
+
+
+
+src/main/java/org/apache/hadoop/hbase/io/HalfStoreFileReader.java
+<http://review.cloudera.org/r/467/#comment2756>
+
+    This looks like an improvement.
+
+
+
+src/main/java/org/apache/hadoop/hbase/io/Reference.java
+<http://review.cloudera.org/r/467/#comment2757>
+
+    Whats this?  A different kind of reference?
+
+
+
+src/main/java/org/apache/hadoop/hbase/io/Reference.java
+<http://review.cloudera.org/r/467/#comment2758>
+
+    Do you need to specify the ordinals?  Wont they be these numbers anyways? Or is it in case someone adds a new type of reference?
+
+
+
+src/main/java/org/apache/hadoop/hbase/io/Reference.java
+<http://review.cloudera.org/r/467/#comment2759>
+
+    Why not just use the ordinal?  http://download-llnw.oracle.com/javase/1.5.0/docs/api/java/lang/Enum.html#ordinal()  And serialize the int?
+
+
+
+src/main/java/org/apache/hadoop/hbase/io/Reference.java
+<http://review.cloudera.org/r/467/#comment2760>
+
+    Hmm... is this good?  You are dropping some the region name when you toString.  Do we have to?
+
+
+
+src/main/java/org/apache/hadoop/hbase/io/Reference.java
+<http://review.cloudera.org/r/467/#comment2765>
+
+    This could be a problem when fellas migrate old data to use this new hbase.  If there are References in the old data, then this deserialization will fail?  I'm fine w/ you creating a new issue named something like "Migration from 0.20.x hbase to 0.90" and adding a note in there that we need to consider this little issue.  Better though would be if the data was able to migrate itself at runtime; i.e. recognize a boolean on the stream and then deserialize the old style into the new, etc.
+
+
+
+src/main/java/org/apache/hadoop/hbase/ipc/HBaseRPCProtocolVersion.java
+<http://review.cloudera.org/r/467/#comment2767>
+
+    Good.
+
+
+
+src/main/java/org/apache/hadoop/hbase/mapreduce/LoadIncrementalHFiles.java
+<http://review.cloudera.org/r/467/#comment2768>
+
+    Is this comment right?
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/BaseScanner.java
+<http://review.cloudera.org/r/467/#comment2770>
+
+    Why Random negative number?  Why not just leave it blank?
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/BaseScanner.java
+<http://review.cloudera.org/r/467/#comment2775>
+
+    It'd be cool breaking up these methods so they were static if possible so you could unit test them to ensure they do as advertised.
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/DeleteSnapshot.java
+<http://review.cloudera.org/r/467/#comment2776>
+
+    Check the result.  It may not have worked.  If it didn't deserves a WARN at least.
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+<http://review.cloudera.org/r/467/#comment2777>
+
+    You might want to check the returns from these methods.
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+<http://review.cloudera.org/r/467/#comment2778>
+
+    Don't bother warning I'd say.. just throw
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+<http://review.cloudera.org/r/467/#comment2779>
+
+    Yeah, just throw... that'll show in logs anyway (I believe)
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+<http://review.cloudera.org/r/467/#comment2780>
+
+    I'm with Ted on this one. Need to do something about it else it'll annoy till the end of time.
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/RestoreSnapshot.java
+<http://review.cloudera.org/r/467/#comment2781>
+
+    This looks like it should be a general utility method (Not important)
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/RestoreSnapshot.java
+<http://review.cloudera.org/r/467/#comment2782>
+
+    If table were big, this could be prohibitively expensive?  A single-threaded copy of all of a tables data?  We could compliment this with MR-base restore, something that did the copy using MR?
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/SnapshotLogCleaner.java
+<http://review.cloudera.org/r/467/#comment2784>
+
+    This looks like a class that you could write a unit test for?
+
+
+- stack
+
+
+
+
+
+Message from: "Chongxin Li" <lichongxin@zju.edu.cn>
+
+
+bq.  On 2010-08-10 10:49:06, stack wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/HSnapshotDescriptor.java, line 36
+bq.  > <http://review.cloudera.org/r/467/diff/3/?file=6001#file6001line36>
+bq.  >
+bq.  >     Drop the H.  Call it SnapshotDescriptor
+
+Alright
+
+
+bq.  On 2010-08-10 10:49:06, stack wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/HSnapshotDescriptor.java, line 41
+bq.  > <http://review.cloudera.org/r/467/diff/3/?file=6001#file6001line41>
+bq.  >
+bq.  >     If it is in under the snapshot directory maybe just call this file snapshotinfo? Drop the '.' prefix.  The '.' prefix is usually to demark 'special' files we don't want to consider as part of normal operation.  In this case, we are under a snapshot directory, already outside of 'normal' operation.
+
+This is named following .regioninfo
+
+
+bq.  On 2010-08-10 10:49:06, stack wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/HRegionInfo.java, line 373
+bq.  > <http://review.cloudera.org/r/467/diff/3/?file=6000#file6000line373>
+bq.  >
+bq.  >     How often is this called?  If it happens alot, it could add up -- be expensive.
+
+Not too much actually. This method is only called in BaseScanner when reference rows in META are checked and synchronized with the reference files. And right now there would be at most five rows to be checked in one scan of META.
+There is no region info saved in each reference row. Thus reference row which is a combination of SNAPSHOT_PREFIX and region name is parsed to obtain the region name. That's why we need this method.
+
+
+- Chongxin
+
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+http://review.cloudera.org/r/467/#review800
+-----------------------------------------------------------
+
+
+
+
+
+Message from: "Chongxin Li" <lichongxin@zju.edu.cn>
+
+
+bq.  On 2010-08-10 10:04:44, Ted Yu wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/master/HMaster.java, line 962
+bq.  > <http://review.cloudera.org/r/467/diff/3/?file=6015#file6015line962>
+bq.  >
+bq.  >     It would be better to move crashed snapshots into a separate directory under snapshot rootDir.
+
+If so, probably we need the above method.
+But why move crashed snapshots into a separate directory? It would be pretty hard to recover a crashed snapshot.
+
+
+bq.  On 2010-08-10 10:04:44, Ted Yu wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/master/HMaster.java, line 945
+bq.  > <http://review.cloudera.org/r/467/diff/3/?file=6015#file6015line945>
+bq.  >
+bq.  >     If you create directory for failed snapshots, you can also add listFailedSnapshots() method.
+
+Currently there is no directory for failed snapshots. If snapshot fails, it is cleaned up and exception is thrown to notify the user.
+
+
+bq.  On 2010-08-10 10:04:44, Ted Yu wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/master/HMaster.java, line 930
+bq.  > <http://review.cloudera.org/r/467/diff/3/?file=6015#file6015line930>
+bq.  >
+bq.  >     Do we need to abort TableSnapshot processing in case of exception ?
+
+For snapshot which is created by TableSnapshot, the table must be offline and snapshot is totally driven by the master. Region servers have no awareness of such a snapshot. So in case of exception, just clean up the failed snapshot. There is no need to abort the snapshot across the cluster.
+
+Regarding SnapshotMonitor, it only monitors the snapshots which are created across the region servers.
+
+
+- Chongxin
+
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+http://review.cloudera.org/r/467/#review799
+-----------------------------------------------------------
+
+
+
+
+
+Message from: "Ted Yu" <ted_yu@yahoo.com>
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+http://review.cloudera.org/r/467/#review829
+-----------------------------------------------------------
+
+
+
+src/main/java/org/apache/hadoop/hbase/io/Reference.java
+<http://review.cloudera.org/r/467/#comment2793>
+
+    I think the current code is backward compatible. Boolean value of true is interpreted as TOP, value of false is BOTTOM.
+    Since ENTIRE is introduced, this code is not backward compatible.
+    
+    See:
+    http://download.oracle.com/javase/1.4.2/docs/api/java/io/DataOutput.html#writeBoolean%28boolean%29
+
+
+- Ted
+
+
+
+
+
+Message from: "Ted Yu" <ted_yu@yahoo.com>
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+http://review.cloudera.org/r/467/#review830
+-----------------------------------------------------------
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+<http://review.cloudera.org/r/467/#comment2794>
+
+    Moving crashed snapshots has two benefits:
+    1. future call to listSnapshots() wouldn't encounter IOException.
+    2. it's easy for user to get statistics on failed snapshots and analyze them
+    
+    Or, if you log enough information when cleaning up the failed snapshot.
+    
+
+
+- Ted
+
+
+
+
+
+Message from: "Chongxin Li" <lichongxin@zju.edu.cn>
+
+
+bq.  On 2010-08-10 22:40:31, Ted Yu wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/master/HMaster.java, line 962
+bq.  > <http://review.cloudera.org/r/467/diff/3/?file=6015#file6015line962>
+bq.  >
+bq.  >     Moving crashed snapshots has two benefits:
+bq.  >     1. future call to listSnapshots() wouldn't encounter IOException.
+bq.  >     2. it's easy for user to get statistics on failed snapshots and analyze them
+bq.  >     
+bq.  >     Or, if you log enough information when cleaning up the failed snapshot.
+bq.  >
+
+What about snapshot fails when it is being created? Currently it is cleaned up if exception occurs in HMaster.snapshot. Should we also move it to this directory? Then for reference information sync, should we also take the reference files of these failed snapshots into account?
+
+
+- Chongxin
+
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+http://review.cloudera.org/r/467/#review830
+-----------------------------------------------------------
+
+
+
+
+
+Message from: "Chongxin Li" <lichongxin@zju.edu.cn>
+
+
+bq.  On 2010-08-10 21:34:40, stack wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/HTableDescriptor.java, line 673
+bq.  > <http://review.cloudera.org/r/467/diff/3/?file=6002#file6002line673>
+bq.  >
+bq.  >     This is fine for an hbase that is a fresh install but what about case where the data has been migrated from an older hbase version; it won't have this column family in .META.  We should make a little migration script that adds it or on start of new version, check for it and if not present, create it.
+
+That's right. But AddColumn operation requires the table disabled to proceed, ROOT table can not be disabled once the system is started. Then how could we execute the migration script or check and create it on start of new version?
+
+
+bq.  On 2010-08-10 21:34:40, stack wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java, line 899
+bq.  > <http://review.cloudera.org/r/467/diff/3/?file=6005#file6005line899>
+bq.  >
+bq.  >     Can the snapshot name be empty and then we'll make one up?
+
+a default snapshot name? or a auto-generated snapshot name, such as creation time?
+
+
+bq.  On 2010-08-10 21:34:40, stack wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java, line 951
+bq.  > <http://review.cloudera.org/r/467/diff/3/?file=6005#file6005line951>
+bq.  >
+bq.  >     For restore of the snapshot, do you use loadtable.rb or Todd's new bulkloading scripts?
+
+Currently, NO...
+Snapshot is composed of a list of log files and a bunch of reference files for HFiles of the table. These reference files have the same hierarchy as the original table and the name is in the format of "1239384747630.tablename", where the front is the file name of the referred HFile and the latter is table name for snapshot. Thus to restore a snapshot, just copy reference files (which are just a few bytes) to the table dir, update the META and split the logs. When this table is enabled, the system know how to replay the commit edits and read such a reference file. Methods getReferredToFile, open in StoreFile are updated to deal with this kind of reference files for snapshots.
+
+At present, snapshot can only be restored to the table whose name is the same as the one for which the snapshot is created. That the old table with the same name must be deleted before restore a snapshot. That's what I do in unit test TestAdmin. Restoring snapshot to a different table name has a low priority. It has not been implemented yet.
+
+
+bq.  On 2010-08-10 21:34:40, stack wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/io/Reference.java, line 50
+bq.  > <http://review.cloudera.org/r/467/diff/3/?file=6008#file6008line50>
+bq.  >
+bq.  >     Whats this?  A different kind of reference?
+
+Yes.. This is the reference file in snapshot. It references an HFile of the original table.
+
+
+bq.  On 2010-08-10 21:34:40, stack wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/master/SnapshotLogCleaner.java, line 115
+bq.  > <http://review.cloudera.org/r/467/diff/3/?file=6018#file6018line115>
+bq.  >
+bq.  >     This looks like a class that you could write a unit test for?
+
+Sure, I'll add another case in TestLogsCleaner.
+
+
+bq.  On 2010-08-10 21:34:40, stack wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/master/RestoreSnapshot.java, line 130
+bq.  > <http://review.cloudera.org/r/467/diff/3/?file=6017#file6017line130>
+bq.  >
+bq.  >     If table were big, this could be prohibitively expensive?  A single-threaded copy of all of a tables data?  We could compliment this with MR-base restore, something that did the copy using MR?
+
+This method is only used in RestoreSnapshot, where reference files of snapshot are copied to the table dir. These reference files just contains a few bytes instead of the table's data. Snapshots share the table data with the original table and other snapshots. Do we still need a MR job?
+
+
+bq.  On 2010-08-10 21:34:40, stack wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/master/BaseScanner.java, line 212
+bq.  > <http://review.cloudera.org/r/467/diff/3/?file=6013#file6013line212>
+bq.  >
+bq.  >     Why Random negative number?  Why not just leave it blank?
+
+If a blank value is used as the key, there would be only one item at last if it is the first few times to scan the regions. Using random negative number indicates all these regions have not been scanned before. If it has been scanned, there would be a last checking time for it instead.
+
+
+bq.  On 2010-08-10 21:34:40, stack wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/mapreduce/LoadIncrementalHFiles.java, line 251
+bq.  > <http://review.cloudera.org/r/467/diff/3/?file=6012#file6012line251>
+bq.  >
+bq.  >     Is this comment right?
+
+I just renamed the Ranges to caps, comment was not changed.
+
+
+bq.  On 2010-08-10 21:34:40, stack wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/io/Reference.java, line 149
+bq.  > <http://review.cloudera.org/r/467/diff/3/?file=6008#file6008line149>
+bq.  >
+bq.  >     Hmm... is this good?  You are dropping some the region name when you toString.  Do we have to?
+
+This has not been changed. Just rename field "region" to "range"
+
+
+bq.  On 2010-08-10 21:34:40, stack wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/io/Reference.java, line 156
+bq.  > <http://review.cloudera.org/r/467/diff/3/?file=6008#file6008line156>
+bq.  >
+bq.  >     This could be a problem when fellas migrate old data to use this new hbase.  If there are References in the old data, then this deserialization will fail?  I'm fine w/ you creating a new issue named something like "Migration from 0.20.x hbase to 0.90" and adding a note in there that we need to consider this little issue.  Better though would be if the data was able to migrate itself at runtime; i.e. recognize a boolean on the stream and then deserialize the old style into the new, etc.
+
+Actually I think it is fine to migrate old data to new hbase. Old references are serialized by DataOutput.writeBoolean(boolean), where value (byte)1 is written if the argument is true and value (byte)0 is written if argument is false. 
+
+See (from Ted's review):
+http://download.oracle.com/javase/1.4.2/docs/api/java/io/DataOutput.html#writeBoolean%28boolean%29
+
+Thus value (byte)1 was written if it is the top file region (isTopFileRegion is true). That is exactly the same as current value of TOP. For the same reason, this deserialization would work for the references in the old data, right? 
+
+That's why we can not use ordinal of Enum and serialize the int value. The serialization size of this field would be different for the new data and old data if int value is used.
+
+
+- Chongxin
+
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+http://review.cloudera.org/r/467/#review823
+-----------------------------------------------------------
+
+
+
+
+
+Message from: "Chongxin Li" <lichongxin@zju.edu.cn>
+
+
+bq.  On 2010-08-10 22:20:23, Ted Yu wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/io/Reference.java, line 156
+bq.  > <http://review.cloudera.org/r/467/diff/3/?file=6008#file6008line156>
+bq.  >
+bq.  >     I think the current code is backward compatible. Boolean value of true is interpreted as TOP, value of false is BOTTOM.
+bq.  >     Since ENTIRE is introduced, this code is not backward compatible.
+bq.  >     
+bq.  >     See:
+bq.  >     http://download.oracle.com/javase/1.4.2/docs/api/java/io/DataOutput.html#writeBoolean%28boolean%29
+
+Why it is not backward compatible when ENTIRE is introduces? The value for ENTIRE is 2, different from the old written value of boolean.
+
+
+- Chongxin
+
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+http://review.cloudera.org/r/467/#review829
+-----------------------------------------------------------
+
+
+
+
+
+Message from: stack@duboce.net
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+http://review.cloudera.org/r/467/#review840
+-----------------------------------------------------------
+
+
+This is looking really great Li.  If you can address the comments below in a new version, lets get this patch committed.
+
+Unfortunately, the master rewrite is going to change a bunch of the stuff that this patch depends on.  For example, BaseScanner is going away.  But, thats not your issue.
+
+What about scaling?  The only problematic issue I saw  was copy of storefiles on restore.  We should file an issue to do that via a MR job.
+
+
+src/main/java/org/apache/hadoop/hbase/master/SnapshotMonitor.java
+<http://review.cloudera.org/r/467/#comment2820>
+
+    final
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/SnapshotMonitor.java
+<http://review.cloudera.org/r/467/#comment2821>
+
+    Why let this out?
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/SnapshotMonitor.java
+<http://review.cloudera.org/r/467/#comment2822>
+
+    Want to remove this or enable the assertion?  One or the other I'd say rather than this.
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/SnapshotOperation.java
+<http://review.cloudera.org/r/467/#comment2823>
+
+    This class looks good.
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/SnapshotTracker.java
+<http://review.cloudera.org/r/467/#comment2824>
+
+    Its a pity this class is named so.  We're about to bring in a new patch that redoes the zk stuff -- breaks it up into pieces each with a singular purpose; e.g. tracking root location or tracking meta region server -- and unfortunately the pattern is to name these purposed classes *Tracker.  There'll be a clash of this kinda Tracker and the new zk Trackers.  Not important, just saying in case you have another name in mind for this class.
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/SnapshotTracker.java
+<http://review.cloudera.org/r/467/#comment2825>
+
+    Can you make this a configuration? int maxRetries = Configuration.getInt("hbase.snapshot.retries", 3); or something?  It doesn't have to go into hbase-default.xml
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/SnapshotTracker.java
+<http://review.cloudera.org/r/467/#comment2826>
+
+    Yeah, can the max retries be made into a data member rather than hardcoded everywhere in this class?
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/TableSnapshot.java
+<http://review.cloudera.org/r/467/#comment2827>
+
+    Looks like you need more explaination here?  This is a special case right where the table is offline and we're asked to make a snapshot of it?
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/TableSnapshot.java
+<http://review.cloudera.org/r/467/#comment2828>
+
+    Its not a backup, its creating references, right?
+
+
+
+src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
+<http://review.cloudera.org/r/467/#comment2829>
+
+    This looks like an improvement, making it static so can be used more generally.
+
+
+
+src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
+<http://review.cloudera.org/r/467/#comment2830>
+
+    And flushing is disabled at this point too, right?  Compactions? (Good).
+
+
+
+src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java
+<http://review.cloudera.org/r/467/#comment2831>
+
+    If snapshot fails, do we have to do cleanup?
+
+
+
+src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+<http://review.cloudera.org/r/467/#comment2832>
+
+    Good
+
+
+
+src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+<http://review.cloudera.org/r/467/#comment2833>
+
+    This looks good.
+
+
+
+src/main/java/org/apache/hadoop/hbase/regionserver/SnapshotThread.java
+<http://review.cloudera.org/r/467/#comment2834>
+
+    Call this Snapshotter instead?
+
+
+
+src/main/java/org/apache/hadoop/hbase/regionserver/Store.java
+<http://review.cloudera.org/r/467/#comment2835>
+
+    Do we have to do this down at the Store level?  Coud we move it up to Region or up to the RegionServer itself?  It already has an HTable instance.
+
+
+
+src/main/java/org/apache/hadoop/hbase/regionserver/StoreFile.java
+<http://review.cloudera.org/r/467/#comment2836>
+
+    Why you have to pass the reference?  It wasn't needed previously?
+
+
+
+src/main/java/org/apache/hadoop/hbase/util/FSUtils.java
+<http://review.cloudera.org/r/467/#comment2837>
+
+    Does this stuff belong in here in this general utility class?  Should it be polluted with References?  Should this stuff be over in io package where the Reference is or static methods on Reference?
+
+
+
+src/test/java/org/apache/hadoop/hbase/master/TestSnapshot.java
+<http://review.cloudera.org/r/467/#comment2838>
+
+    What about a test of restore from snapshot?  Is there one?  I dont' see it?
+
+
+
+src/test/java/org/apache/hadoop/hbase/master/TestSnapshotFailure.java
+<http://review.cloudera.org/r/467/#comment2839>
+
+    Good test
+
+
+
+src/test/java/org/apache/hadoop/hbase/regionserver/TestHRegionSnapshot.java
+<http://review.cloudera.org/r/467/#comment2840>
+
+    There is getTestDir(final String subdirName) FYI
+
+
+
+src/test/java/org/apache/hadoop/hbase/regionserver/TestHRegionSnapshot.java
+<http://review.cloudera.org/r/467/#comment2841>
+
+    Looks good.
+
+
+
+src/test/java/org/apache/hadoop/hbase/regionserver/TestZKSnapshotWatcher.java
+<http://review.cloudera.org/r/467/#comment2842>
+
+    Great
+
+
+- stack
+
+
+
+
+
+Message from: "Ted Yu" <ted_yu@yahoo.com>
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+http://review.cloudera.org/r/467/#review846
+-----------------------------------------------------------
+
+
+
+src/main/java/org/apache/hadoop/hbase/io/Reference.java
+<http://review.cloudera.org/r/467/#comment2846>
+
+    I meant value of 2 cannot be correctly interpreted as boolean.
+    
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+<http://review.cloudera.org/r/467/#comment2847>
+
+    I think we need to limit the space consumed by failed snapshots.
+    This issue can be addressed by a future JIRA.
+
+
+- Ted
+
+
+
+
+
+Message from: "Chongxin Li" <lichongxin@zju.edu.cn>
+
+
+bq.  On 2010-08-10 21:34:40, stack wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/master/HMaster.java, line 234
+bq.  > <http://review.cloudera.org/r/467/diff/3/?file=6015#file6015line234>
+bq.  >
+bq.  >     You might want to check the returns from these methods.
+
+Snapshot root dir might already exist, e.g. created in previous start up, then mkdirs would return false. But this is normal.
+
+Here are previous comments from Todd:
+you can just call mkdirs, I think, and it won't fail if it already exists
+
+
+- Chongxin
+
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+http://review.cloudera.org/r/467/#review823
+-----------------------------------------------------------
+
+
+
+
+
+Message from: "Chongxin Li" <lichongxin@zju.edu.cn>
+
+
+bq.  On 2010-08-11 11:32:27, stack wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/master/SnapshotMonitor.java, line 166
+bq.  > <http://review.cloudera.org/r/467/diff/3/?file=6019#file6019line166>
+bq.  >
+bq.  >     Want to remove this or enable the assertion?  One or the other I'd say rather than this.
+
+remove it
+
+
+bq.  On 2010-08-11 11:32:27, stack wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/master/SnapshotTracker.java, line 1
+bq.  > <http://review.cloudera.org/r/467/diff/3/?file=6021#file6021line1>
+bq.  >
+bq.  >     Its a pity this class is named so.  We're about to bring in a new patch that redoes the zk stuff -- breaks it up into pieces each with a singular purpose; e.g. tracking root location or tracking meta region server -- and unfortunately the pattern is to name these purposed classes *Tracker.  There'll be a clash of this kinda Tracker and the new zk Trackers.  Not important, just saying in case you have another name in mind for this class.
+
+I'll think about it. Any suggestion?
+
+
+bq.  On 2010-08-11 11:32:27, stack wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java, line 2288
+bq.  > <http://review.cloudera.org/r/467/diff/3/?file=6024#file6024line2288>
+bq.  >
+bq.  >     And flushing is disabled at this point too, right?  Compactions? (Good).
+
+yes, flushing and compaction are disabled when snapshot.
+
+
+bq.  On 2010-08-11 11:32:27, stack wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/regionserver/Store.java, line 944
+bq.  > <http://review.cloudera.org/r/467/diff/3/?file=6027#file6027line944>
+bq.  >
+bq.  >     Do we have to do this down at the Store level?  Coud we move it up to Region or up to the RegionServer itself?  It already has an HTable instance.
+
+This method is only used to delete old store files after compaction, is it appropriate to move it to Region?
+
+
+bq.  On 2010-08-11 11:32:27, stack wrote:
+bq.  > src/test/java/org/apache/hadoop/hbase/master/TestSnapshot.java, line 382
+bq.  > <http://review.cloudera.org/r/467/diff/3/?file=6037#file6037line382>
+bq.  >
+bq.  >     What about a test of restore from snapshot?  Is there one?  I dont' see it?
+
+It's already in TestAdmin
+
+
+bq.  On 2010-08-11 11:32:27, stack wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/util/FSUtils.java, line 713
+bq.  > <http://review.cloudera.org/r/467/diff/3/?file=6032#file6032line713>
+bq.  >
+bq.  >     Does this stuff belong in here in this general utility class?  Should it be polluted with References?  Should this stuff be over in io package where the Reference is or static methods on Reference?
+
+OK, I'll move it to Reference
+
+
+bq.  On 2010-08-11 11:32:27, stack wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/regionserver/StoreFile.java, line 267
+bq.  > <http://review.cloudera.org/r/467/diff/3/?file=6028#file6028line267>
+bq.  >
+bq.  >     Why you have to pass the reference?  It wasn't needed previously?
+
+Previously there is only one type of reference file, i.e. reference after split. But right now there are another type of reference file for snapshot. We need to know the reference type to get the referred to file. 
+
+This is used for table restored from snapshot.
+
+
+bq.  On 2010-08-11 11:32:27, stack wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java, line 2355
+bq.  > <http://review.cloudera.org/r/467/diff/3/?file=6024#file6024line2355>
+bq.  >
+bq.  >     If snapshot fails, do we have to do cleanup?
+
+HRegions just quit the snapshot mode if fails. The master would be notified with failure and do the clean up work for the whole snapshot.
+
+
+- Chongxin
+
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+http://review.cloudera.org/r/467/#review840
+-----------------------------------------------------------
+
+
+
+
+
+Message from: "Chongxin Li" <lichongxin@zju.edu.cn>
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+http://review.cloudera.org/r/467/
+-----------------------------------------------------------
+
+(Updated 2010-08-12 02:43:42.872855)
+
+
+Review request for hbase.
+
+
+Summary
+-------
+
+This patch includes the first three sub-tasks of HBASE-50:
+1. Start and monitor the creation of snapshot via ZooKeeper
+2. Create snapshot of an HBase table
+3. Some existing functions of HBase are modified to support snapshot
+
+Currently snapshots can be created as expected, but can not be restored or deleted yet
+
+
+This addresses bug HBASE-50.
+    http://issues.apache.org/jira/browse/HBASE-50
+
+
+Diffs (updated)
+-----
+
+  src/main/java/org/apache/hadoop/hbase/HConstants.java c77ebf5 
+  src/main/java/org/apache/hadoop/hbase/HRegionInfo.java ee94690 
+  src/main/java/org/apache/hadoop/hbase/HTableDescriptor.java 0d57270 
+  src/main/java/org/apache/hadoop/hbase/SnapshotDescriptor.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/SnapshotExistsException.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/TablePartiallyOpenException.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java 8b01aa0 
+  src/main/java/org/apache/hadoop/hbase/io/HalfStoreFileReader.java ed12e7a 
+  src/main/java/org/apache/hadoop/hbase/io/HbaseObjectWritable.java 85fde3a 
+  src/main/java/org/apache/hadoop/hbase/io/Reference.java 219203c 
+  src/main/java/org/apache/hadoop/hbase/io/hfile/HFile.java b2de7e4 
+  src/main/java/org/apache/hadoop/hbase/ipc/HBaseRPCProtocolVersion.java d4bcbed 
+  src/main/java/org/apache/hadoop/hbase/ipc/HMasterInterface.java bd48a4b 
+  src/main/java/org/apache/hadoop/hbase/mapreduce/LoadIncrementalHFiles.java 1183584 
+  src/main/java/org/apache/hadoop/hbase/master/BaseScanner.java 69eab39 
+  src/main/java/org/apache/hadoop/hbase/master/DeleteSnapshot.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/master/HMaster.java e4bd30d 
+  src/main/java/org/apache/hadoop/hbase/master/LogsCleaner.java 9d1a8b8 
+  src/main/java/org/apache/hadoop/hbase/master/RestoreSnapshot.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/master/SnapshotLogCleaner.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/master/SnapshotMonitor.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/master/SnapshotOperation.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/master/SnapshotTracker.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/master/TableDelete.java 1153e62 
+  src/main/java/org/apache/hadoop/hbase/master/TableSnapshot.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java 6dc41a4 
+  src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java 6a54736 
+  src/main/java/org/apache/hadoop/hbase/regionserver/Snapshotter.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/regionserver/Store.java ae9e190 
+  src/main/java/org/apache/hadoop/hbase/regionserver/StoreFile.java 757a50c 
+  src/main/java/org/apache/hadoop/hbase/regionserver/ZKSnapshotWatcher.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/regionserver/wal/HLog.java 9593286 
+  src/main/java/org/apache/hadoop/hbase/replication/master/ReplicationLogCleaner.java 4d4b00a 
+  src/main/java/org/apache/hadoop/hbase/util/FSUtils.java 5cf3481 
+  src/main/java/org/apache/hadoop/hbase/zookeeper/ZooKeeperWrapper.java 3827fa5 
+  src/main/resources/hbase-default.xml b73f0ff 
+  src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java 4d09fe9 
+  src/test/java/org/apache/hadoop/hbase/client/TestAdmin.java c9b78b9 
+  src/test/java/org/apache/hadoop/hbase/master/TestLogsCleaner.java 8b7f60f 
+  src/test/java/org/apache/hadoop/hbase/master/TestSnapshot.java PRE-CREATION 
+  src/test/java/org/apache/hadoop/hbase/master/TestSnapshotFailure.java PRE-CREATION 
+  src/test/java/org/apache/hadoop/hbase/regionserver/TestCompaction.java 34b8044 
+  src/test/java/org/apache/hadoop/hbase/regionserver/TestHRegion.java 98bd3e5 
+  src/test/java/org/apache/hadoop/hbase/regionserver/TestHRegionSnapshot.java PRE-CREATION 
+  src/test/java/org/apache/hadoop/hbase/regionserver/TestStoreFile.java 38ef520 
+  src/test/java/org/apache/hadoop/hbase/regionserver/TestZKSnapshotWatcher.java PRE-CREATION 
+
+Diff: http://review.cloudera.org/r/467/diff
+
+
+Testing
+-------
+
+Unit tests and integration tests with mini cluster passed.
+
+
+Thanks,
+
+Chongxin
+
+
+
+
+Message from: "Ted Yu" <ted_yu@yahoo.com>
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+http://review.cloudera.org/r/467/#review869
+-----------------------------------------------------------
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/SnapshotTracker.java
+<http://review.cloudera.org/r/467/#comment2875>
+
+    How about SnapshotWatcher ?
+
+
+
+src/main/java/org/apache/hadoop/hbase/regionserver/Store.java
+<http://review.cloudera.org/r/467/#comment2874>
+
+    I think putting this in Region is good.
+
+
+
+src/main/java/org/apache/hadoop/hbase/regionserver/StoreFile.java
+<http://review.cloudera.org/r/467/#comment2876>
+
+    Can we get to hbase root directly ?
+
+
+- Ted
+
+
+
+
+
+Message from: "Chongxin Li" <lichongxin@zju.edu.cn>
+
+
+bq.  On 2010-08-12 02:53:06, Ted Yu wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/master/SnapshotTracker.java, line 1
+bq.  > <http://review.cloudera.org/r/467/diff/3/?file=6021#file6021line1>
+bq.  >
+bq.  >     How about SnapshotWatcher ?
+
+Will it sound like this class implement the Watcher interface of ZK?
+
+
+bq.  On 2010-08-12 02:53:06, Ted Yu wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/regionserver/StoreFile.java, line 283
+bq.  > <http://review.cloudera.org/r/467/diff/3/?file=6028#file6028line283>
+bq.  >
+bq.  >     Can we get to hbase root directly ?
+
+Since this method is static, we probably need another parameter for root directory?
+
+
+- Chongxin
+
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+http://review.cloudera.org/r/467/#review869
+-----------------------------------------------------------
+
+
+
+
+
+Message from: "Chongxin Li" <lichongxin@zju.edu.cn>
+
+
+bq.  On 2010-08-10 21:34:40, stack wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/HTableDescriptor.java, line 673
+bq.  > <http://review.cloudera.org/r/467/diff/3/?file=6002#file6002line673>
+bq.  >
+bq.  >     This is fine for an hbase that is a fresh install but what about case where the data has been migrated from an older hbase version; it won't have this column family in .META.  We should make a little migration script that adds it or on start of new version, check for it and if not present, create it.
+bq.  
+bq.  Chongxin Li wrote:
+bq.      That's right. But AddColumn operation requires the table disabled to proceed, ROOT table can not be disabled once the system is started. Then how could we execute the migration script or check and create it on start of new version?
+
+This can be done with a script when HBase is shutdown. The script scans the root region with MetaUtils and add the column family SNAPSHOT to .META. table?
+
+
+- Chongxin
+
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+http://review.cloudera.org/r/467/#review823
+-----------------------------------------------------------
+
+
+
+
+
+Message from: "Ted Yu" <ted_yu@yahoo.com>
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+http://review.cloudera.org/r/467/#review874
+-----------------------------------------------------------
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/BaseScanner.java
+<http://review.cloudera.org/r/467/#comment2888>
+
+    Check return value.
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/DeleteSnapshot.java
+<http://review.cloudera.org/r/467/#comment2887>
+
+    Should return value be checked ?
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/DeleteSnapshot.java
+<http://review.cloudera.org/r/467/#comment2886>
+
+    Is there more to be done here ?
+
+
+- Ted
+
+
+
+
+
+Message from: "Chongxin Li" <lichongxin@zju.edu.cn>
+
+
+bq.  On 2010-08-12 10:33:25, Ted Yu wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/master/DeleteSnapshot.java, line 98
+bq.  > <http://review.cloudera.org/r/467/diff/4/?file=6589#file6589line98>
+bq.  >
+bq.  >     Is there more to be done here ?
+
+Deleting the region dir?
+
+
+bq.  On 2010-08-12 10:33:25, Ted Yu wrote:
+bq.  > src/main/java/org/apache/hadoop/hbase/master/DeleteSnapshot.java, line 94
+bq.  > <http://review.cloudera.org/r/467/diff/4/?file=6589#file6589line94>
+bq.  >
+bq.  >     Should return value be checked ?
+
+Deleting the snapshot directory at last would delete all snapshot files anyway. Do we still have to check the return value? What if the return value if false, just log it?
+
+
+- Chongxin
+
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+http://review.cloudera.org/r/467/#review874
+-----------------------------------------------------------
+
+
+
+
+
+Message from: "Ted Yu" <ted_yu@yahoo.com>
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+http://review.cloudera.org/r/467/#review897
+-----------------------------------------------------------
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/DeleteSnapshot.java
+<http://review.cloudera.org/r/467/#comment2925>
+
+    We should log if we fail to delete.
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/DeleteSnapshot.java
+<http://review.cloudera.org/r/467/#comment2924>
+
+    Yes.
+
+
+- Ted
+
+
+
+
+
+Message from: "Chongxin Li" <lichongxin@zju.edu.cn>
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+http://review.cloudera.org/r/467/
+-----------------------------------------------------------
+
+(Updated 2010-08-14 01:30:00.941083)
+
+
+Review request for hbase.
+
+
+Changes
+-------
+
+1. Update HMaster to check and add the snapshot family for META (with MetaUtils) if it does not exist when the cluster is started. This is used for the data which has been migrated from an older hbase version.
+2. Check the return value of delete
+
+
+Summary
+-------
+
+This patch includes the first three sub-tasks of HBASE-50:
+1. Start and monitor the creation of snapshot via ZooKeeper
+2. Create snapshot of an HBase table
+3. Some existing functions of HBase are modified to support snapshot
+
+Currently snapshots can be created as expected, but can not be restored or deleted yet
+
+
+This addresses bug HBASE-50.
+    http://issues.apache.org/jira/browse/HBASE-50
+
+
+Diffs (updated)
+-----
+
+  src/main/java/org/apache/hadoop/hbase/HConstants.java c77ebf5 
+  src/main/java/org/apache/hadoop/hbase/HRegionInfo.java ee94690 
+  src/main/java/org/apache/hadoop/hbase/HTableDescriptor.java 0d57270 
+  src/main/java/org/apache/hadoop/hbase/SnapshotDescriptor.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/SnapshotExistsException.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/TablePartiallyOpenException.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java 8b01aa0 
+  src/main/java/org/apache/hadoop/hbase/io/HalfStoreFileReader.java ed12e7a 
+  src/main/java/org/apache/hadoop/hbase/io/HbaseObjectWritable.java 85fde3a 
+  src/main/java/org/apache/hadoop/hbase/io/Reference.java 219203c 
+  src/main/java/org/apache/hadoop/hbase/io/hfile/HFile.java b2de7e4 
+  src/main/java/org/apache/hadoop/hbase/ipc/HBaseRPCProtocolVersion.java d4bcbed 
+  src/main/java/org/apache/hadoop/hbase/ipc/HMasterInterface.java bd48a4b 
+  src/main/java/org/apache/hadoop/hbase/mapreduce/LoadIncrementalHFiles.java 1183584 
+  src/main/java/org/apache/hadoop/hbase/master/BaseScanner.java 69eab39 
+  src/main/java/org/apache/hadoop/hbase/master/DeleteSnapshot.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/master/HMaster.java e4bd30d 
+  src/main/java/org/apache/hadoop/hbase/master/LogsCleaner.java 9d1a8b8 
+  src/main/java/org/apache/hadoop/hbase/master/RestoreSnapshot.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/master/SnapshotLogCleaner.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/master/SnapshotMonitor.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/master/SnapshotOperation.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/master/SnapshotTracker.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/master/TableDelete.java 1153e62 
+  src/main/java/org/apache/hadoop/hbase/master/TableSnapshot.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java 6dc41a4 
+  src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java 6a54736 
+  src/main/java/org/apache/hadoop/hbase/regionserver/Snapshotter.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/regionserver/Store.java ae9e190 
+  src/main/java/org/apache/hadoop/hbase/regionserver/StoreFile.java 757a50c 
+  src/main/java/org/apache/hadoop/hbase/regionserver/ZKSnapshotWatcher.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/regionserver/wal/HLog.java 9593286 
+  src/main/java/org/apache/hadoop/hbase/replication/master/ReplicationLogCleaner.java 4d4b00a 
+  src/main/java/org/apache/hadoop/hbase/util/FSUtils.java 5cf3481 
+  src/main/java/org/apache/hadoop/hbase/util/MetaUtils.java 4481b12 
+  src/main/java/org/apache/hadoop/hbase/zookeeper/ZooKeeperWrapper.java 3827fa5 
+  src/main/resources/hbase-default.xml b73f0ff 
+  src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java 4d09fe9 
+  src/test/java/org/apache/hadoop/hbase/client/TestAdmin.java c9b78b9 
+  src/test/java/org/apache/hadoop/hbase/master/TestLogsCleaner.java 8b7f60f 
+  src/test/java/org/apache/hadoop/hbase/master/TestSnapshot.java PRE-CREATION 
+  src/test/java/org/apache/hadoop/hbase/master/TestSnapshotFailure.java PRE-CREATION 
+  src/test/java/org/apache/hadoop/hbase/regionserver/TestCompaction.java 34b8044 
+  src/test/java/org/apache/hadoop/hbase/regionserver/TestHRegion.java 98bd3e5 
+  src/test/java/org/apache/hadoop/hbase/regionserver/TestHRegionSnapshot.java PRE-CREATION 
+  src/test/java/org/apache/hadoop/hbase/regionserver/TestStoreFile.java 38ef520 
+  src/test/java/org/apache/hadoop/hbase/regionserver/TestZKSnapshotWatcher.java PRE-CREATION 
+
+Diff: http://review.cloudera.org/r/467/diff
+
+
+Testing
+-------
+
+Unit tests and integration tests with mini cluster passed.
+
+
+Thanks,
+
+Chongxin
+
+
+
+
+Message from: "Chongxin Li" <lichongxin@zju.edu.cn>
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+http://review.cloudera.org/r/467/#review904
+-----------------------------------------------------------
+
+
+
+src/main/java/org/apache/hadoop/hbase/util/MetaUtils.java
+<http://review.cloudera.org/r/467/#comment2942>
+
+    Why set retries number to 1 here?
+    Since I use MetaUtils in HMaster to scan root region when system is started, this would have a impact for other parts of the system. Is it OK to remove this?
+
+
+- Chongxin
+
+
+
+
+
+Message from: "Ted Yu" <ted_yu@yahoo.com>
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+http://review.cloudera.org/r/467/#review924
+-----------------------------------------------------------
+
+
+
+src/main/java/org/apache/hadoop/hbase/zookeeper/ZooKeeperWrapper.java
+<http://review.cloudera.org/r/467/#comment3015>
+
+    Should call currentThread().interrupt()
+
+
+
+src/main/java/org/apache/hadoop/hbase/zookeeper/ZooKeeperWrapper.java
+<http://review.cloudera.org/r/467/#comment3016>
+
+    Should call currentThread().interrupt()
+
+
+- Ted
+
+
+
+
+
+Message from: "Ted Yu" <ted_yu@yahoo.com>
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+http://review.cloudera.org/r/467/#review927
+-----------------------------------------------------------
+
+
+
+src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+<http://review.cloudera.org/r/467/#comment3024>
+
+    Write a script that calls this method.
+
+
+- Ted
+
+
+
+
+
+Message from: "Chongxin Li" <lichongxin@zju.edu.cn>
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+http://review.cloudera.org/r/467/#review957
+-----------------------------------------------------------
+
+
+1. Rename SnapshotTracker to SnapshotSentinel
+2. Write a script (add_snapshot_family.rb) to add snapshot family for META and remove method HMaster.addSnapshotFamily. The script is not tested yet (how?)
+
+- Chongxin
+
+
+
+
+
+Message from: "Chongxin Li" <lichongxin@zju.edu.cn>
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+http://review.cloudera.org/r/467/
+-----------------------------------------------------------
+
+(Updated 2010-08-19 08:35:37.043957)
+
+
+Review request for hbase.
+
+
+Summary
+-------
+
+This patch includes the first three sub-tasks of HBASE-50:
+1. Start and monitor the creation of snapshot via ZooKeeper
+2. Create snapshot of an HBase table
+3. Some existing functions of HBase are modified to support snapshot
+
+Currently snapshots can be created as expected, but can not be restored or deleted yet
+
+
+This addresses bug HBASE-50.
+    http://issues.apache.org/jira/browse/HBASE-50
+
+
+Diffs (updated)
+-----
+
+  bin/add_snapshot_family.rb PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/HConstants.java c77ebf5 
+  src/main/java/org/apache/hadoop/hbase/HRegionInfo.java ee94690 
+  src/main/java/org/apache/hadoop/hbase/HTableDescriptor.java 0d57270 
+  src/main/java/org/apache/hadoop/hbase/SnapshotDescriptor.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/SnapshotExistsException.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/TablePartiallyOpenException.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/client/HBaseAdmin.java 8b01aa0 
+  src/main/java/org/apache/hadoop/hbase/io/HalfStoreFileReader.java ed12e7a 
+  src/main/java/org/apache/hadoop/hbase/io/HbaseObjectWritable.java 85fde3a 
+  src/main/java/org/apache/hadoop/hbase/io/Reference.java 219203c 
+  src/main/java/org/apache/hadoop/hbase/io/hfile/HFile.java b2de7e4 
+  src/main/java/org/apache/hadoop/hbase/ipc/HBaseRPCProtocolVersion.java d4bcbed 
+  src/main/java/org/apache/hadoop/hbase/ipc/HMasterInterface.java bd48a4b 
+  src/main/java/org/apache/hadoop/hbase/mapreduce/LoadIncrementalHFiles.java 1183584 
+  src/main/java/org/apache/hadoop/hbase/master/BaseScanner.java 69eab39 
+  src/main/java/org/apache/hadoop/hbase/master/DeleteSnapshot.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/master/HMaster.java e4bd30d 
+  src/main/java/org/apache/hadoop/hbase/master/LogsCleaner.java 9d1a8b8 
+  src/main/java/org/apache/hadoop/hbase/master/RestoreSnapshot.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/master/SnapshotLogCleaner.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/master/SnapshotMonitor.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/master/SnapshotOperation.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/master/SnapshotSentinel.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/master/TableDelete.java 1153e62 
+  src/main/java/org/apache/hadoop/hbase/master/TableSnapshot.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/regionserver/HRegion.java 6dc41a4 
+  src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java 6a54736 
+  src/main/java/org/apache/hadoop/hbase/regionserver/Snapshotter.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/regionserver/Store.java ae9e190 
+  src/main/java/org/apache/hadoop/hbase/regionserver/StoreFile.java 757a50c 
+  src/main/java/org/apache/hadoop/hbase/regionserver/ZKSnapshotWatcher.java PRE-CREATION 
+  src/main/java/org/apache/hadoop/hbase/regionserver/wal/HLog.java 9593286 
+  src/main/java/org/apache/hadoop/hbase/replication/master/ReplicationLogCleaner.java 4d4b00a 
+  src/main/java/org/apache/hadoop/hbase/util/FSUtils.java 5cf3481 
+  src/main/java/org/apache/hadoop/hbase/zookeeper/ZooKeeperWrapper.java 3827fa5 
+  src/main/resources/hbase-default.xml b73f0ff 
+  src/test/java/org/apache/hadoop/hbase/HBaseTestingUtility.java 4d09fe9 
+  src/test/java/org/apache/hadoop/hbase/client/TestAdmin.java c9b78b9 
+  src/test/java/org/apache/hadoop/hbase/master/TestLogsCleaner.java 8b7f60f 
+  src/test/java/org/apache/hadoop/hbase/master/TestSnapshot.java PRE-CREATION 
+  src/test/java/org/apache/hadoop/hbase/master/TestSnapshotFailure.java PRE-CREATION 
+  src/test/java/org/apache/hadoop/hbase/regionserver/TestCompaction.java 34b8044 
+  src/test/java/org/apache/hadoop/hbase/regionserver/TestHRegion.java 98bd3e5 
+  src/test/java/org/apache/hadoop/hbase/regionserver/TestHRegionSnapshot.java PRE-CREATION 
+  src/test/java/org/apache/hadoop/hbase/regionserver/TestStoreFile.java 38ef520 
+  src/test/java/org/apache/hadoop/hbase/regionserver/TestZKSnapshotWatcher.java PRE-CREATION 
+
+Diff: http://review.cloudera.org/r/467/diff
+
+
+Testing
+-------
+
+Unit tests and integration tests with mini cluster passed.
+
+
+Thanks,
+
+Chongxin
+
+
+
+
+Message from: "Ted Yu" <ted_yu@yahoo.com>
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+http://review.cloudera.org/r/467/#review995
+-----------------------------------------------------------
+
+
+
+bin/add_snapshot_family.rb
+<http://review.cloudera.org/r/467/#comment3204>
+
+    Please remove this comment.
+
+
+
+src/main/java/org/apache/hadoop/hbase/HConstants.java
+<http://review.cloudera.org/r/467/#comment3203>
+
+    Should the archive directory be named ".archive" ?
+
+
+- Ted
+
+
+
+
+
+Message from: "Chongxin Li" <lichongxin@zju.edu.cn>
+
+-----------------------------------------------------------
+This is an automatically generated e-mail. To reply, visit:
+http://review.cloudera.org/r/467/
+-----------------------------------------------------------
+
+(Updated 2010-09-06 04:34:53.459404)
+
+
+Review request for hbase.
+
+Changes
+-------
+
+Add Mapreduce based export (ExportSnapshot) and import (ImportSnapshot) for snapshot, so that snapshot of an hbase table could be exported and imported to other data centers. Unit test (TestSnapshotExport) has passed.
+
+
+Summary
+-------
+
+This patch includes the first three sub-tasks of HBASE-50:
+1. Start and monitor the creation of snapshot via ZooKeeper
+2. Create snapshot of an HBase table
+3. Some existing functions of HBase are modified to support snapshot
+
+Currently snapshots can be created as expected, but can not be restored or deleted yet
+
+
+This addresses bug HBASE-50.
+    http://issues.apache.org/jira/browse/HBASE-50
+
+
+Diff: http://review.cloudera.org/r/467/diff
+
+
+Testing
+-------
+
+Unit tests and integration tests with mini cluster passed.
+
+
+Thanks,
+
+Chongxin
+
+
+
+
+If no one is working on this, I'd like to pick up shepherding in Chongxin's original patch (updating to trunk, completion of features, etc) into trunk.
+
+Go for it Jesse.  My guess is that a lot has changed since but basic notions should still hold.
+
+I've been thinking about how to do this for a while (before reading the ticket) and came up with a pretty similar architecture - good to know I wasn't crazy. A bit bummed initially seeing how much Chongxin had gotten done, but going through his stuff it turns out I need to rewrite almost everything (smile) along with a couple tweaks here and there. 
+
+I'll put up a doc with the architecture diffs (nothing major planned, mostly OO design stuff at the moment) when I get closer to done
+
+We had a meetup within a meetup at the HBase User Group meetup tonight to talk about the difficulties and next steps with snapshotting. The main takeaways were:
+* exact time is inconsistent across a cluster (even with NTP) as we need millisecond exactness for point-in-time snapshots
+* two-phase commit where we block writes in the first phase (completes in a set timeout) seems the most reasonable approach for ensuring a fully consistent view
+* maybe fully consistent across the whole table isn't necessary, maybe per RS consistency within a window is acceptable
+** possibly achieved by scheduling a time for a snapshot sometime in the future in zk and letting each RS snapshot makes it 'close enough'
+* zk triggered snapshots make it even harder to ensure timeout boundaries due to RS no hard guarantees on notifications and even then zk timeouts causing presence issues
+
+Even with all of this, I'm planning the first pass to be zk based (until we decide that unavailability suffers too much) and with a simple two-phase, write-locking per involved region approach. We can probably iterate on that to bring down the latency.
+
+The main issue here is I don't see a way to ensure that in a snapshot, all RS take a snapshot "now" but still allow reading/writing on either side (pretty sure this is a CAP limitation). 
+
+bq. maybe fully consistent across the whole table isn't necessary
+Can you explain more about the above use case ?
+
+This issue has more than 4 years' trace and 6 sub-tasks.
+
+If we're not reusing much of Chongxin's code, we should put discussion into a new JIRA.
+
+bq. maybe fully consistent across the whole table isn't necessary
+
+This was just something that has come up in multiple conversations - is full table, consistent snapshots necessary? The default answer seems to be "yes, because that is what we get with mysql/postgres/oracle", with the implication that we _have to have it_ for production HBase. However, its inherently a different storage model and it may be that we just need to change the pointy-haired managers' ideas of what's necessary. If instead we can say its is consistent view, per regionserver, at some point from 2:51:00 to 2:51:30 pm on friday, then we can save a lot of pain and can be done with _very little downtime_, to the point where you can mask it in a 'slow request'. If that isn't acceptable, then the only way I see to do it is to drop write availability while the snapshot is taking place (fastest region has to to wait on the slowest region to finish) to get the fully consistent view. 
+
+No reason with the current design that we couldn't allow both, it would just be another flag to pass in while making the snapshot and really only touches about 5 lines of the guts of the implementation.
+
+Currently, we only guarantee row-level consistency. Getting into cross-RS consistency means we bump up against CAP and have to give up even more availability (for a fully consistent view, all RS needs to block writes, which could take as long as the timeout (30sec - 1min in the worst case) or slowest region  - whichever is faster, which in many cases is unacceptable). 
+
+However, if you can take point-in-time within a window as acceptable ("sloppy snapshot")  - maybe the window is thirty seconds - when each region blocks writes for the time each region takes to make the snapshot (max of maybe a few seconds as no data is being copied, but rather just a few references created and counts incremented) you keep availability high without really sacrificing any of the consistency guarantees we currently make. 
+
+Clearly, this breaks the multi-put situation where two puts go to different servers but that is potentially acceptable since we don't make guarantees there either, just that on return, all of the puts have completed. Same problem as with doing any of the current backup solutions (replication not included). If you are worried about cross-RS transactions, you have to use something like Omid (or similar) to track transactions, and that system can then also decide when a snapshot is allowable to 
+ensure all parts of the multi-put complete.
+
+bq. If we're not reusing much of Chongxin's code, we should put discussion into a new JIRA
+
+A lot of the infrastructure we have has changed (eg. zookeeper utilities, locking on the RS), but the new features - reference counting, possibly importing/exporting snapshots, etc - will definitely be reused exactly or only slightly modified. So at 50/50 on what is kept and what is tossed, at least right now. 
+
+We have also gone through like 3 different stops and starts on this ticket. I worry moving to a new ticket will cause even worse fragmentation, at least until the code being used doesn't even resemble Chongxin's :)
+
+@Jesse:
+When you create new review request on review board, leave Bugs field empty.
+Thanks
+
+After moving up the code to the trunk, realized that the implementation has bascially completely changed except for a couple small classes. As such, I opened HBASE-6055 to track the rest of my progress. 
+
+Should we close out this issue in favor of hbase-6055 Jesse?
+
+@stack: +1 I don't see a point in keeping this open, given the codebase divergence.
+
+Closing this issue, an old friend, because no long valid.  Its been superceded by hbase-6055.  I'm sure we'll be back though.  A bunch of good discussion has gone on in here down through the years.
+
+During a jira scan, I found that all its subtasks were open, so I closed them.
+

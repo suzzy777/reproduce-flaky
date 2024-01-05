@@ -1,0 +1,531 @@
+This bug came up during the development of a test for the new health checks beging developed by [~gkleiman] and [~alexr].  The test can be found here: https://reviews.apache.org/r/55901/
+
+The new health checks rely on periodically launching nested container sessions with the agent, which increases the chances of them being destroyed at arbitrary times when the container they are execing into gets destroyed.
+
+In the test we observed here, the setup was:
+1) Start the scheduler driver
+2) Launch a task group with the default executor that includes a single long running task
+3) Wait for the task to return a status of HEALTHY one time
+4) Stop the scheduler driver without explicitly waiting for any of the tasks to complete
+5) Exit the test
+
+With this setup, all of the ASSERTS in the test itself passed, but the test failed because there were remaining processes once the test exited (after a timeout of 15 seconds):
+{noformat}
+../../src/tests/cluster.cpp:570: Failure
+Failed to wait 15secs for wait
+...
+[  FAILED  ] HealthCheckTest.DefaultExecutorCmdHealthCheck (15341 ms)
+[----------] 1 test from HealthCheckTest (15347 ms total)
+[----------] Global test environment tear-down
+../../src/tests/environment.cpp:836: Failure
+Failed
+Tests completed with child processes remaining:
+-+- 33680 /Users/klueska/projects/mesos/build/src/.libs/mesos-tests --verbose
+ |-+- 33728 /Users/klueska/projects/mesos/build/src/.libs/mesos-containerizer launch
+ | \--- 33770 sleep 120
+ \--- 33772 /Users/klueska/projects/mesos/build/src/.libs/mesos-io-switchboard --heartbeat_interval=30secs --help=false --socket_address=/tmp/mesos-io-switch
+[==========] 1 test from 1 test case ran. (15370 ms total)
+[  PASSED  ] 0 tests.
+[  FAILED  ] 1 test, listed below:
+[  FAILED  ] HealthCheckTest.DefaultExecutorCmdHealthCheck
+ 1 FAILED TEST
+{noformat}
+
+Exiting the test should cause all containers to be destroyed and cleaned up, so I started digging through the logs to figure out why this wasn't happening. The most interesting section of the log is:
+{noformat}I0131 15:48:58.234776 528384 switchboard.cpp:601] Created I/O switchboard server (pid: 33772) listening on socket file '/tmp/mesos-io-switchboard-3491c69e-dbcf-4d13-b0f0-080f7516b2d6' for container 416f480c-fd4f-496b-939d-7a85b42362d6.96251fd8-5c2a-4016-9308-3b7f15e24ba7.96251fd8-5c2a-4016-9308-3b7f15e24ba7-health-check
+W0131 15:48:58.236217 4284416 http.cpp:2278] Failed to launch nested container 416f480c-fd4f-496b-939d-7a85b42362d6.96251fd8-5c2a-4016-9308-3b7f15e24ba7.96251fd8-5c2a-4016-9308-3b7f15e24ba7-health-check: Container is being destroyed during preparing
+I0131 15:49:03.227895 4284416 slave.cpp:5078] Killing executor 'default' of framework 65f6131d-5602-4f69-875b-fb84e8ad91c5-0000 (via HTTP)
+E0131 15:49:03.231164 4820992 process.cpp:2419] Failed to shutdown socket with fd 12: Socket is not connected
+E0131 15:49:03.231312 4820992 process.cpp:2419] Failed to shutdown socket with fd 19: Socket is not connected
+E0131 15:49:03.231590 4820992 process.cpp:2419] Failed to shutdown socket with fd 9: Socket is not connected
+E0131 15:49:03.231788 4820992 process.cpp:2419] Failed to shutdown socket with fd 7: Socket is not connected
+I0131 15:49:03.237408 4820992 switchboard.cpp:782] Sending SIGTERM to I/O switchboard server (pid: 33772) since container 416f480c-fd4f-496b-939d-7a85b42362d6.96251fd8-5c2a-4016-9308-3b7f15e24ba7.96251fd8-5c2a-4016-9308-3b7f15e24ba7-health-check is being destroyed
+{noformat}
+
+This shows that we are attempting to kill the {{default}} executor framework (which in turn will kill all of its children). However, the timing of this results in that an IOSwitchboard for container {{416f480c-fd4f-496b-939d-7a85b42362d6.96251fd8-5c2a-4016-9308-3b7f15e24ba7.96251fd8-5c2a-4016-9308-3b7f15e24ba7-health-check}} has already been created, but the container itself is being killed during the {{PREPARE}} phase. The IOSwitchboard then get's sent the {{SIGTERM}} signal, but we never see it actually exit.
+
+To debug this further, I added some output to the IOSwitchboard main function to print timestamps when it started, received the SIGTERM, and when it exited. What I observed was that the timestamps for starting the switchboard and sending the SIGTERM signal from the agent logs matched up nicely with the timestamps generated from the switchboard itself. However, the exit timestamp wasn't until 15 seconds later once the entire test was torn down.
+
+This lead me to believe that the IOSwitchboard was being blocked from exiting because of the condition it relies on to exit gracefully. Namely, it requires the FDs it allocates to a container to be closed before it will terminate. It requires this so that it can flush any remaining output the container might be generating before exiting cleanly. We don't yet have a "failsafe" in place to force kill the switchboard if it waits in this state for too long. Even if we did, the timeout would likely be on the order or minutes, because something really bad would have to be going on if it got stuck in this state (or if there was a bug as there appears to be now).
+
+Going back to the containerizer code, I noticed that Jie had a comment that we were leaking the IOSwitchboard FDs in cases where the container launch path failed (which is exactly the case being considered here -- remember the line from the agent log for "{{Container is being destroyed during preparing}}").
+
+Now I knew why the IOSwitchboard wasn't exiting, but why was the blocking the container itself from being destroyed and causing deadlock?
+
+Well, that has to do with the way the way the destroy path works. When destroy is called, it will loop through all of its isolators calling {{cleanup()}} on each of them and waiting for all of their futures to be satisfied before fully destroying the container. When it hits the IOSwitchboard (which is an isolator), its cleanup function was blocked on the the switchboard itself exiting. Since its FDs were leaked and the switchboard could never exit, the destroy path was blocked, resulting in the observed deadlock.
+
+The proposed fix then is to make sure that the IOSwitchboard FDs are not leaked on all code paths where the container->launch() call might fail.
+
+https://reviews.apache.org/r/56195
+
+Wondering why command health check needs io switchboard?
+
+Because in the future check output needs to be passed to the scheduler. 
+
+OK, sounds to me that you need to get the output, but you definitely don't need the `tee` functionality from io switchboard. Can we think about how to get the output in a way that does not require io switchboard. I think it should be doable. Just need to make the logger configurable for that container, and probably introduce an "in-memory" logger.
+
+fork-exec io switchboard for each command health check sounds really unfortunate and expensive.
+
+We talked about having a way to launch a switchboard in the agent instead
+of as a separate process. This seems like a use case for that combined with
+an in memory logger.
+
+
+
+
+Right now though, the logger is an agent flag, so you can't pick the logger
+used on a per container basis.
+
+It sounds like what we really want is a way to launch a nested container
+with DEBUG semantics that doesn't log at all and just makes its output
+available to external connections.
+
+I'm fact these are the semantics we usually want for any launch nested
+container session. In all cases it could be handled in the agent without
+requiring an external process (because the lifetime of the container is
+tied to the lifetime of the connection).
+
+We originally implemented the switchboard as an external process to handle
+"attach" semantics for containers that continue to run across agent
+restarts.
+
+For any session based containers though, there is no real need for an
+external process (or logging for that matter).
+
+We decided to keep the external process for sessions just to keep things
+simple, since they only would only be in itnitiated very infrequently by a
+user for debugging purposes.
+
+Maybe it's worth revising this now that we will have health checks
+launching nested containers very frequently.
+
+
+
+
+Yea, if we don't have to launch IO switchboard for every health checks, that's probably better. We opted for this approach for the MVP because the long term solution seemed quite involved?
+
+Couple more questions though
+
+1) I would imagine `tee` functionality being useful for debugging because someone can look in the stdout/stderr files to know what happened when an health check went wrong. Alternatively, the executor can dump the information it gets from HTTP response in the sandox.
+
+2) Is IO switchboard per health check really expensive? We are already launching one process per command health check (the actual command), what's so worse about launching 2 (command process and IO switchboard) instead ? Just curious. 
+
+I removed the targetVersion. It didn't make it into 1.2.0-rc1, and it sounds like the real fix would be non-trivial.
+Feel free to retarget to 1.3.0 if/when you like.
+
+Updated review: https://reviews.apache.org/r/56195/
+
+This should be backported to 1.2.x assuming it makes it in before the next RC is cut.
+
+I applied the chain (https://reviews.apache.org/r/56195/) to make sure that it fixes the test I introduce in https://reviews.apache.org/r/55901/.
+
+It improves things a bit. It used to fail consistently on macOS and now it is flaky.
+
+What I observed is that for some reason the agent sometimes waits ~15 seconds before sending SIGTERM to the I/O Switchboard
+
+Here are the logs of one failed run:
+
+{noformat}
+[==========] Running 1 test from 1 test case.
+[----------] Global test environment set-up.
+[----------] 1 test from HealthCheckTest
+[ RUN      ] HealthCheckTest.DefaultExecutorCommandHealthCheck
+I0228 14:29:19.078368 3475919808 cluster.cpp:160] Creating default 'local' authorizer
+I0228 14:29:19.084883 238907392 master.cpp:383] Master 98c48dab-fd2b-404e-85dc-4ec5dd0d635c (172.18.8.139) started on 172.18.8.139:55836
+I0228 14:29:19.084915 238907392 master.cpp:385] Flags at startup: --acls="" --agent_ping_timeout="15secs" --agent_reregister_timeout="10mins" --allocation_interval="1secs" --allocator="HierarchicalDRF" --authenticate_agents="true" --authenticate_frameworks="true" --authenticate_http_frameworks="true" --authenticate_http_readonly="true" --authenticate_http_readwrite="true" --authenticators="crammd5" --authorizers="local" --credentials="/private/var/folders/jr/17y2w4ld019bsn9vhx0c13f80000gn/T/xZZCGr/credentials" --framework_sorter="drf" --help="false" --hostname_lookup="true" --http_authenticators="basic" --http_framework_authenticators="basic" --initialize_driver_logging="true" --log_auto_initialize="true" --logbufsecs="0" --logging_level="INFO" --max_agent_ping_timeouts="5" --max_completed_frameworks="50" --max_completed_tasks_per_framework="1000" --max_unreachable_tasks_per_framework="1000" --quiet="false" --recovery_agent_removal_limit="100%" --registry="in_memory" --registry_fetch_timeout="1mins" --registry_gc_interval="15mins" --registry_max_agent_age="2weeks" --registry_max_agent_count="102400" --registry_store_timeout="100secs" --registry_strict="false" --root_submissions="true" --user_sorter="drf" --version="false" --webui_dir="/Users/gaston/mesos/master/share/mesos/webui" --work_dir="/private/var/folders/jr/17y2w4ld019bsn9vhx0c13f80000gn/T/xZZCGr/master" --zk_session_timeout="10secs"
+I0228 14:29:19.086030 238907392 master.cpp:435] Master only allowing authenticated frameworks to register
+I0228 14:29:19.086041 238907392 master.cpp:449] Master only allowing authenticated agents to register
+I0228 14:29:19.086046 238907392 master.cpp:462] Master only allowing authenticated HTTP frameworks to register
+I0228 14:29:19.086050 238907392 credentials.hpp:37] Loading credentials for authentication from '/private/var/folders/jr/17y2w4ld019bsn9vhx0c13f80000gn/T/xZZCGr/credentials'
+I0228 14:29:19.086334 238907392 master.cpp:507] Using default 'crammd5' authenticator
+I0228 14:29:19.086369 238907392 authenticator.cpp:519] Initializing server SASL
+I0228 14:29:19.100981 238907392 auxprop.cpp:73] Initialized in-memory auxiliary property plugin
+I0228 14:29:19.101080 238907392 http.cpp:933] Using default 'basic' HTTP authenticator for realm 'mesos-master-readonly'
+I0228 14:29:19.101274 238907392 http.cpp:933] Using default 'basic' HTTP authenticator for realm 'mesos-master-readwrite'
+I0228 14:29:19.101414 238907392 http.cpp:933] Using default 'basic' HTTP authenticator for realm 'mesos-master-scheduler'
+I0228 14:29:19.101528 238907392 master.cpp:587] Authorization enabled
+I0228 14:29:19.101702 240517120 hierarchical.cpp:161] Initialized hierarchical allocator process
+I0228 14:29:19.101740 239443968 whitelist_watcher.cpp:77] No whitelist given
+I0228 14:29:19.105717 240517120 master.cpp:2122] Elected as the leading master!
+I0228 14:29:19.105738 240517120 master.cpp:1646] Recovering from registrar
+I0228 14:29:19.105811 239443968 registrar.cpp:329] Recovering registrar
+I0228 14:29:19.111151 239443968 registrar.cpp:362] Successfully fetched the registry (0B) in 5.309952ms
+I0228 14:29:19.111287 239443968 registrar.cpp:461] Applied 1 operations in 35us; attempting to update the registry
+I0228 14:29:19.111824 239443968 registrar.cpp:506] Successfully updated the registry in 500992ns
+I0228 14:29:19.111928 239443968 registrar.cpp:392] Successfully recovered registrar
+I0228 14:29:19.112283 237834240 master.cpp:1760] Recovered 0 agents from the registry (136B); allowing 10mins for agents to re-register
+I0228 14:29:19.112303 239980544 hierarchical.cpp:188] Skipping recovery of hierarchical allocator: nothing to recover
+I0228 14:29:19.114262 3475919808 containerizer.cpp:220] Using isolation: posix/cpu,posix/mem,filesystem/posix
+I0228 14:29:19.114516 3475919808 provisioner.cpp:249] Using default backend 'copy'
+I0228 14:29:19.116535 3475919808 cluster.cpp:446] Creating default 'local' authorizer
+I0228 14:29:19.117291 238370816 slave.cpp:211] Mesos agent started on (1)@172.18.8.139:55836
+I0228 14:29:19.117319 238370816 slave.cpp:212] Flags at startup: --acls="" --appc_simple_discovery_uri_prefix="http://" --appc_store_dir="/var/folders/jr/17y2w4ld019bsn9vhx0c13f80000gn/T/mesos/store/appc" --authenticate_http_readonly="true" --authenticate_http_readwrite="false" --authenticatee="crammd5" --authentication_backoff_factor="1secs" --authorizer="local" --container_disk_watch_interval="15secs" --containerizers="mesos" --credential="/var/folders/jr/17y2w4ld019bsn9vhx0c13f80000gn/T/HealthCheckTest_DefaultExecutorCommandHealthCheck_3qqMz4/credential" --default_role="*" --disk_watch_interval="1mins" --docker="docker" --docker_kill_orphans="true" --docker_registry="https://registry-1.docker.io" --docker_remove_delay="6hrs" --docker_socket="/var/run/docker.sock" --docker_stop_timeout="0ns" --docker_store_dir="/var/folders/jr/17y2w4ld019bsn9vhx0c13f80000gn/T/mesos/store/docker" --docker_volume_checkpoint_dir="/var/run/mesos/isolators/docker/volume" --enforce_container_disk_quota="false" --executor_registration_timeout="1mins" --executor_shutdown_grace_period="5secs" --fetcher_cache_dir="/var/folders/jr/17y2w4ld019bsn9vhx0c13f80000gn/T/HealthCheckTest_DefaultExecutorCommandHealthCheck_3qqMz4/fetch" --fetcher_cache_size="2GB" --frameworks_home="" --gc_delay="1weeks" --gc_disk_headroom="0.1" --hadoop_home="" --help="false" --hostname_lookup="true" --http_authenticators="basic" --http_command_executor="false" --http_credentials="/var/folders/jr/17y2w4ld019bsn9vhx0c13f80000gn/T/HealthCheckTest_DefaultExecutorCommandHealthCheck_3qqMz4/http_credentials" --http_heartbeat_interval="30secs" --initialize_driver_logging="true" --isolation="posix/cpu,posix/mem" --launcher="posix" --launcher_dir="/Users/gaston/mesosphere/mesos/build/src" --logbufsecs="0" --logging_level="INFO" --max_completed_executors_per_framework="150" --oversubscribed_resources_interval="15secs" --qos_correction_interval_min="0ns" --quiet="false" --recover="reconnect" --recovery_timeout="15mins" --registration_backoff_factor="10ms" --resources="cpus:2;gpus:0;mem:1024;disk:1024;ports:[31000-32000]" --runtime_dir="/var/folders/jr/17y2w4ld019bsn9vhx0c13f80000gn/T/HealthCheckTest_DefaultExecutorCommandHealthCheck_3qqMz4" --sandbox_directory="/mnt/mesos/sandbox" --strict="true" --switch_user="true" --version="false" --work_dir="/var/folders/jr/17y2w4ld019bsn9vhx0c13f80000gn/T/HealthCheckTest_DefaultExecutorCommandHealthCheck_tLRhsF"
+I0228 14:29:19.117663 238370816 credentials.hpp:86] Loading credential for authentication from '/var/folders/jr/17y2w4ld019bsn9vhx0c13f80000gn/T/HealthCheckTest_DefaultExecutorCommandHealthCheck_3qqMz4/credential'
+I0228 14:29:19.117790 238370816 slave.cpp:354] Agent using credential for: test-principal
+I0228 14:29:19.117808 238370816 credentials.hpp:37] Loading credentials for authentication from '/var/folders/jr/17y2w4ld019bsn9vhx0c13f80000gn/T/HealthCheckTest_DefaultExecutorCommandHealthCheck_3qqMz4/http_credentials'
+I0228 14:29:19.117972 238370816 http.cpp:933] Using default 'basic' HTTP authenticator for realm 'mesos-agent-readonly'
+I0228 14:29:19.118873 3475919808 sched.cpp:232] Version: 1.3.0
+I0228 14:29:19.118849 238370816 slave.cpp:541] Agent resources: cpus(*):2; mem(*):1024; disk(*):1024; ports(*):[31000-32000]
+I0228 14:29:19.118916 238370816 slave.cpp:549] Agent attributes: [  ]
+I0228 14:29:19.118928 238370816 slave.cpp:554] Agent hostname: 172.18.8.139
+I0228 14:29:19.119047 238907392 status_update_manager.cpp:177] Pausing sending status updates
+I0228 14:29:19.119207 238907392 sched.cpp:336] New master detected at master@172.18.8.139:55836
+I0228 14:29:19.119254 238907392 sched.cpp:407] Authenticating with master master@172.18.8.139:55836
+I0228 14:29:19.119282 238907392 sched.cpp:414] Using default CRAM-MD5 authenticatee
+I0228 14:29:19.119418 239443968 authenticatee.cpp:97] Initializing client SASL
+I0228 14:29:19.119933 238907392 state.cpp:62] Recovering state from '/var/folders/jr/17y2w4ld019bsn9vhx0c13f80000gn/T/HealthCheckTest_DefaultExecutorCommandHealthCheck_tLRhsF/meta'
+I0228 14:29:19.120177 241590272 status_update_manager.cpp:203] Recovering status update manager
+I0228 14:29:19.120388 239980544 containerizer.cpp:599] Recovering containerizer
+I0228 14:29:19.121381 238907392 provisioner.cpp:410] Provisioner recovery complete
+I0228 14:29:19.121618 238370816 slave.cpp:5559] Finished recovery
+I0228 14:29:19.122174 238370816 slave.cpp:5733] Querying resource estimator for oversubscribable resources
+I0228 14:29:19.122339 239980544 status_update_manager.cpp:177] Pausing sending status updates
+I0228 14:29:19.122339 238370816 slave.cpp:931] New master detected at master@172.18.8.139:55836
+I0228 14:29:19.122413 238370816 slave.cpp:966] Detecting new master
+I0228 14:29:19.122500 238370816 slave.cpp:5747] Received oversubscribable resources {} from the resource estimator
+I0228 14:29:19.122725 239443968 authenticatee.cpp:121] Creating new client SASL connection
+I0228 14:29:19.122872 241053696 master.cpp:7210] Authenticating scheduler-5711276a-2d47-49db-a175-98964e58f90c@172.18.8.139:55836
+I0228 14:29:19.122949 237834240 authenticator.cpp:414] Starting authentication session for crammd5-authenticatee(1)@172.18.8.139:55836
+I0228 14:29:19.123051 240517120 authenticator.cpp:98] Creating new server SASL connection
+I0228 14:29:19.123159 238907392 authenticatee.cpp:213] Received SASL authentication mechanisms: CRAM-MD5
+I0228 14:29:19.123199 238907392 authenticatee.cpp:239] Attempting to authenticate with mechanism 'CRAM-MD5'
+I0228 14:29:19.123262 238907392 authenticator.cpp:204] Received SASL authentication start
+I0228 14:29:19.123308 238907392 authenticator.cpp:326] Authentication requires more steps
+I0228 14:29:19.123378 238907392 authenticatee.cpp:259] Received SASL authentication step
+I0228 14:29:19.123486 238370816 authenticator.cpp:232] Received SASL authentication step
+I0228 14:29:19.123517 238370816 auxprop.cpp:109] Request to lookup properties for user: 'test-principal' realm: 'Gastons-MacBook-Pro-2.local' server FQDN: 'Gastons-MacBook-Pro-2.local' SASL_AUXPROP_VERIFY_AGAINST_HASH: false SASL_AUXPROP_OVERRIDE: false SASL_AUXPROP_AUTHZID: false
+I0228 14:29:19.123544 238370816 auxprop.cpp:181] Looking up auxiliary property '*userPassword'
+I0228 14:29:19.123574 238370816 auxprop.cpp:181] Looking up auxiliary property '*cmusaslsecretCRAM-MD5'
+I0228 14:29:19.123589 238370816 auxprop.cpp:109] Request to lookup properties for user: 'test-principal' realm: 'Gastons-MacBook-Pro-2.local' server FQDN: 'Gastons-MacBook-Pro-2.local' SASL_AUXPROP_VERIFY_AGAINST_HASH: false SASL_AUXPROP_OVERRIDE: false SASL_AUXPROP_AUTHZID: true
+I0228 14:29:19.123601 238370816 auxprop.cpp:131] Skipping auxiliary property '*userPassword' since SASL_AUXPROP_AUTHZID == true
+I0228 14:29:19.123610 238370816 auxprop.cpp:131] Skipping auxiliary property '*cmusaslsecretCRAM-MD5' since SASL_AUXPROP_AUTHZID == true
+I0228 14:29:19.123622 238370816 authenticator.cpp:318] Authentication success
+I0228 14:29:19.123672 238907392 authenticatee.cpp:299] Authentication success
+I0228 14:29:19.123710 239443968 master.cpp:7240] Successfully authenticated principal 'test-principal' at scheduler-5711276a-2d47-49db-a175-98964e58f90c@172.18.8.139:55836
+I0228 14:29:19.123755 241590272 authenticator.cpp:432] Authentication session cleanup for crammd5-authenticatee(1)@172.18.8.139:55836
+I0228 14:29:19.123926 241053696 sched.cpp:513] Successfully authenticated with master master@172.18.8.139:55836
+I0228 14:29:19.123946 241053696 sched.cpp:836] Sending SUBSCRIBE call to master@172.18.8.139:55836
+I0228 14:29:19.124032 241053696 sched.cpp:869] Will retry registration in 788.765853ms if necessary
+I0228 14:29:19.124119 238370816 master.cpp:2789] Received SUBSCRIBE call for framework 'default' at scheduler-5711276a-2d47-49db-a175-98964e58f90c@172.18.8.139:55836
+I0228 14:29:19.124137 238370816 master.cpp:2158] Authorizing framework principal 'test-principal' to receive offers for roles '{ * }'
+I0228 14:29:19.124435 238907392 master.cpp:2866] Subscribing framework default with checkpointing disabled and capabilities [  ]
+I0228 14:29:19.124768 238370816 sched.cpp:759] Framework registered with 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000
+I0228 14:29:19.124790 241590272 hierarchical.cpp:286] Added framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000
+I0228 14:29:19.124850 238370816 sched.cpp:773] Scheduler::registered took 66us
+I0228 14:29:19.124866 241590272 hierarchical.cpp:1838] No allocations performed
+I0228 14:29:19.124884 241590272 hierarchical.cpp:1928] No inverse offers to send out!
+I0228 14:29:19.124902 241590272 hierarchical.cpp:1422] Performed allocation for 0 agents in 72us
+I0228 14:29:19.132097 239443968 slave.cpp:993] Authenticating with master master@172.18.8.139:55836
+I0228 14:29:19.132141 239443968 slave.cpp:1004] Using default CRAM-MD5 authenticatee
+I0228 14:29:19.132225 241053696 authenticatee.cpp:121] Creating new client SASL connection
+I0228 14:29:19.132381 241590272 master.cpp:7210] Authenticating slave(1)@172.18.8.139:55836
+I0228 14:29:19.132449 238907392 authenticator.cpp:414] Starting authentication session for crammd5-authenticatee(2)@172.18.8.139:55836
+I0228 14:29:19.132587 238370816 authenticator.cpp:98] Creating new server SASL connection
+I0228 14:29:19.132699 239980544 authenticatee.cpp:213] Received SASL authentication mechanisms: CRAM-MD5
+I0228 14:29:19.132719 239980544 authenticatee.cpp:239] Attempting to authenticate with mechanism 'CRAM-MD5'
+I0228 14:29:19.132807 237834240 authenticator.cpp:204] Received SASL authentication start
+I0228 14:29:19.132843 237834240 authenticator.cpp:326] Authentication requires more steps
+I0228 14:29:19.132930 241053696 authenticatee.cpp:259] Received SASL authentication step
+I0228 14:29:19.133054 241590272 authenticator.cpp:232] Received SASL authentication step
+I0228 14:29:19.133078 241590272 auxprop.cpp:109] Request to lookup properties for user: 'test-principal' realm: 'Gastons-MacBook-Pro-2.local' server FQDN: 'Gastons-MacBook-Pro-2.local' SASL_AUXPROP_VERIFY_AGAINST_HASH: false SASL_AUXPROP_OVERRIDE: false SASL_AUXPROP_AUTHZID: false
+I0228 14:29:19.133087 241590272 auxprop.cpp:181] Looking up auxiliary property '*userPassword'
+I0228 14:29:19.133097 241590272 auxprop.cpp:181] Looking up auxiliary property '*cmusaslsecretCRAM-MD5'
+I0228 14:29:19.133107 241590272 auxprop.cpp:109] Request to lookup properties for user: 'test-principal' realm: 'Gastons-MacBook-Pro-2.local' server FQDN: 'Gastons-MacBook-Pro-2.local' SASL_AUXPROP_VERIFY_AGAINST_HASH: false SASL_AUXPROP_OVERRIDE: false SASL_AUXPROP_AUTHZID: true
+I0228 14:29:19.133116 241590272 auxprop.cpp:131] Skipping auxiliary property '*userPassword' since SASL_AUXPROP_AUTHZID == true
+I0228 14:29:19.133123 241590272 auxprop.cpp:131] Skipping auxiliary property '*cmusaslsecretCRAM-MD5' since SASL_AUXPROP_AUTHZID == true
+I0228 14:29:19.133134 241590272 authenticator.cpp:318] Authentication success
+I0228 14:29:19.133209 239443968 authenticatee.cpp:299] Authentication success
+I0228 14:29:19.133249 241053696 master.cpp:7240] Successfully authenticated principal 'test-principal' at slave(1)@172.18.8.139:55836
+I0228 14:29:19.133347 237834240 authenticator.cpp:432] Authentication session cleanup for crammd5-authenticatee(2)@172.18.8.139:55836
+I0228 14:29:19.133471 238370816 slave.cpp:1088] Successfully authenticated with master master@172.18.8.139:55836
+I0228 14:29:19.133594 238370816 slave.cpp:1516] Will retry registration in 15.661984ms if necessary
+I0228 14:29:19.133688 240517120 master.cpp:5423] Registering agent at slave(1)@172.18.8.139:55836 (172.18.8.139) with id 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-S0
+I0228 14:29:19.133873 239443968 registrar.cpp:461] Applied 1 operations in 37us; attempting to update the registry
+I0228 14:29:19.134423 239443968 registrar.cpp:506] Successfully updated the registry in 525824ns
+I0228 14:29:19.134778 241590272 slave.cpp:4347] Received ping from slave-observer(1)@172.18.8.139:55836
+I0228 14:29:19.134827 239980544 master.cpp:5497] Registered agent 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-S0 at slave(1)@172.18.8.139:55836 (172.18.8.139) with cpus(*):2; mem(*):1024; disk(*):1024; ports(*):[31000-32000]
+I0228 14:29:19.134873 241590272 slave.cpp:1134] Registered with master master@172.18.8.139:55836; given agent ID 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-S0
+I0228 14:29:19.134896 241590272 fetcher.cpp:94] Clearing fetcher cache
+I0228 14:29:19.135002 240517120 status_update_manager.cpp:184] Resuming sending status updates
+I0228 14:29:19.135016 238907392 hierarchical.cpp:518] Added agent 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-S0 (172.18.8.139) with cpus(*):2; mem(*):1024; disk(*):1024; ports(*):[31000-32000] (allocated: {})
+I0228 14:29:19.135195 241590272 slave.cpp:1162] Checkpointing SlaveInfo to '/var/folders/jr/17y2w4ld019bsn9vhx0c13f80000gn/T/HealthCheckTest_DefaultExecutorCommandHealthCheck_tLRhsF/meta/slaves/98c48dab-fd2b-404e-85dc-4ec5dd0d635c-S0/slave.info'
+I0228 14:29:19.135504 241590272 slave.cpp:1200] Forwarding total oversubscribed resources {}
+I0228 14:29:19.135565 238907392 hierarchical.cpp:1928] No inverse offers to send out!
+I0228 14:29:19.135587 238907392 hierarchical.cpp:1422] Performed allocation for 1 agents in 512us
+I0228 14:29:19.135793 239443968 master.cpp:7039] Sending 1 offers to framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000 (default) at scheduler-5711276a-2d47-49db-a175-98964e58f90c@172.18.8.139:55836
+I0228 14:29:19.135916 239443968 master.cpp:6056] Received update of agent 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-S0 at slave(1)@172.18.8.139:55836 (172.18.8.139) with total oversubscribed resources {}
+I0228 14:29:19.136096 241053696 sched.cpp:933] Scheduler::resourceOffers took 109us
+I0228 14:29:19.141821 237834240 master.cpp:3825] Processing ACCEPT call for offers: [ 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-O0 ] on agent 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-S0 at slave(1)@172.18.8.139:55836 (172.18.8.139) for framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000 (default) at scheduler-5711276a-2d47-49db-a175-98964e58f90c@172.18.8.139:55836
+I0228 14:29:19.141887 237834240 master.cpp:3401] Authorizing framework principal 'test-principal' to launch task d36c01f3-5d2f-4772-883b-db620421324e
+I0228 14:29:19.143775 237834240 master.cpp:9101] Adding task d36c01f3-5d2f-4772-883b-db620421324e with resources cpus(*)(allocated: *):1.9; mem(*)(allocated: *):992; disk(*)(allocated: *):992; ports(*)(allocated: *):[31000-32000] on agent 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-S0 at slave(1)@172.18.8.139:55836 (172.18.8.139)
+I0228 14:29:19.143901 237834240 master.cpp:4680] Launching task group { d36c01f3-5d2f-4772-883b-db620421324e } of framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000 (default) at scheduler-5711276a-2d47-49db-a175-98964e58f90c@172.18.8.139:55836 with resources cpus(*)(allocated: *):1.9; mem(*)(allocated: *):992; disk(*)(allocated: *):992; ports(*)(allocated: *):[31000-32000] on agent 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-S0 at slave(1)@172.18.8.139:55836 (172.18.8.139)
+I0228 14:29:19.144158 239443968 slave.cpp:1626] Got assigned task group containing tasks [ d36c01f3-5d2f-4772-883b-db620421324e ] for framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000
+I0228 14:29:19.144616 239443968 slave.cpp:1786] Launching task group containing tasks [ d36c01f3-5d2f-4772-883b-db620421324e ] for framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000
+I0228 14:29:19.145138 239443968 paths.cpp:547] Trying to chown '/var/folders/jr/17y2w4ld019bsn9vhx0c13f80000gn/T/HealthCheckTest_DefaultExecutorCommandHealthCheck_tLRhsF/slaves/98c48dab-fd2b-404e-85dc-4ec5dd0d635c-S0/frameworks/98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000/executors/default/runs/a49b6fdc-56e6-4ccf-b400-83aaf3ad8452' to user 'gaston'
+I0228 14:29:19.145843 239443968 slave.cpp:6481] Launching executor 'default' of framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000 with resources cpus(*)(allocated: *):0.1; mem(*)(allocated: *):32; disk(*)(allocated: *):32 in work directory '/var/folders/jr/17y2w4ld019bsn9vhx0c13f80000gn/T/HealthCheckTest_DefaultExecutorCommandHealthCheck_tLRhsF/slaves/98c48dab-fd2b-404e-85dc-4ec5dd0d635c-S0/frameworks/98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000/executors/default/runs/a49b6fdc-56e6-4ccf-b400-83aaf3ad8452'
+I0228 14:29:19.146229 240517120 containerizer.cpp:992] Starting container a49b6fdc-56e6-4ccf-b400-83aaf3ad8452 for executor 'default' of framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000
+I0228 14:29:19.146332 239443968 slave.cpp:2119] Queued task group containing tasks [ d36c01f3-5d2f-4772-883b-db620421324e ] for executor 'default' of framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000
+I0228 14:29:19.146389 239443968 slave.cpp:884] Successfully attached file '/var/folders/jr/17y2w4ld019bsn9vhx0c13f80000gn/T/HealthCheckTest_DefaultExecutorCommandHealthCheck_tLRhsF/slaves/98c48dab-fd2b-404e-85dc-4ec5dd0d635c-S0/frameworks/98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000/executors/default/runs/a49b6fdc-56e6-4ccf-b400-83aaf3ad8452'
+I0228 14:29:19.148890 241590272 containerizer.cpp:1489] Launching 'mesos-containerizer' with flags '--help="false" --launch_info="{"command":{"arguments":["mesos-default-executor","--launcher_dir=\/Users\/gaston\/mesosphere\/mesos\/build\/src"],"shell":false,"value":"\/Users\/gaston\/mesosphere\/mesos\/build\/src\/mesos-default-executor"},"environment":{"variables":[{"name":"LIBPROCESS_PORT","type":"VALUE","value":"0"},{"name":"MESOS_AGENT_ENDPOINT","type":"VALUE","value":"172.18.8.139:55836"},{"name":"MESOS_CHECKPOINT","type":"VALUE","value":"0"},{"name":"MESOS_DIRECTORY","type":"VALUE","value":"\/var\/folders\/jr\/17y2w4ld019bsn9vhx0c13f80000gn\/T\/HealthCheckTest_DefaultExecutorCommandHealthCheck_tLRhsF\/slaves\/98c48dab-fd2b-404e-85dc-4ec5dd0d635c-S0\/frameworks\/98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000\/executors\/default\/runs\/a49b6fdc-56e6-4ccf-b400-83aaf3ad8452"},{"name":"MESOS_EXECUTOR_ID","type":"VALUE","value":"default"},{"name":"MESOS_EXECUTOR_SHUTDOWN_GRACE_PERIOD","type":"VALUE","value":"5secs"},{"name":"MESOS_FRAMEWORK_ID","type":"VALUE","value":"98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000"},{"name":"MESOS_HTTP_COMMAND_EXECUTOR","type":"VALUE","value":"0"},{"name":"MESOS_SLAVE_ID","type":"VALUE","value":"98c48dab-fd2b-404e-85dc-4ec5dd0d635c-S0"},{"name":"MESOS_SLAVE_PID","type":"VALUE","value":"slave(1)@172.18.8.139:55836"},{"name":"MESOS_SANDBOX","type":"VALUE","value":"\/var\/folders\/jr\/17y2w4ld019bsn9vhx0c13f80000gn\/T\/HealthCheckTest_DefaultExecutorCommandHealthCheck_tLRhsF\/slaves\/98c48dab-fd2b-404e-85dc-4ec5dd0d635c-S0\/frameworks\/98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000\/executors\/default\/runs\/a49b6fdc-56e6-4ccf-b400-83aaf3ad8452"}]},"user":"gaston","working_directory":"\/var\/folders\/jr\/17y2w4ld019bsn9vhx0c13f80000gn\/T\/HealthCheckTest_DefaultExecutorCommandHealthCheck_tLRhsF\/slaves\/98c48dab-fd2b-404e-85dc-4ec5dd0d635c-S0\/frameworks\/98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000\/executors\/default\/runs\/a49b6fdc-56e6-4ccf-b400-83aaf3ad8452"}" --pipe_read="6" --pipe_write="8" --runtime_directory="/var/folders/jr/17y2w4ld019bsn9vhx0c13f80000gn/T/HealthCheckTest_DefaultExecutorCommandHealthCheck_3qqMz4/containers/a49b6fdc-56e6-4ccf-b400-83aaf3ad8452"'
+I0228 14:29:19.153650 241590272 launcher.cpp:135] Forked child with pid '16006' for container 'a49b6fdc-56e6-4ccf-b400-83aaf3ad8452'
+I0228 14:29:19.156491 238907392 fetcher.cpp:353] Starting to fetch URIs for container: a49b6fdc-56e6-4ccf-b400-83aaf3ad8452, directory: /var/folders/jr/17y2w4ld019bsn9vhx0c13f80000gn/T/HealthCheckTest_DefaultExecutorCommandHealthCheck_tLRhsF/slaves/98c48dab-fd2b-404e-85dc-4ec5dd0d635c-S0/frameworks/98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000/executors/default/runs/a49b6fdc-56e6-4ccf-b400-83aaf3ad8452
+I0228 14:29:19.243399 240517120 process.cpp:3704] Handling HTTP event for process 'slave(1)' with path: '/slave(1)/api/v1/executor'
+I0228 14:29:19.244144 239443968 http.cpp:327] HTTP POST for /slave(1)/api/v1/executor from 172.18.8.139:55843
+I0228 14:29:19.244298 239443968 slave.cpp:3170] Received Subscribe request for HTTP executor 'default' of framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000
+I0228 14:29:19.245337 238370816 slave.cpp:2361] Sending queued task group task group containing tasks [ d36c01f3-5d2f-4772-883b-db620421324e ] to executor 'default' of framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000 (via HTTP)
+I0228 14:29:19.258466 238370816 process.cpp:3704] Handling HTTP event for process 'slave(1)' with path: '/slave(1)/api/v1'
+I0228 14:29:19.258891 241053696 http.cpp:327] HTTP POST for /slave(1)/api/v1 from 172.18.8.139:55845
+I0228 14:29:19.259102 241053696 http.cpp:541] Processing call LAUNCH_NESTED_CONTAINER
+I0228 14:29:19.260445 239443968 containerizer.cpp:1756] Starting nested container a49b6fdc-56e6-4ccf-b400-83aaf3ad8452.f80bfc66-462a-421a-9ea2-3c46aa812ae6
+I0228 14:29:19.260642 239443968 containerizer.cpp:1780] Trying to chown '/var/folders/jr/17y2w4ld019bsn9vhx0c13f80000gn/T/HealthCheckTest_DefaultExecutorCommandHealthCheck_tLRhsF/slaves/98c48dab-fd2b-404e-85dc-4ec5dd0d635c-S0/frameworks/98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000/executors/default/runs/a49b6fdc-56e6-4ccf-b400-83aaf3ad8452/containers/f80bfc66-462a-421a-9ea2-3c46aa812ae6' to user 'gaston'
+I0228 14:29:19.262100 238907392 containerizer.cpp:1489] Launching 'mesos-containerizer' with flags '--help="false" --launch_info="{"command":{"shell":true,"value":"sleep 120"},"environment":{"variables":[{"name":"MESOS_SANDBOX","type":"VALUE","value":"\/var\/folders\/jr\/17y2w4ld019bsn9vhx0c13f80000gn\/T\/HealthCheckTest_DefaultExecutorCommandHealthCheck_tLRhsF\/slaves\/98c48dab-fd2b-404e-85dc-4ec5dd0d635c-S0\/frameworks\/98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000\/executors\/default\/runs\/a49b6fdc-56e6-4ccf-b400-83aaf3ad8452\/containers\/f80bfc66-462a-421a-9ea2-3c46aa812ae6"}]},"user":"gaston","working_directory":"\/var\/folders\/jr\/17y2w4ld019bsn9vhx0c13f80000gn\/T\/HealthCheckTest_DefaultExecutorCommandHealthCheck_tLRhsF\/slaves\/98c48dab-fd2b-404e-85dc-4ec5dd0d635c-S0\/frameworks\/98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000\/executors\/default\/runs\/a49b6fdc-56e6-4ccf-b400-83aaf3ad8452\/containers\/f80bfc66-462a-421a-9ea2-3c46aa812ae6"}" --pipe_read="10" --pipe_write="11" --runtime_directory="/var/folders/jr/17y2w4ld019bsn9vhx0c13f80000gn/T/HealthCheckTest_DefaultExecutorCommandHealthCheck_3qqMz4/containers/a49b6fdc-56e6-4ccf-b400-83aaf3ad8452/containers/f80bfc66-462a-421a-9ea2-3c46aa812ae6"'
+I0228 14:29:19.263371 238907392 launcher.cpp:135] Forked child with pid '16034' for container 'a49b6fdc-56e6-4ccf-b400-83aaf3ad8452.f80bfc66-462a-421a-9ea2-3c46aa812ae6'
+I0228 14:29:19.265130 240517120 fetcher.cpp:353] Starting to fetch URIs for container: a49b6fdc-56e6-4ccf-b400-83aaf3ad8452.f80bfc66-462a-421a-9ea2-3c46aa812ae6, directory: /var/folders/jr/17y2w4ld019bsn9vhx0c13f80000gn/T/HealthCheckTest_DefaultExecutorCommandHealthCheck_tLRhsF/slaves/98c48dab-fd2b-404e-85dc-4ec5dd0d635c-S0/frameworks/98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000/executors/default/runs/a49b6fdc-56e6-4ccf-b400-83aaf3ad8452/containers/f80bfc66-462a-421a-9ea2-3c46aa812ae6
+I0228 14:29:19.272331 241590272 process.cpp:3704] Handling HTTP event for process 'slave(1)' with path: '/slave(1)/api/v1'
+I0228 14:29:19.272691 238907392 http.cpp:327] HTTP POST for /slave(1)/api/v1 from 172.18.8.139:55846
+I0228 14:29:19.273295 241590272 http.cpp:541] Processing call LAUNCH_NESTED_CONTAINER_SESSION
+I0228 14:29:19.273628 241053696 containerizer.cpp:1756] Starting nested container a49b6fdc-56e6-4ccf-b400-83aaf3ad8452.f80bfc66-462a-421a-9ea2-3c46aa812ae6.f80bfc66-462a-421a-9ea2-3c46aa812ae6-health-check
+I0228 14:29:19.273794 241053696 containerizer.cpp:1780] Trying to chown '/var/folders/jr/17y2w4ld019bsn9vhx0c13f80000gn/T/HealthCheckTest_DefaultExecutorCommandHealthCheck_tLRhsF/slaves/98c48dab-fd2b-404e-85dc-4ec5dd0d635c-S0/frameworks/98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000/executors/default/runs/a49b6fdc-56e6-4ccf-b400-83aaf3ad8452/containers/f80bfc66-462a-421a-9ea2-3c46aa812ae6/containers/f80bfc66-462a-421a-9ea2-3c46aa812ae6-health-check' to user 'gaston'
+I0228 14:29:19.277046 239443968 process.cpp:3704] Handling HTTP event for process 'slave(1)' with path: '/slave(1)/api/v1/executor'
+E0228 14:29:19.279794 242126848 process.cpp:2426] Failed to shutdown socket with fd 9: Socket is not connected
+I0228 14:29:19.280057 238907392 http.cpp:327] HTTP POST for /slave(1)/api/v1/executor from 172.18.8.139:55844
+I0228 14:29:19.280192 238907392 slave.cpp:3817] Handling status update TASK_RUNNING (UUID: a6dba5ec-a683-454f-8f74-ff551c831ba9) for task d36c01f3-5d2f-4772-883b-db620421324e of framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000
+I0228 14:29:19.280318 240517120 switchboard.cpp:542] Launching 'mesos-io-switchboard' with flags '--heartbeat_interval="30secs" --help="false" --socket_address="/tmp/mesos-io-switchboard-60f3f4d2-5ebf-4e7d-bf28-d563d309b88a" --stderr_from_fd="15" --stderr_to_fd="2" --stdin_to_fd="12" --stdout_from_fd="13" --stdout_to_fd="1" --tty="false" --wait_for_connection="true"' for container a49b6fdc-56e6-4ccf-b400-83aaf3ad8452.f80bfc66-462a-421a-9ea2-3c46aa812ae6.f80bfc66-462a-421a-9ea2-3c46aa812ae6-health-check
+I0228 14:29:19.280520 238907392 process.cpp:3704] Handling HTTP event for process 'slave(1)' with path: '/slave(1)/api/v1'
+I0228 14:29:19.281404 240517120 switchboard.cpp:572] Created I/O switchboard server (pid: 16044) listening on socket file '/tmp/mesos-io-switchboard-60f3f4d2-5ebf-4e7d-bf28-d563d309b88a' for container a49b6fdc-56e6-4ccf-b400-83aaf3ad8452.f80bfc66-462a-421a-9ea2-3c46aa812ae6.f80bfc66-462a-421a-9ea2-3c46aa812ae6-health-check
+I0228 14:29:19.281841 237834240 http.cpp:327] HTTP POST for /slave(1)/api/v1 from 172.18.8.139:55847
+I0228 14:29:19.282076 237834240 http.cpp:541] Processing call WAIT_NESTED_CONTAINER
+I0228 14:29:19.283356 239443968 containerizer.cpp:1489] Launching 'mesos-containerizer' with flags '--help="false" --launch_info="{"command":{"shell":true,"value":"exit $STATUS"},"environment":{"variables":[{"name":"STATUS","type":"VALUE","value":"0"}]},"user":"gaston"}" --pipe_read="9" --pipe_write="12" --runtime_directory="/var/folders/jr/17y2w4ld019bsn9vhx0c13f80000gn/T/HealthCheckTest_DefaultExecutorCommandHealthCheck_3qqMz4/containers/a49b6fdc-56e6-4ccf-b400-83aaf3ad8452/containers/f80bfc66-462a-421a-9ea2-3c46aa812ae6/containers/f80bfc66-462a-421a-9ea2-3c46aa812ae6-health-check"'
+I0228 14:29:19.283644 238370816 status_update_manager.cpp:323] Received status update TASK_RUNNING (UUID: a6dba5ec-a683-454f-8f74-ff551c831ba9) for task d36c01f3-5d2f-4772-883b-db620421324e of framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000
+I0228 14:29:19.283686 238370816 status_update_manager.cpp:500] Creating StatusUpdate stream for task d36c01f3-5d2f-4772-883b-db620421324e of framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000
+I0228 14:29:19.284668 239443968 launcher.cpp:135] Forked child with pid '16045' for container 'a49b6fdc-56e6-4ccf-b400-83aaf3ad8452.f80bfc66-462a-421a-9ea2-3c46aa812ae6.f80bfc66-462a-421a-9ea2-3c46aa812ae6-health-check'
+I0228 14:29:19.284781 238370816 status_update_manager.cpp:377] Forwarding update TASK_RUNNING (UUID: a6dba5ec-a683-454f-8f74-ff551c831ba9) for task d36c01f3-5d2f-4772-883b-db620421324e of framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000 to the agent
+I0228 14:29:19.285346 240517120 slave.cpp:4257] Forwarding the update TASK_RUNNING (UUID: a6dba5ec-a683-454f-8f74-ff551c831ba9) for task d36c01f3-5d2f-4772-883b-db620421324e of framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000 to master@172.18.8.139:55836
+I0228 14:29:19.285527 239980544 slave.cpp:4151] Status update manager successfully handled status update TASK_RUNNING (UUID: a6dba5ec-a683-454f-8f74-ff551c831ba9) for task d36c01f3-5d2f-4772-883b-db620421324e of framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000
+I0228 14:29:19.285584 240517120 master.cpp:6201] Status update TASK_RUNNING (UUID: a6dba5ec-a683-454f-8f74-ff551c831ba9) for task d36c01f3-5d2f-4772-883b-db620421324e of framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000 from agent 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-S0 at slave(1)@172.18.8.139:55836 (172.18.8.139)
+I0228 14:29:19.285619 240517120 master.cpp:6269] Forwarding status update TASK_RUNNING (UUID: a6dba5ec-a683-454f-8f74-ff551c831ba9) for task d36c01f3-5d2f-4772-883b-db620421324e of framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000
+I0228 14:29:19.285775 240517120 master.cpp:8350] Updating the state of task d36c01f3-5d2f-4772-883b-db620421324e of framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000 (latest state: TASK_RUNNING, status update state: TASK_RUNNING)
+I0228 14:29:19.285989 241053696 sched.cpp:1041] Scheduler::statusUpdate took 130us
+I0228 14:29:19.286181 239980544 master.cpp:5137] Processing ACKNOWLEDGE call a6dba5ec-a683-454f-8f74-ff551c831ba9 for task d36c01f3-5d2f-4772-883b-db620421324e of framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000 (default) at scheduler-5711276a-2d47-49db-a175-98964e58f90c@172.18.8.139:55836 on agent 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-S0
+I0228 14:29:19.286715 239443968 status_update_manager.cpp:395] Received status update acknowledgement (UUID: a6dba5ec-a683-454f-8f74-ff551c831ba9) for task d36c01f3-5d2f-4772-883b-db620421324e of framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000
+I0228 14:29:19.286967 241053696 slave.cpp:3106] Status update manager successfully handled status update acknowledgement (UUID: a6dba5ec-a683-454f-8f74-ff551c831ba9) for task d36c01f3-5d2f-4772-883b-db620421324e of framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000
+I0228 14:29:19.287169 240517120 fetcher.cpp:353] Starting to fetch URIs for container: a49b6fdc-56e6-4ccf-b400-83aaf3ad8452.f80bfc66-462a-421a-9ea2-3c46aa812ae6.f80bfc66-462a-421a-9ea2-3c46aa812ae6-health-check, directory: /var/folders/jr/17y2w4ld019bsn9vhx0c13f80000gn/T/HealthCheckTest_DefaultExecutorCommandHealthCheck_tLRhsF/slaves/98c48dab-fd2b-404e-85dc-4ec5dd0d635c-S0/frameworks/98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000/executors/default/runs/a49b6fdc-56e6-4ccf-b400-83aaf3ad8452/containers/f80bfc66-462a-421a-9ea2-3c46aa812ae6/containers/f80bfc66-462a-421a-9ea2-3c46aa812ae6-health-check
+I0228 14:29:19.333760 238907392 http.cpp:2724] Received EOF attach response for a49b6fdc-56e6-4ccf-b400-83aaf3ad8452.f80bfc66-462a-421a-9ea2-3c46aa812ae6.f80bfc66-462a-421a-9ea2-3c46aa812ae6-health-check
+I0228 14:29:19.334024 239980544 containerizer.cpp:2067] Destroying container a49b6fdc-56e6-4ccf-b400-83aaf3ad8452.f80bfc66-462a-421a-9ea2-3c46aa812ae6.f80bfc66-462a-421a-9ea2-3c46aa812ae6-health-check in RUNNING state
+W0228 14:29:19.334038 238907392 http.cpp:2739] Launch nested container session connection for container a49b6fdc-56e6-4ccf-b400-83aaf3ad8452.f80bfc66-462a-421a-9ea2-3c46aa812ae6.f80bfc66-462a-421a-9ea2-3c46aa812ae6-health-check closed
+I0228 14:29:19.334241 239980544 launcher.cpp:151] Asked to destroy container a49b6fdc-56e6-4ccf-b400-83aaf3ad8452.f80bfc66-462a-421a-9ea2-3c46aa812ae6.f80bfc66-462a-421a-9ea2-3c46aa812ae6-health-check
+I0228 14:29:19.335008 241053696 process.cpp:3704] Handling HTTP event for process 'slave(1)' with path: '/slave(1)/api/v1'
+I0228 14:29:19.335394 238907392 http.cpp:327] HTTP POST for /slave(1)/api/v1 from 172.18.8.139:55849
+I0228 14:29:19.335556 238907392 http.cpp:541] Processing call WAIT_NESTED_CONTAINER
+I0228 14:29:19.347013 241053696 switchboard.cpp:885] I/O switchboard server process for container a49b6fdc-56e6-4ccf-b400-83aaf3ad8452.f80bfc66-462a-421a-9ea2-3c46aa812ae6.f80bfc66-462a-421a-9ea2-3c46aa812ae6-health-check has terminated (status=0)
+I0228 14:29:19.356932 239980544 containerizer.cpp:2430] Container a49b6fdc-56e6-4ccf-b400-83aaf3ad8452.f80bfc66-462a-421a-9ea2-3c46aa812ae6.f80bfc66-462a-421a-9ea2-3c46aa812ae6-health-check has exited
+I0228 14:29:19.357700 240517120 provisioner.cpp:484] Ignoring destroy request for unknown container a49b6fdc-56e6-4ccf-b400-83aaf3ad8452.f80bfc66-462a-421a-9ea2-3c46aa812ae6.f80bfc66-462a-421a-9ea2-3c46aa812ae6-health-check
+I0228 14:29:19.357811 239443968 containerizer.cpp:2346] Checkpointing termination state to nested container's runtime directory '/var/folders/jr/17y2w4ld019bsn9vhx0c13f80000gn/T/HealthCheckTest_DefaultExecutorCommandHealthCheck_3qqMz4/containers/a49b6fdc-56e6-4ccf-b400-83aaf3ad8452/containers/f80bfc66-462a-421a-9ea2-3c46aa812ae6/containers/f80bfc66-462a-421a-9ea2-3c46aa812ae6-health-check/termination'
+I0228 14:29:19.363263 238907392 process.cpp:3704] Handling HTTP event for process 'slave(1)' with path: '/slave(1)/api/v1'
+I0228 14:29:19.363633 241590272 http.cpp:327] HTTP POST for /slave(1)/api/v1 from 172.18.8.139:55850
+I0228 14:29:19.363831 241590272 http.cpp:541] Processing call LAUNCH_NESTED_CONTAINER_SESSION
+I0228 14:29:19.364068 240517120 containerizer.cpp:1756] Starting nested container a49b6fdc-56e6-4ccf-b400-83aaf3ad8452.f80bfc66-462a-421a-9ea2-3c46aa812ae6.f80bfc66-462a-421a-9ea2-3c46aa812ae6-health-check
+I0228 14:29:19.364181 240517120 containerizer.cpp:1780] Trying to chown '/var/folders/jr/17y2w4ld019bsn9vhx0c13f80000gn/T/HealthCheckTest_DefaultExecutorCommandHealthCheck_tLRhsF/slaves/98c48dab-fd2b-404e-85dc-4ec5dd0d635c-S0/frameworks/98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000/executors/default/runs/a49b6fdc-56e6-4ccf-b400-83aaf3ad8452/containers/f80bfc66-462a-421a-9ea2-3c46aa812ae6/containers/f80bfc66-462a-421a-9ea2-3c46aa812ae6-health-check' to user 'gaston'
+I0228 14:29:19.364517 238370816 process.cpp:3704] Handling HTTP event for process 'slave(1)' with path: '/slave(1)/api/v1/executor'
+I0228 14:29:19.364897 241590272 http.cpp:327] HTTP POST for /slave(1)/api/v1/executor from 172.18.8.139:55844
+I0228 14:29:19.364995 241590272 slave.cpp:3817] Handling status update TASK_RUNNING (UUID: aef04c6c-c29b-45d0-b4bd-c8557cd330ef) for task d36c01f3-5d2f-4772-883b-db620421324e in health state healthy of framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000
+I0228 14:29:19.365909 239980544 status_update_manager.cpp:323] Received status update TASK_RUNNING (UUID: aef04c6c-c29b-45d0-b4bd-c8557cd330ef) for task d36c01f3-5d2f-4772-883b-db620421324e in health state healthy of framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000
+I0228 14:29:19.366019 239980544 status_update_manager.cpp:377] Forwarding update TASK_RUNNING (UUID: aef04c6c-c29b-45d0-b4bd-c8557cd330ef) for task d36c01f3-5d2f-4772-883b-db620421324e in health state healthy of framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000 to the agent
+I0228 14:29:19.366130 237834240 slave.cpp:4257] Forwarding the update TASK_RUNNING (UUID: aef04c6c-c29b-45d0-b4bd-c8557cd330ef) for task d36c01f3-5d2f-4772-883b-db620421324e in health state healthy of framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000 to master@172.18.8.139:55836
+I0228 14:29:19.366253 237834240 slave.cpp:4151] Status update manager successfully handled status update TASK_RUNNING (UUID: aef04c6c-c29b-45d0-b4bd-c8557cd330ef) for task d36c01f3-5d2f-4772-883b-db620421324e in health state healthy of framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000
+I0228 14:29:19.366312 240517120 master.cpp:6201] Status update TASK_RUNNING (UUID: aef04c6c-c29b-45d0-b4bd-c8557cd330ef) for task d36c01f3-5d2f-4772-883b-db620421324e in health state healthy of framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000 from agent 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-S0 at slave(1)@172.18.8.139:55836 (172.18.8.139)
+I0228 14:29:19.366348 240517120 master.cpp:6269] Forwarding status update TASK_RUNNING (UUID: aef04c6c-c29b-45d0-b4bd-c8557cd330ef) for task d36c01f3-5d2f-4772-883b-db620421324e in health state healthy of framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000
+I0228 14:29:19.366454 240517120 master.cpp:8350] Updating the state of task d36c01f3-5d2f-4772-883b-db620421324e of framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000 (latest state: TASK_RUNNING, status update state: TASK_RUNNING)
+I0228 14:29:19.366621 238907392 sched.cpp:1041] Scheduler::statusUpdate took 118us
+I0228 14:29:19.366901 240517120 master.cpp:5137] Processing ACKNOWLEDGE call aef04c6c-c29b-45d0-b4bd-c8557cd330ef for task d36c01f3-5d2f-4772-883b-db620421324e of framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000 (default) at scheduler-5711276a-2d47-49db-a175-98964e58f90c@172.18.8.139:55836 on agent 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-S0
+I0228 14:29:19.367105 241053696 status_update_manager.cpp:395] Received status update acknowledgement (UUID: aef04c6c-c29b-45d0-b4bd-c8557cd330ef) for task d36c01f3-5d2f-4772-883b-db620421324e of framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000
+I0228 14:29:19.367364 237834240 slave.cpp:3106] Status update manager successfully handled status update acknowledgement (UUID: aef04c6c-c29b-45d0-b4bd-c8557cd330ef) for task d36c01f3-5d2f-4772-883b-db620421324e of framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000
+I0228 14:29:19.367382 3475919808 sched.cpp:2021] Asked to stop the driver
+I0228 14:29:19.367460 239980544 sched.cpp:1203] Stopping framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000
+I0228 14:29:19.367565 241590272 master.cpp:7752] Processing TEARDOWN call for framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000 (default) at scheduler-5711276a-2d47-49db-a175-98964e58f90c@172.18.8.139:55836
+I0228 14:29:19.367588 241590272 master.cpp:7764] Removing framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000 (default) at scheduler-5711276a-2d47-49db-a175-98964e58f90c@172.18.8.139:55836
+I0228 14:29:19.367600 241590272 master.cpp:3134] Deactivating framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000 (default) at scheduler-5711276a-2d47-49db-a175-98964e58f90c@172.18.8.139:55836
+I0228 14:29:19.367761 239980544 hierarchical.cpp:415] Deactivated framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000
+I0228 14:29:19.367810 240517120 slave.cpp:2659] Asked to shut down framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000 by master@172.18.8.139:55836
+I0228 14:29:19.367827 240517120 slave.cpp:2684] Shutting down framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000
+I0228 14:29:19.367828 241590272 master.cpp:8350] Updating the state of task d36c01f3-5d2f-4772-883b-db620421324e of framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000 (latest state: TASK_KILLED, status update state: TASK_KILLED)
+I0228 14:29:19.367848 240517120 slave.cpp:5084] Shutting down executor 'default' of framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000 (via HTTP)
+I0228 14:29:19.368228 241590272 master.cpp:8444] Removing task d36c01f3-5d2f-4772-883b-db620421324e with resources cpus(*)(allocated: *):1.9; mem(*)(allocated: *):992; disk(*)(allocated: *):992; ports(*)(allocated: *):[31000-32000] of framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000 on agent 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-S0 at slave(1)@172.18.8.139:55836 (172.18.8.139)
+I0228 14:29:19.368283 239443968 hierarchical.cpp:1092] Recovered cpus(*)(allocated: *):1.9; mem(*)(allocated: *):992; disk(*)(allocated: *):992; ports(*)(allocated: *):[31000-32000] (total: cpus(*):2; mem(*):1024; disk(*):1024; ports(*):[31000-32000], allocated: cpus(*)(allocated: *):0.1; mem(*)(allocated: *):32; disk(*)(allocated: *):32) on agent 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-S0 from framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000
+I0228 14:29:19.368439 241590272 master.cpp:8473] Removing executor 'default' with resources cpus(*)(allocated: *):0.1; mem(*)(allocated: *):32; disk(*)(allocated: *):32 of framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000 on agent 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-S0 at slave(1)@172.18.8.139:55836 (172.18.8.139)
+I0228 14:29:19.368811 239980544 hierarchical.cpp:1092] Recovered cpus(*)(allocated: *):0.1; mem(*)(allocated: *):32; disk(*)(allocated: *):32 (total: cpus(*):2; mem(*):1024; disk(*):1024; ports(*):[31000-32000], allocated: {}) on agent 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-S0 from framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000
+I0228 14:29:19.368932 239980544 hierarchical.cpp:362] Removed framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000
+I0228 14:29:19.372098 237834240 process.cpp:3704] Handling HTTP event for process 'slave(1)' with path: '/slave(1)/api/v1'
+I0228 14:29:19.372248 238370816 switchboard.cpp:542] Launching 'mesos-io-switchboard' with flags '--heartbeat_interval="30secs" --help="false" --socket_address="/tmp/mesos-io-switchboard-3ca09e4e-04c7-424a-b413-414479a93b4e" --stderr_from_fd="14" --stderr_to_fd="2" --stdin_to_fd="11" --stdout_from_fd="12" --stdout_to_fd="1" --tty="false" --wait_for_connection="true"' for container a49b6fdc-56e6-4ccf-b400-83aaf3ad8452.f80bfc66-462a-421a-9ea2-3c46aa812ae6.f80bfc66-462a-421a-9ea2-3c46aa812ae6-health-check
+I0228 14:29:19.373545 238370816 switchboard.cpp:572] Created I/O switchboard server (pid: 16078) listening on socket file '/tmp/mesos-io-switchboard-3ca09e4e-04c7-424a-b413-414479a93b4e' for container a49b6fdc-56e6-4ccf-b400-83aaf3ad8452.f80bfc66-462a-421a-9ea2-3c46aa812ae6.f80bfc66-462a-421a-9ea2-3c46aa812ae6-health-check
+I0228 14:29:19.373714 239443968 http.cpp:327] HTTP POST for /slave(1)/api/v1 from 172.18.8.139:55851
+I0228 14:29:19.373986 239443968 http.cpp:541] Processing call KILL_NESTED_CONTAINER
+I0228 14:29:19.374460 240517120 containerizer.cpp:2067] Destroying container a49b6fdc-56e6-4ccf-b400-83aaf3ad8452.f80bfc66-462a-421a-9ea2-3c46aa812ae6 in RUNNING state
+I0228 14:29:19.374486 240517120 containerizer.cpp:2067] Destroying container a49b6fdc-56e6-4ccf-b400-83aaf3ad8452.f80bfc66-462a-421a-9ea2-3c46aa812ae6.f80bfc66-462a-421a-9ea2-3c46aa812ae6-health-check in PREPARING state
+I0228 14:29:19.374856 240517120 containerizer.cpp:2138] Waiting for the isolators to complete preparing before destroying container a49b6fdc-56e6-4ccf-b400-83aaf3ad8452.f80bfc66-462a-421a-9ea2-3c46aa812ae6.f80bfc66-462a-421a-9ea2-3c46aa812ae6-health-check
+W0228 14:29:19.375854 241590272 http.cpp:2303] Failed to launch nested container a49b6fdc-56e6-4ccf-b400-83aaf3ad8452.f80bfc66-462a-421a-9ea2-3c46aa812ae6.f80bfc66-462a-421a-9ea2-3c46aa812ae6-health-check: Container is being destroyed during preparing
+I0228 14:29:19.375948 240517120 process.cpp:3761] Failed to process request for '/slave(1)/api/v1': Container is being destroyed during preparing
+I0228 14:29:19.375988 239980544 process.cpp:1456] Returning '500 Internal Server Error' for '/slave(1)/api/v1' (Container is being destroyed during preparing)
+I0228 14:29:20.104522 239443968 hierarchical.cpp:1838] No allocations performed
+I0228 14:29:20.104562 239443968 hierarchical.cpp:1422] Performed allocation for 1 agents in 105us
+I0228 14:29:21.105509 237834240 hierarchical.cpp:1838] No allocations performed
+I0228 14:29:21.105546 237834240 hierarchical.cpp:1422] Performed allocation for 1 agents in 104us
+I0228 14:29:22.108916 238907392 hierarchical.cpp:1838] No allocations performed
+I0228 14:29:22.108978 238907392 hierarchical.cpp:1422] Performed allocation for 1 agents in 166us
+I0228 14:29:23.114136 241590272 hierarchical.cpp:1838] No allocations performed
+I0228 14:29:23.114208 241590272 hierarchical.cpp:1422] Performed allocation for 1 agents in 136us
+I0228 14:29:24.118439 239443968 hierarchical.cpp:1838] No allocations performed
+I0228 14:29:24.118491 239443968 hierarchical.cpp:1422] Performed allocation for 1 agents in 121us
+I0228 14:29:24.368199 238370816 slave.cpp:5157] Killing executor 'default' of framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000 (via HTTP)
+I0228 14:29:24.368348 240517120 containerizer.cpp:2067] Destroying container a49b6fdc-56e6-4ccf-b400-83aaf3ad8452 in RUNNING state
+E0228 14:29:24.370486 242126848 process.cpp:2426] Failed to shutdown socket with fd 17: Socket is not connected
+E0228 14:29:24.370611 242126848 process.cpp:2426] Failed to shutdown socket with fd 18: Socket is not connected
+E0228 14:29:24.370775 242126848 process.cpp:2426] Failed to shutdown socket with fd 6: Socket is not connected
+E0228 14:29:24.371027 242126848 process.cpp:2426] Failed to shutdown socket with fd 8: Socket is not connected
+I0228 14:29:24.376883 242126848 switchboard.cpp:786] Sending SIGTERM to I/O switchboard server (pid: 16078) since container a49b6fdc-56e6-4ccf-b400-83aaf3ad8452.f80bfc66-462a-421a-9ea2-3c46aa812ae6.f80bfc66-462a-421a-9ea2-3c46aa812ae6-health-check is being destroyed
+I0228 14:29:24.402745 239443968 switchboard.cpp:885] I/O switchboard server process for container a49b6fdc-56e6-4ccf-b400-83aaf3ad8452.f80bfc66-462a-421a-9ea2-3c46aa812ae6.f80bfc66-462a-421a-9ea2-3c46aa812ae6-health-check has terminated (status=0)
+I0228 14:29:24.402770 240517120 containerizer.cpp:2430] Container a49b6fdc-56e6-4ccf-b400-83aaf3ad8452 has exited
+I0228 14:29:24.403672 237834240 provisioner.cpp:484] Ignoring destroy request for unknown container a49b6fdc-56e6-4ccf-b400-83aaf3ad8452.f80bfc66-462a-421a-9ea2-3c46aa812ae6.f80bfc66-462a-421a-9ea2-3c46aa812ae6-health-check
+I0228 14:29:24.403811 241053696 containerizer.cpp:2346] Checkpointing termination state to nested container's runtime directory '/var/folders/jr/17y2w4ld019bsn9vhx0c13f80000gn/T/HealthCheckTest_DefaultExecutorCommandHealthCheck_3qqMz4/containers/a49b6fdc-56e6-4ccf-b400-83aaf3ad8452/containers/f80bfc66-462a-421a-9ea2-3c46aa812ae6/containers/f80bfc66-462a-421a-9ea2-3c46aa812ae6-health-check/termination'
+I0228 14:29:24.404547 241053696 launcher.cpp:151] Asked to destroy container a49b6fdc-56e6-4ccf-b400-83aaf3ad8452.f80bfc66-462a-421a-9ea2-3c46aa812ae6
+I0228 14:29:24.506726 240517120 containerizer.cpp:2430] Container a49b6fdc-56e6-4ccf-b400-83aaf3ad8452.f80bfc66-462a-421a-9ea2-3c46aa812ae6 has exited
+I0228 14:29:24.507402 239443968 provisioner.cpp:484] Ignoring destroy request for unknown container a49b6fdc-56e6-4ccf-b400-83aaf3ad8452.f80bfc66-462a-421a-9ea2-3c46aa812ae6
+I0228 14:29:24.507544 237834240 containerizer.cpp:2346] Checkpointing termination state to nested container's runtime directory '/var/folders/jr/17y2w4ld019bsn9vhx0c13f80000gn/T/HealthCheckTest_DefaultExecutorCommandHealthCheck_3qqMz4/containers/a49b6fdc-56e6-4ccf-b400-83aaf3ad8452/containers/f80bfc66-462a-421a-9ea2-3c46aa812ae6/termination'
+I0228 14:29:24.508003 237834240 process.cpp:3761] Failed to process request for '/slave(1)/api/v1': discarded
+I0228 14:29:24.508090 237834240 process.cpp:3761] Failed to process request for '/slave(1)/api/v1': discarded
+E0228 14:29:24.508436 238907392 slave.cpp:4748] Termination of executor 'default' of framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000 failed: Failed to destroy nested containers: discarded
+I0228 14:29:24.508592 238907392 slave.cpp:4870] Cleaning up executor 'default' of framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000 (via HTTP)
+W0228 14:29:24.508638 241590272 master.cpp:6325] Ignoring unknown exited executor 'default' of framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000 on agent 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-S0 at slave(1)@172.18.8.139:55836 (172.18.8.139)
+I0228 14:29:24.508813 238370816 gc.cpp:55] Scheduling '/var/folders/jr/17y2w4ld019bsn9vhx0c13f80000gn/T/HealthCheckTest_DefaultExecutorCommandHealthCheck_tLRhsF/slaves/98c48dab-fd2b-404e-85dc-4ec5dd0d635c-S0/frameworks/98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000/executors/default/runs/a49b6fdc-56e6-4ccf-b400-83aaf3ad8452' for gc 6.99999411208296days in the future
+../../src/tests/health_check_tests.cpp:2239: Failure
+(containerizer->wait(containerId)).failure(): Failed to destroy nested containers: discarded
+I0228 14:29:24.508894 238907392 slave.cpp:4958] Cleaning up framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000
+I0228 14:29:24.508911 238370816 gc.cpp:55] Scheduling '/var/folders/jr/17y2w4ld019bsn9vhx0c13f80000gn/T/HealthCheckTest_DefaultExecutorCommandHealthCheck_tLRhsF/slaves/98c48dab-fd2b-404e-85dc-4ec5dd0d635c-S0/frameworks/98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000/executors/default' for gc 6.99999411031407days in the future
+I0228 14:29:24.508985 238370816 status_update_manager.cpp:285] Closing status update streams for framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000
+I0228 14:29:24.509016 238370816 status_update_manager.cpp:531] Cleaning up status update stream for task d36c01f3-5d2f-4772-883b-db620421324e of framework 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000
+I0228 14:29:24.509093 237834240 gc.cpp:55] Scheduling '/var/folders/jr/17y2w4ld019bsn9vhx0c13f80000gn/T/HealthCheckTest_DefaultExecutorCommandHealthCheck_tLRhsF/slaves/98c48dab-fd2b-404e-85dc-4ec5dd0d635c-S0/frameworks/98c48dab-fd2b-404e-85dc-4ec5dd0d635c-0000' for gc 6.99999410862222days in the future
+../../src/tests/cluster.cpp:576: Failure
+Value of: containers.get().empty()
+  Actual: false
+Expected: true
+Failed to destroy containers: { a49b6fdc-56e6-4ccf-b400-83aaf3ad8452 }
+I0228 14:29:24.510141 238370816 slave.cpp:803] Agent terminating
+I0228 14:29:24.510295 237834240 master.cpp:1264] Agent 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-S0 at slave(1)@172.18.8.139:55836 (172.18.8.139) disconnected
+I0228 14:29:24.510311 237834240 master.cpp:3171] Disconnecting agent 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-S0 at slave(1)@172.18.8.139:55836 (172.18.8.139)
+I0228 14:29:24.510367 237834240 master.cpp:3190] Deactivating agent 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-S0 at slave(1)@172.18.8.139:55836 (172.18.8.139)
+I0228 14:29:24.510488 239980544 hierarchical.cpp:646] Agent 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-S0 deactivated
+I0228 14:29:24.513273 239443968 master.cpp:1103] Master terminating
+I0228 14:29:24.513537 237834240 hierarchical.cpp:551] Removed agent 98c48dab-fd2b-404e-85dc-4ec5dd0d635c-S0
+[  FAILED  ] HealthCheckTest.DefaultExecutorCommandHealthCheck (5442 ms)
+[----------] 1 test from HealthCheckTest (5447 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test case ran. (5467 ms total)
+[  PASSED  ] 0 tests.
+[  FAILED  ] 1 test, listed below:
+[  FAILED  ] HealthCheckTest.DefaultExecutorCommandHealthCheck
+
+ 1 FAILED TEST
+{noformat}
+
+{noformat}
+commit cbb99ce0a60c08eb0156461a8c3c3ef5ce8646ca
+Author: Kevin Klues <klueska@gmail.com>
+Date:   Wed Mar 1 09:55:13 2017 -0800
+
+    Renamed 'SubprocessInfo' to 'ContainerIO' in 'ContainerLogger'.
+    
+    Renamed 'SubprocessInfo' to 'ContainerIO' in 'ContainerLogger'.
+    
+    Review: https://reviews.apache.org/r/57121/
+{noformat}
+{noformat}
+commit 3aa7e1b67074eb67794bf2e4c18ff24d2ecf37f3
+Author: Kevin Klues <klueska@gmail.com>
+Date:   Wed Mar 1 09:55:18 2017 -0800
+
+    Added STDIN IO to 'ContainerLogger::ContainerIO' class.
+    
+    Added STDIN IO to 'ContainerLogger::ContainerIO' class.
+    
+    Review: https://reviews.apache.org/r/57122/
+{noformat}
+{noformat}
+commit 48c376a5fdbee4569e4af9144139d638c7924548
+Author: Kevin Klues <klueska@gmail.com>
+Date:   Wed Mar 1 09:55:21 2017 -0800
+
+    Fixed ContainerLogger / IOSwitchboard FD leaks.
+    
+    Previously, the containizer launch path would leak FDs if the
+    containerizer launch path failed between successfully calling
+    prepare() on either the ContainerLogger (in the case of the Docker
+    containerizer) or the IOSwitchboard (in the case of the mesos
+    containerizer) and forking the actual container.
+    
+    These components relied on the Subprocess call inside launcher->fork()
+    to close these FDS on their behalf. If the containerizer launch path
+    failed somewhere between calling prepare() and making this fork()
+    call, these FDs would never be closed.
+    
+    In the case of the IOSwitchboard, this would lead to deadlock in the
+    destroy path because the future returned by the IOSwitchboard's
+    cleanup function would never be satisfied. The IOSwitchboard doesn't
+    shutdown until the FDs it allocates to the container have been closed.
+    
+    This commit fixes this problem by updating the
+    ContainerLogger::ContainerIO::FD abstraction to change the way it
+    manages FDS. Instead of tagging each FD with the Subprocess::IO::OWNED
+    label and forcing the launcher->fork() call to deal with closing the
+    FDs once it's forked a new subprocess, we now do things slightly
+    differently now.
+    
+    We now keep the default DUP label on each FD (instead fo changing it
+    to OWNED) to cause launcher->fork() to dup it before mapping it onto
+    the stdin/stdout/stderr of the subprocess. It then only closes the
+    duped FD, leaving the original one open.
+    
+    In doing so, it's now the containerizer's responsibility to ensure
+    that these FDs are closed properly (whether that's between a
+    successful prepare() call and launcher->fork()) or after
+    launcher->fork() has completed successfully). While this has the
+    potential to complicate things slightly on the SUCCESS path,
+    at least it is now the containerizers's responsibility to close these
+    FDS in *all* cases, rather than splitting that responsibility across
+    components.
+    
+    In order to simplify this, we've also modified the
+    ContainerLogger::ContainerIO::FD abstraction to hold a Shared
+    pointer to its underlying file descriptor and (optionally) close it on
+    destruction. With this, we can ensure that all file descriptors
+    created through this abstraction will be automatically closed onced
+    their final reference goes out of scope (even if its been copied
+    around several times).
+    
+    In essence, this releases the containerizer from the burden of manually
+    closing these FDS itself. So long as it holds the final reference to
+    these FDs (which it does), they will be automatically closed along
+    *any* path out of containerizer->launch(). These are exactly the
+    semantics we want to achieve.
+    
+    In the case of the the ContainerLogger, ownership of these FDs (and
+    thus their final reference) is passed to the containerizer in the
+    ContainerIO struct returned by prepare(). In the case of the
+    IOSwitchboard, we had to add a new API call to transfer ownership
+    (since it is an isolator and prepare() can only return a protobuf),
+    but the end result is the same.
+    
+    Review: https://reviews.apache.org/r/56195/
+{noformat}
+{noformat}
+commit 0d717e08e90a38d9d17864b9d51c45ea0b35b3a5
+Author: Kevin Klues <klueska@gmail.com>
+Date:   Wed Mar 1 09:55:25 2017 -0800
+
+    Pulled 'ContainerIO' out of the 'ContainerLogger'.
+    
+    Pulled 'ContainerIO' out of the 'ContainerLogger'.
+    
+    Review: https://reviews.apache.org/r/57176/
+{noformat}
+

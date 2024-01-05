@@ -1,0 +1,659 @@
+[~zyork],  I'm digging the flaky ut, which was introduced by HBASE-20447,  I read  the patch for HBASE-20447... and found that I did not quite understand the patch :-(   ...
+
+{code}
+        int comparison = BlockCacheUtil.validateBlockAddition(existingBlock, cachedItem, cacheKey);
+        if (comparison != 0) {
+          if (comparison < 0) {
+            LOG.warn("Cached block contents differ by nextBlockOnDiskSize. Keeping cached block.");
+            return;
+          } else {
+            LOG.warn("Cached block contents differ by nextBlockOnDiskSize. Caching new block.");
+          }
+{code} 
+Why can just keep the existing cached block and return  when  existingBlock.nextBlockOnDiskSize < cachedItem.nextBlockOnDiskSize ...  actually ,  [~yuzhihong@gmail.com] asked the same question [1] , seem not answered .. 
+
+1. https://issues.apache.org/jira/browse/HBASE-20447?focusedCommentId=16441782&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-16441782
+
+
+
+Sorry the comment wasn't updated, I think I had updated the comment locally, but it must not have been pushed out.
+
+ 
+
+Basically there are 3 cases here:
+
+equality (0) -> these blocks are exactly the same, no issue.
+
+(-1) -> The existing block has nextBlockOnDiskSize set so we will get performance gains by keeping that version.
+
+(1) -> The new block has nextBlockOnDiskSize set so it makes sense to cache the new version
+
+ 
+
+Please let me know if anything is unclear, I can try to clear it up and I can try to improve this logging.
+
+Where is the test failing? AFAIK there shouldn't be much flakiness in this test, but let's fix it if there is.
+
+Thanks for digging in!
+
+Zack:
+You can get test failure from:
+https://builds.apache.org/job/HBASE-Find-Flaky-Tests/lastSuccessfulBuild/artifact/dashboard.html
+
+[~yuzhihong@gmail.com] None of those build links actually load for me...
+
+https://builds.apache.org/job/HBASE-Flaky-Tests/33718/testReport/junit/org.apache.hadoop.hbase.io.hfile.bucket/TestBucketCache/testCacheBlockNextBlockMetadataMissing_0__blockSize_8_192__bucketSizes_null_/
+
+I will attach the above test output.
+
+bq. The existing block has nextBlockOnDiskSize set so we will get performance gains by keeping that version.
+If the existingBlock has nextBlockOnDiskSize set , while cachedItem has nextBlockOnDiskSize(default = -1) unset, the comparison should be positive number ? 
+So there is a typo ? 
+
+{code}
+     if (cb != null) {
+       int comparison = BlockCacheUtil.validateBlockAddition(cb.getBuffer(), buf, cacheKey);
+       if (comparison != 0) {
+-        if (comparison < 0) {
++        if (comparison > 0) {
+           LOG.warn("Cached block contents differ by nextBlockOnDiskSize. Keeping cached block.");
+           return;
+         } else {
+{code}
+
+Check it again,  I would suggest that not depend on the comparison code  which is calculated by comparing the serialized ByteBuffer.. because if bigEndian  or not , the comparsion code will diff , it's a potential risk .. 
+{code}
+//HeapByteBuffer#putInt
+    static void putInt(ByteBuffer bb, int bi, int x, boolean bigEndian) {
+        if (bigEndian)
+            putIntB(bb, bi, x);
+        else
+            putIntL(bb, bi, x);
+    }
+{code}
+
+In BlockCacheUtil#validateBlockAddition, I think we can just compare the block without  nextBlockMetadata first, if not equal, throw the RE, otherwise, just compare the nextBlockOnDiskSize ... the trouble is , it's not easy to access the nextBlockOnDiskSize member in the abstract Cacheable interface ... 
+I think we can just define a new method in Cacheable . 
+
+Add some log for digging,  and I think it's related to here [1]
+When cache a block, the BucketCache put it into ramCache then write to io-engine async.  if the blockWithoutNextBlockMetadata is still in ramCache, then the blockWithNextBlockMetadata will not be put into ramCache ( putIfAbsent ), so the assert failed.  the putIfAbsent was introduced in HBASE-13301, because [~Apache9]  fixed another race bug... 
+
+1. https://github.com/apache/hbase/blob/master/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/bucket/BucketCache.java#L457
+
+
+I think the basic assumption for block cache implementation is that the content for a key will never change. So it will be buggy if the content can be changed. I think we need to find a way to make it immutable, instead of adding more checks in BucketCache.
+
+I'm not familiar with HBASE-20447 but I'm a bit nervous that caching an already cached block. It may introduce memory leak as we will lost the pointer to the old block?
+
+And seems the original code after HBASE-13301 still have possible memory leak, as things could happen like this, we checked backing map, it is not there, and then a Writer thread write into the backing map, and remove it from the ramCache, and then we check ramCache, it is not there either, then we put it into the writer queue and cause recaching an existent block...
+
+bq.   then we check ramCache, it is not there either, then we put it into the writer queue and cause recaching an existent block... 
+Yes , it's true.  it may cache two diff blocks with the same key into io-engine,  but only one BucketEntry in the backingMap .... 
+
+[~openinx] Ah... I see that putIfAbsent now. I wonder why my testing didn't uncover that (I ran it many times. I must have just gotten lucky :) )
+
+ 
+
+[~Apache9] caching an already cached block was present long before HBASE-20447 (see [2]). It seems that to fix your memory leak case we need to add locking on the key. 
+
+ 
+
+Does this need to be a putIfAbsent? What is the harm in replacing the key if it is in the ramCache and hasn't been persisted yet?
+
+ 
+
+ [2] [https://github.com/apache/hbase/blob/master/hbase-server/src/main/java/org/apache/hadoop/hbase/io/hfile/bucket/BucketCache.java#L440]
+
+{quote}
+caching an already cached block was present long before HBASE-20447 (see [2]). It seems that to fix your memory leak case we need to add locking on the key.
+{quote}
+
+The line you provide is to prevent caching the already cached block... But with HBASE-20447 if the nextBlockOnDiskSize is different, we may ignore this check and then caching the already cached block and cause memory leak.
+
+And as I said above, the original code before HBASE-20447 may still have races and cause caching an already cached block. I think we may need to add a check in the WriterThread to prevent this...
+
+The patch will come today.. 
+
+Upload the initial version, run 20 times with the patch under my local, the UT is not flaky any more... 
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 16s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green}  0m  0s{color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  5m 22s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 53s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 18s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  4m 57s{color} | {color:green} branch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 14s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 31s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  5m 21s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 57s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  1m 57s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 16s{color} | {color:green} hbase-server: The patch generated 0 new + 81 unchanged - 1 fixed = 81 total (was 82) {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  4m 59s{color} | {color:green} patch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green} 10m 56s{color} | {color:green} Patch does not cause any errors with Hadoop 2.7.4 or 3.0.0. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 16s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 33s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} unit {color} | {color:red} 19m 59s{color} | {color:red} hbase-server in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 11s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 64m 30s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hbase.io.hfile.TestLruBlockCache |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hbase:b002b0b |
+| JIRA Issue | HBASE-20789 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12929540/HBASE-20789.v1.patch |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  shadedjars  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux 482a0e2b74de 3.13.0-139-generic #188-Ubuntu SMP Tue Jan 9 14:43:09 UTC 2018 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build/component/dev-support/hbase-personality.sh |
+| git revision | master / 65d84df005 |
+| maven | version: Apache Maven 3.5.4 (1edded0938998edf8bf061f1ceb3cfdeccf443fe; 2018-06-17T18:33:14Z) |
+| Default Java | 1.8.0_171 |
+| findbugs | v3.1.0-RC3 |
+| unit | https://builds.apache.org/job/PreCommit-HBASE-Build/13434/artifact/patchprocess/patch-unit-hbase-server.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/13434/testReport/ |
+| Max. process+thread count | 643 (vs. ulimit of 10000) |
+| modules | C: hbase-server U: hbase-server |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/13434/console |
+| Powered by | Apache Yetus 0.7.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+| (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 17s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green}  0m  0s{color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  4m 59s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 51s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 12s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  4m 31s{color} | {color:green} branch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 21s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 33s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  4m 59s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 54s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  1m 54s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 16s{color} | {color:green} hbase-server: The patch generated 0 new + 94 unchanged - 1 fixed = 94 total (was 95) {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  4m 37s{color} | {color:green} patch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green} 10m 29s{color} | {color:green} Patch does not cause any errors with Hadoop 2.7.4 or 3.0.0. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 18s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 31s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}116m 44s{color} | {color:green} hbase-server in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 20s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}159m 20s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hbase:b002b0b |
+| JIRA Issue | HBASE-20789 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12929562/HBASE-20789.v2.patch |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  shadedjars  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux 9af0c2888a6d 3.13.0-139-generic #188-Ubuntu SMP Tue Jan 9 14:43:09 UTC 2018 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build/component/dev-support/hbase-personality.sh |
+| git revision | master / 6198e1fc7d |
+| maven | version: Apache Maven 3.5.4 (1edded0938998edf8bf061f1ceb3cfdeccf443fe; 2018-06-17T18:33:14Z) |
+| Default Java | 1.8.0_171 |
+| findbugs | v3.1.0-RC3 |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/13435/testReport/ |
+| Max. process+thread count | 4684 (vs. ulimit of 10000) |
+| modules | C: hbase-server U: hbase-server |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/13435/console |
+| Powered by | Apache Yetus 0.7.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+[~openinx]
+{quote}bq. If the existingBlock has nextBlockOnDiskSize set , while cachedItem has nextBlockOnDiskSize(default = -1) unset, the comparison should be positive number ? 
+ So there is a typo ?
+{quote}
+No, cachedItem will be smaller in that case and so the comparison will be -1. I think this is why you were having difficulty getting the tests to pass. Please flip the '>' back to a '<'
+
+| (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 18s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green}  0m  0s{color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  5m 11s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 45s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 12s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  4m 37s{color} | {color:green} branch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 15s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 34s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  4m 55s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 42s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  1m 42s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 13s{color} | {color:green} hbase-server: The patch generated 0 new + 94 unchanged - 1 fixed = 94 total (was 95) {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  4m 32s{color} | {color:green} patch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green} 10m 20s{color} | {color:green} Patch does not cause any errors with Hadoop 2.7.4 or 3.0.0. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 40s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 31s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}125m  1s{color} | {color:green} hbase-server in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 22s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}167m 35s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hbase:b002b0b |
+| JIRA Issue | HBASE-20789 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12929665/HBASE-20789.v3.patch |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  shadedjars  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux 42a12ab790b2 3.13.0-139-generic #188-Ubuntu SMP Tue Jan 9 14:43:09 UTC 2018 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build@2/component/dev-support/hbase-personality.sh |
+| git revision | master / 78e7dd6537 |
+| maven | version: Apache Maven 3.5.4 (1edded0938998edf8bf061f1ceb3cfdeccf443fe; 2018-06-17T18:33:14Z) |
+| Default Java | 1.8.0_171 |
+| findbugs | v3.1.0-RC3 |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/13448/testReport/ |
+| Max. process+thread count | 4904 (vs. ulimit of 10000) |
+| modules | C: hbase-server U: hbase-server |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/13448/console |
+| Powered by | Apache Yetus 0.7.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+[~zyork], [~Apache9] any other concern ?  Thanks.  
+
+Left some comments on RB.
+
+As [~Apache9] comment on RB,  there's problem here  in patch.v3:
+
+{code}
+443	    if (replaceExistingCacheBlock) {
+444	      ramCache.put(cacheKey, re);
+445	    } else if (ramCache.putIfAbsent(cacheKey, re) != null) {
+446	      return;
+447	    }
+{code}
+
+Can not just replace the cacheKey with new RAMQueueEntry, because  the heapSize of bucket cache need to update if removing entry from ramCache.  the WriterThread  write to io-engine firstly, then sync, then remove the RAMQueueEntry from ramCache.  It's possible that the removed entry is not the right one. 
+
+{code}
+t1.   thread0 try to cache block0 with key0 (BucketCache#cacheBlock)
+t2.   replace it into ramCache; 
+t3.   writer thread write to io-engine;
+ // t4.    another thread1 try to cache block1 with same key0; (BucketCache#cacheBlock)
+ // t5.    replace block0 with block1  in ramCache 
+t5.   remove the entry (block1) with key0 from ramCache; 
+{code}
+
+Finally,the thread0 will remove the incorrect block1... the heap size is wrong also.. 
+
+So for safety, we still keep the putIfAbsent() to ensure that only one thread will remove entry from ramCache...  the flaky ut has been fixed by waiting until the cache flushed to io-engine...  
+
+| (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 12s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green}  0m  0s{color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  4m 20s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 37s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m  1s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  3m 58s{color} | {color:green} branch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 57s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 26s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  4m 24s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 35s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  1m 35s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m  3s{color} | {color:green} hbase-server: The patch generated 0 new + 94 unchanged - 1 fixed = 94 total (was 95) {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  4m  1s{color} | {color:green} patch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green}  9m  7s{color} | {color:green} Patch does not cause any errors with Hadoop 2.7.4 or 3.0.0. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  1m 57s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 27s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}115m 50s{color} | {color:green} hbase-server in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 17s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}152m 31s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hbase:b002b0b |
+| JIRA Issue | HBASE-20789 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12929935/HBASE-20789.v4.patch |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  shadedjars  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux 611aaeda2ad3 4.4.0-43-generic #63-Ubuntu SMP Wed Oct 12 13:48:03 UTC 2016 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build/component/dev-support/hbase-personality.sh |
+| git revision | master / 7c5188f39e |
+| maven | version: Apache Maven 3.5.4 (1edded0938998edf8bf061f1ceb3cfdeccf443fe; 2018-06-17T18:33:14Z) |
+| Default Java | 1.8.0_171 |
+| findbugs | v3.1.0-RC3 |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/13469/testReport/ |
+| Max. process+thread count | 5330 (vs. ulimit of 10000) |
+| modules | C: hbase-server U: hbase-server |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/13469/console |
+| Powered by | Apache Yetus 0.7.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Pushed to branch-2 & branch-2.1 & master branch.  branch-2.0 has no HBASE-20447, but actually  i think need those fix, will upload a patch for branch-2.0.
+Uploaded patch for branch-1 (can also apply to branch-1.4), if hadoop QA says OK, I'll commit to branch-1 & branch-1.4 
+
+| (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 31s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green}  0m  0s{color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} master Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  5m 15s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 52s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 11s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  4m 37s{color} | {color:green} branch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 10s{color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 32s{color} | {color:green} master passed {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  5m  1s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  1m 50s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  1m 50s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 14s{color} | {color:green} hbase-server: The patch generated 0 new + 94 unchanged - 1 fixed = 94 total (was 95) {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  4m 47s{color} | {color:green} patch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green} 11m  3s{color} | {color:green} Patch does not cause any errors with Hadoop 2.7.4 or 3.0.0. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green}  2m 28s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 30s{color} | {color:green} the patch passed {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:green}+1{color} | {color:green} unit {color} | {color:green}157m 28s{color} | {color:green} hbase-server in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 25s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}201m 27s{color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hbase:b002b0b |
+| JIRA Issue | HBASE-20789 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12930076/HBASE-20789.v5.patch |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  shadedjars  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux cf3c5fb496fd 3.13.0-139-generic #188-Ubuntu SMP Tue Jan 9 14:43:09 UTC 2018 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build/component/dev-support/hbase-personality.sh |
+| git revision | master / 380350d5bc |
+| maven | version: Apache Maven 3.5.4 (1edded0938998edf8bf061f1ceb3cfdeccf443fe; 2018-06-17T18:33:14Z) |
+| Default Java | 1.8.0_171 |
+| findbugs | v3.1.0-RC3 |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/13481/testReport/ |
+| Max. process+thread count | 4672 (vs. ulimit of 10000) |
+| modules | C: hbase-server U: hbase-server |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/13481/console |
+| Powered by | Apache Yetus 0.7.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+[~stack],  I think this issue and HBASE-20447 are critical bug fix,  and should go into branch-2.0,  How do you think ? 
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue}  0m 26s{color} | {color:blue} Docker mode activated. {color} |
+|| || || || {color:brown} Prechecks {color} ||
+| {color:blue}0{color} | {color:blue} findbugs {color} | {color:blue}  0m  0s{color} | {color:blue} Findbugs executables are not available. {color} |
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green}  0m  0s{color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green}  0m  0s{color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green}  0m  0s{color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+|| || || || {color:brown} branch-1 Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  7m 39s{color} | {color:green} branch-1 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 30s{color} | {color:green} branch-1 passed with JDK v1.8.0_172 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 33s{color} | {color:green} branch-1 passed with JDK v1.7.0_181 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green}  1m 15s{color} | {color:green} branch-1 passed {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  2m 26s{color} | {color:green} branch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 31s{color} | {color:green} branch-1 passed with JDK v1.8.0_172 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 33s{color} | {color:green} branch-1 passed with JDK v1.7.0_181 {color} |
+|| || || || {color:brown} Patch Compile Tests {color} ||
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green}  1m 26s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 31s{color} | {color:green} the patch passed with JDK v1.8.0_172 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 31s{color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green}  0m 33s{color} | {color:green} the patch passed with JDK v1.7.0_181 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green}  0m 33s{color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} checkstyle {color} | {color:red}  1m 10s{color} | {color:red} hbase-server: The patch generated 2 new + 117 unchanged - 1 fixed = 119 total (was 118) {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green}  0m  0s{color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} shadedjars {color} | {color:green}  2m 17s{color} | {color:green} patch has no errors when building our shaded downstream artifacts. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green}  1m 26s{color} | {color:green} Patch does not cause any errors with Hadoop 2.7.4. {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 24s{color} | {color:green} the patch passed with JDK v1.8.0_172 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green}  0m 34s{color} | {color:green} the patch passed with JDK v1.7.0_181 {color} |
+|| || || || {color:brown} Other Tests {color} ||
+| {color:red}-1{color} | {color:red} unit {color} | {color:red}127m 12s{color} | {color:red} hbase-server in the patch failed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green}  0m 25s{color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black}150m 22s{color} | {color:black} {color} |
+\\
+\\
+|| Reason || Tests ||
+| Failed junit tests | hadoop.hbase.mapreduce.TestSecureLoadIncrementalHFiles |
+|   | hadoop.hbase.mapreduce.TestLoadIncrementalHFiles |
+|   | hadoop.hbase.mapreduce.TestLoadIncrementalHFilesUseSecurityEndPoint |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=17.05.0-ce Server=17.05.0-ce Image:yetus/hbase:1f3957d |
+| JIRA Issue | HBASE-20789 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12930108/HBASE-20789.branch-1.v1.patch |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  shadedjars  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux 2ce039fd2472 4.4.0-116-generic #140-Ubuntu SMP Mon Feb 12 21:23:04 UTC 2018 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build/component/dev-support/hbase-personality.sh |
+| git revision | branch-1 / f94ad9d |
+| maven | version: Apache Maven 3.0.5 |
+| Default Java | 1.7.0_181 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-openjdk-amd64:1.8.0_172 /usr/lib/jvm/java-7-openjdk-amd64:1.7.0_181 |
+| checkstyle | https://builds.apache.org/job/PreCommit-HBASE-Build/13486/artifact/patchprocess/diff-checkstyle-hbase-server.txt |
+| unit | https://builds.apache.org/job/PreCommit-HBASE-Build/13486/artifact/patchprocess/patch-unit-hbase-server.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/13486/testReport/ |
+| Max. process+thread count | 3704 (vs. ulimit of 10000) |
+| modules | C: hbase-server U: hbase-server |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/13486/console |
+| Powered by | Apache Yetus 0.7.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Results for branch branch-2
+	[build #939 on builds.a.o|https://builds.apache.org/job/HBase%20Nightly/job/branch-2/939/]: (x) *{color:red}-1 overall{color}*
+----
+details (if available):
+
+(/) {color:green}+1 general checks{color}
+-- For more information [see general report|https://builds.apache.org/job/HBase%20Nightly/job/branch-2/939//General_Nightly_Build_Report/]
+
+
+
+
+(x) {color:red}-1 jdk8 hadoop2 checks{color}
+-- For more information [see jdk8 (hadoop2) report|https://builds.apache.org/job/HBase%20Nightly/job/branch-2/939//JDK8_Nightly_Build_Report_(Hadoop2)/]
+
+
+(/) {color:green}+1 jdk8 hadoop3 checks{color}
+-- For more information [see jdk8 (hadoop3) report|https://builds.apache.org/job/HBase%20Nightly/job/branch-2/939//JDK8_Nightly_Build_Report_(Hadoop3)/]
+
+
+(/) {color:green}+1 source release artifact{color}
+-- See build output for details.
+
+
+(/) {color:green}+1 client integration test{color}
+
+
+Results for branch branch-2.1
+	[build #18 on builds.a.o|https://builds.apache.org/job/HBase%20Nightly/job/branch-2.1/18/]: (x) *{color:red}-1 overall{color}*
+----
+details (if available):
+
+(/) {color:green}+1 general checks{color}
+-- For more information [see general report|https://builds.apache.org/job/HBase%20Nightly/job/branch-2.1/18//General_Nightly_Build_Report/]
+
+
+
+
+(/) {color:green}+1 jdk8 hadoop2 checks{color}
+-- For more information [see jdk8 (hadoop2) report|https://builds.apache.org/job/HBase%20Nightly/job/branch-2.1/18//JDK8_Nightly_Build_Report_(Hadoop2)/]
+
+
+(x) {color:red}-1 jdk8 hadoop3 checks{color}
+-- For more information [see jdk8 (hadoop3) report|https://builds.apache.org/job/HBase%20Nightly/job/branch-2.1/18//JDK8_Nightly_Build_Report_(Hadoop3)/]
+
+
+(/) {color:green}+1 source release artifact{color}
+-- See build output for details.
+
+
+(/) {color:green}+1 client integration test{color}
+
+
+Please file a new issue about the branch-2.0 and branch-1.x backport? We can not release 2.1.0 if there are still open issues for it...
+
+Hadoop QA for branch-1.x seems OK (The failed UT are timeout, unrelated), Fixed the checkstyle and pushed to branch-1 & branch-1.4 .
+Patches for branch-2 can work with branch-2.0 too, so just pushed two patches to branch-2.0. 
+
+Thanks [~Apache9], [~zyork], [~yuzhihong@gmail.com]  for reviewing. 
+
+Results for branch branch-2.0
+	[build #508 on builds.a.o|https://builds.apache.org/job/HBase%20Nightly/job/branch-2.0/508/]: (x) *{color:red}-1 overall{color}*
+----
+details (if available):
+
+(/) {color:green}+1 general checks{color}
+-- For more information [see general report|https://builds.apache.org/job/HBase%20Nightly/job/branch-2.0/508//General_Nightly_Build_Report/]
+
+
+
+
+(x) {color:red}-1 jdk8 hadoop2 checks{color}
+-- For more information [see jdk8 (hadoop2) report|https://builds.apache.org/job/HBase%20Nightly/job/branch-2.0/508//JDK8_Nightly_Build_Report_(Hadoop2)/]
+
+
+(x) {color:red}-1 jdk8 hadoop3 checks{color}
+-- For more information [see jdk8 (hadoop3) report|https://builds.apache.org/job/HBase%20Nightly/job/branch-2.0/508//JDK8_Nightly_Build_Report_(Hadoop3)/]
+
+
+(/) {color:green}+1 source release artifact{color}
+-- See build output for details.
+
+
+Results for branch branch-1
+	[build #370 on builds.a.o|https://builds.apache.org/job/HBase%20Nightly/job/branch-1/370/]: (x) *{color:red}-1 overall{color}*
+----
+details (if available):
+
+(x) {color:red}-1 general checks{color}
+-- For more information [see general report|https://builds.apache.org/job/HBase%20Nightly/job/branch-1/370//General_Nightly_Build_Report/]
+
+
+(x) {color:red}-1 jdk7 checks{color}
+-- For more information [see jdk7 report|https://builds.apache.org/job/HBase%20Nightly/job/branch-1/370//JDK7_Nightly_Build_Report/]
+
+
+(x) {color:red}-1 jdk8 hadoop2 checks{color}
+-- For more information [see jdk8 (hadoop2) report|https://builds.apache.org/job/HBase%20Nightly/job/branch-1/370//JDK8_Nightly_Build_Report_(Hadoop2)/]
+
+
+
+
+(x) {color:red}-1 source release artifact{color}
+-- See build output for details.
+
+
+Results for branch master
+	[build #386 on builds.a.o|https://builds.apache.org/job/HBase%20Nightly/job/master/386/]: (x) *{color:red}-1 overall{color}*
+----
+details (if available):
+
+(/) {color:green}+1 general checks{color}
+-- For more information [see general report|https://builds.apache.org/job/HBase%20Nightly/job/master/386//General_Nightly_Build_Report/]
+
+
+
+
+(/) {color:green}+1 jdk8 hadoop2 checks{color}
+-- For more information [see jdk8 (hadoop2) report|https://builds.apache.org/job/HBase%20Nightly/job/master/386//JDK8_Nightly_Build_Report_(Hadoop2)/]
+
+
+(x) {color:red}-1 jdk8 hadoop3 checks{color}
+-- For more information [see jdk8 (hadoop3) report|https://builds.apache.org/job/HBase%20Nightly/job/master/386//JDK8_Nightly_Build_Report_(Hadoop3)/]
+
+
+(/) {color:green}+1 source release artifact{color}
+-- See build output for details.
+
+
+(/) {color:green}+1 client integration test{color}
+
+
+Results for branch branch-1.4
+	[build #375 on builds.a.o|https://builds.apache.org/job/HBase%20Nightly/job/branch-1.4/375/]: (x) *{color:red}-1 overall{color}*
+----
+details (if available):
+
+(x) {color:red}-1 general checks{color}
+-- For more information [see general report|https://builds.apache.org/job/HBase%20Nightly/job/branch-1.4/375//General_Nightly_Build_Report/]
+
+
+(x) {color:red}-1 jdk7 checks{color}
+-- For more information [see jdk7 report|https://builds.apache.org/job/HBase%20Nightly/job/branch-1.4/375//JDK7_Nightly_Build_Report/]
+
+
+(x) {color:red}-1 jdk8 hadoop2 checks{color}
+-- For more information [see jdk8 (hadoop2) report|https://builds.apache.org/job/HBase%20Nightly/job/branch-1.4/375//JDK8_Nightly_Build_Report_(Hadoop2)/]
+
+
+
+
+(x) {color:red}-1 source release artifact{color}
+-- See build output for details.
+
+

@@ -1,0 +1,257 @@
+[~marcuse] [~djoshi] it looks like you are pretty experienced with compaction code, do you see any issue with first proposal? 
+
+If reading this correctly, I wonder if this should also be a issue with org.apache.cassandra.io.sstable.format.SSTableReader#cloneWithNewSummarySamplingLevel which is called by org.apache.cassandra.io.sstable.IndexSummaryRedistribution; this modifies the summary file in place.
+
+[~dcapwell] you are right. {{IndexSummary}} can definitely cause trouble for entire-sstable-streaming.. Then the only option we have is to apply first approach to {{IndexSummary}} because we can't make {{IndexSummary}} fixed-length encoding..
+
+Or we can consider a lock approach
+
+One way could be to mark the sstable compacting while we stream the index summary and sstable metadata components
+
+bq. One way could be to mark the sstable compacting while we stream the index summary and sstable metadata components
+
+if the sstables are already in compacting state, does it mean entire-sstable-streaming will be blocked until compaction is finished? 
+
+It'd be nice to minize the lock scope, so "critical section" only include "metadata mutation" (rewrite index summary and stats metadata) which should be fast.
+
+I took a quick look and have a few comments
+
+* https://github.com/apache/cassandra/pull/642/files#diff-de503ddc819368b078a86f6d9e3921aeR211-R228. isn't the write async; we are just storing on a buffer to be written later?  Looking at org.apache.cassandra.net.AsyncStreamingOutputPlus#writeFileToChannelZeroCopy it calls channel.writeAndFlush but doesn't look at the future, so the write is async.  
+* have you done any longevity testing of this?  My fear is that compaction will get blocked while streaming is running which could cause slowness or stability issues.
+
+bq. https://github.com/apache/cassandra/pull/642/files#diff-de503ddc819368b078a86f6d9e3921aeR211-R228. isn't the write async; we are just storing on a buffer to be written later? Looking at org.apache.cassandra.net.AsyncStreamingOutputPlus#writeFileToChannelZeroCopy it calls channel.writeAndFlush but doesn't look at the future, so the write is async.
+
+{{writeFileToChannelZeroCopy}} is async, but if I remember correctly about unix file system: once a file is opened, reader won't be affected by file deletion or rewrite. So when the synchronized block completes, all component file-channels are already opened and in-sync with {{ComponentManifest}}, even if they are not flushed from netty outbound buffer to kernel.
+
+I agree with you that the atomicity should be made more obvious rather than relying on underlying FS. I will find a cleaner approach.
+
+bq. have you done any longevity testing of this? My fear is that compaction will get blocked while streaming is running which could cause slowness or stability issues.
+
+Not yet, ticket is still "in-progress".  It'd be nice to reuse the tests did in CASSANDRA-14556..
+
+bq. Make STATS mutation as a proper compaction to create hard link on the compacting sstable components with a new descriptor, except STATS files which will be copied entirely. Then mutation will be applied on the new STATS file. At the end, old sstable will be released. This ensures all sstable components are immutable and shouldn't make these special compaction tasks slower.
+
+I had a [prototype|https://github.com/jasonstack/cassandra/blob/cb9bdaf037fd550b84fe5b7da89f9c56dc729c35/src/java/org/apache/cassandra/db/compaction/StatsMutationCompaction.java#L72] using the hardlink approach which should avoid blocking between compaction and streaming. The only thing I don't like is redistributing index summary every hour will explode sstable generation.. what do you guys think?
+
+bq. writeFileToChannelZeroCopy is async, but if I remember correctly about unix file system: once a file is opened, reader won't be affected by file deletion or rewrite. So when the synchronized block completes, all component file-channels are already opened and in-sync with ComponentManifest, even if they are not flushed from netty outbound buffer to kernel.
+
+Yep, checked and see that each region in netty holds reference to the channel so you are right, will not be impacted by delete.
+
+bq. The only thing I don't like is redistributing index summary every hour will explode sstable generation..
+
+That could have negatives for third party tools like backups since they would look like new sstables; versioning the Statistics.db file would be nice but adds its own complexity as well.
+
+
+Looking closer at org.apache.cassandra.db.streaming.CassandraOutgoingFile#write, why not take advantage of the fact a FD will be immune to the swap and just create the FD at the start of the method?  This would give you the ability to write the header and the body without worrying about locking.
+
+{quote}Looking closer at org.apache.cassandra.db.streaming.CassandraOutgoingFile#write, why not take advantage of the fact a FD will be immune to the swap and just create the FD at the start of the method? This would give you the ability to write the header and the body without worrying about locking.
+{quote}
+ 
+
+We can acquire the FD inside the lock to avoid accessing a partially written file, then use the FD during streaming.
+
+bq. avoid accessing a partially written file
+
+Don't we write to a tmp file then do a atomic move and replace?  So would we need to worry about a partial file?
+
+{quote}Don't we write to a tmp file then do a atomic move and replace? So would we need to worry about a partial file?
+{quote}
+For index summary, it deletes first. (I believe the reason for deletion is that index summary file can be large, up to 2GB. It'd be nice to release the old file earlier if it's not used) Of course, we can change it to use temp file..
+
+bq. if the sstables are already in compacting state, does it mean entire-sstable-streaming will be blocked until compaction is finished?
+
+[~jasonstack] What if we just abort the ongoing compaction involving the SSTable we want to stream? (Then we can mark it ourselves for the period including manifest generation, stats streaming, and index summary streaming?)
+
+The danger, I guess, is aborting compactions that are almost done. Two ways around that I can see. One is to try to prioritize ZCS for non-compacting SSTables first. The other is just to fall back to legacy streaming if the SSTable is already compacting. Or we can do both of those things.
+
+[~jasonstack] I thought a bit more about our earlier chat (and had a quick chat w/ [~bdeggleston]), and it seems like the simplest thing might be handling the stats and index summary in slightly different ways.
+
+The STATS component is small. We could just buffer it up, use that buffered size in the manifest, and stream that buffer. It special-cases this component, but we more or less avoid having to reason about the risk of blocking compactions, a repair completing, etc.
+
+For the SUMMARY, we take advantage of the fact that possibly/infrequently delaying the redistribution task isn't a big suboptimal outcome. We have a simple lock that protects it (on {{SSTableRader}}, similar to what you've already mentioned or as a threadsafe set of readers in a central location), i.e. streaming acquires it when the manifest is created and releases it when the index summary completes streaming (where that "completion" happens in the non-SSL case isn't 100% clear to me)...and index redistribution acquires it _before_ it creates a transaction in {{getRestributionTransactions()}}, then releases it when the redistribution is complete (so we never have to block a compaction). Streaming might have to deal with a short delay if a redistribution is running, but a.) that doesn't happen that often and b.) the summary (I think) is usually not very large. ({{getRestributionTransactions()}} can ignore streaming SSTables just like it ignores compacting ones.
+
+[~maedhroz] thanks for the suggestions.
+
+bq. (where that "completion" happens in the non-SSL case isn't 100% clear to me)
+
+The netty streaming itself is async, but {{CassandraEntireSSTableStreamWriter#write}} is actually blocking because {{AsyncStreamingOutputPlus#flush}} will wait for data being written to network. We don't need to worry about it.
+
+I ended up with sstable read/write lock approach:
+* During entire-sstable streaming, {{CassandraOutgoingFile}} will execute the streaming code within the sstable read-lock. So multiple streamings on the same sstable can start at the same time. I think it's fine to block stats-mutation/index-summary redistribution until streaming completion.
+* For stats mutation and index summary redistribution, they will perform the component mutation in the sstable write-lock.
+* Didn't reuse the synchronization on `tidy.global` because they are used in normal compaction tasks, so I added a separate read-write lock.
+
+bq. simplest thing might be handling the stats an index summary in slightly different ways.
+
+I feel handling stats differently may make it harder to maintain or to reason.
+
+bq. During entire-sstable streaming, CassandraOutgoingFile will execute the streaming code within the sstable read-lock. So multiple streamings on the same sstable can start at the same time. I think it's fine to block stats-mutation/index-summary redistribution until streaming completion.
+
+I'm still looking at the patch itself, but the thing I'm most curious about at a design level is whether holding the SSTable read lock until we write the entirety of the SSTable to the network is safe in the face of a concurrent incremental repair. In other words, how likely is it that an incremental repair already in flight would have to wait a significant period of time to complete with an entire SSTable in the middle of streaming?
+
+We've already talked about the possibility of just buffering the stats component, but if we think that makes things too hard to reason around, what if we instead broke the streaming into mutable vs. immutable components and wrote the mutable components first (then released the read lock)? That might at least reduce the window, and repair couldn't block while the largest components (like the data file, and perhaps index components in the future) are streaming.
+
+WDYT?
+
+CC [~bdeggleston]
+
+I don't think introducing a lock here is going to work. The incremental repair concern is an issue, but I'm more concerned about this freezing up compaction. If an outgoing stream is taking a really long time for some reason, any compaction task trying to mutate the level of that sstable will be blocking a compaction thread waiting to acquire that lock. There typically aren't a lot of compaction executors (2-8 if auto configured, probably no more than 4 in most cases), so a few of these would noticably constrain compaction throughput, or stop it entirely.
+
+Updated the patch to load stats component into memory, so that entire-sstable streaming will not block LCS and incremental repair..
+
+ 
+
+If we want to reduce the blocking time for index summary redistribution, we can consider:
+ * writing new index summary to a temp file and replacing the old file atomically; at the beginning of streaming, open all file channel instances which still point to the old files (this is file system dependent).
+ * writing new index summary to a temp file and replacing the old file atomically; on the streaming side, use hard link to make sure it streams the same file.
+
+WDYT?
+
+bq. writing new index summary to a temp file and replacing the old file atomically; on the streaming side, use hard link to make sure it streams the same file
+
+I like this a lot. It could also be used in the stats component case, which at least consolidates our approach to this kind of problem (in general). The {{ComponentManifest}} becomes more of a {{ComponentStreamer}}, given we'd delegate the responsibility for putting bytes on the stream to it.
+
+[~jasonstack] I left a few more minor comments around the PR, but I'm +1 overall at this point. I don't think there's a good alternative to the current approach unless we start trading away disk space to write the new index summary to a temp file and atomic rename (which doesn't even work on all supported operating systems).
+
+[~maedhroz] thanks for the feedback. I have squashed and pushed.
+
+ 
+There are two types of concurrent component mutations.
+* index summary redistribution compaction - deletes index summary and write a new one
+* pending repair manager's RepairFinishedCompactionTask - atomic replace old stats with new stats file (delete and rewrite on Windows).
+
+In order to avoid streaming mismatched ComponentManifest and files, now manifest will create hard links
+on the mutatable components and stream the hard-linked files instead of the original files which may have been modified.
+
+To prevent creating hard links on partially written index summary or stats file in Windows OS, a read lock is
+needed to create hard links and write lock is needed for saving index summary and stats metadata.
+
+With this approach, only saving index summary may block entire-sstable streaming but index summary redistribution is not very frequent. We can get rid of the blocking by writing index summary to a temp file and replace the old summary atomically.
+(Note: atomic replace doesn't work on Windows, so we have to delete first)
+
+
+This is pretty close, I just have a few things to address.
+
+1) Orphaned hard links need to be cleaned up on startup.
+
+2) Using the streaming session id for the hard link name, instead of a time uuid, would make debugging some issues easier.
+
+3) ComponentManifest: the changes to this class feel a bit awkward to me. I think it would be cleaner if hard link creation and management was handled by a separate class. It should also be autocloseable so we're not deleting hard links in a finally block.
+
+4) Concurrency: This is much better wrt concurrency, but I think there's still some room for improvement. The main thing I'm concerned about is the nested lock acquisition in {{cloneWithNewSummarySamplingLevel}}. This makes it easier to introduce deadlocks in the future, and we should avoid doing this if we can. In this case, if you could guarantee that no more than 1 index resample can happen at once for a given sstable, the only thing you'd need to synchronize in `cloneWithNewSummarySamplingLevel` is `saveSummary`. If you did that, you could just synchronize hard link creation on `tidy.global`, instead of introducing a new lock.
+
+bq. 1) Orphaned hard links need to be cleaned up on startup.
+bq. 2) Using the streaming session id for the hard link name, instead of a time uuid, would make debugging some issues easier.
+
++1
+
+bq. 3) ComponentManifest: the changes to this class feel a bit awkward to me. I think it would be cleaner if hard link creation and management was handled by a separate class. It should also be autocloseable so we're not deleting hard links in a finally block.
+
+Agree (and commented to this effect) that we should make whatever that class is auto-closable. I'm just not sure what level we want to do this at. The creation of what we're now calling {{ComponentManifest}} might not be simple to break up. We could leave {{ComponentManifest}} the way it was before this patch and have a separate class, let's call it {{ComponentContext}}, that embeds it. The {{ComponentContext}} would only be used on the write side, where it would mostly be responsible for what the manifest doesn't do: provide a channel and file size. There could even be an interface, let's call it {{StreamingComponent}}, which just provides a size and channel, and the {{ComponentContext}} could be an {{Iterable<StreamingComponent>}}. (It seems like this would fit the usage in {{CassandraEntireSSTableStreamWriter}}.) Either way, the receiving side of the streaming logic could continue to deal with just a clean {{ComponentManifest}}, free of things like the unused {{hardLinks}} (which doesn't need to be transient?).
+
+bq. if you could guarantee that no more than 1 index resample can happen at once for a given sstable, the only thing you'd need to synchronize in `cloneWithNewSummarySamplingLevel` is `saveSummary`. If you did that, you could just synchronize hard link creation on `tidy.global`, instead of introducing a new lock.
+
+I think we can guarantee that only one index summary resampling is going on at a time for an SSTable, but not necessarily on the same thread from run to run. What non-final state does the {{synchronized (tidy.global)}} block in {{recloneWithNewSummarySamplingLevel()}} protect? It's probably not the metadata, since that's already a {{TableMetadataRef}} (and effectively volatile). That leaves {{indexSummary}}, which perhaps we cold make {{volatile}}, and all the state used in {{cloneAndReplace()}}...but we could just extend the {{synchronized (tidy.global)}} block to include the latter. Nothing expensive happens inside {{cloneAndReplace()}}, AFAICT.
+
+I tried this locally, just with a quick and dirty substitution in the current wrapper methods for the read and write lock, and it does seem to pass the newly added tests (and fail with locking removed completely).
+
+CC [~jasonstack]
+
+bq. 1) Orphaned hard links need to be cleaned up on startup.
+
+If the hard links end with `.tmp`, they will be cleaned up on startup by {{StartupChecks#checkSystemKeyspaceState}}
+
+bq. 2) Using the streaming session id for the hard link name, instead of a time uuid, would make debugging some issues easier.
+
+I think the same streaming plan id is used by different peers. It may fail to create hardlink when streaming the same sstables to different peers in the same stream plan. 
+
+bq. We could leave ComponentManifest the way it was before this patch and have a separate class, let's call it ComponentContext, that embeds it.
+
++1
+
+bq. In this case, if you could guarantee that no more than 1 index resample can happen at once for a given sstable, the only thing you'd need to synchronize in `cloneWithNewSummarySamplingLevel` is `saveSummary`. If you did that, you could just synchronize hard link creation on `tidy.global`, instead of introducing a new lock.
+
+Agreed with caleb, no more than 1 index resample can happen concurrently for a given sstable as sstable is marked as compacting before resampling.
+
+bq. That leaves indexSummary, which perhaps we cold make volatile, and all the state used in cloneAndReplace()...but we could just extend the synchronized (tidy.global) block to include the latter. Nothing expensive happens inside cloneAndReplace(), AFAICT.
+
+good idea
+
+bq. synchronized (tidy.global)
+
+The old approach was to synchronize entire streaming phase, so I didn't use "synchronized (tidy.global)" which may block concurrent compactions. 
+
+But now only hard-link creation is synchronized, using "synchronized (tidy.global)" is better than introducing a new lock.
+
+
+bq. they will be cleaned up on startup by StartupChecks#checkSystemKeyspaceState
+
+Is it there or in {{CassandraDaemon#setup()}}? Either way, it looks like {{ColumnFamilyStoreTest}} covers the scrub logic already.
+
+[~jasonstack] [~benedict] I [made a pass|https://github.com/maedhroz/cassandra/tree/CASSANDRA-15861-final-summary] at a builder-based approach (to making more of {{SSTableReader}}'s fields {{final}}) based on the [current branch/PR|https://github.com/apache/cassandra/pull/642#discussion_r470073171]. There are some loose ends to tie up, but it does at least make progress toward consolidating the logic that builds the components necessary for reader creation. (It also seems to pass the tests in this PR and things like {{FailingRepairTest}} and {{SSTableReaderTest}} without trouble.)
+
+updated the patch based on caleb's builder approach, now dfile/ifile/bf/indexSummary are all final.
+
+[~jasonstack] it looks like the original commits and some of the review fixes have been squashed together. Can you un-squash them? Squashing like that makes it much more difficult to review incrementally.
+
+[~bdeggleston] I have restored previous commits, sorry for the trouble
+
+No problem [~jasonstack], this LGTM. I've made 1 small change renaming the 2 {{SSTableReader#mutateAndReloadStats}} implementations to make what you're mutating more obvious, and pushed them [here|https://github.com/bdeggleston/cassandra/tree/CASSANDRA-15861-test]. Assuming a green test run and no objections about the rename, I'll commit once I get the second committer +1
+
+This clashes with https://issues.apache.org/jira/browse/CASSANDRA-15406 I am working on for a very long time and I havent been able to manage to merge it. There seems to be a clash with some functionality related to how size of files is computed because it is broken and it reports wrong numbers in netstats.
+
+Could somebody verify that this patch is compatible with 15406 and it does not break things? It is pretty frustrating to continuously rewrite already fully prepared and tested code.
+
+The problem with the original code is nicely summarized in this comment downwards and input from Benjamin Lerer https://issues.apache.org/jira/browse/CASSANDRA-15406?focusedCommentId=17181389&page=com.atlassian.jira.plugin.system.issuetabpanels%3Acomment-tabpanel#comment-17181389
+
+[~stefan.miklosovic] I took a brief look at the patch in 15406, I think there are just minor superficial conflicts, no compatibility issue.
+
+Could you elaborate on what needs to be changed specifically in mine code so it will be fully ok again? Are you already sure that your changes are computing sizes in both compressed and uncompressed paths right? (with and without entire sstable streaming)
+
+bq. Could you elaborate on what needs to be changed specifically in mine code so it will be fully ok again?
+
+hmm.. some moved codes in {{CassandraOutgoingFiles}}. What are you worried about?
+
+bq. Are you already sure that your changes are computing sizes in both compressed and uncompressed paths right?
+
+this patch is for zero-copy-streaming to avoid partial written files, not about how size is calculated.
+
+The change in {{CassandraStreamHeder}} around compressed size is to restore original behavior (reduce GC) before storege-engine refactoring.
+
+I understand that this is the most probably just more important patch than my "percentage tracking" where I am just accidentally fixing some size-related bug and thats life ... But I would really like to see the test where we are checking this properly because netstats can again report some weird numbers and we are back in square one. The ideal test would look like - generate some sstables compressed / uncompressed and try to stream it in their entirety / without and check that the total sizes to be streamed are equal to sum of sizes of all individual tables. For all 4 combinations. I have checked your PR and I dont see this kind of test and I am worried that it will be not be matching again.
+
+[~stefan.miklosovic] CASSANDRA-15406 as been going on for so long that I perfectly understand your frustration and the fact that you are worried to go to square one. The good news is that I am reviewer on both patches and I will do my best to ensure that there are no problem between them.
+[~jasonstack] found an interesting issue with the missing part in the size calculation. I missed that part by not digging deeper enough in the code history. That would have caused us to reintroduce CASSANDRA-10680. I need to have a new look at that part for CASSANDRA-15406
+
+Thanks [~blerer], but anyway, a test as I mentioned would be awesome to see when the code / logic which is touching this has changed little bit and we would be sure it is just computed right. The fact that we found that issue as part of 15406 is telling ... It would also simplify a lot my patch because right now I am literally parsing the output of netstats and I track that these numbers do make sense and the total is eventually equal to that sum. I am not so strong in internals so I am not able to write that "low level" test on my own. But ultimately it is not about me having things easier, but imho we should really test that and this patch seems to be like a good candidate to do it.
+
+This part of the code was obviously broken. Having some tests to ensure that it does not happen again makes total sense.
+
+Pushed a unit test to verify "compressionMetadata" is used to calculate the transferred size for compressed sstable.
+
+Thanks.  FYI I am testing this patch out by constantly rebuilding (though have to truncate the available range table) while generating load on a cluster, early results looked good but will let you know (streaming doesn't seem to be the easiest thing to monitor atm).
+
+Overall LGTM +1.
+
+I also took this branch and deployed to a 6 node cluster and rebuilt the nodes in a loop to constantly run streaming, everything looked fine on this front.
+
+[~blerer] not merging as I have not seen your review yet
+
+bq. Benjamin Lerer not merging as I have not seen your review yet
+
+We do have 2 committer +1's (from [~bdeggleston] and [~dcapwell]) and one non-committer +1 (me). Do we strictly need [~blerer]'s +1? (To be clear, I'm fine if he wants to look...)
+
+Sorry, [~maedhroz] it took me a bit of time to get to it, I started yesterday to dig into it and I would like to finish it. 
+
++1 on my side.
+
+4 +1s, ill start the commit and redo the tests.
+
+PR (used source control link, which we use for commit): https://github.com/apache/cassandra/pull/642
+
+CI results: https://app.circleci.com/pipelines/github/dcapwell/cassandra?branch=commit_remote_branch%2FCASSANDRA-15861-trunk-F185BC93-1063-40DC-ADD2-CE06C061DDB4
+
+one of the dtest fails, so reran and got green: https://app.circleci.com/pipelines/github/dcapwell/cassandra/507/workflows/fc1746fd-6568-4f2f-bc84-c7c40c94426c/jobs/2775/parallel-runs/0?filterBy=ALL
+
+Thanks for the review and feedback
+

@@ -1,0 +1,420 @@
+[~appy] FYI.
+
+Maybe the first thing is that we need to figure out why it is so easy to crash when executing mvn test... The nightly job always fail in this way...
+
+bq. It seems that the jvm may crash during the mvn test run and then we will kill all the running tests and then we may mark some of them as hang which leads to the false positive.
+Makes sense.
+
+This one suggests that it can be memory issue : https://stackoverflow.com/questions/42298883/maven-build-failure-when-running-tests-due-to-jvm-crash
+Looking at old nighly job (https://builds.apache.org/job/HBase-Trunk_matrix/configure), it was using -Xmx6100M. But the new jobs seem to be using just 3g (https://github.com/apache/hbase/blob/master/dev-support/docker/Dockerfile#L40)
+
+But the [console output|https://builds.apache.org/job/HBASE-Flaky-Tests/24830/consoleFull] doesn't say anything about out-of-memory, which i have seen in some cases in the past. So maybe it's not the issue.
+
+Oh, this looks promising: http://maven.apache.org/surefire/maven-surefire-plugin/faq.html#vm-termination
+And we have quite a few System.exit in our code.
+
+Since the failure is in hbase-server tests, just looking for System.exit calls in that module and those on which it depends. Also, ignoring the calls from main() fns of tools. Here's list of possible culprits:
+- HMaster#InitializationMonitor#run()
+...there may be others, but not obvious at first look.
+
+
+I don't think any of our tests call System#exit. Would be happy if was proven wrong...
+
+yeah probably, i don't see any unit test calling it (although ITs do). In the non -test code, it's mostly main() fn in tools.
+But digging around more:
+- TestZKMainServer seems to be [handling System.exit() appropriately|https://github.com/apache/hbase/blob/master/hbase-zookeeper/src/test/java/org/apache/hadoop/hbase/zookeeper/TestZKMainServer.java#L85]. So do all other tests.
+Here's what method: https://stackoverflow.com/questions/309396/java-how-to-test-methods-that-call-system-exit
+- The only case where it might be wrong is, ImportTsv#createSubmittableJob calling System.exit(). TestImportTsv calls that fn multiple times.
+
+
+https://stackoverflow.com/questions/5401281/preventing-system-exit-from-api
+
+I think we could try this? Disable System.exit when running UTs, and we can output something when System.exit is called so we can know who is the criminal.
+
+I've registered a SecurityManager in HConstants. Need some hack to let the surefire framework can still call System.exit.
+
+First is that surefire will use System.exit to exit even for a successful test.
+Second is that ForkedBooter.kill will use System.exit, I believe it is used to kill timeout test.
+
+I've already hack for these two cases and started the third try.
+
+I was thinking of going the way where we would replace all System.exit(X) calls with a util function which would additionally dump stack trace at LOG.debug (testing level) before calling System.exit itself.
+
+Adding SecurityManager globally for everything seems like a strong and major change to jvm environment (even if just for tests).
+
+ 
+
+This is only a temporary approach to find out who calls System.exit in test, and then we could find the solution.
+
+If I do not throw ExitException for ForkedBooter.kill then the test run will crash... Let me add more logs and try again.
+
+It seems a surefire issue.
+
+I run mvn test locally in hbase-server module, and TestJMXConnectorServer fails, this is a known issue, and then comes lots of crashes.
+
+This is one of the failed UT
+{noformat}
+Error occurred in starting fork, check output in log
+Process Exit Code: 1
+Crashed tests:
+org.apache.hadoop.hbase.master.balancer.TestRegionsOnMasterOptions
+        at org.apache.maven.plugin.surefire.booterclient.ForkStarter.awaitResultsDone(ForkStarter.java:496)
+        at org.apache.maven.plugin.surefire.booterclient.ForkStarter.runSuitesForkPerTestSet(ForkStarter.java:443)
+        at org.apache.maven.plugin.surefire.booterclient.ForkStarter.run(ForkStarter.java:295)
+        at org.apache.maven.plugin.surefire.booterclient.ForkStarter.run(ForkStarter.java:246)
+        at org.apache.maven.plugin.surefire.AbstractSurefireMojo.executeProvider(AbstractSurefireMojo.java:1124)
+        at org.apache.maven.plugin.surefire.AbstractSurefireMojo.executeAfterPreconditionsChecked(AbstractSurefireMojo.java:954)
+        ... 23 more
+Caused by: org.apache.maven.surefire.booter.SurefireBooterForkException: The forked VM terminated without properly saying goodbye. VM crash or System.exit called?
+Command was /bin/sh -c cd /home/zhangduo/hbase/code/hbase-server && /home/zhangduo/opt/jdk1.8.0_151/jre/bin/java -enableassertions -Dhbase.build.id=2018-01-17T22:44:23Z -Xmx2800m -Djava.security.egd=file:/dev/./urandom -Djava.net.preferIPv4Stack=true -Djava.awt.headless=true -jar /home/zhangduo/hbase/code/hbase-server/target/surefire/surefirebooter3125641250160453662.jar /home/zhangduo/hbase/code/hbase-server/target/surefire 2018-01-18T06-44-36_642-jvmRun2 surefire7506668156192398602tmp surefire_14263036952065448117423tmp
+{noformat}
+
+And I checked org.apache.hadoop.hbase.master.balancer.TestRegionsOnMasterOptions-output.txt, the only place where we call System.exit is
+{noformat}
+org.apache.hadoop.hbase.HConstants$ExitException: There is no escape!
+        at org.apache.hadoop.hbase.HConstants$NoExitSecurityManager.checkExit(HConstants.java:63)
+        at java.lang.Runtime.halt(Runtime.java:273)
+        at org.apache.maven.surefire.booter.ForkedBooter.kill(ForkedBooter.java:300)
+        at org.apache.maven.surefire.booter.ForkedBooter.kill(ForkedBooter.java:294)
+        at org.apache.maven.surefire.booter.ForkedBooter.access$300(ForkedBooter.java:68)
+        at org.apache.maven.surefire.booter.ForkedBooter$4.update(ForkedBooter.java:247)
+        at org.apache.maven.surefire.booter.CommandReader$CommandRunnable.insertToListeners(CommandReader.java:475)
+        at org.apache.maven.surefire.booter.CommandReader$CommandRunnable.run(CommandReader.java:421)
+        at java.lang.Thread.run(Thread.java:748)
+{noformat}
+
+Notice here I only log the exception without throwing it out if it is called from the surefire plugin. So it is killed by the surefire plugin? And then surefire plugin tells us the VM exited abnormally...
+
+bq. Notice here I only log the exception without throwing it out if it is called from the surefire plugin. So it is killed by the surefire plugin? And then surefire plugin tells us the VM exited abnormally...
+Didn't understand what you meant.
+
+Another possible cause for this one, from reading around, is, failed native call. That can happen for so many reasons - over memory (but i think that one shows up explicitly as OOM), apache machine killing jvm for overuse of resources? (wild guess), etc.
+I think we really need hs_err files to help debug this one.
+
+
+Oh oh, another way to narrow down search space is, run small+medium tests separately from large tests.
+
+I mean the only place where we call System.exit for the crashed UTs is from the surefire plugin itself. So it is very strange that why surefire tells us the UT is crashed since it is killed by surefire itself.
+
+And for the JNI crash, first as you said, we should have a hs_err file, and still, the surefire plugin will not have the chance to call System.exit if the JVM is crashed in native code. But the result shows that, it does call System.exit before the UT exits.
+
+Thanks.
+
+This is weird, trying to see a crash explicitly on my machine, i added {{System.exit(0)}} to TestEntityLocks#setUp and ran {{mvn test -PrunAllTests -pl hbase-server}}, but the tests just keep going on for several minutes (at which point i stop them myself).
+{noformat}
+-------------------------------------------------------
+ T E S T S
+-------------------------------------------------------
+Running org.apache.hadoop.hbase.client.locking.TestEntityLocks
+Running org.apache.hadoop.hbase.client.TestAllowPartialScanResultCache
+Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.293 s - in org.apache.hadoop.hbase.client.TestAllowPartialScanResultCache
+Running org.apache.hadoop.hbase.client.TestBatchScanResultCache
+Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.285 s - in org.apache.hadoop.hbase.client.TestBatchScanResultCache
+Running org.apache.hadoop.hbase.client.TestCompleteResultScanResultCache
+Tests run: 5, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 1.183 s - in org.apache.hadoop.hbase.client.TestCompleteResultScanResultCache
+Running org.apache.hadoop.hbase.client.TestConnectionUtils
+Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.547 s - in org.apache.hadoop.hbase.client.TestConnectionUtils
+Running org.apache.hadoop.hbase.client.TestHBaseAdminNoCluster
+Tests run: 2, Failures: 0, Errors: 0, Skipped: 1, Time elapsed: 8.153 s - in org.apache.hadoop.hbase.client.TestHBaseAdminNoCluster
+Running org.apache.hadoop.hbase.client.TestIntraRowPagination
+Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 2.268 s - in org.apache.hadoop.hbase.client.TestIntraRowPagination
+Running org.apache.hadoop.hbase.client.TestPutDeleteEtcCellIteration
+Tests run: 6, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 1.273 s - in org.apache.hadoop.hbase.client.TestPutDeleteEtcCellIteration
+Running org.apache.hadoop.hbase.client.TestResult
+Tests run: 11, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 2.187 s - in org.apache.hadoop.hbase.client.TestResult
+Running org.apache.hadoop.hbase.codec.TestCellMessageCodec
+Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 1.654 s - in org.apache.hadoop.hbase.codec.TestCellMessageCodec
+Running org.apache.hadoop.hbase.conf.TestConfigurationManager
+Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.467 s - in org.apache.hadoop.hbase.conf.TestConfigurationManager
+Running org.apache.hadoop.hbase.constraint.TestConstraints
+Tests run: 6, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 1.963 s - in org.apache.hadoop.hbase.constraint.TestConstraints
+Running org.apache.hadoop.hbase.coprocessor.TestCoprocessorConfiguration
+Tests run: 6, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 3.401 s - in org.apache.hadoop.hbase.coprocessor.TestCoprocessorConfiguration
+Running org.apache.hadoop.hbase.coprocessor.TestCoprocessorHost
+Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.573 s - in org.apache.hadoop.hbase.coprocessor.TestCoprocessorHost
+Running org.apache.hadoop.hbase.coprocessor.TestCoprocessorInterface
+Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 5.89 s - in org.apache.hadoop.hbase.coprocessor.TestCoprocessorInterface
+{noformat}
+
+So that's because we set   {{<forkedProcessTimeoutInSeconds>${surefire.timeout}</forkedProcessTimeoutInSeconds>}} where surefire.timeout is 900 i.e. 15 min.
+I tried setting it to 30 sec, but the tests still keep on running :-/
+
+{color:red}Edit{color}: So it makes sense, the timeout is to kill rouge forked jvms which don't shutdown themselves. Whereas in our case, jvm goes away without returned the result to surefire - totally different thing.
+
+So to iterate faster in trying to understand what/when/how this happens, i switched to hbase-http module and made following two changes:
+- Added System.exit(0) at the end of all tests of TestConfServlet (since it runs first)
+- Added 5 sec sleep to TestHttpServer so i can {{kill -9 }}it when it's running
+
+Some important mvn props:
+reuseForks=false (that's our default in root pom)
+surefire.firstPartForkCount = 1, so next jvm is not started until previous one ends.
+
+It's interesting that the error is thrown only after all tests finish running, and not immediately when some test calls System.exit(0) or some test jvm crashes.
+
+{noformat}
+$ mvn test -PrunAllTests -pl hbase-http
+-------------------------------------------------------
+ T E S T S
+-------------------------------------------------------
+Running org.apache.hadoop.hbase.http.conf.TestConfServlet
+Running org.apache.hadoop.hbase.http.jmx.TestJMXJsonServlet
+Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.63 s - in org.apache.hadoop.hbase.http.jmx.TestJMXJsonServlet
+Running org.apache.hadoop.hbase.http.lib.TestStaticUserWebFilter
+Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 1.338 s - in org.apache.hadoop.hbase.http.lib.TestStaticUserWebFilter
+Running org.apache.hadoop.hbase.http.log.TestLogLevel
+Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.73 s - in org.apache.hadoop.hbase.http.log.TestLogLevel
+Running org.apache.hadoop.hbase.http.TestGlobalFilter
+Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.724 s - in org.apache.hadoop.hbase.http.TestGlobalFilter
+Running org.apache.hadoop.hbase.http.TestHtmlQuoting
+Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 1.143 s - in org.apache.hadoop.hbase.http.TestHtmlQuoting
+Running org.apache.hadoop.hbase.http.TestHttpRequestLog
+Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.376 s - in org.apache.hadoop.hbase.http.TestHttpRequestLog
+Running org.apache.hadoop.hbase.http.TestHttpRequestLogAppender
+Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.223 s - in org.apache.hadoop.hbase.http.TestHttpRequestLogAppender
+Running org.apache.hadoop.hbase.http.TestHttpServer
+Running org.apache.hadoop.hbase.http.TestHttpServerLifecycle
+Tests run: 6, Failures: 0, Errors: 0, Skipped: 6, Time elapsed: 0.002 s - in org.apache.hadoop.hbase.http.TestHttpServerLifecycle
+Running org.apache.hadoop.hbase.http.TestHttpServerWebapps
+Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.546 s - in org.apache.hadoop.hbase.http.TestHttpServerWebapps
+Running org.apache.hadoop.hbase.http.TestPathFilter
+Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.766 s - in org.apache.hadoop.hbase.http.TestPathFilter
+Running org.apache.hadoop.hbase.http.TestServletFilter
+Tests run: 3, Failures: 0, Errors: 0, Skipped: 1, Time elapsed: 0.757 s - in org.apache.hadoop.hbase.http.TestServletFilter
+Running org.apache.hadoop.hbase.http.TestSpnegoHttpServer
+Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 1.651 s - in org.apache.hadoop.hbase.http.TestSpnegoHttpServer
+Running org.apache.hadoop.hbase.http.TestSSLHttpServer
+Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.389 s - in org.apache.hadoop.hbase.http.TestSSLHttpServer
+
+Results:
+
+Tests run: 31, Failures: 0, Errors: 0, Skipped: 7
+
+------------------------------------------------------------------------
+BUILD FAILURE
+------------------------------------------------------------------------
+Total time: 41.684 s
+Finished at: 2018-01-24T17:17:36-08:00
+Final Memory: 77M/867M
+------------------------------------------------------------------------
+[ERROR] Failed to execute goal org.apache.maven.plugins:maven-surefire-plugin:2.20.1:test (default-test) on project hbase-http: There are test failures.
+[ERROR]
+[ERROR] Please refer to /Users/appy/apache/hbase/hbase-http/target/surefire-reports for the individual test results.
+[ERROR] Please refer to dump files (if any exist) [date]-jvmRun[N].dump, [date].dumpstream and [date]-jvmRun[N].dumpstream.
+[ERROR] ExecutionException The forked VM terminated without properly saying goodbye. VM crash or System.exit called?
+[ERROR] Command was /bin/sh -c cd /Users/appy/apache/hbase/hbase-http && /Library/Java/JavaVirtualMachines/jdk1.8.0_152.jdk/Contents/Home/jre/bin/java -enableassertions -Dhbase.build.id=2018-01-25T01:16:55Z -Xmx2800m -Djava.security.egd=file:/dev/./urandom -Djava.net.preferIPv4Stack=true -Djava.awt.headless=true -XX:ErrorFile=/Users/appy/apache/hbase/hbase-http/target/classes/hs_err_pid%p.log -jar /Users/appy/apache/hbase/hbase-http/target/surefire/surefirebooter1670234724455998120.jar /Users/appy/apache/hbase/hbase-http/target/surefire 2018-01-24T17-17-04_960-jvmRun1 surefire826046890227282714tmp surefire_08917843261632866625tmp
+[ERROR] Process Exit Code: 0
+[ERROR] Crashed tests:
+[ERROR] org.apache.hadoop.hbase.http.conf.TestConfServlet
+[ERROR] ExecutionException The forked VM terminated without properly saying goodbye. VM crash or System.exit called?
+[ERROR] Command was /bin/sh -c cd /Users/appy/apache/hbase/hbase-http && /Library/Java/JavaVirtualMachines/jdk1.8.0_152.jdk/Contents/Home/jre/bin/java -enableassertions -Dhbase.build.id=2018-01-25T01:16:55Z -Xmx2800m -Djava.security.egd=file:/dev/./urandom -Djava.net.preferIPv4Stack=true -Djava.awt.headless=true -XX:ErrorFile=/Users/appy/apache/hbase/hbase-http/target/classes/hs_err_pid%p.log -jar /Users/appy/apache/hbase/hbase-http/target/surefire/surefirebooter8079462470974596876.jar /Users/appy/apache/hbase/hbase-http/target/surefire 2018-01-24T17-17-04_960-jvmRun1 surefire799216347605645008tmp surefire_84750862494178897145tmp
+[ERROR] Error occurred in starting fork, check output in log
+[ERROR] Process Exit Code: 137
+[ERROR] Crashed tests:
+[ERROR] org.apache.hadoop.hbase.http.TestHttpServer
+[ERROR] org.apache.maven.surefire.booter.SurefireBooterForkException: ExecutionException The forked VM terminated without properly saying goodbye. VM crash or System.exit called?
+[ERROR] Command was /bin/sh -c cd /Users/appy/apache/hbase/hbase-http && /Library/Java/JavaVirtualMachines/jdk1.8.0_152.jdk/Contents/Home/jre/bin/java -enableassertions -Dhbase.build.id=2018-01-25T01:16:55Z -Xmx2800m -Djava.security.egd=file:/dev/./urandom -Djava.net.preferIPv4Stack=true -Djava.awt.headless=true -XX:ErrorFile=/Users/appy/apache/hbase/hbase-http/target/classes/hs_err_pid%p.log -jar /Users/appy/apache/hbase/hbase-http/target/surefire/surefirebooter1670234724455998120.jar /Users/appy/apache/hbase/hbase-http/target/surefire 2018-01-24T17-17-04_960-jvmRun1 surefire826046890227282714tmp surefire_08917843261632866625tmp
+[ERROR] Process Exit Code: 0
+[ERROR] Crashed tests:
+[ERROR] org.apache.hadoop.hbase.http.conf.TestConfServlet
+[ERROR] ExecutionException The forked VM terminated without properly saying goodbye. VM crash or System.exit called?
+[ERROR] Command was /bin/sh -c cd /Users/appy/apache/hbase/hbase-http && /Library/Java/JavaVirtualMachines/jdk1.8.0_152.jdk/Contents/Home/jre/bin/java -enableassertions -Dhbase.build.id=2018-01-25T01:16:55Z -Xmx2800m -Djava.security.egd=file:/dev/./urandom -Djava.net.preferIPv4Stack=true -Djava.awt.headless=true -XX:ErrorFile=/Users/appy/apache/hbase/hbase-http/target/classes/hs_err_pid%p.log -jar /Users/appy/apache/hbase/hbase-http/target/surefire/surefirebooter8079462470974596876.jar /Users/appy/apache/hbase/hbase-http/target/surefire 2018-01-24T17-17-04_960-jvmRun1 surefire799216347605645008tmp surefire_84750862494178897145tmp
+[ERROR] Error occurred in starting fork, check output in log
+[ERROR] Process Exit Code: 137
+[ERROR] Crashed tests:
+[ERROR] org.apache.hadoop.hbase.http.TestHttpServer
+[ERROR] at org.apache.maven.plugin.surefire.booterclient.ForkStarter.awaitResultsDone(ForkStarter.java:496)
+[ERROR] at org.apache.maven.plugin.surefire.booterclient.ForkStarter.runSuitesForkPerTestSet(ForkStarter.java:443)
+[ERROR] at org.apache.maven.plugin.surefire.booterclient.ForkStarter.run(ForkStarter.java:295)
+[ERROR] at org.apache.maven.plugin.surefire.booterclient.ForkStarter.run(ForkStarter.java:246)
+[ERROR] at org.apache.maven.plugin.surefire.AbstractSurefireMojo.executeProvider(AbstractSurefireMojo.java:1124)
+[ERROR] at org.apache.maven.plugin.surefire.AbstractSurefireMojo.executeAfterPreconditionsChecked(AbstractSurefireMojo.java:954)
+[ERROR] at org.apache.maven.plugin.surefire.AbstractSurefireMojo.execute(AbstractSurefireMojo.java:832)
+[ERROR] at org.apache.maven.plugin.DefaultBuildPluginManager.executeMojo(DefaultBuildPluginManager.java:134)
+[ERROR] at org.apache.maven.lifecycle.internal.MojoExecutor.execute(MojoExecutor.java:207)
+[ERROR] at org.apache.maven.lifecycle.internal.MojoExecutor.execute(MojoExecutor.java:153)
+[ERROR] at org.apache.maven.lifecycle.internal.MojoExecutor.execute(MojoExecutor.java:145)
+[ERROR] at org.apache.maven.lifecycle.internal.LifecycleModuleBuilder.buildProject(LifecycleModuleBuilder.java:116)
+[ERROR] at org.apache.maven.lifecycle.internal.LifecycleModuleBuilder.buildProject(LifecycleModuleBuilder.java:80)
+[ERROR] at org.apache.maven.lifecycle.internal.builder.singlethreaded.SingleThreadedBuilder.build(SingleThreadedBuilder.java:51)
+[ERROR] at org.apache.maven.lifecycle.internal.LifecycleStarter.execute(LifecycleStarter.java:128)
+[ERROR] at org.apache.maven.DefaultMaven.doExecute(DefaultMaven.java:307)
+[ERROR] at org.apache.maven.DefaultMaven.doExecute(DefaultMaven.java:193)
+[ERROR] at org.apache.maven.DefaultMaven.execute(DefaultMaven.java:106)
+[ERROR] at org.apache.maven.cli.MavenCli.execute(MavenCli.java:863)
+[ERROR] at org.apache.maven.cli.MavenCli.doMain(MavenCli.java:288)
+[ERROR] at org.apache.maven.cli.MavenCli.main(MavenCli.java:199)
+[ERROR] at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+[ERROR] at sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:62)
+[ERROR] at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+[ERROR] at java.lang.reflect.Method.invoke(Method.java:498)
+[ERROR] at org.codehaus.plexus.classworlds.launcher.Launcher.launchEnhanced(Launcher.java:289)
+[ERROR] at org.codehaus.plexus.classworlds.launcher.Launcher.launch(Launcher.java:229)
+[ERROR] at org.codehaus.plexus.classworlds.launcher.Launcher.mainWithExitCode(Launcher.java:415)
+[ERROR] at org.codehaus.plexus.classworlds.launcher.Launcher.main(Launcher.java:356)
+[ERROR] Caused by: org.apache.maven.surefire.booter.SurefireBooterForkException: The forked VM terminated without properly saying goodbye. VM crash or System.exit called?
+[ERROR] Command was /bin/sh -c cd /Users/appy/apache/hbase/hbase-http && /Library/Java/JavaVirtualMachines/jdk1.8.0_152.jdk/Contents/Home/jre/bin/java -enableassertions -Dhbase.build.id=2018-01-25T01:16:55Z -Xmx2800m -Djava.security.egd=file:/dev/./urandom -Djava.net.preferIPv4Stack=true -Djava.awt.headless=true -XX:ErrorFile=/Users/appy/apache/hbase/hbase-http/target/classes/hs_err_pid%p.log -jar /Users/appy/apache/hbase/hbase-http/target/surefire/surefirebooter8079462470974596876.jar /Users/appy/apache/hbase/hbase-http/target/surefire 2018-01-24T17-17-04_960-jvmRun1 surefire799216347605645008tmp surefire_84750862494178897145tmp
+[ERROR] Error occurred in starting fork, check output in log
+[ERROR] Process Exit Code: 137
+[ERROR] Crashed tests:
+[ERROR] org.apache.hadoop.hbase.http.TestHttpServer
+[ERROR] at org.apache.maven.plugin.surefire.booterclient.ForkStarter.fork(ForkStarter.java:686)
+[ERROR] at org.apache.maven.plugin.surefire.booterclient.ForkStarter.fork(ForkStarter.java:535)
+[ERROR] at org.apache.maven.plugin.surefire.booterclient.ForkStarter.access$700(ForkStarter.java:116)
+[ERROR] at org.apache.maven.plugin.surefire.booterclient.ForkStarter$2.call(ForkStarter.java:431)
+[ERROR] at org.apache.maven.plugin.surefire.booterclient.ForkStarter$2.call(ForkStarter.java:408)
+[ERROR] at java.util.concurrent.FutureTask.run(FutureTask.java:266)
+[ERROR] at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1149)
+[ERROR] at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:624)
+[ERROR] at java.lang.Thread.run(Thread.java:748)
+[ERROR] -> [Help 1]
+[ERROR]
+[ERROR] To see the full stack trace of the errors, re-run Maven with the -e switch.
+[ERROR] Re-run Maven using the -X switch to enable full debug logging.
+[ERROR]
+[ERROR] For more information about the errors and possible solutions, please read the following articles:
+[ERROR] [Help 1] http://cwiki.apache.org/confluence/display/MAVEN/MojoExecutionException
+{noformat}
+
+
+
+So at this point, main thing to demystify is - is it system.exit calls that's screwing us up, or some failed native calls crashing jvm.
+
+Either way, setting jvm option {{-XX:ErrorFile}} and archiving that location is the way to go because:
+- If we don't see that file in artifacts, then it should have been system.exit call
+- If we do see it, then it's likely some native call and we can use the error file for further debug.
+
+
+Arghh, setting -XX:ErrorFile doesn't work with surefire. Apparently coredump uses the same output stream as required by maven, this results in following issue: http://maven.apache.org/components/surefire/maven-failsafe-plugin/faq.html#corruptedstream
+The results file is  [^2018-01-24T17-45-37_000-jvmRun1.dumpstream]  (generated it by running a test and manually killing it using kill -9)
+It's not ideal, but it's better than nothing.
+Ptal at  [^HBASE-19803.master.001.patch] . Let's get it in and wait for more failures? [~Apache9] [~stack]
+
+What you thinking then [~appy] The dumpStream is archived IIRC. The mangled thread dump in it is useful? Is it for the surefire driver or is it forked JVM? I'd be +1 for trying it for a while to see if it turns up anything. Anything better than driving blind sir.
+
+Checked the stacktrace a bit
+{noformat}
+org.apache.hadoop.hbase.HConstants$ExitException: There is no escape!
+        at org.apache.hadoop.hbase.HConstants$NoExitSecurityManager.checkExit(HConstants.java:63)
+        at java.lang.Runtime.halt(Runtime.java:273)
+        at org.apache.maven.surefire.booter.ForkedBooter.kill(ForkedBooter.java:300)
+        at org.apache.maven.surefire.booter.ForkedBooter.kill(ForkedBooter.java:294)
+        at org.apache.maven.surefire.booter.ForkedBooter.access$300(ForkedBooter.java:68)
+        at org.apache.maven.surefire.booter.ForkedBooter$4.update(ForkedBooter.java:247)
+        at org.apache.maven.surefire.booter.CommandReader$CommandRunnable.insertToListeners(CommandReader.java:475)
+        at org.apache.maven.surefire.booter.CommandReader$CommandRunnable.run(CommandReader.java:421)
+        at java.lang.Thread.run(Thread.java:748)
+{noformat}
+
+https://github.com/apache/maven-surefire/blob/surefire-2.20.1/surefire-api/src/main/java/org/apache/maven/surefire/booter/CommandReader.java#L421
+
+https://github.com/apache/maven-surefire/blob/surefire-2.20.1/surefire-booter/src/main/java/org/apache/maven/surefire/booter/ForkedBooter.java#L247
+
+I think it is obvious that the UT is killed by the surefire itself. CommandReader is a class that keep reading data from stdin to get commands from the plugin process. And in the ForkedBooter, we actually do the kill job by calling System.exit, see the below code.
+
+{code}
+                    DumpErrorSingleton.getSingleton()
+                            .dumpText( "Killing self fork JVM. Received SHUTDOWN command from Maven shutdown hook." );
+                    kill();
+{code}
+
+This is not a kill by signal since the command is gotten from stdin. I think this is correct direction to go, find out why the plugin process(or called maven master process?) wants to kill the forked test process.
+
+Thanks.
+
+Pushing and starting another nightly run.
+
+I have a part which tells that this might not be useful since java always tries to core dump on vm crash (at worst, in /tmp dir), and if there were any core dumps happening, surefire plugin should have caught them anyways (irrespective of location) and generated a *.dumpstream file in surefire-reports.
+
+I see 5 .dump files (not .dumpstream) in test_logs.zip of [https://builds.apache.org/job/HBase%20Nightly/job/branch-2/197|https://builds.apache.org/job/HBase%20Nightly/job/branch-2/197]. That 
+-rw-r--r-- 1 appy staff 226B Jan 23 14:43 2018-01-23T20-53-29_364-jvmRun1.dump
+-rw-r--r-- 1 appy staff 226B Jan 23 14:43 2018-01-23T20-53-29_364-jvmRun2.dump
+-rw-r--r-- 1 appy staff 331B Jan 23 14:43 2018-01-23T20-53-29_364-jvmRun3.dump
+-rw-r--r-- 1 appy staff 226B Jan 23 14:43 2018-01-23T20-53-29_364-jvmRun4.dump
+-rw-r--r-- 1 appy staff 226B Jan 23 14:43 2018-01-23T20-53-29_364-jvmRun5.dump
+
+What i don't understand is, why does surefire plugin try to stop all 5 jvms at exactly 21:55:35 and 22:43:34.
+
+I think i have cracked it, it's basically this:
+{color:red}Edit{color}: Adding more details.
+- Some test goes bad (which one? - basically what we were trying to figure out) in a way that the jvm dies (Hence our category based timeout is useless here)
+- Since the jvm died without reporting to surefire, the plugin's main process keeps waiting
+- After 900 sec (forkedProcessTimeoutInSeconds), the plugin issues 'shutdown' to *all* forked JVMs (that's what we see *.dump files), basically killing every test running at that time.  (IDK why all jvm, it's just what am observing)
+** Side note: if findHangingTests.py reports X number of hanging tests, and we have surefire forkcount as Y, then there should be *at least* ceiling[X/Y] count of the following message in each *.dump file.
+{noformat}
+# Created on 2018-01-25T12:14:47.114
+Killing self fork JVM. Received SHUTDOWN command from Maven shutdown hook.
+{noformat}
+
+With that figured, it was easy to find culprit tests.
+Look for timestamp of "Killed self fork..." messages in dump file and find the tests which started *exactly 900 sec before it* Any hanging test (as reported by our script) with start timestamp between these two times was just caught in cross fire.
+
+Applying the method to #207 run (https://builds.apache.org/job/HBase%20Nightly/job/master/207/) will reveal these three culprit tests:
+- security.token.TestTokenAuthentication
+- master.balancer.TestStochasticLoadBalancer
+- regionserver.TestRegionServerReportForDuty
+
+OK, so the problem is, we have a 15 minutes timeout, if there is a test that hangs longer than this period, the surefire plugin will try to kill all the ongoing tests and report a failure to us?
+
+The timeout limit from junit does not work? Damn...
+
+Thanks [~appy]. Let's fix these three UTs first.
+
+Yes, but we need that timeout, no? You have a way around?
+
+Chatted with him, Duo was talking about CategoryBasedTimeout. Updated explanation above to cover that case.
+
+Fix for TestTokenAuthentication - HBASE-19862
+Looking at TestRegionServerReportForDuty logs, the test was stuck and running until surefire killed the JVM. HBASE-19866
+
+Btw, this can happen even when category based timeout is being correctly enforced because Timeout rule puts the timeout on each individual test method and not on whole test class.
+For eg, a medium test class with 6 methods where each takes 2.5 minute each (within Timeout rule), will take total time 15min.
+
+{quote}
+For eg, a medium test class with 6 methods where each takes 2.5 minute each (within Timeout rule), will take total time 15min.
+{quote}
+Bad news...
+
+ Great stuff lads.
+
+Using ClassRule instead of Rule can change to limit the total time of running a test class. But seems we need to add a line to every tests, which is really a pain...
+
+Maybe a possible way is to do it at once first, and then add a UT to make sure that we always have a CategoryBasedTimeout ClassRule for every UTs.
+
+What do you think? [~stack] [~appy].
+
+Thanks.
+
+Sounds good.
+The easiest way to do might be using junit's RunListener#testStarted and using reflection on the test class (Description#getTestClass). If it doesn't have Timeout rule, throwing exception might fail the test.
+
+
+{quote}
+The easiest way to do might be using junit's RunListener#testStarted and using reflection on the test class (Description#getTestClass). If it doesn't have Timeout rule, throwing exception might fail the test.
+{quote}
+
+Sounds good. Let me open an issue for it.
+
+The issue by [~Apache9] that explores adding CategoryBasedTimer as a ClassRule
+
+{quote}Maybe a possible way is to do it at once first, and then add a UT to make sure that we always have a CategoryBasedTimeout ClassRule for every UTs.
+{quote}
+I endorse this approach. Our test suite becomes more and more unruly as time goes by.  Weeding and fixup consumes weeks of developer time on an ongoing basis (witness the last few weeks of test fixup/flakie suppression). The only counter we have to the ever-increasing disorder is enforcing more order/constraints. Let me comment on HBASE-19873 approach over there. Great work lads.
+
+[~appy] The flakey test finder job is hang?
+
+https://builds.apache.org/job/HBASE-Find-Flaky-Tests/
+
+The last build can not start...
+
+I've changed the label from 'ubuntu' to 'ubuntu||Hadoop' so it can start a new build...
+
+{quote}[~appy] The flakey test finder job is hang?
+{quote}
+I was wondering why it wasn't moving today...
+
+Seems the infra sucks... I added label Hadoop but the two new builds still fail due to disconnect from the build machine...
+
+Yeah, it's infra issue. I'm not able to even access the site https://builds.apache.org/
+
+Fixed by HBASE-19873.
+

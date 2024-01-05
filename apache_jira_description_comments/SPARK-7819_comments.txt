@@ -1,0 +1,311 @@
+FYI, I believe I have worked around the problem for now by disabling isolation by hacking:
+
+sql/hive/src/main/scala/org/apache/spark/sql/hive/HiveContext.scala
+
+-        isolationOn = true,
++       isolationOn = false,
+
+I suppose this is good enough for us since we only need the pre-built version of hive (as provided by the mapr4 profile).
+
+Shutting down the SparkContext doesn't affect other things in the JVM. Isn't this a problem with how the native code is loaded? it should be able to check that it's loaded and avoid this if needed.
+
+I think the right solution here is probably to configure all of the MapR classes as shared across the isolation boundary.  Can you try adding any MapR packages prefixes to [{{spark.sql.hive.metastore.sharedPrefixes}}|https://github.com/apache/spark/blob/master/sql/hive/src/main/scala/org/apache/spark/sql/hive/HiveContext.scala#L127]?
+
+>>>  Isn't this a problem with how the native code is loaded?
+Indeed, unfortunately, it's MapR's code, not mine :(
+
+>>> Can you try adding any MapR packages prefixes to spark.sql.hive.metastore.sharedPrefixes
+Ah, didn't think of that (even though I saw such a capability in the code), I'll try it out and let you know.
+
+Adding the prefixes did not seem to work.
+
+I tried adding this to my test.py script
+
+    conf.set('spark.sql.hive.metastore.sharedPrefixes', 'com.mapr,mapr')
+
+I also tried adding to spark-defaults.conf
+
+spark.sql.hive.metastore.sharedPrefixes com.mapr,mapr
+
+
+Would it be possible to make the isolationOn parameter configurable?
+Setting it to False (via a code change) worked around the problem for me.
+I imagine there will be other cases where people are packaging other libraries (maybe third party hive UDFs) where they would find difficulty tracking down what prefixes to exclude.
+
+[~coderfi] I just checked in a bug fix related to the class loader and the spark sql conf set in spark conf (e.g. spark-default). Can you try to the latest 1.4 branch and put the following entry in the {{conf/spark-defaults.conf}} 
+
+{{spark.sql.hive.metastore.sharedPrefixes com.mysql.jdbc,org.postgresql,com.microsoft.sqlserver,oracle.jdbc,com.mapr.fs.shim.LibraryLoader,com.mapr.security.JNISecurity,com.mapr.fs.jni}}
+
+Basically, it contains a few packages for JDBC drivers and a few mapr packages.
+
+We will try to figure out a way to let JNI libs work with our two classloaders.
+
+btw, I fix I did is https://github.com/apache/spark/commit/572b62cafe4bc7b1d464c9dcfb449c9d53456826.
+
+Will do, thanks.
+
+FYI, seems to work on a basic test, thanks!
+
+However, I am running into a Out of PermGen space error on other tests further down in the same process.
+I'll try increasing the memory settings in the JVM OPTS to see if it goes away. Hopefully it's not due to some sort of a resource leak, but simply because more classes need to be kept in memory now.
+
+Fi
+
+
+[~coderfi] Can you provide some details on those other tests?
+
+Hello, sorry for not responding sooner, been quite hectic at work.
+
+We have a smoke test that I run whenever I'm testing a new Spark custom build.
+
+Basically it's a python script that test various parts of the Spark API.
+During the course of the execution, several Spark Contexts are created, as is HiveContext and SQLContext wrappers.
+The test is rather light, but it does a decent job of giving me a heads up when an API changes underneath me so I can give our developers fair warning. :)
+It does things like reading/writing parquet files, reading/writing files to MARPFS, word count jobs, hive queries, DataFrame API calls, etc.
+It also serves as a light benchmark suite, so that I can keep an eye on performance that may have been introduced by the spark distribution, or by regular operational shenanigans on our Mesos cluster.
+
+The test takes a simple 4-node dev/integration cluster about 200 seconds to run, moving around 100 GB of data from a non-local MAPRFS cluster via raw textFile and HiveContext/SQLContext queries.
+
+Anyway, per my last comment, we ran out of PermGen in this script.
+
+I created an even newer Spark 1.4 build, git 84da653192a2d9edb82d0dbe50f577c4dc6a0c78 and deployed it to our test cluster.
+I then updated the spark-defaults.conf per your suggestions, as well as increasing the JVM PermGen settings:
+
+    spark.sql.hive.metastore.sharedPrefixes com.mysql.jdbc,org.postgresql,com.microsoft.sqlserver,oracle.jdbc,com.mapr.fs.shim.LibraryLoader,com.mapr.security.JNISecurity,com.mapr.fs.jni
+
+    spark.driver.extraJavaOptions -XX:+CMSClassUnloadingEnabled -XX:+CMSPermGenSweepingEnabled -XX:MaxPermSize=512M
+
+I'm not sure if CMSClassUnloadingEnabled and CMSPermGenSweepingEnabled is needed. I came across these settings on StackOverflow, and it sounded like it wouldn't hurt, considering what the Isolated Hive Client Loader might be trying to do.
+
+Incidentally, I typically run this smoke test script as an Ipython Notebook, this lets me also do smoke tests on non-spark related apis (such as using matplotlib).
+
+With the above settings, I was able to get through the smoke test without errors.
+Just for kicks, I ran it a second time (WITHIN the same running kernel), hoping (or not) to see a OOM.
+It worked! So a third time, and it still worked.
+I kicked it off a fourth time (still within the same ipython kernel) and was about to declare this a success, when the script failed with an InvalidClassCastException (attached).
+
+Very strange! Not sure what could cause it.
+
+Anyway, I tried a fifth time (still within the same kernel), and it passed just fine.
+
+Considering the smoke tests worked fine 4 out of 5 times, I'm satisfied enough, and will chalk this up as some flakiness in the JVM and all the funky class loading. Also, did I mention that this ipython Notebook is also running in a docker container on a XEN Hypervisor VM ? Maybe that had something to do with it. :) 
+
+So it would appear that increasing the PermGen space should be highly recommended (and maybe a default stock setting) in order to avoid the PermGen OOM error.
+
+
+
+
+
+
+
+Also, it is quite possible that the VM host itself was under a low memory condition at the time of my testing last time around, silly me, forgot to check....
+
+Has anyone tried this with spark-submit? It works in the shell but it fails with a compiled app... 
+
+{code}
+  val conf = new SparkConf().set("spark.sql.hive.metastore.sharedPrefixes", "com.mysql.jdbc,org.postgresql,com.microsoft.sqlserver,oracle.jdbc,com.mapr.fs.shim.LibraryLoader,com.mapr.security.JNISecurity,com.mapr.fs.jni") //spark HC mapr4 workaround
+  val sc = new SparkContext(conf)
+  val hc = new HiveContext(sc)
+  println(" Res = " + hc.sql("select pw_end_date from pz.sample_dates").count())
+{code}
+
+@Fi - have you tried with spark-submit? 
+
+For the InvalidClassCastException, is there any chance that the driver and workers were running different versions of Spark 1.4.0?
+
+[~nemccarthy] Can you post the stack trace? Also, are you using 1.4.0 rc4?
+
+Building of spark 1.4 branch, built 2 days ago. I can try building from the RC4 tag.
+
+Spark-submit command;
+
+/apps/spark/spark-1.4.0-SNAPSHOT-bin-mapr4.0.2_yarn_j6_2.10/bin/spark-submit --class com.myapp.TestMain --master yarn-client --conf spark.sql.hive.metastore.sharedPrefixes=com.mysql.jdbc,org.postgresql,com.microsoft.sqlserver,oracle.jdbc,com.mapr.fs.shim.LibraryLoader,com.mapr.security.JNISecurity,com.mapr.fs.jni  ~/app-jar_2.10-0.1.0-SNAPSHOT.jar 
+
+Stack;
+{code}
+15/06/04 06:03:13 INFO metastore: Connected to metastore.
+15/06/04 06:03:13 INFO SessionState: No Tez session required at this point. hive.execution.engine=mr.
+java.lang.reflect.InvocationTargetException
+	at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:57)
+	at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	at java.lang.reflect.Method.invoke(Method.java:606)
+	at com.mapr.fs.ShimLoader.loadNativeLibrary(ShimLoader.java:323)
+	at com.mapr.fs.ShimLoader.load(ShimLoader.java:198)
+	at org.apache.hadoop.conf.CoreDefaultProperties.<clinit>(CoreDefaultProperties.java:59)
+	at java.lang.Class.forName0(Native Method)
+	at java.lang.Class.forName(Class.java:274)
+	at org.apache.hadoop.conf.Configuration.getClassByNameOrNull(Configuration.java:1857)
+	at org.apache.hadoop.conf.Configuration.getProperties(Configuration.java:2072)
+	at org.apache.hadoop.conf.Configuration.loadResource(Configuration.java:2282)
+	at org.apache.hadoop.conf.Configuration.loadResources(Configuration.java:2234)
+	at org.apache.hadoop.conf.Configuration.getProps(Configuration.java:2151)
+	at org.apache.hadoop.conf.Configuration.set(Configuration.java:1002)
+	at org.apache.hadoop.conf.Configuration.set(Configuration.java:974)
+	at org.apache.hadoop.mapred.JobConf.setJar(JobConf.java:518)
+	at org.apache.hadoop.mapred.JobConf.setJarByClass(JobConf.java:536)
+	at org.apache.hadoop.mapred.JobConf.<init>(JobConf.java:430)
+	at org.apache.hadoop.hive.conf.HiveConf.initialize(HiveConf.java:1366)
+	at org.apache.hadoop.hive.conf.HiveConf.<init>(HiveConf.java:1332)
+	at org.apache.spark.sql.hive.client.ClientWrapper.<init>(ClientWrapper.scala:99)
+	at sun.reflect.NativeConstructorAccessorImpl.newInstance0(Native Method)
+	at sun.reflect.NativeConstructorAccessorImpl.newInstance(NativeConstructorAccessorImpl.java:57)
+	at sun.reflect.DelegatingConstructorAccessorImpl.newInstance(DelegatingConstructorAccessorImpl.java:45)
+	at java.lang.reflect.Constructor.newInstance(Constructor.java:526)
+	at org.apache.spark.sql.hive.client.IsolatedClientLoader.liftedTree1$1(IsolatedClientLoader.scala:170)
+	at org.apache.spark.sql.hive.client.IsolatedClientLoader.<init>(IsolatedClientLoader.scala:166)
+	at org.apache.spark.sql.hive.HiveContext.metadataHive$lzycompute(HiveContext.scala:212)
+	at org.apache.spark.sql.hive.HiveContext.metadataHive(HiveContext.scala:175)
+	at org.apache.spark.sql.hive.HiveContext.setConf(HiveContext.scala:358)
+	at org.apache.spark.sql.SQLContext$$anonfun$3.apply(SQLContext.scala:186)
+	at org.apache.spark.sql.SQLContext$$anonfun$3.apply(SQLContext.scala:185)
+	at scala.collection.IndexedSeqOptimized$class.foreach(IndexedSeqOptimized.scala:33)
+	at scala.collection.mutable.ArrayOps$ofRef.foreach(ArrayOps.scala:108)
+	at org.apache.spark.sql.SQLContext.<init>(SQLContext.scala:185)
+	at org.apache.spark.sql.hive.HiveContext.<init>(HiveContext.scala:71)
+	at au.com.quantium.personalisation.sampling.TestMain$delayedInit$body.apply(TestMain.scala:26)
+	at scala.Function0$class.apply$mcV$sp(Function0.scala:40)
+	at scala.runtime.AbstractFunction0.apply$mcV$sp(AbstractFunction0.scala:12)
+	at scala.App$$anonfun$main$1.apply(App.scala:71)
+	at scala.App$$anonfun$main$1.apply(App.scala:71)
+	at scala.collection.immutable.List.foreach(List.scala:318)
+	at scala.collection.generic.TraversableForwarder$class.foreach(TraversableForwarder.scala:32)
+	at scala.App$class.main(App.scala:71)
+	at au.com.quantium.personalisation.sampling.TestMain$.main(TestMain.scala:11)
+	at au.com.quantium.personalisation.sampling.TestMain.main(TestMain.scala)
+	at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:57)
+	at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	at java.lang.reflect.Method.invoke(Method.java:606)
+	at org.apache.spark.deploy.SparkSubmit$.org$apache$spark$deploy$SparkSubmit$$runMain(SparkSubmit.scala:664)
+	at org.apache.spark.deploy.SparkSubmit$.doRunMain$1(SparkSubmit.scala:169)
+	at org.apache.spark.deploy.SparkSubmit$.submit(SparkSubmit.scala:192)
+	at org.apache.spark.deploy.SparkSubmit$.main(SparkSubmit.scala:111)
+	at org.apache.spark.deploy.SparkSubmit.main(SparkSubmit.scala)
+Caused by: java.lang.UnsatisfiedLinkError: Native Library /tmp/mapr-nathanm-libMapRClient.1.4.0-SNAPSHOT.so already loaded in another classloader
+	at java.lang.ClassLoader.loadLibrary1(ClassLoader.java:1931)
+	at java.lang.ClassLoader.loadLibrary0(ClassLoader.java:1890)
+	at java.lang.ClassLoader.loadLibrary(ClassLoader.java:1851)
+	at java.lang.Runtime.load0(Runtime.java:795)
+	at java.lang.System.load(System.java:1062)
+	at com.mapr.fs.shim.LibraryLoader.load(LibraryLoader.java:29)
+	... 56 more
+Exception in thread "main" java.lang.ExceptionInInitializerError
+	at com.mapr.fs.ShimLoader.load(ShimLoader.java:215)
+	at org.apache.hadoop.conf.CoreDefaultProperties.<clinit>(CoreDefaultProperties.java:59)
+	at java.lang.Class.forName0(Native Method)
+	at java.lang.Class.forName(Class.java:274)
+	at org.apache.hadoop.conf.Configuration.getClassByNameOrNull(Configuration.java:1857)
+	at org.apache.hadoop.conf.Configuration.getProperties(Configuration.java:2072)
+	at org.apache.hadoop.conf.Configuration.loadResource(Configuration.java:2282)
+	at org.apache.hadoop.conf.Configuration.loadResources(Configuration.java:2234)
+	at org.apache.hadoop.conf.Configuration.getProps(Configuration.java:2151)
+	at org.apache.hadoop.conf.Configuration.set(Configuration.java:1002)
+	at org.apache.hadoop.conf.Configuration.set(Configuration.java:974)
+	at org.apache.hadoop.mapred.JobConf.setJar(JobConf.java:518)
+	at org.apache.hadoop.mapred.JobConf.setJarByClass(JobConf.java:536)
+	at org.apache.hadoop.mapred.JobConf.<init>(JobConf.java:430)
+	at org.apache.hadoop.hive.conf.HiveConf.initialize(HiveConf.java:1366)
+	at org.apache.hadoop.hive.conf.HiveConf.<init>(HiveConf.java:1332)
+	at org.apache.spark.sql.hive.client.ClientWrapper.<init>(ClientWrapper.scala:99)
+	at sun.reflect.NativeConstructorAccessorImpl.newInstance0(Native Method)
+	at sun.reflect.NativeConstructorAccessorImpl.newInstance(NativeConstructorAccessorImpl.java:57)
+	at sun.reflect.DelegatingConstructorAccessorImpl.newInstance(DelegatingConstructorAccessorImpl.java:45)
+	at java.lang.reflect.Constructor.newInstance(Constructor.java:526)
+	at org.apache.spark.sql.hive.client.IsolatedClientLoader.liftedTree1$1(IsolatedClientLoader.scala:170)
+	at org.apache.spark.sql.hive.client.IsolatedClientLoader.<init>(IsolatedClientLoader.scala:166)
+	at org.apache.spark.sql.hive.HiveContext.metadataHive$lzycompute(HiveContext.scala:212)
+	at org.apache.spark.sql.hive.HiveContext.metadataHive(HiveContext.scala:175)
+	at org.apache.spark.sql.hive.HiveContext.setConf(HiveContext.scala:358)
+	at org.apache.spark.sql.SQLContext$$anonfun$3.apply(SQLContext.scala:186)
+	at org.apache.spark.sql.SQLContext$$anonfun$3.apply(SQLContext.scala:185)
+	at scala.collection.IndexedSeqOptimized$class.foreach(IndexedSeqOptimized.scala:33)
+	at scala.collection.mutable.ArrayOps$ofRef.foreach(ArrayOps.scala:108)
+	at org.apache.spark.sql.SQLContext.<init>(SQLContext.scala:185)
+	at org.apache.spark.sql.hive.HiveContext.<init>(HiveContext.scala:71)
+	at au.com.quantium.personalisation.sampling.TestMain$delayedInit$body.apply(TestMain.scala:26)
+	at scala.Function0$class.apply$mcV$sp(Function0.scala:40)
+	at scala.runtime.AbstractFunction0.apply$mcV$sp(AbstractFunction0.scala:12)
+	at scala.App$$anonfun$main$1.apply(App.scala:71)
+	at scala.App$$anonfun$main$1.apply(App.scala:71)
+	at scala.collection.immutable.List.foreach(List.scala:318)
+	at scala.collection.generic.TraversableForwarder$class.foreach(TraversableForwarder.scala:32)
+	at scala.App$class.main(App.scala:71)
+	at au.com.quantium.personalisation.sampling.TestMain$.main(TestMain.scala:11)
+	at au.com.quantium.personalisation.sampling.TestMain.main(TestMain.scala)
+	at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:57)
+	at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	at java.lang.reflect.Method.invoke(Method.java:606)
+	at org.apache.spark.deploy.SparkSubmit$.org$apache$spark$deploy$SparkSubmit$$runMain(SparkSubmit.scala:664)
+	at org.apache.spark.deploy.SparkSubmit$.doRunMain$1(SparkSubmit.scala:169)
+	at org.apache.spark.deploy.SparkSubmit$.submit(SparkSubmit.scala:192)
+	at org.apache.spark.deploy.SparkSubmit$.main(SparkSubmit.scala:111)
+	at org.apache.spark.deploy.SparkSubmit.main(SparkSubmit.scala)
+Caused by: java.lang.reflect.InvocationTargetException
+	at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:57)
+	at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	at java.lang.reflect.Method.invoke(Method.java:606)
+	at com.mapr.fs.ShimLoader.loadNativeLibrary(ShimLoader.java:323)
+	at com.mapr.fs.ShimLoader.load(ShimLoader.java:198)
+	... 50 more
+Caused by: java.lang.UnsatisfiedLinkError: Native Library /tmp/mapr-nathanm-libMapRClient.1.4.0-SNAPSHOT.so already loaded in another classloader
+	at java.lang.ClassLoader.loadLibrary1(ClassLoader.java:1931)
+	at java.lang.ClassLoader.loadLibrary0(ClassLoader.java:1890)
+	at java.lang.ClassLoader.loadLibrary(ClassLoader.java:1851)
+	at java.lang.Runtime.load0(Runtime.java:795)
+	at java.lang.System.load(System.java:1062)
+	at com.mapr.fs.shim.LibraryLoader.load(LibraryLoader.java:29)
+	... 56 more
+{code}
+
+[~nemccarthy] It will be great if you can try RC4 tag. There was a bug (SPARK-8020) that probably affected your test.
+
+Actually, maybe the InvalidClassCastException might be a little too flaky.
+
+I am running a spark job which queries an ORC table daily partition via the HiveContext.
+A single context is created, and I spin up about ten threads (one for each day).
+
+I am seeing plenty of the same errors in various tasks, enough to kill the job for that day.
+
+Curiously, the exact same serialVersionUID are logged in each failure:
+
+     org.apache.spark.sql.hive.MetastoreRelation; local class incompatible: stream classdesc serialVersionUID = 2590680563934099718, local class serialVersionUID = -8650941563091306200
+
+So the interesting thing is that some jobs (for a particular day) work perfectly fine, but others fail.
+I tried running this multi-threaded job again, and the same error occurs, but in different places. 
+It looks like it usually works fine when Spark automatically schedules the task to be rerun.
+So a workaround might be to bump up the number of allowable failures before giving up on the job.
+
+This job works perfectly fine on our Spark 1.3 builds, unfortunately, this issue is occurring too often in a larger job in Spark 1.4 :(
+
+
+@Nathan: No, haven't tried spark-submit. That's for Scala/Java based jobs, right? I am running pyspark jobs, so no. However, while poking around in how this system works, I believe most of the bits that makes spark-submit work is done in the python case as well (i.e. load up spark-env.sh and read in spark-defaults.conf, as well as setup various classpaths).
+BTW, the stacktrace is attached to this ticket as invalidClassException.log
+
+@Yin: The driver and workers (running as a mesos framework), were all running the exact same spark tarball, deployed to SPARK_HOME=/opt/spark/current on the driver and each of the slaves.
+I built from the most recent revision in https://github.com/apache/spark/commits/branch-1.4 (84da653192a2d9edb82d0dbe50f577c4dc6a0c78)
+which already contains the SPARK-8020 fix.
+Anyway, looking at that ticket, I don't recall seeing error messages in the log matching any of the noted stacktraces.
+
+
+@Yin - looks like might build was just a little out of date! RC4 is running well! Thanks!
+
+[~nemccarthy] Thank you for the update! Glad to hear that :)
+
+Yin -
+
+This occurred with my 1.4.0 release (not an earlier release, the official release) I had to put the prefixes in my spark-defaults.conf for it to work. Is this the official way to work around the problem or will something be changing in the code so the prefixes are not required?
+
+Thanks
+
+
+
+[~mandoskippy] Yeah, it is the official way to work around the problem. Since 1.4.0, we introduced isolated class loaders to make Spark SQL be able to connect to different versions of Hive metastore. Basically, our metastore client part is using a different class loader than the other part of the Spark SQL. I am attaching the doc for this conf ({{spark.sql.hive.metastore.sharedPrefixes}}), hope this is helpful.
+
+{quote}
+A comma separated list of class prefixes that should be loaded using the classloader that is shared between Spark SQL and a specific version of Hive. An example of classes that should be shared is JDBC drivers that are needed to talk to the metastore. Other classes that need to be shared are those that interact with classes that are already shared.  For example, custom appenders that are used by log4j.
+{quote}
+
+

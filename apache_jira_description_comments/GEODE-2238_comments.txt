@@ -1,0 +1,148 @@
+I was able to reproduce this running the test in my IDE 50 times.
+
+I see this message in the logs. It looks like vm2 didn't think there were any locators with cluster configuration, so it got no cluster configuration information.
+{noformat}
+[vm_2][info 2016/12/20 17:11:48.802 PST <RMI TCP Connection(1)-127.0.0.1> tid=0x12] No locator(s) found with cluster configuration service
+
+{noformat}
+
+It looks like there is a race in cluster configuration where we can fail to realize the locator has cluster configuration enabled.
+
+I tracked this down a bit further, and I suspect the problem is this code in StartupResponseWithVersionMessage. It calls super.process before calling dm.addHostedLocators. That means that the thread doing cache initialization and waiting for a response probably gets unblocked by super.process and might get through the call to GemfireCacheImpl.requestSharedConfiguration before dm.addHostedLocators is called.
+
+{code}
+@Override
+  protected void process(DistributionManager dm) {
+    super.process(dm);
+    if (this.hostedLocators != null) {
+      dm.addHostedLocators(getSender(), this.hostedLocators, this.isSharedConfigurationEnabled);
+    }
+    if (logger.isDebugEnabled()) {
+      logger.debug("Received StartupResponseWithVersionMessage from a member with version: {}",
+          this.version);
+    }
+  }
+{code}
+
+Even with my fix to the  changes, I saw GEODE-1976 happen in my precheckin. Looking at the logs, I see the same log message about "No locator(s) found with cluster configuration service."
+
+Digging a little deeper, I think my earlier fix is incomplete. I found this code in StartupMessageReplyProcessor. I think this means that as soon as one member replies to the startup message, we will stop waiting. So we have this same problem where the member startup will continue on and get to GemfireCacheImpl.requestSharedConfiguration before we get the hosted locator information from the StartupResponseWithVersionMessage.
+
+{code}
+  /**
+   * overridden from ReplyProcessor21 to allow early-out. If an existing member accepted or rejected
+   * us then we are done.
+   */
+  @Override
+  protected boolean canStopWaiting() {
+    return this.receivedAcceptance || this.receivedRejectionMessage;
+  }
+{code}
+
+I closed GEODE-2244 as a duplicate of GEODE-2238. Below is where initialization of cluster config is async during locator startup. I believe we need to have incoming requests for cluster config determine that cluster config is enabled and then wait on a Future for initialization of cluster config to complete.
+
+The method in InternalLocator is startCache(DistributedSystem):
+{code:java}
+  private void startCache(DistributedSystem ds) {
+
+    GemFireCacheImpl gfc = GemFireCacheImpl.getInstance();
+    if (gfc == null) {
+      logger.info("Creating cache for locator.");
+      this.myCache = new CacheFactory(ds.getProperties()).create();
+      gfc = (GemFireCacheImpl) this.myCache;
+    } else {
+      logger.info("Using existing cache for locator.");
+      ((InternalDistributedSystem) ds).handleResourceEvent(ResourceEvent.LOCATOR_START, this);
+    }
+    startJmxManagerLocationService(gfc);
+
+    startSharedConfigurationService(gfc);
+  }
+{code}
+The method startSharedConfigurationService hands off to a thread to load cluster config and use distributed lock service to become primary cluster config source. This was probably made async due to use of distributed lock service to keep startup responsive. Unfortunately, it opens up a race condition window -- if any requests come in before cluster config is ready, the locator will reply saying it doesn't have cluster config. I think some of our Flaky tests are hitting this race condition.
+
+
+The LocatorStarterRule currently has a workaround related to the async initialization of cluster config:
+{code:java}
+    if (locator.getConfig().getEnableClusterConfiguration()) {
+      Awaitility.await().atMost(65, TimeUnit.SECONDS)
+          .until(() -> assertTrue(locator.isSharedConfigurationRunning()));
+    }
+{code}
+
+
+There are two request/response messages involving cluster config:
+
+1) SharedConfigurationStatusRequest/SharedConfigurationStatusResponse -- used only to get status of cluster config service such as for "status locator" command.
+
+This is implemented with a Future so that handling the SharedConfigurationStatusRequest will correctly wait on a Future until cluster config has been initialized:
+{code:java}
+  public SharedConfigurationStatusResponse getSharedConfigurationStatus() {
+    ExecutorService es =
+        ((GemFireCacheImpl) myCache).getDistributionManager().getWaitingThreadPool();
+    Future<SharedConfigurationStatusResponse> statusFuture =
+        es.submit(new FetchSharedConfigStatus());
+    SharedConfigurationStatusResponse response = null;
+
+    try {
+      response = statusFuture.get(5, TimeUnit.SECONDS);
+    } catch (Exception e) {
+      logger.info("Exception occured while fetching the status {}", CliUtil.stackTraceAsString(e));
+      response = new SharedConfigurationStatusResponse();
+      response.setStatus(SharedConfigurationStatus.UNDETERMINED);
+    }
+    return response;
+  }
+{code}
+
+2) ConfigurationRequest/ConfigurationResponse -- used to request the actual cluster config and return it to a server that's starting up.
+
+The handling of this request looks problematic. It has a retry-loop and it acquires a distributed lock. I don't see anything in this code -- SharedConfiguration.createConfigurationReponse(ConfigurationRequest) -- that is awaiting the initialization of cluster config. The retry loop and the locking would only somewhat reduce the chance of replying before initialization completes. We could probably remove the retry and the use of distributed lock service here and make it much more robust by using a Future in the way that #1 does.
+
+Commit f097d7a776726ceed7c6a7e72782830989465adf in geode's branch refs/heads/develop from [~upthewaterspout]
+[ https://git-wip-us.apache.org/repos/asf?p=geode.git;h=f097d7a ]
+
+GEODE-2238: Fix how peers discover locators with cluster config
+
+Call super.process last in StartupResponseWithVersionMessage, so that
+that threads waiting on the response will have the results of
+dm.addHostedLocators.
+
+
+I fixed the issues related to the startup message. I think that should fix the LuceneClusterConfigurationDUnitTest failure. Assigning this issue to Kirk to look into the startSharedConfigurationService issues. 
+
+Commit 93994481e361d590ae201e7cbecfd18ee45603b4 in geode's branch refs/heads/feature/GEODE-2231 from [~upthewaterspout]
+[ https://git-wip-us.apache.org/repos/asf?p=geode.git;h=9399448 ]
+
+GEODE-2238: Fix how peers discover locators with cluster config
+
+Call super.process last in StartupResponseWithVersionMessage, so that
+that threads waiting on the response will have the results of
+dm.addHostedLocators.
+
+
+Just saw the following test fail with what looks like a related issue:
+{noformat}
+org.apache.geode.test.dunit.RMIException: While invoking org.apache.geode.internal.cache.FixedPRSinglehopDUnitTest$$Lambda$71/1117084078.call in VM 0 running on Host pietas.apache.org with 4 VMs
+	at org.apache.geode.test.dunit.VM.invoke(VM.java:377)
+	at org.apache.geode.test.dunit.VM.invoke(VM.java:347)
+	at org.apache.geode.test.dunit.VM.invoke(VM.java:315)
+	at org.apache.geode.internal.cache.FixedPRSinglehopDUnitTest.testMetadataInClientWithFixedPartitions(FixedPRSinglehopDUnitTest.java:287)
+Caused by: org.apache.geode.GemFireConfigException: cluster configuration service not available
+	at org.apache.geode.internal.cache.GemFireCacheImpl.requestSharedConfiguration(GemFireCacheImpl.java:1025)
+	at org.apache.geode.internal.cache.GemFireCacheImpl.initialize(GemFireCacheImpl.java:1149)
+	at org.apache.geode.internal.cache.GemFireCacheImpl.basicCreate(GemFireCacheImpl.java:758)
+	at org.apache.geode.internal.cache.GemFireCacheImpl.create(GemFireCacheImpl.java:745)
+	at org.apache.geode.cache.CacheFactory.create(CacheFactory.java:173)
+	at org.apache.geode.cache.CacheFactory.create(CacheFactory.java:166)
+	at org.apache.geode.internal.cache.FixedPRSinglehopDUnitTest.createServerWithLocator(FixedPRSinglehopDUnitTest.java:407)
+	at org.apache.geode.internal.cache.FixedPRSinglehopDUnitTest.lambda$testMetadataInClientWithFixedPartitions$e5446efe$1(FixedPRSinglehopDUnitTest.java:288)
+Caused by: org.apache.geode.internal.process.ClusterConfigurationNotAvailableException: Unable to retrieve cluster configuration from the locator.
+	at org.apache.geode.internal.cache.ClusterConfigurationLoader.requestConfigurationFromLocators(ClusterConfigurationLoader.java:259)
+	at org.apache.geode.internal.cache.GemFireCacheImpl.requestSharedConfiguration(GemFireCacheImpl.java:988)
+{noformat}
+
+
+
+this should be fixed now. The cluster configuration service is not started asynchronously anymore.
+

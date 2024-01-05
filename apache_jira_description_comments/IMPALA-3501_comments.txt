@@ -1,0 +1,137 @@
+[~skye] have you seen these tests fail for this reason in any builds besides code coverage? (Either ASAN or otherwise.)
+
+Assuming the above is true, I think EE tests should be able to pick various timeouts depending on when a build is code coverage or not (or asan or not).
+
+We previously doubled this timeout from 20 to 40, but now 40 isn't enough. Typically to get around this we increase the timeout in all builds, but that could cause us to relax our conditions even in the non-code coverage case.
+
+One option would be to have some sort of way for a test author (or flaky test fixer) to say "If this build is code coverage, change the timeout from N to N+M". This lets us relax timeouts on these very slow builds without relaxing constraints in the normal cases.
+
+To do this the python process needs to know what sort of build it's dealing with.
+
+There are a few ways to do this:
+1. Inspect the environment for variables like {{BUILD_ASAN}} or {{BUILD_COVERAGE}}. This will work as long as the entry point was {{buildall.sh}}.
+2. Use {{gcc -D}} to further define that the build was for code coverage (asan is already defined in its case) and then when generating the impala build string, augment an additional substring to show that. This is already done with DEBUG vs. RELEASE. This would be fairly fast and get around the {{buildall.sh}}-only problem. What I'm unsure about is whether there is some parser of the version string that relies on the output being just so. This would break that.
+3. Figure out how to inspect the binary to see if particular code coverage or asan symbols are present. {{nm}} can do this, for instance, but calling it is slow. Plus, it's not clear what we should actually look for. If the toolchain is updated, would {{nm | grep}} still find what we need? We also run the risk of false positive matching.
+
+I've got a python-side idea working ok, but the detection of the build type still needs some work and thought.
+
+Also, the failing build was http://sandbox.jenkins.cloudera.com/job/impala-cdh5-trunk-exhaustive-code-coverage/110/ . The subscribers were killed in 45, not 40 seconds, according to the statestored logs.
+
+At the last infra meeting [~jbapple] said he liked the idea of inspecting the binary directly. I've never had to do that before, or store compile options, so I needed to do some research.
+
+The tl;dr is that I can't tell that Clang stores *any* sort of information or even gives a caller the ability to choose; GCC does by default store *some* information, in DWARF, and you can store more by via a compile-time option.
+
+----
+
+That means if we want to know whether impalad is ASAN, we have to look at the first DWARF compile unit, which with ASAN is an ASAN object; with non-ASAN, it's an Impala object.
+
+{noformat}
+$ toolchain/binutils-2.26/bin/readelf --debug-dump=info --dwarf-depth=1 impalad-asan
+Contents of the .debug_info section:
+
+  Compilation Unit @ offset 0x0:
+   Length:        0xa37 (32-bit)
+   Version:       4
+   Abbrev Offset: 0x0
+   Pointer Size:  8
+ <0><b>: Abbrev Number: 1 (DW_TAG_compile_unit)
+    <c>   DW_AT_producer    : (indirect string, offset: 0x4ef): GNU C++ 4.9.2 -mno-avx2 -m64 -mtune=generic -march=x86-64 -g -O3 -O3 -O3 -O3 -std=c++11 -std=c++11 -std=c++11 -std=c++11 -fdata-sections -fPIC -fno-builtin -fno-exceptions -fomit-frame-pointer -funwind-tables -fno-stack-protector -fvisibility=hidden -fvisibility-inlines-hidden -fno-function-sections -fno-lto -fno-rtti
+    <10>   DW_AT_language    : 4        (C++)
+    <11>   DW_AT_name        : (indirect string, offset: 0x18c): /data/jenkins/workspace/verify-impala-toolchain-package-build/label/ec2-package-ubuntu-14-04/toolchain/source/llvm/llvm-3.8.0.src-p1/projects/compiler-rt/lib/asan/asan_preinit.cc
+...
+ Compilation Unit @ offset 0x289c25:
+   Length:        0x569c (32-bit)
+   Version:       4
+   Abbrev Offset: 0x1d6a5
+   Pointer Size:  8
+ <0><289c30>: Abbrev Number: 1 (DW_TAG_compile_unit)
+    <289c31>   DW_AT_producer    : (indirect string, offset: 0x454f3): clang version 3.8.0 (tags/RELEASE_380/final)
+    <289c35>   DW_AT_language    : 4    (C++)
+    <289c37>   DW_AT_name        : (indirect string, offset: 0x45520): /home/mikeb/.ccache/tmp/daemon-mai.tmp.mikeb-desktop.2499.ii
+    <289c3b>   DW_AT_stmt_list   : 0x51463
+    <289c3f>   DW_AT_comp_dir    : (indirect string, offset: 0x4555d): /home/mikeb/Impala/be/src/service
+    <289c43>   Unknown AT value: 3fe1: 1
+    <289c43>   DW_AT_low_pc      : 0x0
+    <289c4b>   DW_AT_ranges      : 0xb7d60
+ <1><289c4f>: ...
+...
+
+
+$ toolchain/binutils-2.26/bin/readelf --debug-dump=info --dwarf-depth=1 impalad | head -11
+Contents of the .debug_info section:
+
+  Compilation Unit @ offset 0x0:
+   Length:        0xe9e0 (32-bit)
+   Version:       2
+   Abbrev Offset: 0x0
+   Pointer Size:  8
+ <0><b>: Abbrev Number: 1 (DW_TAG_compile_unit)
+    <c>   DW_AT_producer    : (indirect string, offset: 0x351c): GNU C++ 4.9.2 -fpreprocessed -mtune=generic -march=x86-64 -g -ggdb -gdwarf-2 -g -std=c++1y -fno-strict-aliasing -fPIC
+    <10>   DW_AT_language    : 4        (C++)
+    <11>   DW_AT_name        : (indirect string, offset: 0xce48): /home/mikeb/Impala/be/src/service/daemon-main.cc
+{noformat}
+
+If we want to know whether impalad is compiled for code coverage, and we don't want to add any more compile options, we can look for flags pertaining to code generation in the compile unit DWARF information. This is because by default gcc uses {{-grecord-gcc-switches}}. This works with all gcc-compiled binaries: debug, release, debug code codverage, debug release.
+
+Here's what a code coverage debug build looks like:
+{noformat}
+$ toolchain/binutils-2.26/bin/readelf --debug-dump=info --dwarf-depth=1 impalad-cc | head -11
+Contents of the .debug_info section:
+
+  Compilation Unit @ offset 0x0:
+   Length:        0xe9fc (32-bit)
+   Version:       2
+   Abbrev Offset: 0x0
+   Pointer Size:  8
+ <0><b>: Abbrev Number: 1 (DW_TAG_compile_unit)
+    <c>   DW_AT_producer    : (indirect string, offset: 0x296c): GNU C++ 4.9.2 -mtune=generic -march=x86-64 -g -ggdb -gdwarf-2 -g -std=c++1y -fno-strict-aliasing -fprofile-arcs -ftest-coverage -fPIC
+    <10>   DW_AT_language    : 4        (C++)
+    <11>   DW_AT_name        : (indirect string, offset: 0xce7e): /home/mikeb/Impala/be/src/service/daemon-main.cc
+{noformat}
+
+Note that we see {{-fprofile-arcs -ftest-coverage}}.
+
+If we are interested, we can also compile impalad with {{-frecord-gcc-switches}}. In this case a special {{.GCC.command.line}} section is included in the ELF.
+
+{noformat}
+$ toolchain/binutils-2.26/bin/readelf -p .GCC.command.line impalad-cc-dump-frecord-gcc-switches
+...
+  [   5b2]  -D CODE_COVERAGE
+...
+  [   77f]  -fprofile-arcs
+  [   78e]  -ftest-coverage
+  [   79e]  -frecord-gcc-switches
+...
+{noformat}
+
+This output is trimmed but we can see *all* the options used. This is a more extensive set than {{-grecord-gcc-switches}}. (Note: I added {{-D CODE_COVERAGE}} myself locally.)
+
+Again though, Clang doesn't have an equivalent to either.
+
+Any way you try, with binary inspection, there will be some heuristic we must use to determine what sort of build we're dealing with. I think we are going to have to use DWARF information either way, because Clang binaries just don't have anything better from what I found. So it seems like we won't need to change any compile options, and our heuristic can be:
+
+{noformat}
+obtain info of first compile unit
+
+if "asan-preinit.cc" in DW_AT_name then:
+ asan build
+elif "daemon-main.cc" in DW_AT_name then:
+ not asan asan build
+else
+ warn
+
+if not asan build:
+ if "-ggdb" in DW_AT_producer then:
+  debug build
+ else:
+  release build
+ if "-ftest-coverage" in DW_AT_producer then:
+  coverage build
+
+if we cannot find some of these symbols to know the build, we should warn and assume a debug build
+{noformat}
+
+The heuristic depends heavily on our compiler options not changing from these, though additional options would work. The heuristic depends heavily on the first compile units' names not changing. Last, the options exist in the bowels of {{be/CMakeLists.txt}}. A change there might not be picked up in the heuristic. Is it possible to derive the heuristic based on what's in {{be/CMakeLists.txt}}? Maybe that's thinking too much; maybe it's enough just to leave a note there to ensure the heuristic is kept up to date.
+
+https://github.com/cloudera/Impala/commit/bbad07d5d99581b94792312f278ddbbbf02094e6
+

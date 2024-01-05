@@ -1,0 +1,378 @@
+Tagging 2.1.3 rather than earlier based on the reasoning that since this has been around since 2i was added in 0.7 with nobody hitting it in the wild, it must not be a very common occurrence.
+
+If we send a {{RangeTombstoneMarker}} each time we find a deleted index entry, the coordinator will be able to discard the false positives returned the stale node. The problem is that read repair will send back the tombstones to the nodes, corrupting not only the index but also the indexed table. Possible solutions could be to disable read repair for index queries or sending a new type of tombstone that read repair would ignore. 
+
+As an alternative solution, the index could return also the rows pointed by the deleted index entries, without any information about the staleness of the index entries, and use {{Index.postProcessorFor(ReadCommand)}} to discard those rows that doesn't satisfy the index expression after reconcilliation. This would solve the consistency problem without any changes in read repair, or in the coordinator in general. The downside is that we should read in the base table, and possibly send, all the rows pointed by deleted index entries satisfying the expression since last gc. 
+
+I'm working in this last approach here:
+
+||[3.0|https://github.com/apache/cassandra/compare/cassandra-3.0...adelapena:8272-3.0]|[utests|http://cassci.datastax.com/view/Dev/view/adelapena/job/adelapena-8272-3.0-testall/]|[dtests|http://cassci.datastax.com/view/Dev/view/adelapena/job/adelapena-8272-3.0-dtest/]|
+
+The patch is still uncomplete, I'm posting it just to illustrate the approach. I have not yet added dtests for the scenario described by this ticket, although I've tried it manually, and existing dtests pass. 
+
+{{PartitionRangeReadCommand}} overrides {{ReadCommand.executeInternal(ReadOrderGroup)}} to use the index post-processor, that now is required to let the index clean the stale entries.
+
+And [here are the dtests|https://github.com/riptano/cassandra-dtest/compare/master...adelapena:CASSANDRA-8272] reproducing the problem. They use 2 replicas instead of 3. Updates use consistency {{ONE}}, and byteman is used in one of the two nodes to simulate a long latency during index updates. Insertions and selections use consistency {{ALL}}.
+
+Cassandra 2.1 doesn't use byteman so, if we are going to fix this version, we could either add the byteman dependency to 2.1 or modify [the way ccm loads the byteman jars|https://github.com/pcmanus/ccm/blob/master/ccmlib/node.py#L1609].
+
+[~adelapena], I gave a first review pass and the approach looks sensible, so +1 on that.
+
+Unfortunately, the problem is actually quite subtle and there are at least a couple cases where it doesn't fully work.
+
+First of all, when a {{LIMIT}} clause is provided, the query might return no results when there actually are some valid ones: this is because the rows returned as a result of an "index mismatch" are still counted against the limit (by {{CQLCounter}}), which means the coordinator might end up with less valid rows than the requested limit, simply because some replicas returned only mismatched rows. Here's a simple scenario with two nodes:
+1) Write row {{key=1,index=1}}.
+2) Write row {{key=2,index=1}}.
+3) Shutdown node 2.
+4) Delete column {{index}} from row {{key=1}}: the delete will go to node 1, while node 2 will miss it.
+5) Restart node 2 (hints need to be disabled).
+6) Query for {{index=1}}.
+7) Node 1 will return the first row found, i.e. the "mismatched" one {{key=1}}.
+8) Node 2 will return the "missed delete" with {{key=1}}.
+9) Coordinator will merge/post-process the rows, realize there's a mismatch and return no results, while it should have instead returned {{key=2}}.
+
+Second, this patch doesn't fix filtering; while it's true we have a different issue for that ({{CASSANDRA-8273}}), and while we could argue filtering isn't exactly a form of indexing, it is still used in conjunction with indexing, and fixing indexing just to have its results invalidated when filtering is applied seems quite confusing to me.
+
+In the end, I'd suggest the following:
+1) Stick with the current approach! It's good and I do not think using special tombstones would buy us anything.
+2) Fix the first problem above.
+3) Generalize the approach so we can fix filtering and any other indexing implementation (most notably SASI).
+4) To ease the burden of porting between versions, and given this is not a trivial bug fix at all, I'd also suggest to only apply it to 3.11 onwards.
+
+Thoughts?
+
+One more thing I'm realizing we should fix is paging, which seems broken in a similar way to limiting: that is, if the page size is less than the number of mismatched rows we might end up going through "empty" pages until we get to the valid results.
+
+bq. 1) Stick with the current approach! It's good and I do not think using special tombstones would buy us anything.
+
+It would solve the {{LIMIT}} issue for instance. It's also theoretically a bit more efficient as won't ship full rows to the coordinator that it end up discarding.
+
+Not that I'm suggesting we use special tombstones: thinking about it more I think it's actually broken in some cases where we delete/re-insert an entry in rapid succession. Basically, the deletion could end up deleting a valid entry post-re-insert if one of the node haven't seen that re-insert yet.
+
+Besides, the {{LIMIT}} issue isn't that hard to fix and the performance impact is unlikely big in most cases. But my main point is that on principle we should be careful to look at the whole solution before comparing it to alternatives and deciding which one we "stick with". I've seen simple solutions get pretty messy once you fix all edge cases to the point that it wasn't the best solution anymore.
+
+bq. 3) Generalize the approach so we can fix filtering
+
+I wouldn't make that a requirement to commit this ticket. Filtering is genuinely orthogonal to indexing: it's as valid to use with and without indexing, and the code for both is mainly orthogonal. It's in particular not true that fixing this bug will be "invalidated when filtering is applied", especially when 2i is used but filtering isn't (hopefully the most common case in production since filtering is what it is).
+
+Don't get wrong, both problems are certainly related, in that the underlying problem is that replica can return stale data where up-to-date replica don't return anything to indicate this is stale.
+
+But in the indexing cases, we have more information in that we have the index tombstones to know what entries might be stale on another node, so we know *a relatively minimal* set of info (rows) to return to "fix" potentially stale entries from other replica.
+
+In the filtering case, we don't have similar information to help\[1\]: the equivalent to the solution from [~adelapena]'s patch is to say that when a replica sees a row they should filter out, they still return it in case it may be needed to "fix" a stale replica. But doing so exactly amounts to not doing any filtering replica-side and moving it all server-side, which is what I'm suggesting in CASSANDRA-8273.
+
+In other words, this ticket has a mostly-replica-side based solution but the filtering one probably doesn't. That's enough difference imo to not wed ourselves to fixing both problems in the same ticket, and to keep discussion around filtering on CASSANDRA-8273 (doesn't mean we can't cross-reference of course when appropriate).
+
+bq. and any other indexing implementation (most notably SASI)
+
+That I agree is something we should consider. Though tbh, I have doubts we can have a solution that is completely index agnostic. What we need is that indexes return any entries that _was_ recently valid but isn't anymore (up to gc_grace) so that the result from any replica having the old entry can be properly reconciled and skipped. That has to be something the index implementation itself provides to us, and the best we can do is simply specify that index implementations have to do that to be correct. Though I suspect not all custom index implementations will be able to provided that at all in practice.
+
+Don't know about SASI in particular though. I assume it kind of has to keep tombstones for old entries in the first place (not sure how it handles deletes otherwise) and if so, we should certainly update it to implement the new requirement described above.
+
+There is the question of the {{LIMIT}} problem. I think the proper way to fix that is to create a new {{DataLimits}} that keep the {{RowFilter}} around and that doesn't count entries that don't match it (which will have a small cost btw, but I don't see an easy way out). In which case, any "normal" CQL expression will be covered and that will include SASI for this particular part. For custom expressions however, we currently unfornately have {{RowFilter.CustomExpression#isSatisfiedBy()}} always return {{true}} currently, so we'd have to make that method abstract and require index using custom expressions to implement it (which is, strictly speaking, a breaking change and implies 4.0 at this point; more on that below).
+
+
+bq. I'd also suggest to only apply it to 3.11 onwards
+
+One thing that hasn't been mentioned is that the fix has impact on upgrades. Namely, in a mixed cluster, some replica will start to return invalid results and if the coordinator isn't upgraded yet, it won't filter those, which means we'll return invalid entries. More precisely, we may return up-to-date data but that doesn't match the request at all, and I would argue that it's a more serious problem that the one we're actually fixing here (returning slightly stale data but that do match the query). Also, during the upgrade window, I suspect it's much more likely to happen than this bug is in the first place. So I'd argue that during upgrade, the cure is way worst than the disease\[2\].
+
+Anyway, that's a problem to consider and ideally we'd want to avoid it. That does mean we should consider starting to filter entries on index queries coordinator-side in 3.0/3.11 (even though we never return them), and only do the replica-side parts in 4.0, with a fat warning that you need to only upgrade to 4.0 from a 3.X version that has the coordinator-side fix.
+
+Worth noting that this doesn't entirely fly for index using custom indexes: we'd need to have them implement the {{CustomExpression#isSatistiedBy}} method in 3.X in that scheme since we need it for the coordinator-side filtering as well, but making that method abstract in 3.X is, as said above, a breaking change. So we might want to only make the method abstract in 4.0, but add another fat warning that custom index should consider overriding the method in 3.X so later upgrades are correct (unless the index implementation can't implement the new requirement I expressed above, in which case they can change nothing and stay about as broken as they are now, which could be a trade-off).
+
+\[1\]: we could have it if we were to keep historical values on updates for a while, but that's a _massive_ change and is thus a no-go since we're talking about fixing filtering, which is something we decourage in production in the first place.
+\[2\]: to the best of my knowledge (and we've been aware of this problem for a while, so we'd have likely noticed), no user actually reported this problem. It certainly doesn't mean that no-one has hit it, and in fact I'm sure some have, but it means it's rare enough and his consequence mild enough that no-one noticed (or not enough to report it). After all, we only return stale entries for a tiny window and I don't think user rely on 2i consistency _that_ seriously (gut guess admitedly).
+
+
+
+bq. my main point is that on principle we should be careful to look at the whole solution before comparing it to alternatives and deciding which one we "stick with". I've seen simple solutions get pretty messy once you fix all edge cases to the point that it wasn't the best solution anymore.
+
+Of course. And I indeed gave some thoughts on my own to the tombstones solution (as I'm sure [~adelapena] did as well), and I've found it quite more complex that the current one, with little/no gains in return, and, something I didn't mention before, not really complete for indexes covering multiple columns, or if we'll ever want to support multiple indexes per row: in such cases, mixing tombstones and valid column values for all combinations would easily turn into a mess IMHO, while actually returning the row and later post-filter is IMHO cleaner and less error prone. To be noted, we could still "skim" the row when we detect it's related to a stale entry and only keep the index-related columns (and easily add a merging step in the future for the multiple indexes cases): this would buy us the performance optimization you mentioned above, but I see it slightly error prone and I'd rather go with a functionally complete solution first.
+
+bq. It's in particular not true that fixing this bug will be "invalidated when filtering is applied"
+
+I disagree here: if filtering is applied on top of index results, you'll still get wrong results, which is confusing to me (as a user). I understand filtering is also orthogonal, so what about fixing filtering (that is, moving to coordinator-side filtering) only when indexes are present?
+
+bq. That [fixing other index implementations] I agree is something we should consider. Though tbh, I have doubts we can have a solution that is completely index agnostic. 
+
+Of course. But we can still provide some API (i.e. the {{isSatisfiedBy()}} you mentioned) they can leverage. And if we do this kind of work on the SASI-enabled branches, we'll have two different index implementations to test the goodness of our API.
+
+bq. One thing that hasn't been mentioned is that the fix has impact on upgrades. Namely, in a mixed cluster, some replica will start to return invalid results and if the coordinator isn't upgraded yet, it won't filter those, which means we'll return invalid entries.
+
+Excellent point! And definitely something to avoid.
+
+bq. That does mean we should consider starting to filter entries on index queries coordinator-side in 3.0/3.11 (even though we never return them), and only do the replica-side parts in 4.0, with a fat warning that you need to only upgrade to 4.0 from a 3.X version that has the coordinator-side fix.
+
+Mmmhhhh ... clunky. And error prone as the 3.X code would be probably untestable. Couldn't the replica detect the coordinator version and return results accordingly?
+
+bq. Worth noting that this doesn't entirely fly for index using custom indexes: we'd need to have them implement the CustomExpression#isSatistiedBy method in 3.X in that scheme since we need it for the coordinator-side filtering as well, but making that method abstract in 3.X is, as said above, a breaking change.
+
+I'm not sure I get why you _have to_ make that abstract: I think it's fine to leave it as it is and warn users they'll have to override it on upgrade if they want consistent results. And for those implementations that can't implement it, we should maybe add a {{isConsistent}} predicate to disable "consistent filtering" altogether.
+
+Indeed, both returning entries that were recently valid but aren't anymore and checking if the custom expressions are still valid after reconcilliation is something that should be done by index implementations. Also, some implementations could not be able or even not be interested on doing so.
+
+Regarding the {{LIMIT}} problem, the new {{DataLimits}} suggested by [~slebresne] could be provided by a new method {{Index#getPostIndexQueryLimits}}, similar to the existing [{{Index#getPostIndexQueryFilter}}|https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/index/Index.java#L341]. Alternatively, we might just disable the limits at [{{ReadCommand#executeLocally}}|https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/db/ReadCommand.java#L371] and [{{DataResolver#resolve}}|https://github.com/apache/cassandra/blob/trunk/src/java/org/apache/cassandra/service/DataResolver.java#L79] for index queries, and let the indexes take care of restricting the limits at search time. This way the index implementations wouldn't require to specify a {{CustomExpression#isSatistiedBy}} implementation, they would discard the stale entries with their post processor, which could also be used for other things, like sorting.
+
+bq. I disagree here: if filtering is applied on top of index results, you'll still get wrong results
+
+It's possible, but not at all guarantee since the index and filtering will apply to different columns. But that's almost beside the point as my point is that even solving only the indexing will still avoid bugs for some people (at the very least the ones that don't use filtering over indexing at all), so if we can't get agreement on how to fix the filtering, I don't think we should hold the indexing fix.
+
+But mostly, I just want us to have the _discussion_ around filtering in CASSANDRA-8273 to avoid mixing things up, but If we can agree on moving filtering server-side there quickly, then I'm totally fine doing that and the indexing in a single patch if we prefer.
+
+bq. what about fixing filtering (that is, moving to coordinator-side filtering) only when indexes are present?
+
+Well, that kind of already get into the territory of whether we're ok with moving filtering coordinator-side. In fact, I don't think having filtering applied on top of indexing or not change in any way that discussion. Again though, I'm not at all against fixing both issues, I just prefer discussing the two different (though related) problems separately.
+
+bq. But we can still provide some API (i.e. the {{isSatisfiedBy()}} you mentioned) they can leverage.
+
+If you're making a general point, then sure. Otherwise, I'm not sure what else you have in mind (and as I said I don't see what more we can do) so feel free to share.
+
+bq. Mmmhhhh ... clunky. And error prone as the 3.X code would be probably untestable. Couldn't the replica detect the coordinator version and return results accordingly?
+
+We can do anything, but everything version-related is currently wired to the messaging protocol version, which can't currently change in minor versions, so we'd have to rely on the version exchanged through gossip in a way we never have, so with risks associated (typically potential races between when we actually get that version and where we use it). Plus it  would mean quite a bit of (fairly ugly) changes to pass the version where we need it. All that in a minor release. I doubt it's a good idea in practice in this context.
+
+On the flip-side, we do have quite a bit of prior experience adding stuffs to minor releases to fix future major upgrade. I don't disagree it's clunky, mind you, but better the devil you know...
+
+I don't see why it would be untestable though: we can test the added filtering doesn't break anything in 3.x and we can totally test upgrades.
+
+bq. for index using custom indexes: we'd need to have them implement the {{CustomExpression#isSatistiedBy}} method
+
+I was a bit too quick here, it's actually not that simple, because {{CustomExpression}} are created directly from the parser and don't depend on whatever index use them, so we can't have them override/implement it. That said, we do know which index it's use with when we create one so we could change things a bit so index do provide us with their own concrete implementation {{CustomExpression}}, it's just a tiny bit more involved that I made is sound to be.
+
+
+I hadn't really looked at the patch before, but I think we can and should make most things index agnostic here. In particular, I don't think we should use {{Index#postProcessorFor}} for the coordinator-side filtering. What I would do instead is modify {{PartitionRangeReadCommand#ReconcialiationProcessing}} to be:
+{noformat}
+public PartitionIterator postReconciliationProcessing(PartitionIterator result)
+{
+    ColumnFamilyStore cfs = Keyspace.open(metadata().keyspace).getColumnFamilyStore(metadata().name);
+    Index index = getIndex(cfs);
+    if (index == null)
+        return result;
+
+    // Indexes on replica can return results that don't match the query but are necessary
+    // to avoid stale entries from other nodes (see #8272) so we should filter those out
+    // now. Then we apply any index specific post-processor.
+    RowFilter indexFilter = index.getIndexQueryFilter(rowFilter());
+    return index.postProcessorFor(this)
+                .apply(indexFilter.filter(result, metadata(), nowInSec()), this);
+}
+{noformat}
+where we'd just need to add a {{Index#getIndexQueryFilter}} that would be the exact inverse of {{Index#getPostIndexQueryFilter}} (and so this can be simply implemented as a default method that subtract from its input anything from {{Index#getPostIndexQueryFilter}}).
+
+The reason I'm advocating this is two-fold:
+# it's simpler in that it's done once generically instead of being re-implemented by each index implementation; and as index already expose everything we need to do this, no reason to have them do it "manually".
+# probably more importantly, if we do decide to move all filtering coordinator-side in CASSANDRA-8273 (which I do believe is the right thing to do), we'd just have to modify (and actually simplify) that method slightly to
+{noformat}
+public PartitionIterator postReconciliationProcessing(PartitionIterator result)
+{
+    result = rowFilter().filter(result, metadata(), nowInSec());
+    ColumnFamilyStore cfs = Keyspace.open(metadata().keyspace).getColumnFamilyStore(metadata().name);
+    Index index = getIndex(cfs);
+    if (index == null) ? result : index.postProcessorFor(this).apply(result, this);
+}
+{noformat}
+which is imo kind of neat conceptually.
+
+It is true that doing so does mean we need indexes to implement {{CustomExpression#isSatisfiedBy}}, which as I mention in my previous comment requires a slight refactor, but I'd argue that this is something we absolutely should do anyway (and should have done before). It's wrong that this method is currently basically broken for custom expressions: sure we currently happen to not use it in that case, but it's not future-proof at all and it's that kind of tribal knowledge ("you should make sure to not use {{Expression#isSatisfiedBy}} or anything that uses it if there is {{CustomExpression}} involved") that makes the code hard to work with.
+
+bq. could be provided by a new method {{Index#getPostIndexQueryLimits}}, similar to the existing {{Index#getPostIndexQueryFilter}}.
+
+That'd work, though we really don't need indexes to implement it, we can use the {{Index#getIndexQueryFilter}} from above. And so maybe we don't need to add a new method to {{Index}}, and instead just add a {{DataLimits#withFiltering(RowFilter)}} method (that given a {{DataLimits}}, create a new one that only count rows that match the provided {{RowFilter}}) and directly use that with the result of {{Index#getIndexQueryFilter}} when we need it.
+
+bq. Alternatively, we might just disable the limits at {{ReadCommand#executeLocally}} and {{DataResolver#resolve}} for index queries, and let the indexes take care of restricting the limits at search time
+
+I'll admit I'm kind of opposed to that. There is always cases where we need to be able to count stuffs post-query so not being able to do so with index queries would be clunky, if not properly a blocker. For instance, I suspect it'll break paging without quite a bit of special casing. Another example would be the row cache, where we do some stuffs around counting that just wouldn't work in that case (don't get me wrong, we don't use row cache for 2i today, I'm just trying to illustrate that we'd lose flexibility for future developments).
+
+Further, it took some care in CASSANDRA-8099 to cleanly separate the counting of results from the actual producer of data but that imo simplified and cleaned thinks up, and I'd hate to start breaking that kind of "abstraction".
+
+
+bq.  I just want us to have the discussion around filtering in CASSANDRA-8273 to avoid mixing things up, but If we can agree on moving filtering server-side there quickly, then I'm totally fine doing that and the indexing in a single patch if we prefer.
+
+I'm fine with moving filtering server side, and I'm fine with dealing with it on either issues provided we eventually address CASSANDRA-8273 straight away.
+
+bq. If you're making a general point [about API], then sure.
+
+Yes, I'm making a general point. Also see below.
+
+bq. we'd have to rely on the version exchanged through gossip in a way we never have, so with risks associated 
+
+Alright, I don't have enough knowledge to provide a proper risk assessment on my own, so I'm fine with the previously proposed "split" patch.
+
+bq. I think we can and should make most things index agnostic here
+
+Totally agree here, and that's what I meant when saying we should make it work with all index implementations and devise APIs to leverage. I agree we should move away from using {{Index#postProcessorFor}}, and I agree we should keep the counting outside the index implementation (again, as it will be useful to all index implementations), but I'll leave the actual implementation details to [~adelapena] and discuss once we've got a first cut.
+
+So here's my take away about how we should move forward:
+1) Provide a first patch based on 3.11 to fix the coordinator side.
+2) Provide a second patch based on trunk to fix both coordinator and replica side (we could address this first, review, and backport the coordinator side once in agreement).
+3) Discuss filtering in CASSANDRA-8273 and eventually address it here (this patch is getting quite meaty already, but OTOH CASSANDRA-8273 will require a split approach too, so we might want to make our life easier and do everything in one place).
+
+Thoughts?
+
+[~sbtourist], the proposed steps look good to me. 
+
+[~slebresne], now I see that ignoring the limit before post processing has implications that I didn't take into account and that make it a bad idea which I retract. The reasoning behind trying to discard the "tombstone" rows using the post processor instead of the expression is that there could exist implementations where doing so could have a negative impact of performance, especially if they are already using the post processor for sorting or any other stuff. But, thinking it better, these implementations can rely on other methods to mitigate the performance cost of re-evaluating all the expression if the only requirement is to just discard tombstones.
+
+Regarding making {{RowFilter.CustomExpression#isSatisfiedBy()}} abstract, we could provide a new {{Index#customExpressionFor(CFMetaData, ByteBuffer)}} method to let the index provide the custom expression implementation. This new method could have a default implementation returning a new {{RowFilter.CustomExpression}} with the same behaviour that we currently have, that is, an {{#isSatisfiedBy()}} implementation that always returns {{true}}. This way, for 3.x we'll keep compatibility while allowing custom index implementors that don't require incremental upgrades to implement the coordinator side of this bugfix. Then, for trunk, we could either remove the {{Index#customExpressionFor(CFMetaData cfm, ByteBuffer value)}} implementation or keep it as an ease for index implementations not interested in or able of implementing the coordinator side part of this. [Here|https://github.com/adelapena/cassandra/commit/34d3c7d0759c253d2b780b80e140930dc05cd591] is a draft patch showing the approach.
+
+What do you think?
+
+Looks good to me.
+
+bq. for trunk, we could either remove the {{Index#customExpressionFor(CFMetaData cfm, ByteBuffer value)}} implementation or keep it as an ease for index implementations not interested in or able of implementing the coordinator side part of this. 
+
+For what it's worth, I'd really remove it. The default we're providing is just broken for any sensible index implementation, and have a default implementation that is intrinsically broken is wrong. Sure, so far we haven't relied on that implementation, and with this ticket we would rely on it in a particular case only, but all this isn't very future proof. And there is no real cost to asking custom index to implement it: worst case, they can just making it always return true themselves if they so wish, but at least they do it while being plainly aware that it's dodgy and could brake things in the future.
+
+bq. Here is a draft patch showing the approach.
+
+Excellent, I like it too.
+
+It seems that for guaranteeing consistency the replicas should send *all* the rows with a matching obsolete entry in the index. The number of rows to be sent can be quite large in large clusters, so this could have an appreciable impact in performance. 
+
+However, this mechanism is not required when read consistency level is ONE, which I suspect is the most commonly used consistency level for 2i use cases. So, as a performance improvement, we could keep filtering on the replica side when CL=ONE. 
+
+I think we could pass the consistency level (or a boolean indicating if CL=ONE) to the {{Index#searcherFor}} method, in such a way that the index implementation would be expected to provide only not-stale results if CL=ONE, and either stale or not-stale results if CL>ONE. It could be cleaner to keep this logic out of the index implementations, but they are in the best position to efficiently apply replica-side filtering at CL=ONE, because they can possibly use their underlying index structures to simply don't read the stale results instead of just skipping them.
+
+WDYT? Does it make any sense?
+
+I can refer you to [my comment on 8273|https://issues.apache.org/jira/browse/CASSANDRA-8273?focusedCommentId=16007964&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-16007964] on that aspect since it's largely the same aspect, but the short version is that you are right, but at the same time 1) anyone caring about performance should probably use token-aware clients and that make such CL.ONE optimization not really needed, 2) we actually don't ship the consistency with {{ReadCommand}} to replicas, so such optimization cannot be done before 4.0 at best (it requires a protocol change) and 3) the reason why this ticket is "easier" than CASSANDRA-8723 is that we will likely not transfer _that_ much additional rows: we'll only sent row that use to be valid entries for the query but aren't anymore and this since less than gc_grace, which, except maybe for very specific cases, is unlikely for represent a huge overhead for any particular query.
+
+Anyway, not really opposing such optimization, but given it's not useful if you follow performance best practices and given it's a tiny bit more involved than it sounds (and it adds a bit of complexity to the code after all by creating a special case), I'd be happy focusing on correction here and leaving that to a follow-up. 
+
+While I agree it is an edge case, we need to make sure a 2i query doesn't OOM someones node because they just did a mass delete.  So we should make sure we at the very least use the current tombstone overwhelming thresholds when reading these values.
+
++1 on making replicas aware of the CL in 4.0
+
+In terms of what to do about very large sets of "no longer valid" matches, I agree we shouldn't allow ourselves to OOM the node, but what's more, we should fail the query outright if we breach the "threshold".
+
+[~slebresne], I think the optimization could also be useful even if you use token-aware clients. Some index implementations could do faster local searches in the underlying index structure if they know that they have to skip stale entries, provided that the staleness status is one of the indexed dimensions. Additionally, we wouldn't require to read the base table rows pointed by the stale entries.
+
+bq. Some index implementations could do faster local searches in the underlying index structure if they know that they have to skip stale entries
+
+Maybe, but again this is pushing more details to the index implementation in a way that becomes a bit black box for us, and 1) I feel this make things more complex overall and 2) I fear about this beating us back in the future. So even if I was to do that optimization of moving filtering to the replica on CL.ONE, I'd still prefer keeping it index-independent.
+
+Don't get me wrong, this is largely personal opinion I'm expressing here. I _prefer_ keeping things simpler, asking from custom index a behavior that is as simple, consistent and as generic as possible (so with as little special case as possible). As said above, I'm not convinced the amount of stale entries we'll end up dealing with in practice will be really big (again, that's where this mainly differs from CASSANDRA-8273 imo), so I can't shake the feeling that all this would be premature optimization. Or to put it more bluntly, I'm ok with the trade-off of removing a few hypothetical and edge case opportunity for optimization from custom index implementations for the benefit of keeping our code and the general custom index contract simpler and more maintainable.
+
+Note that I'm distinguishing the two level of 1) moving the filtering replica-side for CL.ONE and 2) actually pushing to the index implementation the responsibility of said replica-side CL.ONE filtering. I do kind of feel both are a bit premature optimizations as far as this ticket goes tbh, but I don't mind 1) so much, while I'm a bit more wary of 2) for the reasons expressed above.
+
+[Here|https://github.com/apache/cassandra/compare/cassandra-3.11...adelapena:cc6b762714942e3470daff4b815d3c311f16d856] I'm working on the patch for 3.11. The row filter-aware data limits is not yet finished, thus there are several tests failing, but I think it could be useful to give an idea of the approach:
+
+* Index interface has a new {{Index#getIndexQueryFilter(RowFilter)}} method, intended to return a row filter with only the expressions served by the index. It has a default implementation that returns the opposite to the already existent {{Index#getPostIndexQueryFilter}}.
+
+* Unfortunately, SASI don't return results satisfying the row filter, because {{LIKE}} operator implementation doesn't take into account tokenization. So for now {{SASIIndex#getIndexQueryFilter}} returns an empty filter.
+
+* Index interface has a new {{Index#customExpressionFor(CFMetaData, ByteBuffer)}} method to provide a custom expression implementation. The default implementation returns a {{CustomExpression}} which {{isSatisfiedBy}} method returns always {{true}} to keep compatibility. {{RowFilter.CustomExpression}} class is modified to be abstract, and it has a builder method that requests the specific implementation to the target index. 
+
+* {{PartitionRangeReadCommand#postReconciliationProcessing}} has been moved to {{ReadCommand#postReconciliationProcessing}}. Now it removes all the rows not satisfying  {{Index#getIndexQueryFilter}} before calling to {{Index#postProcessorFor}}, and it is called by all read queries {{#execute}} and {{#executeInternal}} methods implementations.
+
+* {{DataLimits}} has a new method {{newCounter(int, boolean, RowFilter, CFMetaData)}} that returns a new row filter-aware {{DataLimits.Counter}}. This counter, which is a transformation, should include in the results (but not count) all the rows that don't satisfy the row filter. So, when a row filter is specified, {{DataLimits.Counter}} is a not stopping transformation because all the rows not satisfying the filter shouldn't be filtered, although they are not counted.
+
+* Both {{DataResolver#resolve}} and {{ReadQuery#executeInternal}} implementations apply a {{DataLimits.Counter}} transformation using the filter provided by {{Index#getIndexQueryFilter}}.
+
+* {{CustomIndexTest#coordinatorSideFilteringTest}} contains several tests using a custom index implementation that uses pure coordinator-side filtering.
+
+[~slebresne], is it in line with what you suggested? Any recommendation for the row filter-aware {{DataLimits}}?
+
+Yes, that's generally what I had in mind, thanks!
+
+For the row-filter aware counter however, I don't think we can aford to have it not be a stopping transformation: we very much rely on that stopping to not OOM nodes (and generally read the whole database on a read), whether it be for user limits or paging. I'm not sure I understand why stopping it a concern in this case however?
+
+As an aside, had a very very quick scan of the patch, and I'll also note that in {{StorageProxy}} and {{SinglePartitionReadCommand.Group.executeInternal}}, using only the post-processor of the 1st command would break if the index actually makes assumption based on the command it's passed on, so it feels dodgy and I think we sould make sure it's applied to each command result individually.
+
+
+bq. For the row-filter aware counter however, I don't think we can aford to have it not be a stopping transformation: we very much rely on that stopping to not OOM nodes (and generally read the whole database on a read), whether it be for user limits or paging. I'm not sure I understand why stopping it a concern in this case however?
+
+If I understand it right, the idea is to have a {{DataLimits}} (associated to a {{RowFilter}}) that doesn't filter nor count rows that don't satisfy the filter. Any possible deleted index entry from a replica could be required to discard the possible stale results of another replica, so they shouldn't be filtered by {{DataLimits}}. So, if the query limit requires {{n}} rows, we should return not more than {{n}} rows satisfying the filter, and *all* the rows not satisfying the index but being pointed by a deleted index entry. Is this correct? If so, we can't stop reading when we have {{n}} rows satisfying the filter, we should keep reading the all the remaining rows pointed by deleted index entries, independently of the limit and with the subsequent impact on performance.
+
+
+bq. So, if the query limit requires n rows, we should return not more than {{n}} rows satisfying the filter, and *all* the rows not satisfying the index but being pointed by a deleted index entry.
+
+No, I don't think we have to return *all* the rows not satisfying the index. I believe only returning those that are *before* the {{n}} th "valid" entry is enough. I don't think it's different from how we handle tombstones here: we don't return all tombstones, just the ones before the {{n}} th live results.
+
+Note that both with those new "invalid" entries and with tombstones, it's possible that post-resolution on the coordinator we end up being short on results. That is, a "valid" result from A is canceled by a tombstone/"invalid" result of B and vice-versa and we end up with less results than requested. But that's where the short-read protection from {{DataResolver}} kicks in.
+
+Here is a new version of the patch for 3.11 and trunk:
+
+||[3.11|https://github.com/apache/cassandra/compare/cassandra-3.11...adelapena:454617607063bfb554b841f0d891798404faf0b1]|[utests|http://cassci.datastax.com/view/Dev/view/adelapena/job/adelapena-8272-3.11-testall/]|[dtests|http://cassci.datastax.com/view/Dev/view/adelapena/job/adelapena-8272-3.11-dtest/]|
+||[trunk|https://github.com/apache/cassandra/compare/trunk...adelapena:1416d9b082d7f93b187cbf67abd9a917735c4804]|[utests|http://cassci.datastax.com/view/Dev/view/adelapena/job/adelapena-8272-trunk-testall/]|[dtests|http://cassci.datastax.com/view/Dev/view/adelapena/job/adelapena-8272-trunk-dtest/]|
+
+bq. No, I don't think we have to return all the rows not satisfying the index. I believe only returning those that are before the {{n}} th "valid" entry is enough. I don't think it's different from how we handle tombstones here: we don't return all tombstones, just the ones before the {{n}} th live results.
+bq. Note that both with those new "invalid" entries and with tombstones, it's possible that post-resolution on the coordinator we end up being short on results. That is, a "valid" result from A is canceled by a tombstone/"invalid" result of B and vice-versa and we end up with less results than requested. But that's where the short-read protection from {{DataResolver}} kicks in.
+
+Indeed, short-read protection solves the problem, so I have left the {{DataLimits.Counter}} as a stopping transformation. I have added [some dtests|https://github.com/adelapena/cassandra-dtest/blob/CASSANDRA-8272/secondary_indexes_test.py#L1205-L1343] checking these scenarios with indexes.
+
+bq. As an aside, had a very very quick scan of the patch, and I'll also note that in {{StorageProxy}} and {{SinglePartitionReadCommand.Group.executeInternal}}, using only the post-processor of the 1st command would break if the index actually makes assumption based on the command it's passed on, so it feels dodgy and I think we sould make sure it's applied to each command result individually.
+
+Yes, it is dodgy. I have changed it to apply the post processing to each command in the group. 
+
+As we said, the patch for 3.11 only contains the changes in the coordinator side. I have added [a test|https://github.com/adelapena/cassandra/blob/8272-3.11/test/unit/org/apache/cassandra/index/CustomIndexTest.java#L804-L871] in {{CustomIndexTest}} that uses [a custom index implementation|https://github.com/adelapena/cassandra/blob/8272-3.11/test/unit/org/apache/cassandra/index/CustomIndexTest.java#L1180-L1256] to validate coordinator side filtering.
+
+The patch for trunk also modifies regular secondary indexes to send stale rows. SASI don't uses the mechanism because of the aforementioned problem with expressions evaluation and text analysis, I think we should fix this in a separate ticket.
+
+Please let me know what do you think.
+
+It seems that there were some thrift-related dtests failing in the patch for 3.11. While fixing them I have realized that Thrift commands send only the fetched columns, so they may not send the queried columns that are required to apply the index filter in the coordinator side. The indexed column value are actually fetched but filtered [here|https://github.com/apache/cassandra/blob/cassandra-3.11/src/java/org/apache/cassandra/index/internal/keys/KeysSearcher.java#L182-L193] since [CASSANDRA-11523|https://issues.apache.org/jira/browse/CASSANDRA-11523]. So we could just move this filter to the coordinator-side, probably to [ReadCommand#postReconciliationProcessing|https://github.com/adelapena/cassandra/blob/8272-3.11/src/java/org/apache/cassandra/db/ReadCommand.java#L447-L464]. 
+
+However, I think that if we do such replica-side change we would end having the same problem with upgrades that prevents us to apply the full solution to 3.x. That is, not-upgraded replicas could send rows without the indexed-but-not-fetched columns to an upgraded coordinator that would reject them. Complementary, upgraded replicas could send rows including the indexed-but-not-fetched columns to not-upgraded coordinators that would return them without applying the row filter. Probably we could also have problematic scenarios during reconciliation. 
+
+Here is a fixed patch that just skips coordinator-side filtering of index results for Thrift commands:
+
+||[3.11|https://github.com/apache/cassandra/compare/cassandra-3.11...adelapena:82b122b1ce5b172e11b4be7f02fdb7581bd28291]|[utests|http://cassci.datastax.com/view/Dev/view/adelapena/job/adelapena-8272-3.11-testall/]|[dtests|http://cassci.datastax.com/view/Dev/view/adelapena/job/adelapena-8272-3.11-dtest/]|
+||[trunk|https://github.com/apache/cassandra/compare/trunk...adelapena:1416d9b082d7f93b187cbf67abd9a917735c4804]|[utests|http://cassci.datastax.com/view/Dev/view/adelapena/job/adelapena-8272-trunk-testall/]|[dtests|http://cassci.datastax.com/view/Dev/view/adelapena/job/adelapena-8272-trunk-dtest/]|
+
+This means that not included index implementations couldn't benefit from our consistency fix when using Thrift. Included index implementations weren't going to do so anyway because we are not going to apply the replica side of the fix in 3.x.
+
+No news for trunk.
+
+What do you think? Is it acceptable to don't apply the changes to Thrift commands?
+
+I have rebased the patch for trunk [here|https://github.com/adelapena/cassandra/commit/20e89ae19735eb731b103e2c479da44c207d1cf1]. Rebased dtests can be found [here|https://github.com/adelapena/cassandra-dtest/commit/39d21f2a8a8d80b8842703c58c77289f8b644112].
+
+The main differences with the previous patch version are the removal of Thrift stuff (which makes things easier) and the refactor of {{ReadCommand}}/\{{ReadQuery}} introduced by CASSANDRA-7622. For the latter, I have placed {{postReconciliationProcessing}} at {{ReadCommand}} level since it is related to {{StorageProxy}} and reconciliation, whereas {{ReadQuery}} doesn't seem to require this kind of reconciliation.
+
+It is worth remembering that the patch doesn't support rolling upgrades since not-updated coordinators won't be discard the stale rows sent by updated replicas. I think we don't need the patch for 3.11, which was a refactor that didn't solve the consistency problem to don't break rolling upgrades in a non-major version. 
+
+The patch doesn't update SASI to use the new mechanism, so it still behaves the old way. To benefit from this fix, it would need to provide an [{{Index.getIndexQueryFilter}}|https://github.com/adelapena/cassandra/blob/20e89ae19735eb731b103e2c479da44c207d1cf1/src/java/org/apache/cassandra/index/Index.java#L368-L381] implementation able to deal with analyzed values. I think that we could do it in a separate ticket to keep things simple.
+
+I ran the updated patch on our internal CI. There are not failures for the unit tests and the failing dtests are not related to the change.
+
+
+I have just rebased [the patch|https://github.com/adelapena/cassandra/commit/07e228824fb0e4ea04bf0b1ed11b347ce654f02a] with some fixes for indexes on static columns. I have also added a few extra checks to [the dtests|https://github.com/apache/cassandra-dtest/compare/master...adelapena:CASSANDRA-8272].
+
+It seems that there are some cases missed by the previous index tombstone based approach, 
+ which is when the replica with the most recent version of a column has never seen the previous versions of that column that might be in other replicas, for example:
+{code:java}
+CREATE TABLE t (k int PRIMARY KEY, v text);
+CREATE INDEX ON t(v);
+INSERT INTO t(k, v) VALUES (0, 'old') USING TIMESTAMP 1;  // Only node 1 gets it
+INSERT INTO t(k, v) VALUES (0, 'new') USING TIMESTAMP 2;  // Only node 2 gets it
+SELECT * FROM t WHERE v = 'old'; // node 1 returns a stale result!
+{code}
+The attached PR proposes a different approach that is similar to short read protection, and also fixes CASSANDRA-8273.
+
+When there is replica-side protection, we materialize and cache the query results, using a merge listener to take note of the primary keys of rows that doesn't have a response for any of the involved replicas. We know that those silent replicas might have a more recent version of the row that hasn't been included because it doesn't satisfy the filter. Once we have identified and collected those potentially stale rows, we ask for that rows to the silent replicas, with {{SinglePartitionReadCommand}} s that don't use any filtering. Then, we complete the cached filtered results with the responses from the silent replicas, apply the row filter, and we are ready to go.
+
+Another advantage of this approach over the previous one is that coordinators containing the fix can work with replicas that don't contain the fix.
+
+A particular problem is that SASI results don't satisfy the requested row filter when an analyzer is used. This is something that we should fix so the expressions could delegate their evaluation to the specific indexImplementation. I think this is not specially problematic but I think that it should be done in a separate follow up ticket. By now, the fix just skips replica filtering protection when SASI is used, keeping the old behaviour.
+
+I'm attaching a PR for 3.11 and I'm working on the PR for trunk. The dtest PR is updated to include the new cases and queries using filtering instead of indexes.
+
+Since this is a bug fix involving wrong query results, I think it would be great if we could ship it in 4.0.
+
+The PRs for both 3.11 and trunk are ready, CI is [here|https://circleci.com/workflow-run/a936c3c7-18a2-40fc-82bb-d50da360757f] and [here|https://circleci.com/workflow-run/7a22486a-9917-40be-ac9d-fdd2b5d3e354].
+
+The patch LGTM. 
+
+The patch looks really good.  Left some minor comments in the PR: I think we need to disable `ReplicaFilteringProtection` on transient replicas where repaired data are removed purposely to reduce storage requirement to avoid unnecessary RFP.
+
+[~adelapena] Given that {{TestRepair.test_dead_sync_initiator}} had already failed during [CASSANDRA-13606 development|https://ci-cassandra.apache.org/view/all/job/Cassandra-devbranch-dtest/126/parameters/], it looks like this will be ready to commit once we revert the CircleCI branch changes?
+
+Committed to {{cassandra-3.0}} as [dd255ffa07d0263521a1ca863fc2192db19bc04c|https://github.com/apache/cassandra/commit/dd255ffa07d0263521a1ca863fc2192db19bc04c] and merged up to {{cassandra-3.11}} and {{trunk}}.
+
+Dtests committed as [68f05b02842ccf4b2859d35a057d3be77d3313ab|https://github.com/apache/cassandra-dtest/commit/68f05b02842ccf4b2859d35a057d3be77d3313ab].
+
+Thanks for the reviews.
+
+Created CASSANDRA-15861 for "TestRepair.test_dead_sync_initiator" failure. TL;DR: entire-sstable-streaming requires immutable on-disk files but STATS metadata can be mutated causing file size recorded in streaming component manifest to be different from actual transferred file.
+

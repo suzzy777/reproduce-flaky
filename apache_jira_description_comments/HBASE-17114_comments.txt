@@ -1,0 +1,460 @@
+As it's already late night on my site, will upload the patch tomorrow.
+
+[~eclark] [~mantonov] and [~ghelmling] especially looking forward to your thoughts on this idea gentlemen. Thanks.
+
+And others' thoughts are also welcome (Smile).
+
+The new CoDel may help in successfully processing more requests in these overloaded situations.
+
+But, in general, I'm not sure we should handle CQTBE differently from any other retry-triggering exception (other than RetryImmediatelyException), and giving another knob to configure seems like it would just further complicate HBase tuning.
+
+Another approach to this would be to allow the server to hint back to the client how long it should back off.  In this case, the exception itself could carry a multiplier as part of the payload.  As the server remains overloaded for a longer and longer period of time, in could increase the multiplier returned in the exception, which would allow it to hint to clients that they should back off for longer.  The heuristics for doing this correctly may be tricky to get right, but I think this could be more generally applicable.  We could introduce a new parent exception (RetryIOException) to contain the multiplier and apply this in all situations that make sense.  However, this would also require a change to RPC to carry through the multiplier value.  This isn't perfect either -- the multiplier received by the client represents the server state at a previous point in time, which may already have changed.  But I think this is better than just statically configuring different pauses for different exceptions.
+
+bq. the multiplier received by the client represents the server state at a previous point in time
+
+How about passing the timestamp of when the server raises the exception along with the multiplier ?
+Client would be able to adjust the waiting period based on these two pieces of information.
+
+bq. Another approach to this would be to allow the server to hint back to the client how long it should back off.
+Now the ThrottlingException carry a wait interval to client. In our use case, we introduce a new parent exception DoNotRetryNowIOException (ThrottlingExcepiton extends it), which means the client should not retry now and sleep the wait interval carried back by DoNotRetryNowIOException and then retry. Can RS calculate a wait interval (e.g. half of the queue time) and use CallQueueTooBigException carry it back to client?
+
+Thanks [~ghelmling] for the feedback and [~tedyu]/[~zghaobac] for chiming in.
+
+bq. But, in general, I'm not sure we should handle CQTBE differently from any other retry-triggering exception (other than RetryImmediatelyException), and giving another knob to configure seems like it would just further complicate HBase tuning.
+AFAICS we're already doing this in {{ClientExceptionsUtil#isMetaClearingException}} and treated CQTBE/RegionTooBusyException etc. as special exceptions:
+{code}
+  public static boolean isSpecialException(Throwable cur) {
+    return (cur instanceof RegionMovedException || cur instanceof RegionOpeningException
+        || cur instanceof RegionTooBusyException || cur instanceof ThrottlingException
+        || cur instanceof CallQueueTooBigException);
+  }
+{code}
+So handling CQTBE specially may not seem so special?
+
+bq. Another approach to this would be to allow the server to hint back to the client how long it should back off
+Agree this is another good way to handle this, but by default we are still using {{NoBackoffPolicy}} right? So no matter what new mechanism we add into back off policy, by default it won't be valid? Like in our case we're not turning on back off, so this solution won't work for us by default.
+
+IMHO we could open another JIRA to introduce the more fancy solution for back off, and since XiaoMi already has some patch running online I guess [~zghaobac] may like to take the new JIRA? (and to be frank, this kind of patch is well welcome to upstream rather than keeping private :-)). Meanwhile, we should also resolve the problem for users not using back off, and since the problem does exist and we already have some special exception handling logic on client side, the method I proposed is still valid?
+
+I'm uploading the patch, it will tell how many the changes are so we could better check whether it breaks any code scalability/grace. Let me know your thoughts.
+
+Here comes the patch for review.
+
+bq. AFAICS we're already doing this in ClientExceptionsUtil#isMetaClearingException and treated CQTBE/RegionTooBusyException etc. as special exceptions:
+
+It's only special in the sense that it should not clear the client meta cache.  I don't think that implies it should use a different retry pause.
+
+bq. Agree this is another good way to handle this, but by default we are still using NoBackoffPolicy right?
+
+No, a number of places use ConnectionUtils.getPauseTime() which uses an exponential backoff.  Maybe this has changed in master with consolidating use of AsyncProcess, but that would be an unexpected change in behavior.
+
+I'm -1 on using a special unique pause time for CQTBE by default.  I think it should use the configured pause time by default.  If you want to make this overridable for some exception types, that seems ok, but in that case the config property for overriding the value should be more closely tied to the exception.  As a user of HBase, there's no way I would know what "hbase.client.pause.special" means and why it is different.
+
+
+bq. Another approach to this would be to allow the server to hint back to the client how long it should back off
+I guess the above statement about "back off" is the back off policy instead of the exponential backoff array? So I checked the default value of {{ClientBackoffPolicy}}, or could you please explain how to make server hint back? [~ghelmling]
+
+bq. If you want to make this overridable for some exception types, that seems ok, but in that case the config property for overriding the value should be more closely tied to the exception.
+Well, if checking the uploaded patch, it's indeed tied to CQTBE only. Introducing a new property is only for making things more flexible, and of course we could use a hard-coded, like 5 times than the existing pause, for CQTBE. But I'd say this is a trade-off, waiting longer for CQTBE could prevent the vicious circle but is also causing a higher latency, and IMHO user should be able to control such trade-off. If they don't want CQTBE to be special, they could set {{hbase.client.pause.special}} to the same value as {{hbase.client.pause}}, which gives them more options.
+
+No offense but I'm even thinking of making CQTBE thrown optional, because for some case dead-wait for the request to be executed in RpcServer until time-out is preferable by user rather than receiving some exception and retry and fail again, but obviously this is another topic (Smile).
+
+bq. It's only special in the sense that it should not clear the client meta cache
+Sorry but I don't see any difference in "should not clear the client meta cache" and "should not retry so frequently", both trying to resolve some problem and make things better.
+
+OTOH, we already have the {{RetryImmediatelyException}} just because in some case retry w/o waiting is good, then why retry slower is not acceptable? Now that the retry pause already split into immediately and wait, I think it's ok to further split the wait case into quick and slow, wdyt?
+
+Thanks.
+
+-1 to the current patch:
+
+* by default, retries of CQTBE should use the value from hbase.client.pause.  Changing this to use a different config value by default changes behavior unexpectedly for _all_ users.  For the average HBase user, if you've already tuned hbase.client.pause and suddenly find some requests pausing longer than others due to this change, this is a poor experience.
+* hbase.client.pause.special does not describe what this actually configures.  Rename it to hbase.client.pause.callqueuetoobigexception and add it, with no default value, but with a description, to hbase-default.xml.  This needs to be clearly documented.
+* only if hbase.client.pause.callqueuetoobigexception is set should you use this as a "special" pause for CQTBE, otherwise use hbase.client.pause.  This allows you to configure what you need in your environment without impacting all other HBase users.
+* the added test case looks like it will be extremely sensitive to timing in the test environment and will likely be flaky on slow or overloaded machines.  I think it would be better to simply test the calculated pause time for various configs + exceptions instead of trying to do an end to end test of the actual sleep time.
+
+bq. Well, if checking the uploaded patch, it's indeed tied to CQTBE only. Introducing a new property is only for making things more flexible, and of course we could use a hard-coded, like 5 times than the existing pause, for CQTBE. But I'd say this is a trade-off, waiting longer for CQTBE could prevent the vicious circle but is also causing a higher latency, and IMHO user should be able to control such trade-off. If they don't want CQTBE to be special, they could set hbase.client.pause.special to the same value as hbase.client.pause, which gives them more options.
+
+I agree with allowing the user to control the behavior here, but this is also increasing complexity and knowledge needed for configuration tuning, which we already have way too much of.  In general, we should be moving in the direction of making the system dynamically tune itself according to load instead of forcing all users to grapple with yet another configuration property.  By default the configuration should be simple to provide the best experience to all users.  For advanced users who really need to treat CQTBE differently, that should be possible by means of an override, but should not be forced on everyone.
+
+bq. Sorry but I don't see any difference in "should not clear the client meta cache" and "should not retry so frequently", both trying to resolve some problem and make things better.
+
+These are two completely different things.  I don't see the equivalence.  We don't clear the meta cache because we don't have an indication that the region has moved, so there is no need to go back to meta.  The meta cache handling is completely independent of what is appropriate in terms of retries.
+
+bq. No offense but I'm even thinking of making CQTBE thrown optional, because for some case dead-wait for the request to be executed in RpcServer until time-out is preferable by user rather than receiving some exception and retry and fail again, but obviously this is another topic (Smile).
+
+Blocking the RpcServer Reader threads indefinitely when the queue is full, making the server completely unresponsive and spilling overflow back in to the OS networking buffers is pretty poor behavior.  CQTBE is a crude mechanism for back-pressure to the client, but at least it gets the client a response and allows it to make an informed decision about how to proceed.  In the case where the application implements its own retries the client may want to simply fail and kick the exception back up the stack, allowing other layers to retry.  Or the client could decide to retry for a fixed duration.  But in either case I think CQTBE provides a very clear improvement in overall server behavior.  Another part of the puzzle is the CoDel scheduler which will allow more useful work to get done in overloaded situations.
+
+I'm all for improving the client/server interactions in these scenarios, and what I first outlined in this issue was one idea for how to do that more effectively.  However, I would also like us to avoid unexpected surprises for our users, and regressions in server behavior.
+
+I'm not sure of the exact symptoms you're trying to solve, but if you're seeing issues with meta being overloaded, then I'd suggest tuning the configuration for the number of priority handlers and size of the priority queues.  You could also evaluate running with meta hosted on master, which together with zk-less assignment can make region assignment much more stable.
+
+All points on current patch makes sense to me, let me update the patch. Thanks for review [~ghelmling].
+
+bq. For advanced users who really need to treat CQTBE differently, that should be possible by means of an override, but should not be forced on everyone.
+Agreed.
+
+bq. I'm all for improving the client/server interactions in these scenarios, and what I first outlined in this issue was one idea for how to do that more effectively. However, I would also like us to avoid unexpected surprises for our users, and regressions in server behavior.
+Yep, this is indeed a surprise for us since there wasn't any CQTBE thus no special handling in client side codes, and user kept complaining about "what's CQTBE and why it's happening when never before"...
+
+One thing to clarify is that I didn't mean to deny the advantage of introducing CQTBE, and backporting and using it in our 1.1.2 is a proof (smile). My concern lies in the server side behavior change just like you mentioned. I think more document in ref guide would help for users upgrading from an old version w/o CQTBE.
+
+bq. I'm not sure of the exact symptoms you're trying to solve, but if you're seeing issues with meta being overloaded, then I'd suggest tuning the configuration for the number of priority handlers and size of the priority queues.
+Actually we did, we moved meta to an exclusive machine (no other regions on it) and increased priority handlers to 128 (and I'm afraid HBASE-15470 only goes into branch-1.3 and priority queue not controllable before) but still observed a high load, and that's why we further introduce the patch here.
+
+bq. You could also evaluate running with meta hosted on master, which together with zk-less assignment can make region assignment much more stable.
+This feature is also not available before branch-1.3 I'm afraid, and because currently master is light-weight and we could hot-switch it to apply some hot-fix, we may also don't want master to carry meta in future.
+
+
+
+OK, back for this one, sorry for the lag.
+
+Update patch to address review comments.
+
+Regarding UT design, I think we still need to check the *real* execution time, and there's already some design to avoid it to be flaky. The same UT case has been executed daily in our private Jenkins and no intermittent failure observed. Let's see what HadoopQA will say.
+
+| (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 18s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green} 0m 0s {color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue} 0m 30s {color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 3m 26s {color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 32s {color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 40s {color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 36s {color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 18s {color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 29s {color} | {color:green} master passed {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue} 0m 11s {color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 32s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 31s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 31s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 39s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 18s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green} 26m 2s {color} | {color:green} Patch does not cause any errors with Hadoop 2.6.1 2.6.2 2.6.3 2.6.4 2.6.5 2.7.1 2.7.2 2.7.3 or 3.0.0-alpha1. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 46s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 35s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 1m 51s {color} | {color:green} hbase-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 1m 4s {color} | {color:green} hbase-client in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 18s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 42m 7s {color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=1.11.2 Server=1.11.2 Image:yetus/hbase:8d52d23 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12840479/HBASE-17114.v2.patch |
+| JIRA Issue | HBASE-17114 |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  hadoopcheck  hbaseanti  checkstyle  compile  |
+| uname | Linux d54e254b5494 3.13.0-36-lowlatency #63-Ubuntu SMP PREEMPT Wed Sep 3 21:56:12 UTC 2014 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build/component/dev-support/hbase-personality.sh |
+| git revision | master / 86e1785 |
+| Default Java | 1.8.0_111 |
+| findbugs | v3.0.0 |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/4622/testReport/ |
+| modules | C: hbase-common hbase-client U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/4622/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+UT looks good, mind take a look at the v2 patch [~ghelmling] and others? Thanks.
+
+Ping, need some review comments here, thanks. :-)
+
++1 on patch v2.
+
+Please add an entry for this new config, with an empty value but with a description, to hbase-default.xml.
+
+I still think this test is going to be flaky on highly loaded build machines (like ASF infra).
+
+Thanks for review [~ghelmling], will add the config/description in hbase-default.xml.
+
+Regarding the test, let's leave it as is for now and give it a fix if turned out to be flaky on ASF infra. Will keep an eye on the post commit tests.
+
+Add property and description into hbase-default.xml, and check HadoopQA again to see how the newly-added UT is going.
+
+Update description and add release note
+
+| (x) *{color:red}-1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 11s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green} 0m 0s {color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue} 0m 9s {color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 2m 40s {color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 27s {color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 36s {color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 18s {color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 12s {color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 28s {color} | {color:green} master passed {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue} 0m 10s {color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 29s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 29s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 29s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 35s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 17s {color} | {color:green} the patch passed {color} |
+| {color:red}-1{color} | {color:red} whitespace {color} | {color:red} 0m 1s {color} | {color:red} The patch 3 line(s) with tabs. {color} |
+| {color:green}+1{color} | {color:green} xml {color} | {color:green} 0m 1s {color} | {color:green} The patch has no ill-formed XML file. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green} 24m 28s {color} | {color:green} Patch does not cause any errors with Hadoop 2.6.1 2.6.2 2.6.3 2.6.4 2.6.5 2.7.1 2.7.2 2.7.3 or 3.0.0-alpha1. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 35s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 29s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 1m 43s {color} | {color:green} hbase-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 0m 56s {color} | {color:green} hbase-client in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 11s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 37m 54s {color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=1.12.3 Server=1.12.3 Image:yetus/hbase:8d52d23 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12840977/HBASE-17114.v3.patch |
+| JIRA Issue | HBASE-17114 |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  hadoopcheck  hbaseanti  checkstyle  compile  xml  |
+| uname | Linux 0fe37afb922e 4.4.0-43-generic #63-Ubuntu SMP Wed Oct 12 13:48:03 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build/component/dev-support/hbase-personality.sh |
+| git revision | master / 890fcbd |
+| Default Java | 1.8.0_111 |
+| findbugs | v3.0.0 |
+| whitespace | https://builds.apache.org/job/PreCommit-HBASE-Build/4700/artifact/patchprocess/whitespace-tabs.txt |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/4700/testReport/ |
+| modules | C: hbase-common hbase-client U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/4700/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Fix white space.
+
+| (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 12m 58s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green} 0m 0s {color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue} 0m 40s {color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 3m 20s {color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 34s {color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 43s {color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 26s {color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 30s {color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 34s {color} | {color:green} master passed {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue} 0m 12s {color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 37s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 32s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 32s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 39s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 19s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} xml {color} | {color:green} 0m 1s {color} | {color:green} The patch has no ill-formed XML file. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green} 25m 46s {color} | {color:green} Patch does not cause any errors with Hadoop 2.6.1 2.6.2 2.6.3 2.6.4 2.6.5 2.7.1 2.7.2 2.7.3 or 3.0.0-alpha1. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 32s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 29s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 1m 43s {color} | {color:green} hbase-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 0m 55s {color} | {color:green} hbase-client in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 14s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 54m 15s {color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=1.12.2 Server=1.12.2 Image:yetus/hbase:8d52d23 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12840983/HBASE-17114.v4.patch |
+| JIRA Issue | HBASE-17114 |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  hadoopcheck  hbaseanti  checkstyle  compile  xml  |
+| uname | Linux 3bd628b7150d 3.13.0-100-generic #147-Ubuntu SMP Tue Oct 18 16:48:51 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build/component/dev-support/hbase-personality.sh |
+| git revision | master / 890fcbd |
+| Default Java | 1.8.0_111 |
+| findbugs | v3.0.0 |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/4702/testReport/ |
+| modules | C: hbase-common hbase-client U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/4702/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+bq.Set this property to a higher value than hbase.client.pause...
+You want to add some check here and make sure it is not wrongly configured?  When low, ignore and log WARN and go with client pause?
+
+RpcRetryingCallerImpl
+-expectedSleep = callable.sleep(pause, tries);
++expectedSleep = callable.sleep(pauseBase, tries + 1);
+Why this tries + 1 change?
+
+Both nice catch sir, thanks for review. [~anoop.hbase]
+
+Will add the check and make sure {{hbase.client.pause.cqtbe}} is configured no less than {{hbase.client.pause}}. The incorrect {{tries + 1}} change is due to HBASE-14521, master branch has the patch while branch-1 doesn't, and I neglected this when porting from our 1.1.2 to master code base, will correct this in next patch.
+
+New patch addresses new review comments.
+
+| (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 15s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} hbaseanti {color} | {color:green} 0m 0s {color} | {color:green} Patch does not have any anti-patterns. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 1 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue} 0m 13s {color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 3m 29s {color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 40s {color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 52s {color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 21s {color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 46s {color} | {color:green} master passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 41s {color} | {color:green} master passed {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue} 0m 14s {color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 41s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 38s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 38s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 46s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 20s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 0s {color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} xml {color} | {color:green} 0m 1s {color} | {color:green} The patch has no ill-formed XML file. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green} 25m 55s {color} | {color:green} Patch does not cause any errors with Hadoop 2.6.1 2.6.2 2.6.3 2.6.4 2.6.5 2.7.1 2.7.2 2.7.3 or 3.0.0-alpha1. {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 1m 33s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 29s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 1m 45s {color} | {color:green} hbase-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 0m 58s {color} | {color:green} hbase-client in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 15s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 42m 26s {color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=1.12.3 Server=1.12.3 Image:yetus/hbase:8d52d23 |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12841038/HBASE-17114.v5.patch |
+| JIRA Issue | HBASE-17114 |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  hadoopcheck  hbaseanti  checkstyle  compile  xml  |
+| uname | Linux 4bdf145a2159 3.13.0-93-generic #140-Ubuntu SMP Mon Jul 18 21:21:05 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /home/jenkins/jenkins-slave/workspace/PreCommit-HBASE-Build/component/dev-support/hbase-personality.sh |
+| git revision | master / ea91247 |
+| Default Java | 1.8.0_111 |
+| findbugs | v3.0.0 |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/4711/testReport/ |
+| modules | C: hbase-common hbase-client U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/4711/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+[~anoop.hbase], does the v5 patch look good to you? Thanks.
+
+Ok, let me commit this one if no more comments/objections (smile).
+
+Apart from those 2 I was +1 :-)   Go for commit.
+
+Thanks for the confirmation sir, committing now (smile).
+
+Pushed into master branch. Thanks all for review [~ghelmling] [~anoop.hbase] [~tedyu] [~zghaobac]
+
+Will prepare a patch for branch-1 soon.
+
+Uploading patch for branch-1
+
+| (/) *{color:green}+1 overall{color}* |
+\\
+\\
+|| Vote || Subsystem || Runtime || Comment ||
+| {color:blue}0{color} | {color:blue} reexec {color} | {color:blue} 0m 20s {color} | {color:blue} Docker mode activated. {color} |
+| {color:green}+1{color} | {color:green} @author {color} | {color:green} 0m 0s {color} | {color:green} The patch does not contain any @author tags. {color} |
+| {color:green}+1{color} | {color:green} test4tests {color} | {color:green} 0m 0s {color} | {color:green} The patch appears to include 2 new or modified test files. {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue} 0m 33s {color} | {color:blue} Maven dependency ordering for branch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 2m 42s {color} | {color:green} branch-1 passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 44s {color} | {color:green} branch-1 passed with JDK v1.8.0_111 {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 43s {color} | {color:green} branch-1 passed with JDK v1.7.0_80 {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 54s {color} | {color:green} branch-1 passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 31s {color} | {color:green} branch-1 passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 2m 15s {color} | {color:green} branch-1 passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 45s {color} | {color:green} branch-1 passed with JDK v1.8.0_111 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 51s {color} | {color:green} branch-1 passed with JDK v1.7.0_80 {color} |
+| {color:blue}0{color} | {color:blue} mvndep {color} | {color:blue} 0m 15s {color} | {color:blue} Maven dependency ordering for patch {color} |
+| {color:green}+1{color} | {color:green} mvninstall {color} | {color:green} 0m 48s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 36s {color} | {color:green} the patch passed with JDK v1.8.0_111 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 36s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} compile {color} | {color:green} 0m 43s {color} | {color:green} the patch passed with JDK v1.7.0_80 {color} |
+| {color:green}+1{color} | {color:green} javac {color} | {color:green} 0m 43s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} checkstyle {color} | {color:green} 0m 56s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} mvneclipse {color} | {color:green} 0m 25s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} whitespace {color} | {color:green} 0m 1s {color} | {color:green} The patch has no whitespace issues. {color} |
+| {color:green}+1{color} | {color:green} xml {color} | {color:green} 0m 1s {color} | {color:green} The patch has no ill-formed XML file. {color} |
+| {color:green}+1{color} | {color:green} hadoopcheck {color} | {color:green} 19m 33s {color} | {color:green} The patch does not cause any errors with Hadoop 2.4.0 2.4.1 2.5.0 2.5.1 2.5.2 2.6.1 2.6.2 2.6.3 2.7.1. {color} |
+| {color:green}+1{color} | {color:green} hbaseprotoc {color} | {color:green} 0m 25s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} findbugs {color} | {color:green} 2m 21s {color} | {color:green} the patch passed {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 32s {color} | {color:green} the patch passed with JDK v1.8.0_111 {color} |
+| {color:green}+1{color} | {color:green} javadoc {color} | {color:green} 0m 39s {color} | {color:green} the patch passed with JDK v1.7.0_80 {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 1m 45s {color} | {color:green} hbase-common in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} unit {color} | {color:green} 1m 54s {color} | {color:green} hbase-client in the patch passed. {color} |
+| {color:green}+1{color} | {color:green} asflicense {color} | {color:green} 0m 17s {color} | {color:green} The patch does not generate ASF License warnings. {color} |
+| {color:black}{color} | {color:black} {color} | {color:black} 42m 21s {color} | {color:black} {color} |
+\\
+\\
+|| Subsystem || Report/Notes ||
+| Docker | Client=1.11.2 Server=1.11.2 Image:yetus/hbase:e01ee2f |
+| JIRA Patch URL | https://issues.apache.org/jira/secure/attachment/12841236/HBASE-17114.branch-1.patch |
+| JIRA Issue | HBASE-17114 |
+| Optional Tests |  asflicense  javac  javadoc  unit  findbugs  hadoopcheck  hbaseanti  checkstyle  compile  xml  |
+| uname | Linux 64023bd2571d 3.13.0-92-generic #139-Ubuntu SMP Tue Jun 28 20:42:26 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux |
+| Build tool | maven |
+| Personality | /testptch/patchprocess/precommit/personality/hbase.sh |
+| git revision | branch-1 / c8ea822 |
+| Default Java | 1.7.0_80 |
+| Multi-JDK versions |  /usr/lib/jvm/java-8-oracle:1.8.0_111 /usr/lib/jvm/java-7-oracle:1.7.0_80 |
+| findbugs | v3.0.0 |
+|  Test Results | https://builds.apache.org/job/PreCommit-HBASE-Build/4740/testReport/ |
+| modules | C: hbase-common hbase-client U: . |
+| Console output | https://builds.apache.org/job/PreCommit-HBASE-Build/4740/console |
+| Powered by | Apache Yetus 0.3.0   http://yetus.apache.org |
+
+
+This message was automatically generated.
+
+
+
+Pushed into branch-1. All work done here, closing JIRA.
+
+SUCCESS: Integrated in Jenkins build HBase-Trunk_matrix #2052 (See [https://builds.apache.org/job/HBase-Trunk_matrix/2052/])
+HBASE-17114 Add an option to set special retry pause when encountering (liyu: rev 1f3c6f4c077b0cf2baa40134bd2384ff417749c9)
+* (edit) hbase-client/src/main/java/org/apache/hadoop/hbase/client/RpcRetryingCallerFactory.java
+* (edit) hbase-client/src/main/java/org/apache/hadoop/hbase/client/ConnectionImplementation.java
+* (edit) hbase-client/src/main/java/org/apache/hadoop/hbase/client/AsyncProcess.java
+* (edit) hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestAsyncProcess.java
+* (edit) hbase-client/src/main/java/org/apache/hadoop/hbase/client/AsyncRequestFutureImpl.java
+* (edit) hbase-common/src/main/java/org/apache/hadoop/hbase/HConstants.java
+* (edit) hbase-client/src/main/java/org/apache/hadoop/hbase/client/RpcRetryingCallerImpl.java
+* (edit) hbase-common/src/main/resources/hbase-default.xml
+
+
+SUCCESS: Integrated in Jenkins build HBase-1.4 #555 (See [https://builds.apache.org/job/HBase-1.4/555/])
+HBASE-17114 Add an option to set special retry pause when encountering (liyu: rev 4068a8b4d4ff3672a625a73fd7146cf0ae93ad06)
+* (edit) hbase-client/src/main/java/org/apache/hadoop/hbase/client/RpcRetryingCallerFactory.java
+* (edit) hbase-client/src/main/java/org/apache/hadoop/hbase/client/AsyncProcess.java
+* (edit) hbase-common/src/main/java/org/apache/hadoop/hbase/HConstants.java
+* (edit) hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestAsyncProcess.java
+* (edit) hbase-client/src/main/java/org/apache/hadoop/hbase/client/ConnectionManager.java
+* (edit) hbase-client/src/test/java/org/apache/hadoop/hbase/client/TestClientScanner.java
+* (edit) hbase-common/src/main/resources/hbase-default.xml
+* (edit) hbase-client/src/main/java/org/apache/hadoop/hbase/client/RpcRetryingCaller.java
+
+

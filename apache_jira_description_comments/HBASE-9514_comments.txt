@@ -1,0 +1,712 @@
+I was thinking about saving the previous region server of a region in its region state. Whenever a region is transitioning to open, master checks if its previous host region server is known to be dead but not null. If so, aborting the open. The previous region server will be cleared only after SSH finishes log splitting, or master restarts of course.
+
+Should be good if you include startcode.
+
+
+The balancer is not effected by this I think. Can we do the same checks in the region move code paths? 
+
+{code:title=HMaster.balance()}
+if (this.assignmentManager.getRegionStates().isRegionsInTransition()) {
+        Map<String, RegionState> regionsInTransition =
+          this.assignmentManager.getRegionStates().getRegionsInTransition();
+        LOG.debug("Not running balancer because " + regionsInTransition.size() +
+          " region(s) in transition: " + org.apache.commons.lang.StringUtils.
+            abbreviate(regionsInTransition.toString(), 256));
+        return false;
+      }
+      if (this.serverManager.areDeadServersInProgress()) {
+        LOG.debug("Not running balancer because processing dead regionserver(s): " +
+          this.serverManager.getDeadServers());
+        return false;
+      }
+{code}
+
+Thinking again, what if the balancer does those checks, then the RS is dead. We might still be moving the region of a dead server without split finishing from the balancer as far as I understand, right? 
+
+How about a RS is dead but master doesn't know about it yet? So I was thinking to control it from the root, AM#assign() method, the final place an openRegion request is sent out to another RS.
+
+Raising this as a blocker is justified I believe. Note that both the balancer, and merge's are also forcing region assignment, not just user submitted region assignments. 
+bq. So I was thinking to control it from the root, AM#assign() method, the final place an openRegion request is sent out to another RS.
+Sounds good. I was thinking adding a boolean, isAssignable, to the master's in memory state. SSH will first mark the regions as unAssignable, and log splitting termination will reset the bit. AM#assign() will ignore regions who are not assignable. 
+
+Attached patch v1. Added a unit test to test assigning while SSH is not done yet.  Integration test is going on.
+
+Here you are adding back the random region move to try and bring on the issue again:
+
+-        new FlushRandomRegionOfTableAction(tableName)
++        new FlushRandomRegionOfTableAction(tableName),
++        new MoveRandomRegionOfTableAction(tableName)
+
+Why we need this?
+
+-    this.maximumAttempts =
+-      this.server.getConfiguration().getInt("hbase.assignment.maximum.attempts", 10);
++    this.maximumAttempts = Math.max(1,
++      this.server.getConfiguration().getInt("hbase.assignment.maximum.attempts", 10));
+
+It could be configured zero?  You saying try at least once?
+
+I suppose +  public Lock acquireLock(final String encodedName) { has to be public because SSH wants to use it too?
+
+How long do servers hang out in dead servers?
+
+{code}
++        if (!region.isMetaRegion() &&
++            regionStates.wasRegionOnDeadServer(encodedName)) {
++          LOG.info("Skip assigning " + region.getRegionNameAsString()
++            + " because it's host " + regionStates.getLastRegionServerOfRegion(encodedName)
++            + " is dead but not processed");
++          // Make sure the region is offline so that SSH will assign it.
++          // Need to make sure we don't race with SSH.
++          regionOffline(region);
++          return;
++        }
+{code}
+
+I suppose it doesn't matter if in dead server for a long time since each server has a startcode?
+
+Does this big block of new code have to go into the middle of assign?  Can it be broken up a little into methods that are easier to grok?
+
+{code}
++        if (serverManager.isServerOnline(server) &&
++            (t instanceof java.net.SocketTimeoutException ||
++                t instanceof java.net.ConnectException)) {
+{code}
+
+Is it a good idea inserting this wait here for every exception?  What if the exception is a NSRE?  Doesn't NSRE indicate live server?
+
+The big change in the middle I cannot follow.  Can we have a note on what it does?
+
+Do declare and assign in one go I'd say:
+
++    lastAssignments = new HashMap<String, ServerName>();
+
+I like this map in RS.
+
+Good stuff Jimmy
+
+bq. Here you are adding back the random region move to try and bring on the issue again:
+Yes, I'd like to see the data loss issue in HBASE-9338 is fixed.
+
+bq. It could be configured zero? You saying try at least once?
+It can't be 0. It is total max attempts instead of retries.  I added it just in case users mis-configure it.
+
+bq. I suppose + public Lock acquireLock(final String encodedName) { has to be public because SSH wants to use it too?
+That's right.
+
+bq. I suppose it doesn't matter if in dead server for a long time since each server has a startcode?
+That's right. Each server has a startcode. The region will stay in lastAssignments till SSH log split is done.
+
+bq. Does this big block of new code have to go into the middle of assign? Can it be broken up a little into methods that are easier to grok?
+bq. The big change in the middle I cannot follow. Can we have a note on what it does?
+In the middle, there is no change at all actually.  I just aligned the try-block.
+
+bq. Is it a good idea inserting this wait here for every exception? What if the exception is a NSRE? Doesn't NSRE indicate live server?
+For NSRE, the region is offlined right away. To reduce the impact, I don't see a clear reason to wait here for every exception. So I didn't add it.
+
+
+
+bq.  I don't see a clear reason to wait here for every exception. So I didn't add it.
+
+Ok.  I misread it as a blanket wait but now I see it just for connection issues.
+
+Can you describe what the changes are then in a bit of text here in the issue?  It seems like I've covered the main changes if the big bit in the middle is just formatting.  Thanks Jimmy. 
+
+A couple of comments:
+ - should we rename AM.acquireLock -> AM.acquireRegionLock() 
+ - Why not do this for meta? 
+{code}
++        if (!region.isMetaRegion() &&
++            regionStates.wasRegionOnDeadServer(encodedName)) {
+{code}
+
+Is it safe to expire a server like this. It means the master cannot connect to it, but it may still have the zk lease. 
+{code}
++            } else {
++              LOG.info(server + " is not reachable, expire it");
++              serverManager.expireServer(server);
++            }
+{code}
+
+- Should we rename RegionStates.logSplit() -> markAssignable() or something like it. 
+
+Is this timeout intended to be active?
+{code}
++  @Test //(timeout=60000)
+{code}
+
+bq. should we rename AM.acquireLock -> AM.acquireRegionLock()
+Sure, will do.
+bq. Why not do this for meta?
+Let me think how to cover meta as well.
+bq. Is it safe to expire a server like this. It means the master cannot connect to it, but it may still have the zk lease. 
+We have waited for longer than the ZK session timeout. It should be expired.  It is ok to expire twice.
+
+The timeout should be active. I will fix it.
+
+The idea of the patch is to remember the last known region server a region is assigned to. Whenever we try to assign a region, we check if the last known region server of the region is done with log splitting. If not, we don't assign it, and let SSH to complete log splitting and re-assign. We clear the last known region server info when SSH finishes log splitting, or the region is properly closed. The idea is simple but there are several racing points to take care.
+
+bq. We have waited for longer than the ZK session timeout. It should be expired. It is ok to expire twice.
+My understanding is that server expiry should ONLY come from a zookeeper session timeout. The master being not able to connect to RS for more than zk session timeout does not necessarily mean that the session has actually expired. If a network partition happens and master cannot talk to RS, but RS still holds the zk lease, then the master will think that the server is dead, while RS will happily continue to serve the region. Given that the RS will be getting YouAreDeadException if it talks the master afterwards, and we are forcing lease recovery on the RS logs on log splitting, but I fear, while this process is going on there will be an inconsistency window where master will think RS is dead, while it may not be. 
+
+That's a good point.  Let me fix it.
+
+Attached patch v2. It is also on review board: https://reviews.apache.org/r/14177/
+The change is to make sure a region is assignable if SSH is already done for a dead server.  Also fixed some NPE found during integration testing.
+
+
+
+So I chatted with [~jxiang] about this patch.  For me it seems like the region locks are the perfect solution here.  Have the master grab region locks when the regionserver goes down.  Then the splitting server can grab locks.
+
+That should allow the master to ride over any deaths pretty easily, and it uses the already in hbase mechanisms.  However it's a larger patch than the one here.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12603655/trunk-9514_v2.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 18 new or modified tests.
+
+    {color:green}+1 hadoop1.0{color}.  The patch compiles against the hadoop 1.0 profile.
+
+    {color:green}+1 hadoop2.0{color}.  The patch compiles against the hadoop 2.0 profile.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 lineLengths{color}.  The patch does not introduce lines longer than 100
+
+  {color:green}+1 site{color}.  The mvn site goal succeeds with this patch.
+
+     {color:red}-1 core tests{color}.  The patch failed these unit tests:
+                       org.apache.hadoop.hbase.regionserver.wal.TestHLog
+
+Test results: https://builds.apache.org/job/PreCommit-HBASE-Build/7275//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7275//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-prefix-tree.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7275//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-client.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7275//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-common.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7275//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-protocol.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7275//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-server.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7275//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-hadoop1-compat.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7275//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-examples.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7275//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-hadoop-compat.html
+Console output: https://builds.apache.org/job/PreCommit-HBASE-Build/7275//console
+
+This message is automatically generated.
+
+[~eclark] Doesn't this patch already take locks per region to avoid clash of am and ssh?
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12603700/trunk-9514_v3.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 18 new or modified tests.
+
+    {color:green}+1 hadoop1.0{color}.  The patch compiles against the hadoop 1.0 profile.
+
+    {color:green}+1 hadoop2.0{color}.  The patch compiles against the hadoop 2.0 profile.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 lineLengths{color}.  The patch does not introduce lines longer than 100
+
+  {color:green}+1 site{color}.  The mvn site goal succeeds with this patch.
+
+     {color:red}-1 core tests{color}.  The patch failed these unit tests:
+                       org.apache.hadoop.hbase.regionserver.wal.TestHLog
+
+Test results: https://builds.apache.org/job/PreCommit-HBASE-Build/7280//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7280//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-protocol.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7280//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-client.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7280//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-examples.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7280//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-hadoop1-compat.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7280//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-prefix-tree.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7280//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-common.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7280//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-server.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7280//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-hadoop-compat.html
+Console output: https://builds.apache.org/job/PreCommit-HBASE-Build/7280//console
+
+This message is automatically generated.
+
+I'm trying to fix TestHLog.  Its broke.
+
+The patch at RB (v4) looks mostly ok to me, although I must admit that I do not get the full details of AM internals. I am running the ITBL to see whether it fixes that problem. 
+
+[~enis], there are still some issues with it (v4).  My test is still failing. I will let you know after I get a patch passing the test. Thanks.
+
+Thanks Jimmy. The test I ran failed at the generator this time, because of two regions was stuck on FAILED_CLOSE:
+{code}
+4d9c5d2fdcad2855bd7100932734bede	IntegrationTestBigLinkedList,\x0B\xFF\x06\x80\xA5\xF2\x0F\xE0\xCD\x9CDh\xA1\xD8<\xDA,1379559344242.4d9c5d2fdcad2855bd7100932734bede. state=FAILED_CLOSE, ts=Thu Sep 19 03:47:32 UTC 2013 (53154s ago), server=hor8n01,60020,1379562089022 	53154621 
+{code}
+This is definitely related to the latest patch. I can dig a bit more. 
+
+I have fixed that one. I am fixing holes related to split/merge now.
+
+Any update on this [~jxiang]? 
+
+Almost there. Without schema change/master restart actions, I got it green.
+
+[~jxiang] Will your patch cover the scenario HBASE-9665 where balancer starts to move a region while the server hosting the regions dies then the region got lost due to ZK RIT state is messed up with the two concurrent assignments?
+
+[~jeffreyz], yes, it should cover this scenario as well.
+
+I think this should be a release blocker. Marking it as such.
+
+Attached patch v5.  It is also on RB: https://reviews.apache.org/r/14359/.
+
+{color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12605481/trunk-9514_v5.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 30 new or modified tests.
+
+    {color:green}+1 hadoop1.0{color}.  The patch compiles against the hadoop 1.0 profile.
+
+    {color:green}+1 hadoop2.0{color}.  The patch compiles against the hadoop 2.0 profile.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 lineLengths{color}.  The patch does not introduce lines longer than 100
+
+  {color:green}+1 site{color}.  The mvn site goal succeeds with this patch.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in .
+
+Test results: https://builds.apache.org/job/PreCommit-HBASE-Build/7405//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7405//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-protocol.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7405//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-thrift.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7405//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-client.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7405//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-examples.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7405//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-hadoop1-compat.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7405//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-prefix-tree.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7405//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-common.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7405//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-server.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7405//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-hadoop-compat.html
+Console output: https://builds.apache.org/job/PreCommit-HBASE-Build/7405//console
+
+This message is automatically generated.
+
+v5 is what I am testing now. I am going to add some hbck checking to the end of IntegrationTestBigLinkedList if the test fails. So that we can see if any region is stuck in transition, or unassigned at all.
+
+I may dump some cluster info periodically if possible.
+
+What are the main changes in this patch from what you posted previously Jimmy (seems reasonable after skimming first 1/5th but I have reviewed a bunch of this already).
+
+Here is the list of changes:
+1. fixed a bug in AM#assign(line ~2645), when bulk assign fails, each region should be assigned again, otherwise, they will be stuck in transition;
+2. fixed a bug in AM#unassign(line ~2461), if region is offline, assign it again (moved to final block, so all scenarios are covered);
+3. in RegionStates if the last hosting region server is online, get the server's info to confirm it has the expected start code (may be too conservative, hasn't seen it in my test yet);
+4. in AM, force region state offline, if force new plan, check meta to make sure the last assignment is not changed (may be too conservative, hasn't seen it in my test yet);
+5. enhanced bulk assign a little so that if a region is already assign, no need to force assign.
+
+I have a new patch in testing now (v5.1 attached). The new patch has the following changes:
+1. added a CM action to log cluster status every 90 seconds so we know details about regions in transition;
+2. added a hbck check after verification failure so that we know if the cluster is consistent, i.e., any region is lost/unassigned;
+3. added another verify with CM disabled after verification failure so we know if we really have data loss.
+
+It seems that there is no data loss now since 3. shows ok while the test still fails.
+
+Good stuff Jimmy.  So, test fails because we don't recover fast enough or something?  Should we commit what you have?   I can do a pass over it no problem.
+
+Still not sure about why it fails even if there is no data loss.  Yes, please review it.  We can commit it and keep looking into it. Thanks.
+
+New v5.1, rebased to trunk latest, fixed a typo. Put on RB: https://reviews.apache.org/r/14359/
+
+{color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12605845/trunk-9514_v5.1.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 38 new or modified tests.
+
+    {color:green}+1 hadoop1.0{color}.  The patch compiles against the hadoop 1.0 profile.
+
+    {color:green}+1 hadoop2.0{color}.  The patch compiles against the hadoop 2.0 profile.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 lineLengths{color}.  The patch does not introduce lines longer than 100
+
+  {color:green}+1 site{color}.  The mvn site goal succeeds with this patch.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in .
+
+Test results: https://builds.apache.org/job/PreCommit-HBASE-Build/7416//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7416//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-protocol.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7416//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-thrift.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7416//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-client.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7416//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-examples.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7416//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-hadoop1-compat.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7416//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-prefix-tree.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7416//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-common.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7416//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-server.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7416//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-hadoop-compat.html
+Console output: https://builds.apache.org/job/PreCommit-HBASE-Build/7416//console
+
+This message is automatically generated.
+
+Attached v5.2, removed change to IntegrationTestBigLinkedList, so that it stays green. We can look into it further in a different jira.
+
+Running the test with v5.2. Will report back with results. 
+{code}
+hbase org.apache.hadoop.hbase.test.IntegrationTestBigLinkedList --monkey slowDeterministic Loop 5 8 25000000 /user/enis/IntegrationTestBigLinkedList 8 >/tmp/biglinkedlist.log 2>&1
+{code}
+
+
+{color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12605926/trunk-9514_v5.2.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 27 new or modified tests.
+
+    {color:green}+1 hadoop1.0{color}.  The patch compiles against the hadoop 1.0 profile.
+
+    {color:green}+1 hadoop2.0{color}.  The patch compiles against the hadoop 2.0 profile.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 lineLengths{color}.  The patch does not introduce lines longer than 100
+
+  {color:green}+1 site{color}.  The mvn site goal succeeds with this patch.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in .
+
+Test results: https://builds.apache.org/job/PreCommit-HBASE-Build/7419//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7419//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-prefix-tree.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7419//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-client.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7419//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-common.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7419//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-protocol.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7419//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-server.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7419//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-hadoop1-compat.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7419//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-examples.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7419//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-thrift.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7419//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-hadoop-compat.html
+Console output: https://builds.apache.org/job/PreCommit-HBASE-Build/7419//console
+
+This message is automatically generated.
+
+Added patch v5.3, addressed Stack's review comments, removed the move region change to slowDeterministic so the test isn't flaky, will address it in different issues.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12605998/trunk-9514_v5.3.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 38 new or modified tests.
+
+    {color:red}-1 hadoop1.0{color}.  The patch failed to compile against the hadoop 1.0 profile.
+
+Console output: https://builds.apache.org/job/PreCommit-HBASE-Build/7423//console
+
+This message is automatically generated.
+
+v5.3 has a simple compilation error. Do you mind putting this version to RB as well. 
+{code}
++        if (!runVerify(outputDir, numReducers, expectedNumNodes, true)) {
++          LOG.info("Verify.verify failed, let's stop CM and verify again");
++          it.cleanUpMonkey("Monkey broke something");
++          if (!runVerify(outputDir, numReducers, expectedNumNodes, false)) {
++            throw new RuntimeException("Verify.verify failed");
++          }
+{code}
+I did not get why we are running verify again. No matter what, if verify failed once, we should fail the test. 
+
+Other changes look ok to me. although, it is still hard to follow what the edge cases might be. The tests are still running. 
+
+
+
+Rebased to trunk latest, fixed a compilation issue, uploaded to RB.
+The reason we run verify again is to check if there is any difference after we disable the CM. In some cases, we do see differences.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12606036/trunk-9514_v5.4.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 38 new or modified tests.
+
+    {color:green}+1 hadoop1.0{color}.  The patch compiles against the hadoop 1.0 profile.
+
+    {color:green}+1 hadoop2.0{color}.  The patch compiles against the hadoop 2.0 profile.
+
+    {color:red}-1 javadoc{color}.  The javadoc tool appears to have generated 1 warning messages.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 lineLengths{color}.  The patch does not introduce lines longer than 100
+
+  {color:green}+1 site{color}.  The mvn site goal succeeds with this patch.
+
+     {color:red}-1 core tests{color}.  The patch failed these unit tests:
+                       org.apache.hadoop.hbase.master.TestMasterFailover
+
+Test results: https://builds.apache.org/job/PreCommit-HBASE-Build/7425//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7425//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-protocol.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7425//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-thrift.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7425//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-client.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7425//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-examples.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7425//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-hadoop1-compat.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7425//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-prefix-tree.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7425//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-common.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7425//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-server.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7425//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-hadoop-compat.html
+Console output: https://builds.apache.org/job/PreCommit-HBASE-Build/7425//console
+
+This message is automatically generated.
+
+Can you repeat the above fail Jimmy?  Does the javadoc complaint come in w/ this patch?  Want me to review it again?
+
+I can fix the javadoc complaint and the test failure.  We can get this in after [~enis] reviews it.
+
+The test succeeded yesterday for 1B records in total. 
+{code}
+13/10/01 04:44:57 INFO test.IntegrationTestBigLinkedList$Loop: Verify finished with succees. Total nodes=1000000000
+{code}
+
+
+
+You +1 on it [~enis]?
+
+bq. The test succeeded yesterday for 1B records in total.
+Excellent! Let's get it in.
+
+Left some comments at RB. 
+I am +1, except for the changes in ITBLL. I don't think we should mask verify failures in any way. 
+
+Attached v5.5, in ITBLL, we fail the test if the first verify failed, no matter the second passes or not, also added another verify with CM stopped if the first verify with CM stopped fails too.
+
+
+The javadoc issue is not caused by this patch. Totally, there are not many javadoc warnings. We can fix them all in a separate issue.
+
+{color:green}+1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12606160/trunk-9514_v5.5.patch
+  against trunk revision .
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 38 new or modified tests.
+
+    {color:green}+1 hadoop1.0{color}.  The patch compiles against the hadoop 1.0 profile.
+
+    {color:green}+1 hadoop2.0{color}.  The patch compiles against the hadoop 2.0 profile.
+
+    {color:green}+1 javadoc{color}.  The javadoc tool did not generate any warning messages.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 findbugs{color}.  The patch does not introduce any new Findbugs (version 1.3.9) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:green}+1 lineLengths{color}.  The patch does not introduce lines longer than 100
+
+  {color:green}+1 site{color}.  The mvn site goal succeeds with this patch.
+
+    {color:green}+1 core tests{color}.  The patch passed unit tests in .
+
+Test results: https://builds.apache.org/job/PreCommit-HBASE-Build/7433//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7433//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-protocol.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7433//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-thrift.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7433//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-client.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7433//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-examples.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7433//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-hadoop1-compat.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7433//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-prefix-tree.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7433//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-common.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7433//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-server.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HBASE-Build/7433//artifact/trunk/patchprocess/newPatchFindbugsWarningshbase-hadoop-compat.html
+Console output: https://builds.apache.org/job/PreCommit-HBASE-Build/7433//console
+
+This message is automatically generated.
+
+Sorry, i still did not get why we are running verify 2 or 3 times after it failed. If test fails, you can manually run verify again on the table data, since it won't be deleted. Regardless, let's get this version in and get RC rolling I think. 
+
+This issue is that this kind of test takes a while to run. We'd like to collect as much information as possible if it fails so that we can triage any failure quick.
+Thanks for the review.  I am going to integrated the patch into trunk and 0.96.  We can address remaining issues in separate jiras.
+
+Just refreshed my repo, did a mvn clean and now I see:
+
+{quote}
+[ERROR] Failed to execute goal org.apache.maven.plugins:maven-compiler-plugin:2.5.1:testCompile (default-testCompile) on project hbase-it: Compilation failure
+[ERROR] /Users/jdcryans/svn/0.96-commit/hbase-it/src/test/java/org/apache/hadoop/hbase/test/IntegrationTestBigLinkedList.java:[737,19] non-static method setDisplayFullReport() cannot be referenced from a static context
+{quote}
+
+Could this come from this jira?
+
+yep, that is the compilation error i mentioned above. Jimmy, can you please do an addendum. 
+
+JD: HBaseFsck#setDisplayFullReport is a static method in trunk, but not in 0.96.  Let me fix it.
+
+Fixed. Thanks JD and Enis.
+
+FAILURE: Integrated in hbase-0.96 #113 (See [https://builds.apache.org/job/hbase-0.96/113/])
+HBASE-9514 Prevent region from assigning before log splitting is done (jxiang: rev 1528231)
+* /hbase/branches/0.96/hbase-client/src/main/java/org/apache/hadoop/hbase/ClusterStatus.java
+* /hbase/branches/0.96/hbase-it/src/test/java/org/apache/hadoop/hbase/IntegrationTestBase.java
+* /hbase/branches/0.96/hbase-it/src/test/java/org/apache/hadoop/hbase/chaos/actions/AddColumnAction.java
+* /hbase/branches/0.96/hbase-it/src/test/java/org/apache/hadoop/hbase/chaos/actions/CompactRandomRegionOfTableAction.java
+* /hbase/branches/0.96/hbase-it/src/test/java/org/apache/hadoop/hbase/chaos/actions/DumpClusterStatusAction.java
+* /hbase/branches/0.96/hbase-it/src/test/java/org/apache/hadoop/hbase/chaos/actions/FlushRandomRegionOfTableAction.java
+* /hbase/branches/0.96/hbase-it/src/test/java/org/apache/hadoop/hbase/chaos/actions/MergeRandomAdjacentRegionsOfTableAction.java
+* /hbase/branches/0.96/hbase-it/src/test/java/org/apache/hadoop/hbase/chaos/actions/MoveRandomRegionOfTableAction.java
+* /hbase/branches/0.96/hbase-it/src/test/java/org/apache/hadoop/hbase/chaos/actions/MoveRegionsOfTableAction.java
+* /hbase/branches/0.96/hbase-it/src/test/java/org/apache/hadoop/hbase/chaos/factories/SlowDeterministicMonkeyFactory.java
+* /hbase/branches/0.96/hbase-it/src/test/java/org/apache/hadoop/hbase/test/IntegrationTestBigLinkedList.java
+* /hbase/branches/0.96/hbase-server/src/main/java/org/apache/hadoop/hbase/master/AssignmentManager.java
+* /hbase/branches/0.96/hbase-server/src/main/java/org/apache/hadoop/hbase/master/CatalogJanitor.java
+* /hbase/branches/0.96/hbase-server/src/main/java/org/apache/hadoop/hbase/master/DeadServer.java
+* /hbase/branches/0.96/hbase-server/src/main/java/org/apache/hadoop/hbase/master/GeneralBulkAssigner.java
+* /hbase/branches/0.96/hbase-server/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+* /hbase/branches/0.96/hbase-server/src/main/java/org/apache/hadoop/hbase/master/RegionStates.java
+* /hbase/branches/0.96/hbase-server/src/main/java/org/apache/hadoop/hbase/master/ServerManager.java
+* /hbase/branches/0.96/hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/ClosedRegionHandler.java
+* /hbase/branches/0.96/hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/EnableTableHandler.java
+* /hbase/branches/0.96/hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/MetaServerShutdownHandler.java
+* /hbase/branches/0.96/hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/ServerShutdownHandler.java
+* /hbase/branches/0.96/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HBaseFsck.java
+* /hbase/branches/0.96/hbase-server/src/test/java/org/apache/hadoop/hbase/TestDrainingServer.java
+* /hbase/branches/0.96/hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestAssignmentManagerOnCluster.java
+* /hbase/branches/0.96/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestSplitTransactionOnCluster.java
+
+
+FAILURE: Integrated in HBase-TRUNK #4581 (See [https://builds.apache.org/job/HBase-TRUNK/4581/])
+HBASE-9514 Prevent region from assigning before log splitting is done (jxiang: rev 1528227)
+* /hbase/trunk/hbase-client/src/main/java/org/apache/hadoop/hbase/ClusterStatus.java
+* /hbase/trunk/hbase-it/src/test/java/org/apache/hadoop/hbase/IntegrationTestBase.java
+* /hbase/trunk/hbase-it/src/test/java/org/apache/hadoop/hbase/chaos/actions/AddColumnAction.java
+* /hbase/trunk/hbase-it/src/test/java/org/apache/hadoop/hbase/chaos/actions/CompactRandomRegionOfTableAction.java
+* /hbase/trunk/hbase-it/src/test/java/org/apache/hadoop/hbase/chaos/actions/DumpClusterStatusAction.java
+* /hbase/trunk/hbase-it/src/test/java/org/apache/hadoop/hbase/chaos/actions/FlushRandomRegionOfTableAction.java
+* /hbase/trunk/hbase-it/src/test/java/org/apache/hadoop/hbase/chaos/actions/MergeRandomAdjacentRegionsOfTableAction.java
+* /hbase/trunk/hbase-it/src/test/java/org/apache/hadoop/hbase/chaos/actions/MoveRandomRegionOfTableAction.java
+* /hbase/trunk/hbase-it/src/test/java/org/apache/hadoop/hbase/chaos/actions/MoveRegionsOfTableAction.java
+* /hbase/trunk/hbase-it/src/test/java/org/apache/hadoop/hbase/chaos/factories/SlowDeterministicMonkeyFactory.java
+* /hbase/trunk/hbase-it/src/test/java/org/apache/hadoop/hbase/test/IntegrationTestBigLinkedList.java
+* /hbase/trunk/hbase-server/src/main/java/org/apache/hadoop/hbase/master/AssignmentManager.java
+* /hbase/trunk/hbase-server/src/main/java/org/apache/hadoop/hbase/master/CatalogJanitor.java
+* /hbase/trunk/hbase-server/src/main/java/org/apache/hadoop/hbase/master/DeadServer.java
+* /hbase/trunk/hbase-server/src/main/java/org/apache/hadoop/hbase/master/GeneralBulkAssigner.java
+* /hbase/trunk/hbase-server/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+* /hbase/trunk/hbase-server/src/main/java/org/apache/hadoop/hbase/master/RegionStates.java
+* /hbase/trunk/hbase-server/src/main/java/org/apache/hadoop/hbase/master/ServerManager.java
+* /hbase/trunk/hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/ClosedRegionHandler.java
+* /hbase/trunk/hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/EnableTableHandler.java
+* /hbase/trunk/hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/MetaServerShutdownHandler.java
+* /hbase/trunk/hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/ServerShutdownHandler.java
+* /hbase/trunk/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HBaseFsck.java
+* /hbase/trunk/hbase-server/src/test/java/org/apache/hadoop/hbase/TestDrainingServer.java
+* /hbase/trunk/hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestAssignmentManagerOnCluster.java
+* /hbase/trunk/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestSplitTransactionOnCluster.java
+
+
+FAILURE: Integrated in hbase-0.96-hadoop2 #68 (See [https://builds.apache.org/job/hbase-0.96-hadoop2/68/])
+HBASE-9514 Prevent region from assigning before log splitting is done - ADDENDUM (jxiang: rev 1528247)
+* /hbase/branches/0.96/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HBaseFsck.java
+HBASE-9514 Prevent region from assigning before log splitting is done (jxiang: rev 1528231)
+* /hbase/branches/0.96/hbase-client/src/main/java/org/apache/hadoop/hbase/ClusterStatus.java
+* /hbase/branches/0.96/hbase-it/src/test/java/org/apache/hadoop/hbase/IntegrationTestBase.java
+* /hbase/branches/0.96/hbase-it/src/test/java/org/apache/hadoop/hbase/chaos/actions/AddColumnAction.java
+* /hbase/branches/0.96/hbase-it/src/test/java/org/apache/hadoop/hbase/chaos/actions/CompactRandomRegionOfTableAction.java
+* /hbase/branches/0.96/hbase-it/src/test/java/org/apache/hadoop/hbase/chaos/actions/DumpClusterStatusAction.java
+* /hbase/branches/0.96/hbase-it/src/test/java/org/apache/hadoop/hbase/chaos/actions/FlushRandomRegionOfTableAction.java
+* /hbase/branches/0.96/hbase-it/src/test/java/org/apache/hadoop/hbase/chaos/actions/MergeRandomAdjacentRegionsOfTableAction.java
+* /hbase/branches/0.96/hbase-it/src/test/java/org/apache/hadoop/hbase/chaos/actions/MoveRandomRegionOfTableAction.java
+* /hbase/branches/0.96/hbase-it/src/test/java/org/apache/hadoop/hbase/chaos/actions/MoveRegionsOfTableAction.java
+* /hbase/branches/0.96/hbase-it/src/test/java/org/apache/hadoop/hbase/chaos/factories/SlowDeterministicMonkeyFactory.java
+* /hbase/branches/0.96/hbase-it/src/test/java/org/apache/hadoop/hbase/test/IntegrationTestBigLinkedList.java
+* /hbase/branches/0.96/hbase-server/src/main/java/org/apache/hadoop/hbase/master/AssignmentManager.java
+* /hbase/branches/0.96/hbase-server/src/main/java/org/apache/hadoop/hbase/master/CatalogJanitor.java
+* /hbase/branches/0.96/hbase-server/src/main/java/org/apache/hadoop/hbase/master/DeadServer.java
+* /hbase/branches/0.96/hbase-server/src/main/java/org/apache/hadoop/hbase/master/GeneralBulkAssigner.java
+* /hbase/branches/0.96/hbase-server/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+* /hbase/branches/0.96/hbase-server/src/main/java/org/apache/hadoop/hbase/master/RegionStates.java
+* /hbase/branches/0.96/hbase-server/src/main/java/org/apache/hadoop/hbase/master/ServerManager.java
+* /hbase/branches/0.96/hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/ClosedRegionHandler.java
+* /hbase/branches/0.96/hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/EnableTableHandler.java
+* /hbase/branches/0.96/hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/MetaServerShutdownHandler.java
+* /hbase/branches/0.96/hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/ServerShutdownHandler.java
+* /hbase/branches/0.96/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HBaseFsck.java
+* /hbase/branches/0.96/hbase-server/src/test/java/org/apache/hadoop/hbase/TestDrainingServer.java
+* /hbase/branches/0.96/hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestAssignmentManagerOnCluster.java
+* /hbase/branches/0.96/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestSplitTransactionOnCluster.java
+
+
+SUCCESS: Integrated in HBase-TRUNK-on-Hadoop-2.0.0 #771 (See [https://builds.apache.org/job/HBase-TRUNK-on-Hadoop-2.0.0/771/])
+HBASE-9514 Prevent region from assigning before log splitting is done (jxiang: rev 1528227)
+* /hbase/trunk/hbase-client/src/main/java/org/apache/hadoop/hbase/ClusterStatus.java
+* /hbase/trunk/hbase-it/src/test/java/org/apache/hadoop/hbase/IntegrationTestBase.java
+* /hbase/trunk/hbase-it/src/test/java/org/apache/hadoop/hbase/chaos/actions/AddColumnAction.java
+* /hbase/trunk/hbase-it/src/test/java/org/apache/hadoop/hbase/chaos/actions/CompactRandomRegionOfTableAction.java
+* /hbase/trunk/hbase-it/src/test/java/org/apache/hadoop/hbase/chaos/actions/DumpClusterStatusAction.java
+* /hbase/trunk/hbase-it/src/test/java/org/apache/hadoop/hbase/chaos/actions/FlushRandomRegionOfTableAction.java
+* /hbase/trunk/hbase-it/src/test/java/org/apache/hadoop/hbase/chaos/actions/MergeRandomAdjacentRegionsOfTableAction.java
+* /hbase/trunk/hbase-it/src/test/java/org/apache/hadoop/hbase/chaos/actions/MoveRandomRegionOfTableAction.java
+* /hbase/trunk/hbase-it/src/test/java/org/apache/hadoop/hbase/chaos/actions/MoveRegionsOfTableAction.java
+* /hbase/trunk/hbase-it/src/test/java/org/apache/hadoop/hbase/chaos/factories/SlowDeterministicMonkeyFactory.java
+* /hbase/trunk/hbase-it/src/test/java/org/apache/hadoop/hbase/test/IntegrationTestBigLinkedList.java
+* /hbase/trunk/hbase-server/src/main/java/org/apache/hadoop/hbase/master/AssignmentManager.java
+* /hbase/trunk/hbase-server/src/main/java/org/apache/hadoop/hbase/master/CatalogJanitor.java
+* /hbase/trunk/hbase-server/src/main/java/org/apache/hadoop/hbase/master/DeadServer.java
+* /hbase/trunk/hbase-server/src/main/java/org/apache/hadoop/hbase/master/GeneralBulkAssigner.java
+* /hbase/trunk/hbase-server/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+* /hbase/trunk/hbase-server/src/main/java/org/apache/hadoop/hbase/master/RegionStates.java
+* /hbase/trunk/hbase-server/src/main/java/org/apache/hadoop/hbase/master/ServerManager.java
+* /hbase/trunk/hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/ClosedRegionHandler.java
+* /hbase/trunk/hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/EnableTableHandler.java
+* /hbase/trunk/hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/MetaServerShutdownHandler.java
+* /hbase/trunk/hbase-server/src/main/java/org/apache/hadoop/hbase/master/handler/ServerShutdownHandler.java
+* /hbase/trunk/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HBaseFsck.java
+* /hbase/trunk/hbase-server/src/test/java/org/apache/hadoop/hbase/TestDrainingServer.java
+* /hbase/trunk/hbase-server/src/test/java/org/apache/hadoop/hbase/master/TestAssignmentManagerOnCluster.java
+* /hbase/trunk/hbase-server/src/test/java/org/apache/hadoop/hbase/regionserver/TestSplitTransactionOnCluster.java
+
+
+SUCCESS: Integrated in hbase-0.96 #114 (See [https://builds.apache.org/job/hbase-0.96/114/])
+HBASE-9514 Prevent region from assigning before log splitting is done - ADDENDUM (jxiang: rev 1528247)
+* /hbase/branches/0.96/hbase-server/src/main/java/org/apache/hadoop/hbase/util/HBaseFsck.java
+
+
+This issue was closed as part of a bulk closing operation on 2015-11-20. All issues that have been resolved and where all fixVersions have been released have been closed (following discussions on the mailing list).
+
