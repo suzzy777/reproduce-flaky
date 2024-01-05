@@ -1,0 +1,1345 @@
+Proposal for supporting writeable replicas in memory. This is a simplification of what was originally proposed on HDFS-5851 based on community feedback.
+
+I'll include a prototype patch by next week.
+
+Created a development branch HDFS-6581 per r1619458.
+
+A patch to demonstrate the approach we've been trying out.
+
+This is a somewhat refined prototype but there are many rough edges we'll work on in the feature branch, specifically around the lazy writer, eviction and recovery on restart.
+
+Moved the patch to sub-task HDFS-6910.
+
+Looks good overall.  It's good to see progress on this.
+
+Some comments about the design doc:
+
+* Why not use ramfs instead of tmpfs?  ramfs can't swap.
+
+** The problem with using tmpfs is that the system could move the data to swap at any time.  In addition to performance problems, this could cause correctness problems later when we read back the data from swap (i.e. from the hard disk).  Since we don't want to verify checksums here, we should use a storage method that we know never touches the disk.  Tachyon uses ramfs instead of tmpfs for this reason.
+
+* An LRU replacement policy isn't a good choice.  It's very easy for a batch job to kick out everything in memory before it can ever be used again (thrashing).  An LFU (least frequently used) policy would be much better.  We'd have to keep usage statistics to implement this, but that doesn't seem too bad.
+
+* How is the maximum tmpfs/ramfs size per datanode configured?  I think we should use the existing {{dfs.datanode.max.locked.memory}} property to configure this, for consistency.  System administrators should not need to configure separate pools of memory for HDFS-4949 and this feature.  It should be one memory size.
+
+** I also think that cache directives from HDFS-4949 should take precedence over this opportunistic write caching.  If we need to evict some HDFS-5851 cache items to finish our HDFS-4949 caching, we should do that.
+
+* Related to that, we might want to rename {{dfs.datanode.max.locked.memory}} to {{dfs.data.node.max.cache.memory}} or something.
+
+* You can effectively revoke access to a block file stored in ramfs or tmpfs by truncating that file to 0 bytes.  The client can hang on to the file descriptor, but this doesn't keep any data bytes in memory.  So we can move things out of the cache even if the clients are unresponsive.  Also see HDFS-6750 and HDFS-6036 for examples of how we can ask the clients to stop using a short-circuit replica before tearing it down.
+
+If you truncate() a file while a reader has it mmapped, will the reader get 0s or a bus error? I seem to recall it's the latter, which may be a bit nasty for a revocation path.
+
+Why not do what we discussed a couple months back and have a disk replica with mlock? I think this will prevent any writeback.
+
+bq. If you truncate() a file while a reader has it mmapped, will the reader get 0s or a bus error? I seem to recall it's the latter, which may be a bit nasty for a revocation path.
+
+A reader which reads via read() will get EOF.  A reader reading via mmap will get SIGBUS.  It's not nasty, because we only do this after telling the client to stop reading using the mechanism in HDFS-5182.  The client only ever has problems if it goes rogue and decides to ignore our message telling it to stop reading.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12661926/HDFSWriteableReplicasInMemory.pdf
+  against trunk revision .
+
+    {color:red}-1 patch{color}.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/7706//console
+
+This message is automatically generated.
+
+Swap in modern kernels are checksummed with crc32c.
+
+Re: RAMfs, the [tmpfs] mediatype applies to anything which shows up as a directory. Perhaps a rename would make it clearer.
+
+This approach allows someone who wants to mount some other kind of volatile storage (or even a real "ramdisk").
+
+Thank you for taking the time to look at the doc and provide feedback.
+
+bq. The problem with using tmpfs is that the system could move the data to swap at any time. In addition to performance problems, this could cause correctness problems later when we read back the data from swap (i.e. from the hard disk). Since we don't want to verify checksums here, we should use a storage method that we know never touches the disk. Tachyon uses ramfs instead of tmpfs for this reason.
+The implementation makes no assumptions of the underlying partition, whether it is tmpfs or ramfs. I think renaming TMPFS to RAM as Gopal suggested will avoid confusion. I do prefer tmpfs as the OS limits tmpfs usage beyond the configured size so the failure case is safer (DiskOutOfSpace instead of exhaust all RAM). swap is not as much of a concern as it is usually disabled.
+
+bq. An LRU replacement policy isn't a good choice. It's very easy for a batch job to kick out everything in memory before it can ever be used again (thrashing). An LFU (least frequently used) policy would be much better. We'd have to keep usage statistics to implement this, but that doesn't seem too bad.
+Agreed that plain LRU would be a poor choice. Perhaps a hybrid of MRU+LRU would be a good option. i.e. evict the most recently read replica, unless there are replicas older than some threshold, in which case evict the LRU one. The assumption being that a client is unlikely to reread from a recently read replica.
+
+bq. You can effectively revoke access to a block file stored in ramfs or tmpfs by truncating that file to 0 bytes. The client can hang on to the file descriptor, but this doesn't keep any data bytes in memory. So we can move things out of the cache even if the clients are unresponsive. Also see HDFS-6750 and HDFS-6036 for examples of how we can ask the clients to stop using a short-circuit replica before tearing it down.
+Yes I reviewed the former, it looks interesting with eviction in mind. I'll create a subtask to investigate eviction via truncate.
+
+bq. How is the maximum tmpfs/ramfs size per datanode configured? I think we should use the existing dfs.datanode.max.locked.memory property to configure this, for consistency. System administrators should not need to configure separate pools of memory for HDFS-4949 and this feature. It should be one memory size.
+bq. Related to that, we might want to rename dfs.datanode.max.locked.memory to dfs.data.node.max.cache.memory or something.
+The DataNode does not create the RAM disk since we cannot require root. An administrator will have to configure the partition.
+
+I also took a look at the doc, seems pretty reasonable. Had a few questions as well.
+
+* Related to Colin's point about configuring separate pools of memory on the DN, I'd really like to see integration with the cache pools from HDFS-4949. Memory is ideally shareable between HDFS and YARN, and cache pools were designed with that in mind. Simple storage quotas do not fit as well.
+* Quotas are also a very rigid policy and can result in under-utilization. Cache pools are more flexible, and can be extended to support fair share and more complex policies. Avoiding underutilization seems especially important for a limited resource like memory.
+* Do you have any benchmarks? For the read side, we found checksum overhead to be substantial, essentially the cost of a copy. If we use tmpfs, it can swap, so we're forced to calculate checksums at both write and read time. My guess is also that a normal 1-replication write will be fairly fast because of the OS buffer cache, so it'd be nice to quantify the potential improvement.
+* There's a mention of LAZY_PERSIST having a config option to unlink corrupt TMP files. It seems better for this to be per-file rather than NN-wide, since different clients might want different behavior.
+* 5.2.2 lists a con of mmaped files as not having control over page writeback. Is this actually true when using mlock? Also not sure why memory pressure is worse with mmaped files compared to tmpfs. mmap might make eviction+SCR nicer too, since you can just drop the mlocks if you want to evict, and the client has a hope of falling back gracefully.
+
+HSM-related questions
+* Caveat, I'm not sure what the HSM APIs will look like, or how this will be integrated, so some of these might be out of scope.
+* Will we support changing a file from DISK storage type to TMP storage type? I would say no, since cache directives seem better for read caching when something is already on disk.
+* Will we support writing a file on both TMP and another storage type? Similar to the above, it also doesn't feel that useful.
+
+The key difference between tmpfs and ramfs is that unprivileged users can't be allowed write access to ramfs, since you can trivially fill up the entire memory by writing to ramfs.  tmpfs has a kernel-enforced size limit, and swapping.  Since the design outlined here doesn't require giving unprivileged users write access to the temporary area, it is compatible with *both* tmpfs and ramfs.
+
+bq. I do prefer tmpfs as the OS limits tmpfs usage beyond the configured size so the failure case is safer (DiskOutOfSpace instead of exhaust all RAM). swap is not as much of a concern as it is usually disabled.
+
+I can think of two cases where we might run out of memory:
+1. The user configures the DN to use so much memory for cache that there is not enough memory to run other programs.
+
+ramfs: causes applications to be aborted with OOM errors.
+tmpfs: degrades performance to very slow levels by swapping out our "cached" files.
+
+An OOM error is easy to diagnose.  Sluggish performance is not.  The ramfs behavior is better than the tmpfs behavior.
+
+2. There is a bug in the DataNode causing it to try to cache more than it should.
+
+ramfs: causes applications to be aborted with OOM errors.
+tmpfs: degrades performance to very slow levels by swapping out our "cached" files.
+
+The bug is easy to find when using ramfs, hard to find with tmpfs.
+
+So I would say, tmpfs is always worse for us.  Swapping is just not something we ever want, and memory limits are something we enforce ourselves, so tmpfs's features don't help us.
+
+bq. Agreed that plain LRU would be a poor choice. Perhaps a hybrid of MRU+LRU would be a good option. i.e. evict the most recently read replica, unless there are replicas older than some threshold, in which case evict the LRU one. The assumption being that a client is unlikely to reread from a recently read replica.
+
+Yeah, we'll need some benchmarking on this probably.
+
+bq. Yes I reviewed the former, it looks interesting with eviction in mind. I'll create a subtask to investigate eviction via truncate.
+
+Yeah, thanks for the review on HDFS-6750.  As Todd pointed out, we probably want to give clients some warning before the truncate in HDFS-6581, just like we do with HDFS-4949 and the munlock...
+
+bq. The DataNode does not create the RAM disk since we cannot require root. An administrator will have to configure the partition.
+
+Yeah, that makes sense.  Similarly, for HDFS-4949, the administrator must set the ulimit for the DataNode before caching can work.
+
+
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12661926/HDFSWriteableReplicasInMemory.pdf
+  against trunk revision .
+
+    {color:red}-1 patch{color}.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/7713//console
+
+This message is automatically generated.
+
+bq. ramfs: causes applications to be aborted with OOM errors.
+
+If ramfs ate 90% of memory, would a YARN task die or instead just get their heaps swapped?
+
+bq. If ramfs ate 90% of memory, would a YARN task die or instead just get their heaps swapped?
+
+Depends on how much memory 10% of memory is, whether swap is enabled, etc. etc.
+
+The point I was trying to make is that if 90% of ram goes missing, you will notice.  Whereas if tmpfs starts swapping, you may not notice, unless you're paying careful attention to performance.  tmpfs doesn't have the predictability that ramfs does.
+
+Fair enough, the choice of backing layer should not be enforced by this patch.
+
+In that respect, the huge advantage of this particular approach is that the HDFS mediatype [RAM] can now refer to both ramfs and tmpfs transparently according to admin configuration.
+
+As far as tmpfs goes, it was used primarily because HDFS-4949 already has a hard-dependency on tmpfs for handling short-circuit reads (the skip-checksums Andrew was talking about is negotiated over tmpfs today).
+
+I found "/dev/shm" references in HDFS code recently and hit issues with that - filed HDFS-6912, now that I remembered.
+
+bq. So I would say, tmpfs is always worse for us. Swapping is just not something we ever want, and memory limits are something we enforce ourselves, so tmpfs's features don't help us.
+We're in agreement on the relative merits of ramfs vs tmpfs, except that I am assuming performance-sensitive deployments will run with swap disabled, negating the disadvantages of tmpfs. However this is a decision that can be left to the administrator and does not impact the feature design.
+
+[~andrew.wang], responses to your questions below.
+
+{quote}
+Related to Colin's point about configuring separate pools of memory on the DN, I'd really like to see integration with the cache pools from HDFS-4949. Memory is ideally shareable between HDFS and YARN, and cache pools were designed with that in mind. Simple storage quotas do not fit as well.
+Quotas are also a very rigid policy and can result in under-utilization. Cache pools are more flexible, and can be extended to support fair share and more complex policies. Avoiding underutilization seems especially important for a limited resource like memory.
+{quote}
+For now, existing diskspace quota checks will apply on block allocation. We cannot skip this check since the blocks are expected to be written to disk in quick order. I agree uniting the RAM disk size and {{dfs.datanode.max.locked.memory}} configurations is desirable. Since tmpfs grows dynamically perhaps one approach is for the DN to limit \[RAM disk + locked memory\] usage to the config value. The recommendation to administrators could be that they set the RAM disk size to the same value as {{dfs.datanode.max.locked.memory}}. This also allows preferential eviction from either cache or tmpfs as desired to keep the total locked memory usage within the limit. I'll need to think through this but I will file a sub-task meanwhile.
+
+bq. Do you have any benchmarks? For the read side, we found checksum overhead to be substantial, essentially the cost of a copy. If we use tmpfs, it can swap, so we're forced to calculate checksums at both write and read time. My guess is also that a normal 1-replication write will be fairly fast because of the OS buffer cache, so it'd be nice to quantify the potential improvement.
+tmpfs has become somewhat of a diversion. Let's assume the administrator configures either ramfs or tmpfs with swap disabled (our implementation doesn't care) so we don't have extra checksum generation beyond what we do today. I would _really_ like to remove even the existing checksum calculation off the write path for replicas that are being written to memory and have DN compute checksums when it 'lazy persists' to disk. I spent way more looking into this than I wanted to and it is hard to do cleanly with the way the write pipeline is setup today - I can explain the details if you are curious. I am wary of significant changes to the write pipeline here but this is the first optimization I want to address after the initial implementation.
+
+bq. There's a mention of LAZY_PERSIST having a config option to unlink corrupt TMP files. It seems better for this to be per-file rather than NN-wide, since different clients might want different behavior.
+That's a good idea, perhaps via an additional flag per-file. Can we leave the system-wide option for the initial implementation and change it going forward?
+
+bq. 5.2.2 lists a con of mmaped files as not having control over page writeback. Is this actually true when using mlock? Also not sure why memory pressure is worse with mmaped files compared to tmpfs. mmap might make eviction+SCR nicer too, since you can just drop the mlocks if you want to evict, and the client has a hope of falling back gracefully.
+Memory pressure is worse with mmaped files because we cannot control the timing of when the pages will be freed. We can evict pages from memory via unmap faster than the memory manager can write them to disk. tmpfs has better characteristics, once we run into the configured limit we can just stop allocating more blocks in memory. A related optimization I'd really like to have is to use unbuffered IO when writing to block files on disk so we don't churn buffer cache.
+
+{quote}
+Caveat, I'm not sure what the HSM APIs will look like, or how this will be integrated, so some of these might be out of scope.
+Will we support changing a file from DISK storage type to TMP storage type? I would say no, since cache directives seem better for read caching when something is already on disk.
+Will we support writing a file on both TMP and another storage type? Similar to the above, it also doesn't feel that useful.
+{quote}
+We are not setting the storage type on a file. HSM API work (HDFS-5682) has been getting pushed out, most recently in favor memory storage but I'd like to revisit it post 2.6. For now there is no dependence on HSM APIs and no concept of storage type on a file. CCM remains the preferred approach for reads so no change there.
+
+Thank you for reading the doc and providing feedback.
+
+bq. Memory pressure is worse with mmaped files because we cannot control the timing of when the pages will be freed. We can evict pages from memory via unmap faster than the memory manager can write them to disk. tmpfs has better characteristics, once we run into the configured limit we can just stop allocating more blocks in memory. A related optimization I'd really like to have is to use unbuffered IO when writing to block files on disk so we don't churn buffer cache.
+Also our initial proposal on HDFS-5851 was to use mmapped files. However using a RAM disk allows fairly good control over memory usage on the write path with the least effort.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12668679/HDFS-6581.merge.01.patch
+  against trunk revision 14e2639.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 27 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 4 new Findbugs (version 2.0.3) warnings.
+
+        {color:red}-1 release audit{color}.  The applied patch generated 1 release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs hadoop-hdfs-project/hadoop-hdfs-httpfs:
+
+                  org.apache.hadoop.fs.TestFsShellCopy
+                  org.apache.hadoop.fs.shell.TestCopy
+                  org.apache.hadoop.fs.shell.TestCopyPreserveFlag
+                  org.apache.hadoop.hdfs.web.TestWebHdfsFileSystemContract
+                  org.apache.hadoop.hdfs.TestDFSUpgrade
+                  org.apache.hadoop.hdfs.server.namenode.ha.TestPipelinesFailover
+                  org.apache.hadoop.hdfs.TestDFSShell
+                  org.apache.hadoop.hdfs.TestDFSFinalize
+                  org.apache.hadoop.hdfs.server.datanode.TestDataDirs
+                  org.apache.hadoop.hdfs.server.datanode.TestDeleteBlockPool
+                  org.apache.hadoop.hdfs.tools.offlineEditsViewer.TestOfflineEditsViewer
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/8025//testReport/
+Release audit warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/8025//artifact/trunk/patchprocess/patchReleaseAuditProblems.txt
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/8025//artifact/trunk/patchprocess/newPatchFindbugsWarningshadoop-hdfs.html
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/8025//console
+
+This message is automatically generated.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12669452/Test-Plan-for-HDFS-6581-Memory-Storage.pdf
+  against trunk revision c0c7e6f.
+
+    {color:red}-1 patch{color}.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/8055//console
+
+This message is automatically generated.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12669480/HDFS-6581.merge.02.patch
+  against trunk revision ea4e2e8.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 27 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 4 new Findbugs (version 2.0.3) warnings.
+
+        {color:red}-1 release audit{color}.  The applied patch generated 1 release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs hadoop-hdfs-project/hadoop-hdfs-httpfs:
+
+                  org.apache.hadoop.hdfs.server.datanode.TestMultipleNNDataBlockScanner
+                  org.apache.hadoop.hdfs.TestFileAppend4
+                  org.apache.hadoop.hdfs.TestRead
+                  org.apache.hadoop.hdfs.server.namenode.ha.TestDFSZKFailoverController
+                  org.apache.hadoop.hdfs.server.namenode.TestFavoredNodesEndToEnd
+                  org.apache.hadoop.hdfs.server.namenode.ha.TestHAStateTransitions
+                  org.apache.hadoop.hdfs.TestHdfsAdmin
+                  org.apache.hadoop.hdfs.server.datanode.TestDataNodeVolumeFailureReporting
+                  org.apache.hadoop.hdfs.server.datanode.TestBlockHasMultipleReplicasOnSameDN
+                  org.apache.hadoop.hdfs.TestClientReportBadBlock
+                  org.apache.hadoop.hdfs.server.namenode.TestNamenodeCapacityReport
+                  org.apache.hadoop.hdfs.server.namenode.TestNamenodeRetryCache
+                  org.apache.hadoop.hdfs.server.namenode.TestFSEditLogLoader
+                  org.apache.hadoop.hdfs.server.blockmanagement.TestUnderReplicatedBlocks
+                  org.apache.hadoop.hdfs.server.datanode.TestDataNodeMetrics
+                  org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.TestLazyPersistFiles
+                  org.apache.hadoop.hdfs.server.balancer.TestBalancerWithNodeGroup
+                  org.apache.hadoop.hdfs.TestFileAppendRestart
+                  org.apache.hadoop.hdfs.server.namenode.TestSecondaryNameNodeUpgrade
+                  org.apache.hadoop.hdfs.TestEncryptionZonesWithKMS
+                  org.apache.hadoop.hdfs.server.namenode.TestHDFSConcat
+                  org.apache.hadoop.hdfs.server.namenode.metrics.TestNameNodeMetrics
+                  org.apache.hadoop.TestRefreshCallQueue
+                  org.apache.hadoop.hdfs.TestListFilesInDFS
+                  org.apache.hadoop.hdfs.server.datanode.TestDnRespectsBlockReportSplitThreshold
+                  org.apache.hadoop.hdfs.server.namenode.TestNameEditsConfigs
+                  org.apache.hadoop.security.TestPermissionSymlinks
+                  org.apache.hadoop.hdfs.TestDFSRollback
+                  org.apache.hadoop.hdfs.TestFileConcurrentReader
+                  org.apache.hadoop.hdfs.TestFileAppend2
+                  org.apache.hadoop.hdfs.server.namenode.ha.TestXAttrsWithHA
+                  org.apache.hadoop.hdfs.TestGetFileChecksum
+                  org.apache.hadoop.hdfs.server.namenode.ha.TestHAMetrics
+                  org.apache.hadoop.hdfs.server.namenode.ha.TestDNFencing
+                  org.apache.hadoop.hdfs.crypto.TestHdfsCryptoStreams
+                  org.apache.hadoop.hdfs.web.TestWebHdfsFileSystemContract
+                  org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.TestDatanodeRestart
+                  org.apache.hadoop.hdfs.server.blockmanagement.TestOverReplicatedBlocks
+                  org.apache.hadoop.hdfs.server.balancer.TestBalancerWithMultipleNameNodes
+                  org.apache.hadoop.hdfs.server.datanode.TestReadOnlySharedStorage
+                  org.apache.hadoop.hdfs.TestCrcCorruption
+                  org.apache.hadoop.hdfs.server.namenode.TestLargeDirectoryDelete
+                  org.apache.hadoop.hdfs.TestDFSUpgrade
+                  org.apache.hadoop.hdfs.server.namenode.ha.TestPipelinesFailover
+                  org.apache.hadoop.hdfs.server.namenode.TestDeleteRace
+                  org.apache.hadoop.hdfs.server.blockmanagement.TestRBWBlockInvalidation
+                  org.apache.hadoop.hdfs.server.datanode.TestIncrementalBrVariations
+                  org.apache.hadoop.hdfs.TestLeaseRecovery2
+                  org.apache.hadoop.hdfs.server.namenode.TestAclConfigFlag
+                  org.apache.hadoop.cli.TestXAttrCLI
+                  org.apache.hadoop.hdfs.server.blockmanagement.TestBlockManager
+                  org.apache.hadoop.hdfs.server.namenode.TestSequentialBlockId
+                  org.apache.hadoop.hdfs.server.balancer.TestBalancerWithSaslDataTransfer
+                  org.apache.hadoop.hdfs.server.balancer.TestBalancer
+                  org.apache.hadoop.hdfs.server.namenode.TestFSImageWithAcl
+                  org.apache.hadoop.hdfs.server.datanode.TestDataNodeVolumeFailureToleration
+                  org.apache.hadoop.hdfs.server.namenode.ha.TestBootstrapStandbyWithQJM
+                  org.apache.hadoop.hdfs.TestDFSShell
+                  org.apache.hadoop.hdfs.protocol.datatransfer.sasl.TestSaslDataTransfer
+                  org.apache.hadoop.hdfs.server.namenode.TestFSImageWithXAttr
+                  org.apache.hadoop.hdfs.server.balancer.TestBalancerWithEncryptedTransfer
+                  org.apache.hadoop.hdfs.server.namenode.ha.TestHarFileSystemWithHA
+                  org.apache.hadoop.hdfs.server.namenode.TestEditLog
+                  org.apache.hadoop.hdfs.server.datanode.TestDiskError
+                  org.apache.hadoop.security.TestPermission
+                  org.apache.hadoop.hdfs.TestDFSFinalize
+                  org.apache.hadoop.hdfs.TestFileCreationDelete
+                  org.apache.hadoop.hdfs.server.blockmanagement.TestBlockTokenWithDFS
+                  org.apache.hadoop.hdfs.server.datanode.TestNNHandlesCombinedBlockReport
+                  org.apache.hadoop.hdfs.TestDFSStorageStateRecovery
+                  org.apache.hadoop.hdfs.server.namenode.TestXAttrConfigFlag
+                  org.apache.hadoop.hdfs.server.namenode.ha.TestStandbyBlockManagement
+                  org.apache.hadoop.hdfs.server.blockmanagement.TestNodeCount
+                  org.apache.hadoop.hdfs.TestAppendDifferentChecksum
+                  org.apache.hadoop.hdfs.server.namenode.metrics.TestNNMetricFilesInGetListingOps
+                  org.apache.hadoop.hdfs.TestRestartDFS
+                  org.apache.hadoop.hdfs.server.balancer.TestBalancerWithHANameNodes
+                  org.apache.hadoop.cli.TestHDFSCLI
+                  org.apache.hadoop.hdfs.server.datanode.TestNNHandlesBlockReportPerStorage
+                  org.apache.hadoop.hdfs.server.namenode.TestDecommissioningStatus
+                  org.apache.hadoop.hdfs.server.namenode.ha.TestStandbyIsHot
+                  org.apache.hadoop.hdfs.TestHDFSFileSystemContract
+                  org.apache.hadoop.hdfs.server.datanode.TestFsDatasetCacheRevocation
+                  org.apache.hadoop.cli.TestAclCLI
+                  org.apache.hadoop.hdfs.server.namenode.ha.TestStandbyCheckpoints
+                  org.apache.hadoop.hdfs.TestDFSPermission
+                  org.apache.hadoop.cli.TestCryptoAdminCLI
+                  org.apache.hadoop.hdfs.server.datanode.TestDirectoryScanner
+                  org.apache.hadoop.hdfs.server.datanode.TestDeleteBlockPool
+                  org.apache.hadoop.hdfs.TestBlockReaderLocalLegacy
+                  org.apache.hadoop.hdfs.server.namenode.TestEditLogAutoroll
+                  org.apache.hadoop.hdfs.security.token.block.TestBlockToken
+                  org.apache.hadoop.hdfs.server.namenode.TestNameNodeXAttr
+                  org.apache.hadoop.hdfs.server.datanode.TestBlockRecovery
+                  org.apache.hadoop.hdfs.server.blockmanagement.TestPendingInvalidateBlock
+                  org.apache.hadoop.hdfs.TestDFSStartupVersions
+                  org.apache.hadoop.hdfs.TestWriteBlockGetsBlockLengthHint
+                  org.apache.hadoop.hdfs.TestAbandonBlock
+                  org.apache.hadoop.hdfs.TestFetchImage
+                  org.apache.hadoop.hdfs.tools.offlineEditsViewer.TestOfflineEditsViewer
+                  org.apache.hadoop.hdfs.server.namenode.ha.TestHAAppend
+                  org.apache.hadoop.hdfs.TestDatanodeDeath
+                  org.apache.hadoop.hdfs.server.datanode.TestFsDatasetCache
+                  org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.TestInterDatanodeProtocol
+                  org.apache.hadoop.hdfs.server.namenode.ha.TestRetryCacheWithHA
+                  org.apache.hadoop.hdfs.server.datanode.TestDataNodeVolumeFailure
+                  org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.TestRbwSpaceReservation
+                  org.apache.hadoop.hdfs.security.TestDelegationToken
+                  org.apache.hadoop.hdfs.server.datanode.TestCachingStrategy
+                  org.apache.hadoop.hdfs.TestDFSClientExcludedNodes
+                  org.apache.hadoop.hdfs.server.namenode.ha.TestInitializeSharedEdits
+                  org.apache.hadoop.hdfs.TestSnapshotCommands
+                  org.apache.hadoop.hdfs.server.blockmanagement.TestBlocksWithNotEnoughRacks
+                  org.apache.hadoop.hdfs.server.datanode.TestHSync
+                  org.apache.hadoop.hdfs.server.namenode.TestProcessCorruptBlocks
+                  org.apache.hadoop.hdfs.TestDFSOutputStream
+                  org.apache.hadoop.hdfs.server.datanode.TestBlockReplacement
+                  org.apache.hadoop.hdfs.server.namenode.TestBlockUnderConstruction
+                  org.apache.hadoop.hdfs.TestDFSInotifyEventInputStream
+                  org.apache.hadoop.hdfs.security.TestDelegationTokenForProxyUser
+                  org.apache.hadoop.hdfs.server.datanode.TestDataNodeRollingUpgrade
+                  org.apache.hadoop.hdfs.server.datanode.TestTransferRbw
+                  org.apache.hadoop.hdfs.server.namenode.TestListCorruptFileBlocks
+                  org.apache.hadoop.hdfs.server.namenode.ha.TestFailoverWithBlockTokensEnabled
+                  org.apache.hadoop.hdfs.TestReservedRawPaths
+                  org.apache.hadoop.hdfs.server.namenode.TestNameNodeRecovery
+                  org.apache.hadoop.hdfs.server.blockmanagement.TestPendingReplication
+                  org.apache.hadoop.hdfs.TestFileCorruption
+                  org.apache.hadoop.hdfs.server.namenode.TestStorageRestore
+                  org.apache.hadoop.hdfs.server.namenode.TestDiskspaceQuotaUpdate
+
+                                      The test build failed in hadoop-hdfs-project/hadoop-hdfs-httpfs 
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/8058//testReport/
+Release audit warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/8058//artifact/trunk/patchprocess/patchReleaseAuditProblems.txt
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/8058//artifact/trunk/patchprocess/newPatchFindbugsWarningshadoop-hdfs.html
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/8058//console
+
+This message is automatically generated.
+
+It's exciting to see this making progress.
+
+One thing that I would really like to see is an eviction policy other than least recently used (LRU).  LRU has been well-documented to be a very poor policy for scan workloads, which most of HDFS' workloads are.  It would be nice to see something like 2Q (See http://www.tedunangst.com/flak/post/2Q-buffer-cache-algorithm), or at least a pluggable interface that would allow this to be implemented.  I think that very few users, if any, will want LRU.
+
+Do we have performance benchmarks for this?  It would be nice to see that would could get a substantial fraction of memory bandwidth when writing to a single replica in-memory.  That usually means somewhere between 5 gigs/s and 10 gigs/s.  Perhaps it's too early to ask for these, since we haven't implemented HDFS-6933.  But it would be good to start thinking about this.  Also, some of the recent work to use native checksums has substantially reduced the checksum overhead in the write path so maybe we can get an estimate without HDFS-6933.
+
+Thanks for the note. We have been busy getting the basic feature in and stabilizing the branch. I intend to call a merge vote for the branch later this week. Most of the things you mention are somewhat open ended tasks and we plan to address post-merge:
+# Benchmarking writes to memory. This might suggest further work to improve the data write pipeline.
+# Benchmark the impact of CRC computation, evaluate moving it off the hot path.
+# Improve eviction, there's multiple ideas floating around, including integration with CCM.
+
+Contributions would be welcome on any of these.
+
+bq. It would be nice to see that would could get a substantial fraction of memory bandwidth when writing to a single replica in-memory.
+The comparison will be interesting but I can tell you without measurement it is not going to be a substantial fraction of memory bandwidth. We are still going through DataTransferProtocol with all the copies and overhead that involves.
+
+bq. Benchmark the impact of CRC computation, evaluate moving it off the hot path.
+
+We did some benchmarks for HDFS-4949 that put checksumming at 15% overhead when using native CRC32 with the intel CRC instructions.  This was for the read path, not the write path, though.  For writes there will also be a small write I/O amplification factor due to checksumming.
+
+bq. Improve eviction, there's multiple ideas floating around, including integration with CCM.
+
+Sorry, what's CCM?  A good eviction strategy is a core part of this, I have a hard time imagining merging without addressing that.
+
+bq. The comparison will be interesting but I can tell you without measurement it is not going to be a substantial fraction of memory bandwidth. We are still going through DataTransferProtocol with all the copies and overhead that involves.
+
+Before we merged HDFS-4949 we did substantial benchmarking to show performance improvements.  I'd like to see some similar benchmarks here before we can consider merging this branch.  If we can't acheive high write speeds, we should at least be able to demonstrate high read speeds of the data which is in the "HDFS-6581 write cache" (is that the right terminology still?)  We should also figure out how much CPU is used while doing these writes and reads.
+
+In general, if we can't hit our performance numbers, it suggests a design issue that we should address before merging.  There is nothing to be gained from rushing the merge process.  This is especially true since our "competition" here is caching systems that sit outside HDFS, which have been extensively benchmarked and evaulated.
+
+bq. Before we merged HDFS-4949 we did substantial benchmarking to show performance improvements. I'd like to see some similar benchmarks here before we can consider merging this branch. 
+I don't recall any performance numbers were published before merging to trunk. Looking through the Jira even now I don't see any numbers. Maybe it's there - feel free to give a pointer.
+
+The only brief mention of performance is in the test plan where you cite marginal improvement for MapReduce but no numbers. That said I don't want the conversation to get stuck on performance numbers. I am also surprised to hear you talking about design issues at this stage. The current direction is based on broad discussion with the community here and on HDFS-5851, and the overall consensus was to keep DataTransferProtocol in the picture for now. We cannot get close to memory bandwidth without 'short-circuit writes', which is our eventual plan, and the current design is a step in that direction.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12669546/HDFS-6581.merge.03.patch
+  against trunk revision f488611.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 27 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 4 new Findbugs (version 2.0.3) warnings.
+
+        {color:red}-1 release audit{color}.  The applied patch generated 1 release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs hadoop-hdfs-project/hadoop-hdfs-httpfs:
+
+                  org.apache.hadoop.metrics2.impl.TestMetricsSystemImpl
+                  org.apache.hadoop.hdfs.TestDFSFinalize
+                  org.apache.hadoop.hdfs.TestEncryptionZonesWithKMS
+                  org.apache.hadoop.hdfs.TestDFSUpgrade
+                  org.apache.hadoop.hdfs.web.TestWebHdfsFileSystemContract
+                  org.apache.hadoop.hdfs.tools.offlineEditsViewer.TestOfflineEditsViewer
+                  org.apache.hadoop.hdfs.server.namenode.ha.TestPipelinesFailover
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/8064//testReport/
+Release audit warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/8064//artifact/trunk/patchprocess/patchReleaseAuditProblems.txt
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/8064//artifact/trunk/patchprocess/newPatchFindbugsWarningshadoop-hdfs.html
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/8064//console
+
+This message is automatically generated.
+
+bq. I don't recall any performance numbers were published before merging to trunk. Looking through the Jira even now I don't see any numbers. Maybe it's there - feel free to give a pointer.
+
+There are a bunch of performance numbers on HDFS-4953 (a subtask of HDFS-4949).  Enabling zero-copy reads was an important goal of HDFS-4949.  On HDFS-4953, Todd and I discussed how to get close to the optimal 9GB/s per core.  More generally, we knew the HDFS read path could push a few gigs a second even without zero-copy because we'd done the testing beforehand (some of the results are on HDFS-347, some of that discussion is scattered other places).  So we were confident that HDFS-4949 was a performance improvement at the time of the merge.
+
+bq. The current direction is based on broad discussion with the community here and on HDFS-5851, and the overall consensus was to keep DataTransferProtocol in the picture for now.
+
+I'm fine with keeping {{DataTransferProtocol}} in the picture for now.  But you should still be able to show a performance improvement when reading (not writing) the data which you have previously written to the single replica in memory.  If there are flaws in this (for example, if short-circuit doesn't yet work for these blocks, causing slowness) then we should address this before merging.
+
+We should also quantify exactly what the write performance is, even if it's not as good as it could be.  This will tell us what we need to work on in the future and what the priorities should be.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12669765/HDFS-6581.merge.04.patch
+  against trunk revision 485c96e.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 29 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:red}-1 javadoc{color}.  The javadoc tool appears to have generated 112 warning messages.
+        See https://builds.apache.org/job/PreCommit-HDFS-Build/8085//artifact/trunk/patchprocess/diffJavadocWarnings.txt for details.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 4 new Findbugs (version 2.0.3) warnings.
+
+        {color:red}-1 release audit{color}.  The applied patch generated 1 release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs:
+
+                  org.apache.hadoop.crypto.random.TestOsSecureRandom
+                  org.apache.hadoop.ipc.TestCallQueueManager
+                  org.apache.hadoop.ipc.TestFairCallQueue
+
+                                      The test build failed in hadoop-hdfs-project/hadoop-hdfs 
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/8085//testReport/
+Release audit warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/8085//artifact/trunk/patchprocess/patchReleaseAuditProblems.txt
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/8085//artifact/trunk/patchprocess/newPatchFindbugsWarningshadoop-hdfs.html
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/8085//console
+
+This message is automatically generated.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12669844/HDFS-6581.merge.05.patch
+  against trunk revision fad4cd8.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 29 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 3 new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs hadoop-hdfs-project/hadoop-hdfs-httpfs:
+
+                  org.apache.hadoop.crypto.random.TestOsSecureRandom
+                  org.apache.hadoop.hdfs.TestEncryptionZonesWithKMS
+                  org.apache.hadoop.hdfs.server.namenode.ha.TestPipelinesFailover
+                  org.apache.hadoop.hdfs.tools.offlineEditsViewer.TestOfflineEditsViewer
+
+                                      The test build failed in hadoop-hdfs-project/hadoop-hdfs-httpfs 
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/8093//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/8093//artifact/PreCommit-HADOOP-Build-patchprocess/newPatchFindbugsWarningshadoop-hdfs.html
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/8093//console
+
+This message is automatically generated.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12669927/HDFS-6581.merge.06.patch
+  against trunk revision 6fe5c6b.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 29 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 4 new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs hadoop-hdfs-project/hadoop-hdfs-httpfs:
+
+                  org.apache.hadoop.ha.TestZKFailoverControllerStress
+
+                                      The test build failed in hadoop-hdfs-project/hadoop-hdfs-httpfs hadoop-hdfs-project/hadoop-hdfs 
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/8103//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/8103//artifact/PreCommit-HADOOP-Build-patchprocess/newPatchFindbugsWarningshadoop-hdfs.html
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/8103//console
+
+This message is automatically generated.
+
+I'd like to also echo Colin's desire to see some positive benchmark numbers before merging this. Since the point of this JIRA is to improve read/write performance, it really seems like we should verify that some nice gains are possible before adding this complexity. This is what we did for HDFS-4949, and I did also ask for benchmarks in my comment about a month ago.
+
+Arpit, I seem to remember you had a WIP short-circuit writes patch you were working on a while ago. Do you have any numbers from that even? Colin wrote a vectorized sum microbenchmark using zero-copy reads at HDFS-6287 you might be able to adapt. This does dredge up the discussion about the design of short-circuit writes, but maybe that's a bridge that has to be crossed.
+
+[~andrew.wang]: I agree that it would be nice to see a short-circuit write benchmark.  I don't think it's absolutely necessary to see that before merging, though.  But I do think some kind of benchmark of reading and writing from in-memory replicas is necessary, since as you say, this is a performance-focused project.  At least __reading__ from these replicas should be fast, similar to how reading from HDFS-4949 replicas is fast.  Merging without this information would be like merging the ACL branch without ever trying to create an ACL.  How do you know if it works?
+
+I also think we absolutely need a better eviction strategy than LRU before merging.  Any kind of real-world workload will probably show this really clearly.
+
+Sorry for being a party pooper, but I wanted to bring up these concerns before the merge vote.  If this spends another week or two in development, it will be a small price to pay for something we can be proud of.
+
+bq. There are a bunch of performance numbers on HDFS-4953 (a subtask of HDFS-4949). Enabling zero-copy reads was an important goal of HDFS-4949. On HDFS-4953, Todd and I discussed how to get close to the optimal 9GB/s per core.
+HDFS-4953 is not a subtask of HDFS-4949, and you yourself have said that it is an independent change. Also no numbers were cited or provided as evidence when calling the merge vote for HDFS-4949 so I don't think the community could reasonably be expected to take that into consideration.
+
+I acknowledge your concern that the eviction scheme needs tuning and what we have in here is mostly a placeholder. IMO we cannot come up with an ideal scheme with synthetic benchmarks. For that we'd require HDFS applications to run real world workloads using the feature, and it is hard to convince anyone to spend time doing that unless at least the base changes are in a mainline branch. The feature is entirely optional, so we do not risk breaking any existing users. The cost of indefinitely maintaining the feature in a branch is rather high given the regularity of changes happening in trunk.
+
+That said, I see the primary concern being that short-circuit reads must be able to work from memory and that read performance is not regressed. I think that is an entirely reasonable request and will provide evidence to support that before we completing the merge.
+
+bq. I also think we absolutely need a better eviction strategy than LRU before merging. Any kind of real-world workload will probably show this really clearly.
+I agree with the need for better eviction strategy. This will be driven off of applications that use this functionality. But I disagree that we need "better strategy" before the merge.
+
+[~arpitagarwal], is the eviction strategy pluggable and easy to change. If it is so, it should not hold off from merging this change.
+
+bq. Arpit Agarwal, is the eviction strategy pluggable and easy to change. If it is so, it should not hold off from merging this change.
+The eviction scheme is contained in a single new class, so it is fairly easy to change.
+
+Making it pluggable is an even better idea to evaluate alternatives without code changes. I filed HDFS-7100.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12670045/HDFS-6581.merge.07.patch
+  against trunk revision 25fd69a.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 29 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 4 new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs hadoop-hdfs-project/hadoop-hdfs-httpfs:
+
+                  org.apache.hadoop.ha.TestZKFailoverControllerStress
+                  org.apache.hadoop.hdfs.server.namenode.ha.TestPipelinesFailover
+                  org.apache.hadoop.hdfs.server.mover.TestStorageMover
+                  org.apache.hadoop.hdfs.tools.offlineEditsViewer.TestOfflineEditsViewer
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/8112//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/8112//artifact/PreCommit-HADOOP-Build-patchprocess/newPatchFindbugsWarningshadoop-hdfs.html
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/8112//console
+
+This message is automatically generated.
+
+bq. HDFS-4953 is not a subtask of HDFS-4949, and you yourself have said that it is an independent change. Also no numbers were cited or provided as evidence when calling the merge vote for HDFS-4949 so I don't think the community could reasonably be expected to take that into consideration.
+
+When HDFS-4953 was created, it was a subtask of HDFS-4949.  It was moved out because people wanted to be able to take advantage of it more quickly and it was a valuable improvement even without HDFS-4949.
+
+I don't think creating a usable eviction strategy is that hard.  I can help with it, but probably not for a few days.
+
+The move from subversion to git has reduced a lot of the pain of maintaining a branch.  You just periodically do a "git rebase \-i trunk" and you're good to go.  This is once of the biggest advantages of moving to git and if you haven't tried rebase \-i, you should!
+
+Can you give a summary of which tasks you are planning on completing prior to the merge and which after?
+
+bq. HDFS-4953 is not a subtask of HDFS-4949, and you yourself have said that it is an independent change.
+
+Arpit, it's unfair to say that HDFS-4953 isn't related to HDFS-4949. ZCR makes the most sense when it's used in combination with HDFS-4949 which is why we started working on ZCR in the first place. We committed it to the HDFS-4949 branch first and brought it down to trunk before the rest of the branch because other people were interested in using the new API.
+
+bq. Also no numbers were cited or provided as evidence when calling the merge vote for HDFS-4949 so I don't think the community could reasonably be expected to take that into consideration.
+
+I don't think this is a reasonable conclusion. HDFS-4953 is certainly related to HDFS-4949, had benchmark results, and was already closely scrutinized by the community before the merge (37 watchers, including yourself). It didn't seem necessary to bring it up the performance again in the merge email, and we could have easily pointed at the existing results on HDFS-4953 if anyone asked for performance numbers.
+
+I'm trying to be constructive here, which is why I provided a pointer to HDFS-6287. It's a microbenchmark that can actually read at close to memory speed (GB/s), which isn't true of a lot of other tests. Setting something up that writes and then reads using vecsum seems like a reasonable benchmark. Not sure if you have libhdfs bindings for this work yet, but that'd be the best thing if you want to adapt vecsum.
+
+Yeah, it would be nice to have a pre-merge test plan for this.  I can help with some testing but I'd like to know what has already been done and what remains to do.  thanks
+
+Rebase is no silver bullet. Conflicts still need to be resolved manually. Colin, explaining how to use git is a little condescending.
+
+bq. I don't think creating a usable eviction strategy is that hard. I can help with it, but probably not for a few days.
+It would be very little code to convert the current FIFO approach to something like LFU but writing code is easy and demonstrating it actually helps HDFS clients is harder. For your caching feature the measurement was fairly straightforward. The logic for deciding which replicas need to be in memory was outside HDFS. For this feature we'd first need to define "better scheme" and we'd need help from other stack components for evaluation. Think of this feature as providing the overall framework including API, protocol changes and DN support. If there is no argument with the framework design then there should be no objection to doing the eviction fine tuning (which is a very small proportion of the patch, perhaps less than 5% content wise) post-merge. And to restate, we cannot get clients to start evaluating it until the changes are in mainline.
+
+bq. Can you give a summary of which tasks you are planning on completing prior to the merge and which after?
+Please see the test plan attached by Xiaoyu for functional/regression testing. Pre-merge we'll make the eviction scheme pluggable via an interface and provide evidence that short circuit read performance is as good or better than what it is currently to address your concerns. I've outlined the post-merge plan above. This broadly covers write pipeline optimization, crc evaluations and tuning eviction.
+
+I caught up with [~arpitagarwal] about the current eviction policy. Fifo is not a great choice. I think we should consider LRU.
+
+bq. I don't think creating a usable eviction strategy is that hard. I can help with it, but probably not for a few days.
+[~cmccabe], I keep hearing usable eviction strategy and better eviction strategy. What is it? How do you decide it is better or usable? We should make sure the policy we go with is decent enough. I agree Fifo is not it. As regards to other approaches and improvements, one can certainly make it available using the plugin approach.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12670241/HDFS-6581.merge.08.patch
+  against trunk revision db890ee.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 29 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 5 new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs hadoop-hdfs-project/hadoop-hdfs-httpfs:
+
+                  org.apache.hadoop.metrics2.impl.TestMetricsSystemImpl
+                  org.apache.hadoop.hdfs.server.datanode.TestDataNodeMetrics
+                  org.apache.hadoop.hdfs.server.balancer.TestBalancerWithNodeGroup
+                  org.apache.hadoop.hdfs.web.TestWebHdfsFileSystemContract
+                  org.apache.hadoop.hdfs.server.balancer.TestBalancerWithMultipleNameNodes
+                  org.apache.hadoop.hdfs.server.datanode.TestReadOnlySharedStorage
+                  org.apache.hadoop.hdfs.server.namenode.ha.TestPipelinesFailover
+                  org.apache.hadoop.hdfs.server.balancer.TestBalancerWithSaslDataTransfer
+                  org.apache.hadoop.hdfs.server.balancer.TestBalancer
+                  org.apache.hadoop.hdfs.server.balancer.TestBalancerWithEncryptedTransfer
+                  org.apache.hadoop.hdfs.server.blockmanagement.TestBlockTokenWithDFS
+                  org.apache.hadoop.hdfs.server.balancer.TestBalancerWithHANameNodes
+                  org.apache.hadoop.hdfs.TestFileCreation
+                  org.apache.hadoop.hdfs.server.mover.TestStorageMover
+                  org.apache.hadoop.hdfs.TestSmallBlock
+                  org.apache.hadoop.hdfs.TestWriteBlockGetsBlockLengthHint
+                  org.apache.hadoop.hdfs.tools.offlineEditsViewer.TestOfflineEditsViewer
+                  org.apache.hadoop.hdfs.server.namenode.TestFileLimit
+                  org.apache.hadoop.hdfs.TestInjectionForSimulatedStorage
+
+                                      The following test timeouts occurred in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs hadoop-hdfs-project/hadoop-hdfs-httpfs:
+
+org.apache.hadoop.hdfs.TestReplication
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/8124//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/8124//artifact/PreCommit-HADOOP-Build-patchprocess/newPatchFindbugsWarningshadoop-hdfs.html
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/8124//console
+
+This message is automatically generated.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12670257/HDFS-6581.merge.09.patch
+  against trunk revision 84a0a62.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 29 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 5 new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs hadoop-hdfs-project/hadoop-hdfs-httpfs:
+
+                  org.apache.hadoop.crypto.random.TestOsSecureRandom
+                  org.apache.hadoop.ipc.TestCallQueueManager
+                  org.apache.hadoop.hdfs.tools.offlineEditsViewer.TestOfflineEditsViewer
+                  org.apache.hadoop.fs.http.client.TestHttpFSFileSystemLocalFileSystem
+                  org.apache.hadoop.fs.http.client.TestHttpFSFWithWebhdfsFileSystem
+                  org.apache.hadoop.fs.http.server.TestHttpFSServerNoACLs
+                  org.apache.hadoop.fs.http.client.TestHttpFSWithHttpFSFileSystem
+                  org.apache.hadoop.fs.http.server.TestHttpFSServer
+                  org.apache.hadoop.fs.http.server.TestHttpFSServerNoXAttrs
+                  org.apache.hadoop.fs.http.client.TestHttpFSFWithSWebhdfsFileSystem
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/8129//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/8129//artifact/PreCommit-HADOOP-Build-patchprocess/newPatchFindbugsWarningshadoop-hdfs.html
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/8129//console
+
+This message is automatically generated.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12670257/HDFS-6581.merge.09.patch
+  against trunk revision 84a0a62.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 29 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 5 new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs hadoop-hdfs-project/hadoop-hdfs-httpfs:
+
+                  org.apache.hadoop.hdfs.web.TestWebHdfsFileSystemContract
+                  org.apache.hadoop.hdfs.server.namenode.ha.TestPipelinesFailover
+                  org.apache.hadoop.hdfs.tools.offlineEditsViewer.TestOfflineEditsViewer
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/8130//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/8130//artifact/PreCommit-HADOOP-Build-patchprocess/newPatchFindbugsWarningshadoop-hdfs.html
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/8130//console
+
+This message is automatically generated.
+
+Micro-benchmark to verify that SCR performance does not suffer with this feature.
+
+Numbers below for short-circuit reads of 1GB file, Block Size = 256MB, mean throughput over 1000 iterations of reading the file fully, 8GB tmpfs partition as RAM_DISK data directory.
+
+||IO Size||Read Throughput Lazy Persist off (MB/s)||Mean Read Throughput Lazy Persist on (MB/s)||
+|64K|2661|2611|
+|1M|2267|2354|
+
+For comparison, here is the read throughput *without Short-circuit reads*:
+||IO Size||Read Throughput (MB/s)||
+|64K|1470|
+|1M|1275|
+
+bq. Rebase is no silver bullet. Conflicts still need to be resolved manually. Colin, explaining how to use git is a little condescending.
+
+I apologize if it sounded condescending.  I was just trying to point out that the cost of maintaining a branch has gone down due to the switch to git.
+
+bq. It would be very little code to convert the current FIFO approach to something like LFU but writing code is easy and demonstrating it actually helps HDFS clients is harder. For your caching feature the measurement was fairly straightforward. The logic for deciding which replicas need to be in memory was outside HDFS. For this feature we'd first need to define "better scheme" and we'd need help from other stack components for evaluation. Think of this feature as providing the overall framework including API, protocol changes and DN support. If there is no argument with the framework design then there should be no objection to doing the eviction fine tuning (which is a very small proportion of the patch, perhaps less than 5% content wise) post-merge. And to restate, we cannot get clients to start evaluating it until the changes are in mainline.
+
+I agree that testing is needed, and it will be time-consuming.  But I don't understand why LRU was implemented first.  It's very well-known that LRU is a poor fit for scan workloads, which most HDFS workloads are.
+
+My fear here is that we will try to implement a better eviction strategy, but find that the pluggable API introduced in HDFS-7100 is too inflexible to do so.  I'm hoping that this fear is not justified, but until there is an actual LFU or cold/warm/hot scheme implemented, we won't know for sure.  As you said, this isn't much code, so maybe I'll do it if it remains to be done later.
+
+bq. Colin Patrick McCabe, I keep hearing usable eviction strategy and better eviction strategy. What is it? How do you decide it is better or usable? We should make sure the policy we go with is decent enough. I agree Fifo is not it. As regards to other approaches and improvements, one can certainly make it available using the plugin approach.
+
+That's a good point.  I think system-level testing will be needed.  I think it's fine to merge without this system-level testing being done, but I want there to be at least one non-LRU implementation of eviction so that we know that it's possible within this framework.  Basically validating the plugin architecture.
+
+bq. Micro-benchmark to verify that SCR performance does not suffer with this feature.
+
+Thank you, Arpit.  You might also consider using:
+
+{code}
+sudo sh -c “/usr/bin/echo 3 > /proc/sys/vm/drop_caches”
+time hadoop fs -cat /my/non-lazy-persist-file
+sudo sh -c “/usr/bin/echo 3 > /proc/sys/vm/drop_caches”
+time hadoop fs -cat /my/lazy-persist-file
+{code}
+
+to get a benchmark that makes you look better :)  Clearly the lazy-persist file will still be in RAM after caches are dropped, whereas the non-lazy one will not.  I always repeat experiments 3 times and average, I left that out for brevity
+
+bq. My fear here is that we will try to implement a better eviction strategy, but find that the pluggable API introduced in HDFS-7100 is too inflexible to do so. I'm hoping that this fear is not justified, but until there is an actual LFU or cold/warm/hot scheme implemented, we won't know for sure. As you said, this isn't much code, so maybe I'll do it if it remains to be done later.
+Colin, LFU may work better for a general purpose cache, but this feature is targeting a specific use case of smaller intermediate data. Intermediate data is likely to be read once or very few times and is very likely to not fit the typical LFU use case and in fact MFU may be better. IMO without real world evaluation there is no data to support one over the other. Let's help HDFS clients evaluate it.
+
+bq. My fear here is that we will try to implement a better eviction strategy, but find that the pluggable API introduced in HDFS-7100 is too inflexible to do so.
+I don't see any reason to fear. The interface is tagged private and the interactions with DN are in limited portions of the FsDataset code. It will be easy to update if needed.
+
+bq. to get a benchmark that makes you look better  Clearly the lazy-persist file will still be in RAM after caches are dropped, whereas the non-lazy one will not. I always repeat experiments 3 times and average, I left that out for brevity
+Thanks for the idea, might be useful for future testing. For now I trigger the best case scenario for non-lazy persist (data already in buffer cache) just to demonstrate performance is at par. As we'd expect it to be since we're doing SCR from RAM in either case. The numbers are means over 1000 runs discarding the initial sacrificial read fetching block data to buffer cache.
+
+bq. I think system-level testing will be needed. I think it's fine to merge without this system-level testing being done
+To understand how effective memory tier is, and also to be able to tell the difference between different pluggable implementations, we may need good set of metrics. What should those metrics be? Some early thoughts:
+- Number of times a block in memory was read (before being ejected)
+- Average block size for data written to memory tier
+- Time the block was in memory before being ejected
+
+We probably will continue to add metrics based on use cases. We can start by adding some metrics we think are useful. This work can happen in trunk.
+
+Suresh, good suggestions. Let me file a task for metrics. A few other metrics I have been thinking of:
+# Number of blocks written to memory
+# Number of memory writes requested but not satisfied (failed-over to disk)
+# Number of blocks evicted without ever being read from memory
+# Average delay between memory write and disk write (window where a node restart could cause data loss).
+
+It might be also useful to track how often a block was requested to be read shortly after eviction, however that requires more overhead to track.
+
+We can do this work in trunk.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12670595/HDFS-6581.merge.10.patch
+  against trunk revision 7b8df93.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 32 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 4 new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs hadoop-hdfs-project/hadoop-hdfs-httpfs:
+
+                  org.apache.hadoop.metrics2.impl.TestMetricsSystemImpl
+                  org.apache.hadoop.hdfs.server.namenode.ha.TestPipelinesFailover
+                  org.apache.hadoop.hdfs.TestEncryptionZonesWithKMS
+                  org.apache.hadoop.hdfs.web.TestWebHdfsFileSystemContract
+                  org.apache.hadoop.hdfs.tools.offlineEditsViewer.TestOfflineEditsViewer
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/8159//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/8159//artifact/PreCommit-HADOOP-Build-patchprocess/newPatchFindbugsWarningshadoop-hdfs.html
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/8159//console
+
+This message is automatically generated.
+
+Preliminary numbers for write throughput.
+
+The test creates, writes and closes 3 x 2GB files in quick succession and computes the mean E2E time per file. Just looking at raw throughput  makes memory writes look even better.
+
+System RAM: 24GB
+RAM Disk: 8GB
+
+*Baseline, checksums ON*
+||Block Size (MB)||Mean E2E Latency (ms)||
+|128|7235|
+|1024|7005|
+
+*Lazy Persist, checksums ON*
+||Block Size (MB)||Mean E2E Latency (ms)||Improvement over baseline||
+|128|5015|30.6%|
+|1024|4635|33.8%|
+
+*Lazy Persist, checksums OFF*
+||Block Size (MB)||Mean E2E Latency (ms)||Improvement over baseline||
+|128|4504|37.7%|
+|1024|4240|39.4%|
+
+The baseline times were all over the map across runs. I picked the best number. If the buffer cache happens to be dirty - which will be common in practice - the disk write times degrade to 20s for a 2GB file (100MB/s, which happens to be disk write throughput). Correspondingly if the RAM disk is full with dirty data and the lazy writer cannot keep up the memory numbers will suffer. Another potential improvement afforded by writing to RAM disk is that the lazyWriter can use unbuffered disk writes which avoid churning buffer cache (HDFS-7090). We cannot make a corresponding fix in our existing data write pipeline as the best case write latency will suffer significantly.
+
+Thanks for running these numbers Arpit. To convert into MB/s, it seems like we're going from 280 or 292 MB/s baseline to 455 or 487MBs with csums off.
+
+Are you aware of any further copies that can be eliminated in DTP, or via something like short-circuit writes? I'd be satisfied regarding the merge if we had a pretty good estimate of the perf after such improvements are made. Saying that we could go from e.g. 4 copies to 2 copies would suffice for this, better would be results from a prototype.
+
+I have not looked at the DataTransferProtocol well enough to understand how many copies we can eliminate. Reads get 1GB/s over the same protocol so intuitively we should be able to optimize writes to get a similar number. However improving the transfer protocol is a separate feature in itself and should not gate the current changes.
+
+bq. I'd be satisfied regarding the merge if we had a pretty good estimate of the perf after such improvements are made.
+[~andrew.wang], why does that gate this merge? If that is an important feature, certainly please consider creating a jira and making further improvements. But I am at a loss at all the issues we keep bringing up as requirements for the merge, despite a lot of work done to ensure valid concerns people are raising are addressed.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12671152/Test-Plan-for-HDFS-6581-Memory-Storage.pdf
+  against trunk revision 428a766.
+
+    {color:red}-1 patch{color}.  The patch command could not apply the patch.
+
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/8197//console
+
+This message is automatically generated.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12671139/HDFS-6581.merge.11.patch
+  against trunk revision 428a766.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 34 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 3 new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs hadoop-hdfs-project/hadoop-hdfs-httpfs:
+
+                  org.apache.hadoop.crypto.random.TestOsSecureRandom
+
+                                      The test build failed in hadoop-hdfs-project/hadoop-hdfs-httpfs hadoop-hdfs-project/hadoop-hdfs 
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/8194//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/8194//artifact/PreCommit-HADOOP-Build-patchprocess/newPatchFindbugsWarningshadoop-hdfs.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/8194//artifact/PreCommit-HADOOP-Build-patchprocess/newPatchFindbugsWarningshadoop-common.html
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/8194//console
+
+This message is automatically generated.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12671169/HDFS-6581.merge.11.patch
+  against trunk revision dff95f7.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 34 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 3 new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs hadoop-hdfs-project/hadoop-hdfs-httpfs:
+
+                  org.apache.hadoop.crypto.random.TestOsSecureRandom
+                  org.apache.hadoop.hdfs.server.mover.TestStorageMover
+                  org.apache.hadoop.hdfs.web.TestWebHdfsFileSystemContract
+                  org.apache.hadoop.hdfs.TestEncryptionZonesWithKMS
+                  org.apache.hadoop.hdfs.server.namenode.ha.TestPipelinesFailover
+                  org.apache.hadoop.hdfs.tools.offlineEditsViewer.TestOfflineEditsViewer
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/8200//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/8200//artifact/PreCommit-HADOOP-Build-patchprocess/newPatchFindbugsWarningshadoop-common.html
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/8200//artifact/PreCommit-HADOOP-Build-patchprocess/newPatchFindbugsWarningshadoop-hdfs.html
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/8200//console
+
+This message is automatically generated.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12671722/HDFS-6581.merge.12.patch
+  against trunk revision 400e1bb.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 34 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 1 new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs hadoop-hdfs-project/hadoop-hdfs-httpfs:
+
+                  org.apache.hadoop.hdfs.TestEncryptionZonesWithKMS
+                  org.apache.hadoop.hdfs.server.mover.TestStorageMover
+                  org.apache.hadoop.hdfs.tools.offlineEditsViewer.TestOfflineEditsViewer
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/8247//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/8247//artifact/PreCommit-HADOOP-Build-patchprocess/newPatchFindbugsWarningshadoop-hdfs.html
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/8247//console
+
+This message is automatically generated.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12671984/HDFS-6581.merge.14.patch
+  against trunk revision 0577eb3.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 29 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 2 new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs:
+
+                  org.apache.hadoop.metrics2.impl.TestMetricsSystemImpl
+                  org.apache.hadoop.hdfs.TestEncryptionZonesWithKMS
+                  org.apache.hadoop.hdfs.TestBlockStoragePolicy
+                  org.apache.hadoop.hdfs.server.mover.TestStorageMover
+                  org.apache.hadoop.hdfs.tools.offlineEditsViewer.TestOfflineEditsViewer
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/8269//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/8269//artifact/patchprocess/newPatchFindbugsWarningshadoop-hdfs.html
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/8269//console
+
+This message is automatically generated.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12672227/HDFS-6581.merge.15.patch
+  against trunk revision 9e9e9cf.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 29 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 1 new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs:
+
+                  org.apache.hadoop.crypto.random.TestOsSecureRandom
+                  org.apache.hadoop.ha.TestZKFailoverControllerStress
+
+                                      The test build failed in hadoop-hdfs-project/hadoop-hdfs 
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/8282//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/8282//artifact/patchprocess/newPatchFindbugsWarningshadoop-hdfs.html
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/8282//console
+
+This message is automatically generated.
+
+{color:red}-1 overall{color}.  Here are the results of testing the latest attachment 
+  http://issues.apache.org/jira/secure/attachment/12672227/HDFS-6581.merge.15.patch
+  against trunk revision 17d1202.
+
+    {color:green}+1 @author{color}.  The patch does not contain any @author tags.
+
+    {color:green}+1 tests included{color}.  The patch appears to include 29 new or modified test files.
+
+    {color:green}+1 javac{color}.  The applied patch does not increase the total number of javac compiler warnings.
+
+    {color:green}+1 javadoc{color}.  There were no new javadoc warning messages.
+
+    {color:green}+1 eclipse:eclipse{color}.  The patch built with eclipse:eclipse.
+
+    {color:red}-1 findbugs{color}.  The patch appears to introduce 1 new Findbugs (version 2.0.3) warnings.
+
+    {color:green}+1 release audit{color}.  The applied patch does not increase the total number of release audit warnings.
+
+    {color:red}-1 core tests{color}.  The patch failed these unit tests in hadoop-common-project/hadoop-common hadoop-hdfs-project/hadoop-hdfs:
+
+                  org.apache.hadoop.crypto.random.TestOsSecureRandom
+                  org.apache.hadoop.hdfs.TestEncryptionZonesWithKMS
+
+    {color:green}+1 contrib tests{color}.  The patch passed contrib unit tests.
+
+Test results: https://builds.apache.org/job/PreCommit-HDFS-Build/8287//testReport/
+Findbugs warnings: https://builds.apache.org/job/PreCommit-HDFS-Build/8287//artifact/patchprocess/newPatchFindbugsWarningshadoop-hdfs.html
+Console output: https://builds.apache.org/job/PreCommit-HDFS-Build/8287//console
+
+This message is automatically generated.
+
+The findbugs warning and test failures are unrelated to the merge patch.
+
+Branch HDFS-6581 has been merged to trunk. Keeping Jira open until branch-2 merge.
+
+
+FAILURE: Integrated in Hadoop-trunk-Commit #6163 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/6163/])
+HDFS-6950. Add Additional unit tests for HDFS-6581. (Contributed by Xiaoyu Yao) (arp: rev 762b04e9943d6a05e1130fc81ada5b5dc8baab2c)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/DFSTestUtil.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestLazyPersistFiles.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES-HDFS-6581.txt
+HDFS-7064. Fix unit test failures in HDFS-6581 branch. (Contributed by Xiaoyu Yao) (arp: rev 4603e4481f0486afcce6b106d4a92a6e90e5b6d9)
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsVolumeImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES-HDFS-6581.txt
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/shell/CommandWithDestination.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDataDirs.java
+HDFS-7079. Few more unit test fixes for HDFS-6581. (Arpit Agarwal) (arp: rev dcbc46730131a1bdf8416efeb4571794e5c8e369)
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/shell/CommandWithDestination.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES-HDFS-6581.txt
+HDFS-7143. Fix findbugs warnings in HDFS-6581 branch. (Contributed by Tsz Wo Nicholas Sze) (arp: rev feda4733a8279485fc0ff1271f9c22bc44f333f6)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES-HDFS-6581.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/BlockPoolSlice.java
+HDFS-7171. Fix Jenkins failures in HDFS-6581 branch. (Arpit Agarwal) (arp: rev a45ad330facc56f06ed42eb71304c49ef56dc549)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestBlockStoragePolicy.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES-HDFS-6581.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/mover/TestStorageMover.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+HDFS-6581. Update CHANGES.txt in preparation for trunk merge (arp: rev 04b08431a3446300f4715cf135f0e60f85e5bf5a)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES-HDFS-6581.txt
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+
+
+FAILURE: Integrated in Hadoop-Yarn-trunk #698 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/698/])
+HDFS-6950. Add Additional unit tests for HDFS-6581. (Contributed by Xiaoyu Yao) (arp: rev 762b04e9943d6a05e1130fc81ada5b5dc8baab2c)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES-HDFS-6581.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/DFSTestUtil.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestLazyPersistFiles.java
+HDFS-7064. Fix unit test failures in HDFS-6581 branch. (Contributed by Xiaoyu Yao) (arp: rev 4603e4481f0486afcce6b106d4a92a6e90e5b6d9)
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/shell/CommandWithDestination.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES-HDFS-6581.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsVolumeImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDataDirs.java
+HDFS-7079. Few more unit test fixes for HDFS-6581. (Arpit Agarwal) (arp: rev dcbc46730131a1bdf8416efeb4571794e5c8e369)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES-HDFS-6581.txt
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/shell/CommandWithDestination.java
+HDFS-7143. Fix findbugs warnings in HDFS-6581 branch. (Contributed by Tsz Wo Nicholas Sze) (arp: rev feda4733a8279485fc0ff1271f9c22bc44f333f6)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES-HDFS-6581.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/BlockPoolSlice.java
+HDFS-7171. Fix Jenkins failures in HDFS-6581 branch. (Arpit Agarwal) (arp: rev a45ad330facc56f06ed42eb71304c49ef56dc549)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES-HDFS-6581.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/mover/TestStorageMover.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestBlockStoragePolicy.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+HDFS-6581. Update CHANGES.txt in preparation for trunk merge (arp: rev 04b08431a3446300f4715cf135f0e60f85e5bf5a)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES-HDFS-6581.txt
+
+
+FAILURE: Integrated in Hadoop-Hdfs-trunk #1889 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/1889/])
+HDFS-6950. Add Additional unit tests for HDFS-6581. (Contributed by Xiaoyu Yao) (arp: rev 762b04e9943d6a05e1130fc81ada5b5dc8baab2c)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/DFSTestUtil.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES-HDFS-6581.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestLazyPersistFiles.java
+HDFS-7064. Fix unit test failures in HDFS-6581 branch. (Contributed by Xiaoyu Yao) (arp: rev 4603e4481f0486afcce6b106d4a92a6e90e5b6d9)
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsVolumeImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDataDirs.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES-HDFS-6581.txt
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/shell/CommandWithDestination.java
+HDFS-7079. Few more unit test fixes for HDFS-6581. (Arpit Agarwal) (arp: rev dcbc46730131a1bdf8416efeb4571794e5c8e369)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES-HDFS-6581.txt
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/shell/CommandWithDestination.java
+HDFS-7143. Fix findbugs warnings in HDFS-6581 branch. (Contributed by Tsz Wo Nicholas Sze) (arp: rev feda4733a8279485fc0ff1271f9c22bc44f333f6)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES-HDFS-6581.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/BlockPoolSlice.java
+HDFS-7171. Fix Jenkins failures in HDFS-6581 branch. (Arpit Agarwal) (arp: rev a45ad330facc56f06ed42eb71304c49ef56dc549)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/mover/TestStorageMover.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestBlockStoragePolicy.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES-HDFS-6581.txt
+HDFS-6581. Update CHANGES.txt in preparation for trunk merge (arp: rev 04b08431a3446300f4715cf135f0e60f85e5bf5a)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES-HDFS-6581.txt
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+
+
+FAILURE: Integrated in Hadoop-Mapreduce-trunk #1914 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/1914/])
+HDFS-6950. Add Additional unit tests for HDFS-6581. (Contributed by Xiaoyu Yao) (arp: rev 762b04e9943d6a05e1130fc81ada5b5dc8baab2c)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES-HDFS-6581.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestLazyPersistFiles.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/DFSTestUtil.java
+HDFS-7064. Fix unit test failures in HDFS-6581 branch. (Contributed by Xiaoyu Yao) (arp: rev 4603e4481f0486afcce6b106d4a92a6e90e5b6d9)
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/shell/CommandWithDestination.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsVolumeImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES-HDFS-6581.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/TestDataDirs.java
+HDFS-7079. Few more unit test fixes for HDFS-6581. (Arpit Agarwal) (arp: rev dcbc46730131a1bdf8416efeb4571794e5c8e369)
+* hadoop-common-project/hadoop-common/src/main/java/org/apache/hadoop/fs/shell/CommandWithDestination.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES-HDFS-6581.txt
+HDFS-7143. Fix findbugs warnings in HDFS-6581 branch. (Contributed by Tsz Wo Nicholas Sze) (arp: rev feda4733a8279485fc0ff1271f9c22bc44f333f6)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES-HDFS-6581.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/BlockPoolSlice.java
+HDFS-7171. Fix Jenkins failures in HDFS-6581 branch. (Arpit Agarwal) (arp: rev a45ad330facc56f06ed42eb71304c49ef56dc549)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES-HDFS-6581.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/mover/TestStorageMover.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/TestBlockStoragePolicy.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/namenode/FSNamesystem.java
+HDFS-6581. Update CHANGES.txt in preparation for trunk merge (arp: rev 04b08431a3446300f4715cf135f0e60f85e5bf5a)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES-HDFS-6581.txt
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+
+
+I am planning to merge this to branch-2 today, and subsequently to branch-2.6 by tomorrow. As agreed on HDFS-6919, In 2.6 we will indicate in the release notes that the memory for writes on RAM and the memory for caching in datanodes are independent, and a feature to manage them together will be added in the next release.
+
+I have merged this to branch-2 and branch-2.6. 
+
+Hey Jitendra, could you update the trunk CHANGES.txt accordingly? Thanks.
+
+Updated CHANGES.txt in trunk.
+
+FAILURE: Integrated in Hadoop-trunk-Commit #6305 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/6305/])
+Updated CHANGES.txt for HDFS-6581 merge into branch-2.6. (jitendra: rev b85919feef64ed8b05b84ab8c372844a815cc139)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+
+
+SUCCESS: Integrated in Hadoop-Yarn-trunk #720 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/720/])
+Updated CHANGES.txt for HDFS-6581 merge into branch-2.6. (jitendra: rev b85919feef64ed8b05b84ab8c372844a815cc139)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+
+
+FAILURE: Integrated in Hadoop-Hdfs-trunk #1909 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/1909/])
+Updated CHANGES.txt for HDFS-6581 merge into branch-2.6. (jitendra: rev b85919feef64ed8b05b84ab8c372844a815cc139)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+
+
+FAILURE: Integrated in Hadoop-Mapreduce-trunk #1934 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/1934/])
+Updated CHANGES.txt for HDFS-6581 merge into branch-2.6. (jitendra: rev b85919feef64ed8b05b84ab8c372844a815cc139)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+
+
+FAILURE: Integrated in Hadoop-trunk-Commit #6338 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/6338/])
+HDFS-6988. Improve HDFS-6581 eviction configuration (Xiaoyu Yao via Colin P. McCabe) (cmccabe: rev a52eb4bc5fb21574859f779001ea9d95bf5207fe)
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/TestLazyPersistFiles.java
+* hadoop-hdfs-project/hadoop-hdfs/src/test/java/org/apache/hadoop/hdfs/server/balancer/TestBalancer.java
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/datanode/fsdataset/impl/FsDatasetImpl.java
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/DFSConfigKeys.java
+
+
+FAILURE: Integrated in Hadoop-trunk-Commit #8032 (See [https://builds.apache.org/job/Hadoop-trunk-Commit/8032/])
+HDFS-7164. Feature documentation for HDFS-6581. (Contributed by Arpit Agarwal) (arp: rev 5dbc8c9cb00da1ba55e1c94c4c1e19d34cf1bd5a)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/site/resources/images/LazyPersistWrites.png
+* hadoop-hdfs-project/hadoop-hdfs/src/site/markdown/CentralizedCacheManagement.md
+* hadoop-hdfs-project/hadoop-hdfs/src/site/markdown/MemoryStorage.md
+* hadoop-project/src/site/site.xml
+
+
+FAILURE: Integrated in Hadoop-Yarn-trunk #961 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk/961/])
+HDFS-7164. Feature documentation for HDFS-6581. (Contributed by Arpit Agarwal) (arp: rev 5dbc8c9cb00da1ba55e1c94c4c1e19d34cf1bd5a)
+* hadoop-hdfs-project/hadoop-hdfs/src/site/resources/images/LazyPersistWrites.png
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/site/markdown/MemoryStorage.md
+* hadoop-project/src/site/site.xml
+* hadoop-hdfs-project/hadoop-hdfs/src/site/markdown/CentralizedCacheManagement.md
+
+
+FAILURE: Integrated in Hadoop-Yarn-trunk-Java8 #231 (See [https://builds.apache.org/job/Hadoop-Yarn-trunk-Java8/231/])
+HDFS-7164. Feature documentation for HDFS-6581. (Contributed by Arpit Agarwal) (arp: rev 5dbc8c9cb00da1ba55e1c94c4c1e19d34cf1bd5a)
+* hadoop-hdfs-project/hadoop-hdfs/src/site/markdown/MemoryStorage.md
+* hadoop-project/src/site/site.xml
+* hadoop-hdfs-project/hadoop-hdfs/src/site/markdown/CentralizedCacheManagement.md
+* hadoop-hdfs-project/hadoop-hdfs/src/site/resources/images/LazyPersistWrites.png
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+
+
+FAILURE: Integrated in Hadoop-Hdfs-trunk-Java8 #220 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk-Java8/220/])
+HDFS-7164. Feature documentation for HDFS-6581. (Contributed by Arpit Agarwal) (arp: rev 5dbc8c9cb00da1ba55e1c94c4c1e19d34cf1bd5a)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-project/src/site/site.xml
+* hadoop-hdfs-project/hadoop-hdfs/src/site/markdown/CentralizedCacheManagement.md
+* hadoop-hdfs-project/hadoop-hdfs/src/site/resources/images/LazyPersistWrites.png
+* hadoop-hdfs-project/hadoop-hdfs/src/site/markdown/MemoryStorage.md
+
+
+FAILURE: Integrated in Hadoop-Mapreduce-trunk-Java8 #229 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk-Java8/229/])
+HDFS-7164. Feature documentation for HDFS-6581. (Contributed by Arpit Agarwal) (arp: rev 5dbc8c9cb00da1ba55e1c94c4c1e19d34cf1bd5a)
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-project/src/site/site.xml
+* hadoop-hdfs-project/hadoop-hdfs/src/site/resources/images/LazyPersistWrites.png
+* hadoop-hdfs-project/hadoop-hdfs/src/site/markdown/CentralizedCacheManagement.md
+* hadoop-hdfs-project/hadoop-hdfs/src/site/markdown/MemoryStorage.md
+
+
+FAILURE: Integrated in Hadoop-Mapreduce-trunk #2177 (See [https://builds.apache.org/job/Hadoop-Mapreduce-trunk/2177/])
+HDFS-7164. Feature documentation for HDFS-6581. (Contributed by Arpit Agarwal) (arp: rev 5dbc8c9cb00da1ba55e1c94c4c1e19d34cf1bd5a)
+* hadoop-hdfs-project/hadoop-hdfs/src/site/resources/images/LazyPersistWrites.png
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-project/src/site/site.xml
+* hadoop-hdfs-project/hadoop-hdfs/src/site/markdown/MemoryStorage.md
+* hadoop-hdfs-project/hadoop-hdfs/src/site/markdown/CentralizedCacheManagement.md
+
+
+SUCCESS: Integrated in Hadoop-Hdfs-trunk #2159 (See [https://builds.apache.org/job/Hadoop-Hdfs-trunk/2159/])
+HDFS-7164. Feature documentation for HDFS-6581. (Contributed by Arpit Agarwal) (arp: rev 5dbc8c9cb00da1ba55e1c94c4c1e19d34cf1bd5a)
+* hadoop-project/src/site/site.xml
+* hadoop-hdfs-project/hadoop-hdfs/src/site/resources/images/LazyPersistWrites.png
+* hadoop-hdfs-project/hadoop-hdfs/src/site/markdown/MemoryStorage.md
+* hadoop-hdfs-project/hadoop-hdfs/CHANGES.txt
+* hadoop-hdfs-project/hadoop-hdfs/src/site/markdown/CentralizedCacheManagement.md
+
+
