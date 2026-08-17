@@ -1,14 +1,4 @@
 #!/usr/bin/env python3
-"""Automatically retry excluded Java/Maven subjects with compilation repairs.
-
-The pipeline deduplicates test rows by repository URL + commit SHA + Maven
-module, then tries the supplied Maven skip flags under Java 8, 11, and 17.
-Depending on the existing compilation-error category, it can also rewrite HTTP
-URLs in POM files and replace ``-SNAPSHOT`` versions before retrying.
-
-Only Python's standard library is required for CSV input. XLSX category files
-are supported when ``openpyxl`` is installed.
-"""
 
 from __future__ import annotations
 
